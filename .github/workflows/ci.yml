@@ -180,6 +180,13 @@ jobs:
         run: helm lint deploy/chart
       - name: Helm template
         run: helm template xalgorix deploy/chart >/dev/null
+      - name: Dockerfile lint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          failure-threshold: error
+      - name: Validate Docker webui build stage
+        run: docker build --target webui -t xalgorix-webui-ci .
 
   macos-smoke:
     name: macOS ARM64 smoke test
