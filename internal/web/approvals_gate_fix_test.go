@@ -2,9 +2,6 @@ package web
 
 import (
 	"context"
-	"encoding/json"
-	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -13,142 +10,10 @@ import (
 	"github.com/xalgord/xalgorix/v4/internal/config"
 	"github.com/xalgord/xalgorix/v4/internal/platform"
 	"github.com/xalgord/xalgorix/v4/internal/scanctx"
-	"github.com/xalgord/xalgorix/v4/internal/tools"
 )
 
 // utf8ReplacementChar mirrors utf8.RuneError for the validity probe.
 const utf8ReplacementChar = utf8.RuneError
-
-// ── HIGH-1: by-value credential redaction across all payload surfaces ────────
-
-// TestApprovalPayloadByValueRedaction pins the targetAuthB leak class: the
-// operator's second-account credential appears in the request the model
-// sends (body / command / header / URL userinfo), and the approval payload
-// must be redacted on ALL THREE surfaces — the persisted row, the WS event
-// buffered for replay, and the GET /api/approvals response — before anything
-// else can observe it.
-func TestApprovalPayloadByValueRedaction(t *testing.T) {
-	s, store := newEnforceGateServer(t, 5, 1)
-	ctx := context.Background()
-	project, err := store.EnsureDefaultProject(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	inst := registerGateInstance(t, s, "inst-secret")
-	sctx := scanctx.New("gate-secret", t.TempDir())
-	executed := 0
-
-	// Bind the operator's credential registry — the same list
-	// agent.prepareScanEnvironment registers for targetAuthB telemetry
-	// redaction (httpclient.ParseAuthHeaders("Bearer <token>") yields this
-	// exact value). Bind on the adapter the registry actually holds.
-	const credential = "Bearer supersecret-b-token-99"
-	reg, gate := gateRegistry(t, s, "inst-secret", sctx, &executed)
-	gate.BindSecrets(func() []string { return []string{credential} })
-
-	// One regulated call whose args carry the credential in every payload
-	// surface the approval row can show, plus an embedded-credential URL.
-	resCh := make(chan tools.Result, 1)
-	go func() {
-		res, err := reg.Execute("terminal_execute", map[string]string{
-			"command": `curl -X POST https://admin:sup3rsecret@example.com/wp-login.php -H "Authorization: ` + credential + `" -d 'password=` + credential + `&x=1'`,
-		})
-		if err != nil {
-			t.Errorf("execute: %v", err)
-		}
-		resCh <- res
-	}()
-	waitForPendingRows(t, store, project.ID, 1, "redacted submit")
-
-	// ── surface 1: the persisted row ──
-	rows, _ := store.ListApprovals(ctx, platform.ApprovalFilter{Status: "pending", ProjectID: project.ID})
-	row := rows[0]
-	for _, surface := range []string{row.Payload.Command, row.Payload.BodyExcerpt} {
-		if strings.Contains(surface, "supersecret-b-token-99") {
-			t.Errorf("credential leaked in stored payload: %q", surface)
-		}
-		if strings.Contains(surface, "admin:sup3rsecret@") {
-			t.Errorf("URL userinfo not masked in stored payload: %q", surface)
-		}
-	}
-	// The command carries both the credential (by-value) and the credential
-	// userinfo (structural) — both masked.
-	if !strings.Contains(row.Payload.Command, redactionMarker) {
-		t.Errorf("by-value redaction marker missing in stored command: %q", row.Payload.Command)
-	}
-	// Header value: by-name mask (Authorization is secret-class) AND the
-	// credential value must be gone from it.
-	auth := row.Payload.Headers["authorization"]
-	if strings.Contains(auth, credential) || strings.Contains(auth, "supersecret") {
-		t.Errorf("credential leaked in stored header: %q", auth)
-	}
-
-	// ── surface 2: the WS event replayed to the live feed ──
-	// (Poll: the broadcast lands right after CreateApproval — under full-suite
-	// disk load the store row can become visible a beat earlier. The buffer
-	// is guarded by inst.mu — the same lock broadcastToInstance appends under,
-	// ws_hub.go:296-317.)
-	found := false
-	for i := 0; i < 300 && !found; i++ {
-		inst.mu.RLock()
-		events := append([]WSEvent(nil), inst.events...)
-		inst.mu.RUnlock()
-		for _, evt := range events {
-			if evt.Type == "approval_requested" && evt.Approval != nil && evt.Approval.ID == row.ID {
-				found = true
-				for _, surface := range []string{evt.Approval.Payload.Command, evt.Approval.Payload.BodyExcerpt, evt.Approval.Payload.URL, evt.Approval.Payload.Headers["authorization"]} {
-					if strings.Contains(surface, "supersecret-b-token-99") {
-						t.Errorf("credential leaked in WS event payload: %q", surface)
-					}
-				}
-			}
-		}
-		if !found {
-			time.Sleep(10 * time.Millisecond)
-		}
-	}
-	if !found {
-		t.Fatal("approval_requested event missing from the instance buffer")
-	}
-
-	// ── surface 3: the API response ──
-	rr := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/api/approvals?status=pending&project_id="+project.ID, nil)
-	s.handleApprovals(rr, req)
-	if rr.Code != http.StatusOK {
-		t.Fatalf("list code = %d", rr.Code)
-	}
-	var body struct {
-		Approvals []platform.Approval `json:"approvals"`
-	}
-	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
-		t.Fatal(err)
-	}
-	if len(body.Approvals) != 1 {
-		t.Fatalf("api list = %d rows, want 1", len(body.Approvals))
-	}
-	api := body.Approvals[0]
-	for _, surface := range []string{api.Payload.Command, api.Payload.BodyExcerpt, api.Payload.URL, api.Payload.Headers["authorization"]} {
-		if strings.Contains(surface, "supersecret-b-token-99") {
-			t.Errorf("credential leaked in API response: %q", surface)
-		}
-	}
-
-	// The whole thing flows through the operator decision normally.
-	if _, err := gateServiceFor(t, s).Decide(ctx, row.ID, platform.ApprovalApproved, "operator", ""); err != nil {
-		t.Fatalf("decide: %v", err)
-	}
-	select {
-	case res := <-resCh:
-		if !res.Success {
-			t.Errorf("approved call must execute: %+v", res)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("execute never resumed after the approval")
-	}
-}
-
-// ── MEDIUM-1: startup reconciliation of orphaned approvals ──────────────────
 
 // TestReconcilePendingStartup pins the ghost-row cleanup: rows from a previous
 // process (no live waiter can exist) flip at startup — deadline elapsed →

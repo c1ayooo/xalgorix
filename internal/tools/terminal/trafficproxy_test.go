@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/xalgord/xalgorix/v4/internal/proxy"
+	"github.com/xalgord/xalgorix/v4/internal/scopeguard"
 	"github.com/xalgord/xalgorix/v4/internal/trafficproxy"
 )
 
@@ -90,22 +91,26 @@ func TestRateLimitedWrapperOffModeHasNoCAFlag(t *testing.T) {
 func TestPrepareTrafficProxyClientConfig(t *testing.T) {
 	configureMITMForTerminal(t)
 	workDir := t.TempDir()
-	if err := prepareTrafficProxyClientConfig(workDir); err != nil {
+	if err := prepareTrafficProxyClientConfig(workDir, "test-scan"); err != nil {
 		t.Fatal(err)
 	}
 	curlrc, err := os.ReadFile(filepath.Join(workDir, ".curlrc"))
 	if err != nil {
 		t.Fatalf(".curlrc: %v", err)
 	}
-	if !strings.Contains(string(curlrc), "cacert = "+trafficproxy.CAPath()) {
-		t.Fatalf(".curlrc missing CA: %q", curlrc)
+	localCA := filepath.Join(workDir, ".xalgorix-traffic-ca.pem")
+	if !strings.Contains(string(curlrc), "cacert = "+localCA) {
+		t.Fatalf(".curlrc missing workspace CA: %q", curlrc)
+	}
+	if _, err := os.Stat(localCA); err != nil {
+		t.Fatalf("workspace CA: %v", err)
 	}
 	wgetrc, err := os.ReadFile(filepath.Join(workDir, ".wgetrc"))
 	if err != nil {
 		t.Fatalf(".wgetrc: %v", err)
 	}
-	if !strings.Contains(string(wgetrc), "ca_certificate = "+trafficproxy.CAPath()) {
-		t.Fatalf(".wgetrc missing CA: %q", wgetrc)
+	if !strings.Contains(string(wgetrc), "ca_certificate = "+localCA) {
+		t.Fatalf(".wgetrc missing workspace CA: %q", wgetrc)
 	}
 
 	// Idempotent rewrite does not churn the file.
@@ -113,7 +118,7 @@ func TestPrepareTrafficProxyClientConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := prepareTrafficProxyClientConfig(workDir); err != nil {
+	if err := prepareTrafficProxyClientConfig(workDir, "test-scan"); err != nil {
 		t.Fatal(err)
 	}
 	info2, err := os.Stat(filepath.Join(workDir, ".curlrc"))
@@ -132,12 +137,75 @@ func TestPrepareTrafficProxyClientConfigOffWritesNothing(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = trafficproxy.Close() })
 	workDir := t.TempDir()
-	if err := prepareTrafficProxyClientConfig(workDir); err != nil {
+	if err := prepareTrafficProxyClientConfig(workDir, "test-scan"); err != nil {
 		t.Fatal(err)
 	}
 	for _, name := range []string{".curlrc", ".wgetrc"} {
 		if _, err := os.Stat(filepath.Join(workDir, name)); !os.IsNotExist(err) {
 			t.Fatalf("%s written in off mode", name)
 		}
+	}
+}
+
+// TestPrepareTrafficProxyClientConfigEmbedsRunToken pins the subprocess
+// credential wiring (R2b approval closed loop): a registered run token lands
+// in the 0600 HOME-rooted config files as proxy credentials — curl
+// `proxy-user <token>:` and wget `proxy_user=<token>` + `proxy_password=`
+// (wget needs both lines to send Proxy-Authorization: Basic) — never in the
+// 0755 rate-limit wrapper. An unregistered context keeps the CA-only config.
+func TestPrepareTrafficProxyClientConfigEmbedsRunToken(t *testing.T) {
+	configureMITMForTerminal(t)
+	const token = "4a3b2c1d5e6f70819203a4b5c6d7e8f9"
+	t.Cleanup(func() { trafficproxy.UnregisterRun(token, "token-scan") })
+	trafficproxy.RegisterRun(token, "token-inst", "token-scan", scopeguard.Config{})
+
+	workDir := t.TempDir()
+	if err := prepareTrafficProxyClientConfig(workDir, "token-scan"); err != nil {
+		t.Fatal(err)
+	}
+	curlrc, err := os.ReadFile(filepath.Join(workDir, ".curlrc"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(curlrc), "proxy-user = "+token+":") {
+		t.Fatalf(".curlrc missing proxy-user credentials: %q", curlrc)
+	}
+	wgetrc, err := os.ReadFile(filepath.Join(workDir, ".wgetrc"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(wgetrc), "proxy_user="+token) || !strings.Contains(string(wgetrc), "proxy_password=") {
+		t.Fatalf(".wgetrc missing proxy_user/proxy_password pair: %q", wgetrc)
+	}
+	// Config files holding the token stay operator/agent-private (0600 via
+	// storage.WriteAtomic), unlike the 0755 wrapper.
+	for _, name := range []string{".curlrc", ".wgetrc"} {
+		info, err := os.Stat(filepath.Join(workDir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != 0o600 {
+			t.Fatalf("%s mode = %v, want 0600", name, info.Mode().Perm())
+		}
+	}
+
+	// Unregistered context: CA-only config, no credential lines.
+	plainDir := t.TempDir()
+	if err := prepareTrafficProxyClientConfig(plainDir, "unregistered-scan"); err != nil {
+		t.Fatal(err)
+	}
+	curlrc, err = os.ReadFile(filepath.Join(plainDir, ".curlrc"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(curlrc), "proxy-user") {
+		t.Fatalf("credential lines written without a registered token: %q", curlrc)
+	}
+	wgetrc, err = os.ReadFile(filepath.Join(plainDir, ".wgetrc"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(wgetrc), "proxy_user") || strings.Contains(string(wgetrc), "proxy_password") {
+		t.Fatalf("credential lines written without a registered token: %q", wgetrc)
 	}
 }

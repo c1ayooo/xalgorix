@@ -69,6 +69,17 @@ func (a *Agent) verifyFinding(req reporting.VerificationRequest) reporting.Verif
 	// (verifier.go header: the timing invariant depends on the main loop
 	// blocking inside report_vulnerability). Verifier re-tests are read-only
 	// by construction — the restricted tool surface IS the authorization.
+	//
+	// Proxy-gate boundary (R2b closed loop): the loopback proxy may still
+	// pend a verifier RE-TEST at the wire level. Transport retests
+	// (httpclient/send_request) ride the Bearer channel — observe-only.
+	// curl retests share this scan's workspace .curlrc token, so they ride
+	// the subprocess Basic channel: under approval enforce, a high-risk-
+	// shaped retest (auth-mutation/admin features) pends the proxy gate
+	// until the verifier's race deadline and lands as inconclusive
+	// (needs-manual-verification RETAINED — no finding is lost; verification
+	// efficiency degrades and one operator-queue row appears). Accepted
+	// degradation; no verifier.go behavior change (REDESIGN §5.2 R2b).
 	vreg := tools.NewRegistry()
 	vreg.SetScanContextID(a.scanCtx.ID)
 	vreg.SetRequestGuard(a.checkHTTPHop)

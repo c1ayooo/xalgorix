@@ -685,7 +685,18 @@ exec %s "${extra_args[@]+"${extra_args[@]}"}" "$@"
 // CA even when no request-rate wrapper exists (the default posture). When
 // TLS interception is off it writes nothing, so the off mode stays
 // byte-identical to the pre-R2b behavior.
-func prepareTrafficProxyClientConfig(workDir string) error {
+//
+// R2b approval closed loop: when the scan carries a run token, the config
+// also carries the token as proxy credentials — curl `proxy-user <token>:`
+// and wget `proxy_user=<token>` + `proxy_password=` (wget sends Proxy-
+// Authorization: Basic only when BOTH lines are present). curl/python/wget
+// thus attribute their own traffic via the subprocess channel, which is what
+// lets the proxy adjudicate high-risk requests (trafficproxy gate.go). The
+// token deliberately travels in these 0600 HOME-rooted config files and NOT
+// in the 0755 request-rate wrapper (that wrapper carries no secret
+// commitment). No token (mode off, mint failure, stale session) → no
+// credential lines: traffic forwards but stays honestly system-level.
+func prepareTrafficProxyClientConfig(workDir, scanCtxID string) error {
 	if !trafficproxy.MITMEnabled() {
 		return nil
 	}
@@ -707,9 +718,15 @@ func prepareTrafficProxyClientConfig(workDir string) error {
 	}
 	// curl reads $CURL_HOME|$HOME/.curlrc, wget reads $HOME/.wgetrc; the
 	// command environment roots HOME at the scan workspace (commandEnv).
+	curlrc := fmt.Sprintf("cacert = %s\n", localCA)
+	wgetrc := fmt.Sprintf("ca_certificate = %s\n", localCA)
+	if token := trafficproxy.RunTokenFor(scanCtxID); token != "" {
+		curlrc += fmt.Sprintf("proxy-user = %s:\n", token)
+		wgetrc += fmt.Sprintf("proxy_user=%s\nproxy_password=\n", token)
+	}
 	configs := [][2]string{
-		{".curlrc", fmt.Sprintf("cacert = %s\n", localCA)},
-		{".wgetrc", fmt.Sprintf("ca_certificate = %s\n", localCA)},
+		{".curlrc", curlrc},
+		{".wgetrc", wgetrc},
 	}
 	for _, cfg := range configs {
 		path := filepath.Join(workDir, cfg[0])
@@ -1647,7 +1664,7 @@ func runShellInternalContext(parent context.Context, contextID string, command s
 	if err != nil {
 		return commandNotice + fmt.Sprintf("Failed to prepare request-rate runtime %s: %v", workDir, err), -1
 	}
-	if err := prepareTrafficProxyClientConfig(workDir); err != nil {
+	if err := prepareTrafficProxyClientConfig(workDir, contextID); err != nil {
 		log.Printf("[terminal] traffic proxy client config unavailable: %v", err)
 	}
 

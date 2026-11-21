@@ -147,6 +147,22 @@ func (h *proxyHandler) forward(w http.ResponseWriter, r *http.Request, scheme st
 	obs.ReqHeaderNames = headerNames(out.Header)
 	obs.HighRisk = assessHighRisk(obs.Method, obs.URL, string(bodyPreview))
 
+	// Approval closed loop (R2b, gate.go): subprocess-channel high-risk
+	// requests are the only traffic adjudicated at the proxy. Bearer traffic
+	// already met the tool-layer gate (observe-only); unattributed traffic
+	// never gates (system-level red line). The hook blocks synchronously
+	// until a verdict exists (operator decision, deadline, run stop); on
+	// denial the upstream is never contacted and the client gets 403 with
+	// the approval reference. Writing the 403 through http.Error tolerates a
+	// disconnected client (write errors dropped, no panic); the observation
+	// still records the outcome either way.
+	if approved, denial := adjudicateSubprocessHighRisk(attr, obs, string(bodyPreview)); !approved {
+		obs.Status = http.StatusForbidden
+		m.observe(obs)
+		http.Error(w, denial, http.StatusForbidden)
+		return
+	}
+
 	resp, err := m.roundTrip(obs, out)
 	if err != nil {
 		obs.Failed = true
@@ -215,6 +231,20 @@ func (h *proxyHandler) forwardUpgrade(w http.ResponseWriter, r *http.Request, sc
 	obs.URL = redactURL(target.String())
 	obs.ReqHeaderNames = headerNames(r.Header) // names only — raw request, values never recorded
 	obs.HighRisk = assessHighRisk(obs.Method, obs.URL, "")
+
+	// Gate BEFORE the hijack (R2b closed loop, gate.go): a client-supplied
+	// Upgrade header must not become a bypass that smuggles a high-risk write
+	// past the approval queue. The visible method+URL are assessed exactly
+	// like the transport path (no body visibility — the verdict is method/
+	// URL-shaped only); denial answers 403 on the still-unhijacked
+	// ResponseWriter. After a successful hijack the raw-byte relay stays
+	// ungated (documented boundary).
+	if approved, denial := adjudicateSubprocessHighRisk(attr, obs, ""); !approved {
+		obs.Status = http.StatusForbidden
+		m.observe(obs)
+		http.Error(w, denial, http.StatusForbidden)
+		return
+	}
 
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {

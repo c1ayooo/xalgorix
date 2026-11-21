@@ -1104,6 +1104,15 @@ func NewServer(cfg *config.Config, port int) *Server {
 	// keeps every registry ungated — byte-identical legacy behavior.
 	srv.approvalSvc = newApprovalService(srv)
 
+	// R2b approval closed loop: subprocess-channel high-risk HTTP (curl/
+	// wget/python via the loopback MITM proxy) adjudicates through the same
+	// ApprovalService — rows, slots, WS events and timeout=reject are shared
+	// with the registry gate. enforce installs the adapter; off clears the
+	// hook so the proxy stays observe-only. (Bearer tool traffic and
+	// unattributed traffic are structurally excluded on the proxy side —
+	// trafficproxy/gate.go.)
+	srv.installProxyHighRiskGate()
+
 	// Import legacy data dir (pre-migration ~/xalgorix-data/) into the
 	// active dataDir on first start. Idempotent (sentinel-gated) and
 	// non-fatal — failures are logged and the server still starts. Must

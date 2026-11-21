@@ -5,6 +5,7 @@ package trafficproxy
 // provisioned loopback ports), unregistration, and the Chromium bypass list.
 
 import (
+	"encoding/base64"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -41,6 +42,75 @@ func TestAttributionRegistryRoundTrip(t *testing.T) {
 		t.Fatal("resolveToken succeeded after unregistration")
 	}
 	UnregisterRun("", "scan-1") // idempotent
+}
+
+// TestExtractAttributionChannels pins the two attribution channels (R2b
+// closed loop, channel semantics):
+//   - Bearer → ChannelBearer (Go tool transport, already adjudicated);
+//   - Basic whose username is a live run token → ChannelSubprocess (the
+//     env/config-file credentials curl/wget/python translate into this
+//     header);
+//   - Basic whose username is NOT in the registry stays unattributed and is
+//     not consumed (an upstream proxy's own credentials must never
+//     impersonate a Run);
+//   - garbage / missing headers stay unattributed.
+func TestExtractAttributionChannels(t *testing.T) {
+	t.Cleanup(func() { UnregisterRun("chan-tok", "chan-scan") })
+	RegisterRun("chan-tok", "chan-inst", "chan-scan", scopeguard.Config{})
+
+	mk := func(auth string) *http.Request {
+		r, err := http.NewRequest(http.MethodPost, "http://target.example/admin", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if auth != "" {
+			r.Header.Set("Proxy-Authorization", auth)
+		}
+		return r
+	}
+
+	// Bearer: the gated channel.
+	attr, ok := extractAttribution(mk("Bearer chan-tok"))
+	if !ok || attr.InstanceID != "chan-inst" || attr.ScanCtxID != "chan-scan" || attr.Channel != ChannelBearer {
+		t.Fatalf("Bearer attribution = %+v ok=%v", attr, ok)
+	}
+
+	// Basic: the subprocess channel (curl/python send "<token>:" base64).
+	sub := base64.StdEncoding.EncodeToString([]byte("chan-tok:"))
+	attr, ok = extractAttribution(mk("Basic " + sub))
+	if !ok || attr.InstanceID != "chan-inst" || attr.ScanCtxID != "chan-scan" || attr.Channel != ChannelSubprocess {
+		t.Fatalf("Basic attribution = %+v ok=%v", attr, ok)
+	}
+
+	// Unpadded base64 also decodes.
+	unpadded := base64.RawStdEncoding.EncodeToString([]byte("chan-tok:pw"))
+	if _, ok = extractAttribution(mk("Basic " + unpadded)); !ok {
+		t.Fatal("unpadded Basic credentials failed to attribute")
+	}
+
+	// Registry MISS: real-world proxy credentials (user:secret) decode fine
+	// but attribute to nothing — and are NOT an error, just system-level.
+	upstreamCreds := base64.StdEncoding.EncodeToString([]byte("user:secret"))
+	if attr, ok = extractAttribution(mk("Basic " + upstreamCreds)); ok {
+		t.Fatalf("upstream proxy credentials were consumed as attribution: %+v", attr)
+	}
+
+	// The run token with a password part still resolves (username is the key).
+	tokenWithPass := base64.StdEncoding.EncodeToString([]byte("chan-tok:anything"))
+	if _, ok = extractAttribution(mk("Basic " + tokenWithPass)); !ok {
+		t.Fatal("Basic token:password did not attribute")
+	}
+
+	// Garbage: undecodable base64 and unknown schemes stay unattributed.
+	if _, ok = extractAttribution(mk("Basic !!!not-base64!!!")); ok {
+		t.Fatal("undecodable Basic attributed")
+	}
+	if _, ok = extractAttribution(mk("Digest dG9rZW4=")); ok {
+		t.Fatal("unknown auth scheme attributed")
+	}
+	if _, ok = extractAttribution(mk("")); ok {
+		t.Fatal("missing Proxy-Authorization attributed")
+	}
 }
 
 func TestGuardForOperatorMachine(t *testing.T) {

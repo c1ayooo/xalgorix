@@ -199,8 +199,9 @@ func (s *Server) approvalService() *ApprovalService {
 // may replace it). nil disables the pipeline.
 func (s *Server) SetApprovalService(svc *ApprovalService) {
 	s.approvalSvcMu.Lock()
-	defer s.approvalSvcMu.Unlock()
 	s.approvalSvc = svc
+	s.approvalSvcMu.Unlock()
+	s.installProxyHighRiskGate()
 }
 
 // registryGate binds the service to one scan session (installed per registry

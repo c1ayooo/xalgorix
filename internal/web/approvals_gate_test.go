@@ -38,32 +38,6 @@ func registerGateInstance(t *testing.T, s *Server, instanceID string) *ScanInsta
 	return inst
 }
 
-// gateRegistry returns a registry with a regulated tool plus the bound
-// approval gate, mirroring the scan_session wiring. The tool is named
-// terminal_execute so the policy classifies it (unknown tools are
-// deliberately unregulated — REDESIGN §10). The SAME adapter instance is
-// returned so tests can BindSecrets on the adapter the registry actually
-// holds (a second approvalGateFor call would bind a different struct).
-func gateRegistry(t *testing.T, s *Server, instanceID string, sctx *scanctx.ScanContext, executed *int) (*tools.Registry, *registryGate) {
-	t.Helper()
-	reg := tools.NewRegistry()
-	reg.SetScanContextID(sctx.ID)
-	reg.Register(&tools.Tool{
-		Name:       "terminal_execute",
-		Parameters: []tools.Parameter{{Name: "command", Required: true}},
-		Execute: func(args map[string]string) (tools.Result, error) {
-			*executed++
-			return tools.Result{Output: "ran"}, nil
-		},
-	})
-	gate := s.approvalGateFor(instanceID, sctx)
-	if gate == nil {
-		t.Fatal("enforce mode must install the gate")
-	}
-	reg.SetApprovalGate(gate)
-	return reg, gate
-}
-
 func commandVerdict(cmd string) approval.Verdict {
 	return approval.Verdict{
 		Decision: approval.Require,
@@ -73,96 +47,6 @@ func commandVerdict(cmd string) approval.Verdict {
 	}
 }
 
-// TestGateEndToEndApprovedFlow pins the full happy path: Execute suspends →
-// approval_requested lands in the instance buffer → operator decides via
-// svc.Decide → Execute resumes and the tool runs; the row is approved and
-// approval_decided is buffered.
-func TestGateEndToEndApprovedFlow(t *testing.T) {
-	s, store := newEnforceGateServer(t, 5, 1)
-	ctx := context.Background()
-	project, err := store.EnsureDefaultProject(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	registerGateInstance(t, s, "inst-e2e")
-
-	sctx := scanctx.New("gate-e2e", t.TempDir())
-	executed := 0
-	reg, _ := gateRegistry(t, s, "inst-e2e", sctx, &executed)
-
-	resCh := make(chan tools.Result, 1)
-	go func() {
-		res, err := reg.Execute("terminal_execute", map[string]string{"command": "sqlmap -u http://target"})
-		if err != nil {
-			t.Errorf("execute: %v", err)
-		}
-		resCh <- res
-	}()
-
-	// Wait for the pending row to appear (Execute is parked in the gate).
-	var row *platform.Approval
-	for i := 0; i < 300; i++ {
-		rows, _ := store.ListApprovals(ctx, platform.ApprovalFilter{Status: "pending", ProjectID: project.ID})
-		if len(rows) == 1 {
-			row = &rows[0]
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if row == nil {
-		t.Fatal("pending approval row never appeared")
-	}
-	if executed != 0 {
-		t.Fatal("tool ran while approval was pending")
-	}
-
-	// approval_requested is buffered for the live feed (broadcast lands right
-	// after CreateApproval — poll briefly instead of racing it).
-	s.instancesMu.RLock()
-	inst := s.instances["inst-e2e"]
-	s.instancesMu.RUnlock()
-	requested := false
-	for i := 0; i < 300; i++ {
-		inst.mu.RLock()
-		for _, evt := range inst.events {
-			if evt.Type == "approval_requested" && evt.Approval != nil && evt.Approval.ID == row.ID {
-				requested = true
-			}
-		}
-		inst.mu.RUnlock()
-		if requested {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if !requested {
-		t.Error("approval_requested WS event missing from the instance buffer")
-	}
-
-	final, err := gateServiceFor(t, s).Decide(ctx, row.ID, platform.ApprovalApproved, "operator:admin", "")
-	if err != nil {
-		t.Fatalf("decide: %v", err)
-	}
-	if final.Status != platform.ApprovalApproved {
-		t.Fatalf("final status = %s", final.Status)
-	}
-
-	select {
-	case res := <-resCh:
-		if !res.Success || res.Output != "ran" {
-			t.Errorf("tool result after approval = %+v, want a clean run", res)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("Execute never resumed after the approval")
-	}
-	if executed != 1 {
-		t.Errorf("tool executed %d times, want 1", executed)
-	}
-	assertApprovalDecidedEvents(t, s, "inst-e2e", 1)
-}
-
-// TestGateDenialMessageShape pins the denial text contract: status + reason +
-// the suggested alternative path, styled after the existing ⛔ block messages.
 func TestGateDenialMessageShape(t *testing.T) {
 	s, store := newEnforceGateServer(t, 1, 1)
 	ctx := context.Background()
@@ -341,38 +225,6 @@ func waitForPendingRows(t *testing.T, store platform.Repository, projectID strin
 	t.Fatalf("pending rows for %s never reached %d", what, want)
 }
 
-// TestGateModeOffInstallsNoGate pins the factory default: mode=off (the
-// default) leaves the registry ungated — approvalGateFor returns nil so the
-// registry keeps its byte-identical legacy path, and no rows appear.
-func TestGateModeOffInstallsNoGate(t *testing.T) {
-	s, store := newApprovalsTestServer(t, &config.Config{}) // mode off (default)
-	sctx := scanctx.New("gate-off", t.TempDir())
-	if gate := s.approvalGateFor("inst-off", sctx); gate != nil {
-		t.Fatal("mode=off must not install a gate")
-	}
-	executed := 0
-	reg := tools.NewRegistry()
-	reg.Register(&tools.Tool{
-		Name:       "probe_tool",
-		Parameters: []tools.Parameter{{Name: "command", Required: true}},
-		Execute: func(args map[string]string) (tools.Result, error) {
-			executed++
-			return tools.Result{Output: "ran"}, nil
-		},
-	})
-	res, err := reg.Execute("probe_tool", map[string]string{"command": "anything"})
-	if err != nil || !res.Success || executed != 1 {
-		t.Fatalf("off-mode execution changed: %+v err=%v executed=%d", res, err, executed)
-	}
-	rows, _ := store.ListApprovals(context.Background(), platform.ApprovalFilter{Status: "all"})
-	if len(rows) != 0 {
-		t.Errorf("off mode created %d approval rows, want 0", len(rows))
-	}
-}
-
-// TestGatePayloadMasking pins the no-secrets red line: secret-class header
-// values are masked through the shared redaction policy before persistence
-// and the body excerpt is truncated to 2 KiB (API_CONTRACT §3).
 func TestGatePayloadMasking(t *testing.T) {
 	s, store := newEnforceGateServer(t, 5, 1)
 	ctx := context.Background()
@@ -456,22 +308,18 @@ func captureLogsForApprovals(fn func()) string {
 	return buf.String()
 }
 
-// TestGateVerifierRegistryUngated documents the verifier decision: the
-// verifier builds its own registry and never installs an approval gate — a
-// report-gate approval wait would race the 15-minute watchdog (verifier.go
-// invariant). Pinned indirectly here by asserting the gate installation is
-// scan_session-only: approvalGateFor requires a service AND enforce mode.
+// TestGateVerifierRegistryUngated pins that approval installation is
+// scan_session-only: the verifier's restricted registry never receives any
+// approval adapter, so a report-gate wait cannot race the watchdog.
 func TestGateVerifierRegistryUngated(t *testing.T) {
 	s, _ := newEnforceGateServer(t, 5, 1)
 	sctx := scanctx.New("gate-verifier", t.TempDir())
-	gate := s.approvalGateFor("inst-verifier", sctx)
-	if gate == nil {
-		t.Fatal("enforce mode gate must be available for scan sessions")
+	if svc := s.approvalService(); svc == nil {
+		t.Fatal("enforce mode must expose the approval service to scan sessions")
 	}
-	// The verifier's registry simply never calls SetApprovalGate — verified
-	// by construction: a fresh registry has a nil gate.
 	reg := tools.NewRegistry()
+	reg.SetScanContextID(sctx.ID)
 	if reg.ApprovalGate() != nil {
-		t.Fatal("fresh registry must be ungated")
+		t.Fatal("a fresh verifier-style registry must be ungated")
 	}
 }

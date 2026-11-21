@@ -16,6 +16,7 @@ package trafficproxy
 // before the MITM hop — including per-scan provisioned loopback ports.
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net/http"
@@ -25,11 +26,34 @@ import (
 	"github.com/xalgord/xalgorix/v4/internal/scopeguard"
 )
 
-// Attribution identifies the Run a proxied request belongs to.
+// Attribution identifies the Run a proxied request belongs to. Channel
+// records HOW the run token reached the proxy — the approval closed loop
+// adjudicates only the subprocess channel (see gate.go).
 type Attribution struct {
 	InstanceID string
 	ScanCtxID  string
+	Channel    Channel
 }
+
+// Channel classifies the transport that carried the run token to the proxy.
+type Channel int
+
+const (
+	// ChannelNone is unattributed (system-level) traffic. Never gated, never
+	// an InfoItem (observation.go red line).
+	ChannelNone Channel = iota
+	// ChannelBearer is traffic stamped by the Go tool transports
+	// (AttributionRoundTripper). 100% of it already passed (or was waived
+	// by) the tool-layer approval gate — the proxy observes it but never
+	// re-adjudicates it, which is also what keeps the verifier's ungated
+	// retests from colliding with the approval queue.
+	ChannelBearer
+	// ChannelSubprocess is traffic carrying Proxy-Authorization: Basic
+	// credentials minted to curl/wget/python (env proxy userinfo / .curlrc
+	// proxy-user / .wgetrc proxy_user). These requests never met the tool
+	// gate, so a high-risk one is adjudicated at the proxy (gate.go).
+	ChannelSubprocess
+)
 
 type attributionEntry struct {
 	token      string
@@ -170,13 +194,52 @@ func guardFor(scanCtxID, address string) error {
 // extractAttribution reads the run token from Proxy-Authorization. It MUST
 // run before removeHopByHopHeaders strips the header, and the token value is
 // never copied anywhere else (header values are masked out of observations).
+//
+// Two channels:
+//   - "Bearer <token>" — stamped by the Go tool transports → ChannelBearer.
+//   - "Basic <b64>" — minted to subprocesses (env userinfo / .curlrc /
+//     .wgetrc; curl/python/wget translate proxy credentials into this
+//     header). The username (everything before the first ':') is the token.
+//     A registry MISS is deliberately NOT consumed for attribution and never
+//     an error: an upstream proxy's own Basic credentials (a tool testing
+//     proxy auth — handler.go's relaying promise) must not impersonate a Run.
+//     Such traffic stays system-level and is stripped hop-by-hop as before.
 func extractAttribution(r *http.Request) (Attribution, bool) {
 	auth := r.Header.Get("Proxy-Authorization")
-	bearer, ok := strings.CutPrefix(auth, "Bearer ")
-	if !ok {
-		return Attribution{}, false
+	if bearer, ok := strings.CutPrefix(auth, "Bearer "); ok {
+		attr, resolved := resolveToken(strings.TrimSpace(bearer))
+		if resolved {
+			attr.Channel = ChannelBearer
+		}
+		return attr, resolved
 	}
-	return resolveToken(strings.TrimSpace(bearer))
+	if basic, ok := strings.CutPrefix(auth, "Basic "); ok {
+		user, err := decodeBasicUser(basic)
+		if err != nil {
+			return Attribution{}, false
+		}
+		attr, resolved := resolveToken(user)
+		if resolved {
+			attr.Channel = ChannelSubprocess
+		}
+		return attr, resolved
+	}
+	return Attribution{}, false
+}
+
+// decodeBasicUser decodes a Basic credential and returns the username part
+// (everything before the first ':'). Both padded and unpadded standard
+// base64 are accepted (curl always pads; hand-rolled clients may not).
+func decodeBasicUser(b64 string) (string, error) {
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(b64))
+	if err != nil {
+		raw, err = base64.RawStdEncoding.DecodeString(strings.TrimSpace(b64))
+		if err != nil {
+			return "", err
+		}
+	}
+	user, _, _ := strings.Cut(string(raw), ":")
+	return user, nil
 }
 
 var errRequiredNoUpstream = errors.New("trafficproxy: proxy-required mode has no upstream")

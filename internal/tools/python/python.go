@@ -147,7 +147,11 @@ func executePythonForContextCtx(parent context.Context, contextID string, args m
 	// cfg.WorkspaceRoot — both Allow_List descendants. That satisfies R8.8.
 	cmdEnv := pythonWorkspaceEnv(cmd.Dir)
 	if config.Get().ProxyRequired || egressproxy.Required() || trafficproxy.Enabled() {
-		cmdEnv, err = trafficproxy.Environment(cmdEnv)
+		// EnvironmentForScan embeds the run token as proxy-URL userinfo so the
+		// python child attributes its own traffic via Proxy-Authorization:
+		// Basic (the subprocess channel). No token registered → identical to
+		// the plain Environment form.
+		cmdEnv, err = trafficproxy.EnvironmentForScan(cmdEnv, contextID)
 		if err != nil {
 			return tools.Result{}, fmt.Errorf("required proxy unavailable: %w", err)
 		}

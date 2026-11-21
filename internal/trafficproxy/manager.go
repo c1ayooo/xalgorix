@@ -396,6 +396,42 @@ func Environment(base []string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	return environmentWithProxyURL(base, localURL)
+}
+
+// proxyUserinfoPlaceholder is the fixed, non-secret password part embedded
+// after the run token in the proxy URL userinfo. Some python runtimes
+// (urllib/requests on 3.12+) only send Proxy-Authorization: Basic when the
+// proxy userinfo carries BOTH a username and a password, so the token rides
+// as the username and this placeholder as the password. The proxy's Basic
+// attribution reads only the username (everything before the first ':'), so
+// the placeholder never needs to be secret.
+const proxyUserinfoPlaceholder = "xalgorix"
+
+// EnvironmentForScan is Environment with the scan's run token embedded as the
+// proxy URL's userinfo (http://<token>:xalgorix@127.0.0.1:<port>). curl and
+// python requests/urllib translate proxy userinfo into Proxy-Authorization:
+// Basic — which is the subprocess attribution channel (see attribution.go)
+// and the trigger for the proxy-side high-risk approval gate (gate.go). The
+// token rides the SAME registry RegisterRun already maintains; there is no
+// second registry. No token for the scan context (mode off, mint failure,
+// session already torn down) degrades honestly to the unattributed
+// system-level form — the traffic still forwards, it just never claims a Run.
+func EnvironmentForScan(base []string, scanCtxID string) ([]string, error) {
+	localURL, err := LocalURL()
+	if err != nil {
+		return nil, err
+	}
+	if token := RunTokenFor(scanCtxID); token != "" {
+		if u, perr := url.Parse(localURL); perr == nil {
+			u.User = url.UserPassword(token, proxyUserinfoPlaceholder)
+			localURL = u.String()
+		}
+	}
+	return environmentWithProxyURL(base, localURL)
+}
+
+func environmentWithProxyURL(base []string, localURL string) ([]string, error) {
 	env := make([]string, 0, len(base)+8)
 	for _, kv := range base {
 		key, _, ok := strings.Cut(kv, "=")
