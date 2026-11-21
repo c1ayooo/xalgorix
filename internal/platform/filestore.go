@@ -620,6 +620,32 @@ func (s *FileStore) InstanceIDsForProject(_ context.Context, projectID string) (
 	return out, nil
 }
 
+// ProjectScanIDs implements Repository.ProjectScanIDs.
+func (s *FileStore) ProjectScanIDs(ctx context.Context, projectID string) ([]string, error) {
+	runs, err := s.ListRunsByProject(ctx, projectID)
+	if err != nil {
+		return nil, err
+	}
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(runs)*2)
+	add := func(id string) {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			return
+		}
+		if _, dup := seen[id]; dup {
+			return
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	for _, r := range runs {
+		add(r.InstanceID)
+		add(r.LegacyScanID)
+	}
+	return out, nil
+}
+
 // LegacyScanIDs implements Repository.LegacyScanIDs.
 func (s *FileStore) LegacyScanIDs(_ context.Context) (map[string]struct{}, error) {
 	s.mu.RLock()

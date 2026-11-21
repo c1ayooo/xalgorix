@@ -5,6 +5,7 @@ import {
   BadgeCheck,
   Clock,
   FolderKanban,
+  Database,
   ListChecks,
   FileText,
   LayoutGrid,
@@ -43,6 +44,7 @@ const NAV_GROUPS: {
       { to: "/tasks", labelKey: "nav.tasks", icon: ListChecks },
       { to: "/approvals", labelKey: "nav.approvals", icon: BadgeCheck },
       { to: "/findings", labelKey: "nav.findings", icon: ShieldAlert },
+      { to: "/info", labelKey: "nav.info", icon: Database },
     ],
   },
   {

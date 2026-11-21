@@ -113,6 +113,19 @@ func TestSetSessionAuthClears(t *testing.T) {
 	}
 }
 
+func TestClearSessionAuthRemovesBothRoles(t *testing.T) {
+	const ctx = "scan-ctx-clear"
+	SetSessionAuth(ctx, map[string]string{"Cookie": "a=1"})
+	SetSessionAuthB(ctx, map[string]string{"Cookie": "b=2"})
+	ClearSessionAuth(ctx)
+	if got := SessionAuthForContext(ctx); got != nil {
+		t.Fatalf("role A survived ClearSessionAuth: %v", got)
+	}
+	if got := SessionAuthBForContext(ctx); got != nil {
+		t.Fatalf("role B survived ClearSessionAuth: %v", got)
+	}
+}
+
 func TestSetAndGetSessionAuthB(t *testing.T) {
 	const ctx = "scan-ctx-B"
 	// Role A and role B are independent stores.

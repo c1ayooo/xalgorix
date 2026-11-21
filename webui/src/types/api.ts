@@ -53,6 +53,10 @@ export interface WSEvent {
   // guidance_* 事件携带人工意图记录。事件流据此渲染行内决策条。
   approval?: Approval;
   guidance?: Guidance;
+  // 对话流（4zreco transcript 模式）：assistant_delta 增量推送 LLM 输出，
+  // message_id 标识同一条消息；assistant_done 携带全文固化入库。
+  message_id?: string;
+  delta?: string;
 }
 
 export interface AssessmentOutcome {
@@ -770,4 +774,112 @@ export interface GuidanceSendResult {
   guidance_id: string;
   run_id?: string;
   accepted?: boolean; // false = 重复 request_id（幂等命中）
+}
+
+// ---------------------------------------------------------------------------
+// R5 信息空间（CORE_PHILOSOPHY §4；contract §5）
+// ---------------------------------------------------------------------------
+
+export type InfoNature = "observed" | "inferred";
+export type InfoCoordinateStatus = "" | "complete" | "partial" | "pending";
+
+export interface InfoContent {
+  text: string;
+  media_type?: string;
+}
+
+export interface InfoSource {
+  kind: string;
+  name?: string;
+  agent_id?: string;
+  evidence_id?: string;
+}
+
+export interface InfoSubject {
+  kind?: string;
+  identifier: string;
+}
+
+export interface InfoCoordinates {
+  content: InfoContent;
+  source: InfoSource;
+  observed_at: string;
+  subject: InfoSubject;
+  purpose?: string;
+  context?: Record<string, string>;
+  relation_ids?: string[];
+}
+
+export interface InfoItem {
+  id: string;
+  scan_id: string;
+  source_seq: number;
+  nature: InfoNature;
+  coordinates: InfoCoordinates;
+  supports?: string[];
+  valid_from?: string;
+  valid_until?: string;
+  confidence?: number;
+  coordinate_status?: InfoCoordinateStatus;
+  created_at: string;
+}
+
+export interface InfoRegionResult {
+  available: boolean;
+  items: InfoItem[];
+  truncated: boolean;
+  incomplete: boolean;
+  gap_reason?: string;
+}
+
+export interface InfoContextResult {
+  available: boolean;
+  items: InfoItem[];
+  truncated: boolean;
+  incomplete: boolean;
+  gap_reason?: string;
+}
+
+export interface InfoAssociationHit {
+  item: InfoItem;
+  path: string[];
+  depth: number;
+}
+
+export interface InfoAssociationResult {
+  available: boolean;
+  hits: InfoAssociationHit[];
+  truncated: boolean;
+  incomplete: boolean;
+  gap_reason?: string;
+}
+
+export interface InfoRegionParams {
+  projectId: string;
+  subjectKind?: string;
+  subject?: string;
+  purpose?: string;
+  nature?: InfoNature | "";
+  after?: string;
+  before?: string;
+  limit?: number;
+}
+
+export interface InfoContextParams {
+  projectId: string;
+  scanId: string;
+  subject?: string;
+  subjectKind?: string;
+  since?: string;
+  until?: string;
+  limit?: number;
+}
+
+export interface InfoAssociationParams {
+  projectId: string;
+  scanId: string;
+  ids: string;
+  edgeTypes?: string[];
+  maxDepth?: number;
+  limit?: number;
 }

@@ -22,8 +22,10 @@ import (
 	egressproxy "github.com/xalgord/xalgorix/v4/internal/proxy"
 	"github.com/xalgord/xalgorix/v4/internal/resources"
 	"github.com/xalgord/xalgorix/v4/internal/scanctx"
+	"github.com/xalgord/xalgorix/v4/internal/storage"
 	"github.com/xalgord/xalgorix/v4/internal/tools"
 	"github.com/xalgord/xalgorix/v4/internal/tools/iolimit"
+	"github.com/xalgord/xalgorix/v4/internal/trafficproxy"
 )
 
 const maxOutputLen = 20000
@@ -623,6 +625,23 @@ func writeRateLimitedBinaryWrapper(binDir, name string) error {
 	if err != nil || strings.HasPrefix(realPath, binDir+string(os.PathSeparator)) {
 		return nil
 	}
+	// R2b traffic proxy: when TLS interception is active, curl/wget must
+	// trust the traffic-proxy CA or every https target fails verification.
+	// The CA path is embedded by the parent process (XALGORIX_* env vars are
+	// stripped from subprocesses, so it can never ride the environment), and
+	// the flag is skipped when the CA file is absent so a degraded setup
+	// falls back to the historical behavior.
+	caArgs := ""
+	if trafficproxy.MITMEnabled() {
+		if caFile := trafficproxy.CAPath(); caFile != "" {
+			switch name {
+			case "curl":
+				caArgs = fmt.Sprintf("extra_args+=(--cacert %q)", caFile)
+			case "wget":
+				caArgs = fmt.Sprintf("extra_args+=(--ca-certificate %q)", caFile)
+			}
+		}
+	}
 	wrapperPath := filepath.Join(binDir, name)
 	script := fmt.Sprintf(`#!/usr/bin/env bash
 set -euo pipefail
@@ -650,12 +669,45 @@ if command -v flock >/dev/null 2>&1; then
 else
   rate_wait
 fi
-exec %s "$@"
-`, shellQuote(realPath))
+extra_args=()
+%s
+exec %s "${extra_args[@]+"${extra_args[@]}"}" "$@"
+`, caArgs, shellQuote(realPath))
 	// The wrapper must be executable by the agent's subprocesses, so 0755
 	// is intentional; it contains no secrets (a rate-limiting shim around
-	// curl/wget).
+	// curl/wget, plus a CA file path).
 	return os.WriteFile(wrapperPath, []byte(script), 0o755) //nolint:gosec // G306: generated executable wrapper needs exec bit
+}
+
+// prepareTrafficProxyClientConfig writes HOME-scoped curl/wget trust config
+// into the command workspace so subprocess traffic verifies the traffic-proxy
+// CA even when no request-rate wrapper exists (the default posture). When
+// TLS interception is off it writes nothing, so the off mode stays
+// byte-identical to the pre-R2b behavior.
+func prepareTrafficProxyClientConfig(workDir string) error {
+	if !trafficproxy.MITMEnabled() {
+		return nil
+	}
+	caFile := trafficproxy.CAPath()
+	if caFile == "" {
+		return nil
+	}
+	// curl reads $CURL_HOME|$HOME/.curlrc, wget reads $HOME/.wgetrc; the
+	// command environment roots HOME at the scan workspace (commandEnv).
+	configs := [][2]string{
+		{".curlrc", fmt.Sprintf("cacert = %s\n", caFile)},
+		{".wgetrc", fmt.Sprintf("ca_certificate = %s\n", caFile)},
+	}
+	for _, cfg := range configs {
+		path := filepath.Join(workDir, cfg[0])
+		if existing, err := os.ReadFile(path); err == nil && string(existing) == cfg[1] {
+			continue
+		}
+		if err := storage.WriteAtomic(path, []byte(cfg[1])); err != nil {
+			return fmt.Errorf("write %s: %w", cfg[0], err)
+		}
+	}
+	return nil
 }
 
 func writePythonRateLimiter(pythonPath string) error {
@@ -1565,6 +1617,9 @@ func runShellInternal(contextID string, command string) (string, int) {
 	if err != nil {
 		return commandNotice + fmt.Sprintf("Failed to prepare request-rate runtime %s: %v", workDir, err), -1
 	}
+	if err := prepareTrafficProxyClientConfig(workDir); err != nil {
+		log.Printf("[terminal] traffic proxy client config unavailable: %v", err)
+	}
 
 	// Set PATH to include common tool locations (dynamic - works for any user)
 	goPath := os.Getenv("GOPATH")
@@ -1597,8 +1652,8 @@ func runShellInternal(contextID string, command string) (string, int) {
 	cmd := exec.CommandContext(ctx, "bash", "-c", command)
 	cmd.Dir = workDir
 	cmdEnv := commandEnv(homeDir, goPath, workDir, rateRuntime)
-	if config.Get().ProxyRequired || egressproxy.Required() {
-		cmdEnv, err = egressproxy.Environment(cmdEnv)
+	if config.Get().ProxyRequired || egressproxy.Required() || trafficproxy.Enabled() {
+		cmdEnv, err = trafficproxy.Environment(cmdEnv)
 		if err != nil {
 			return commandNotice + fmt.Sprintf("[ERROR] required proxy unavailable: %v", err), -1
 		}

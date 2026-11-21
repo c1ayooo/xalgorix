@@ -515,8 +515,10 @@ var methodologyPhaseNames = func() map[int]string {
 	return m
 }()
 
-// generateReport creates a professional PDF pentest report for a scan.
-func (s *Server) generateReport(scan *ScanRecord) (string, error) {
+// generateReport creates a professional PDF pentest report for a scan. scanDir
+// is supplied by the caller so concurrent reports never share a mutable
+// server-global output directory.
+func (s *Server) generateReport(scan *ScanRecord, scanDir string) (string, error) {
 	language := ""
 	if s.cfg != nil {
 		language = s.cfg.Language
@@ -1794,18 +1796,18 @@ func (s *Server) generateReport(scan *ScanRecord) (string, error) {
 		}
 	}
 
-	// Save PDF — use currentScanDir which is the actual scan directory
+	// Save PDF to the caller-supplied scan directory; fall back to dataDir.
+	scanDir = strings.TrimSpace(scanDir)
 	reportID := scan.ID
-	if strings.TrimSpace(reportID) == "" && s.currentScanDir != "" {
-		reportID = filepath.Base(s.currentScanDir)
+	if strings.TrimSpace(reportID) == "" && scanDir != "" {
+		reportID = filepath.Base(scanDir)
 	}
 	if strings.TrimSpace(reportID) == "" {
 		reportID = "scan"
 	}
 	filename := fmt.Sprintf("xalgorix_report_%s.pdf", reportID)
-	// Try saving to the scan directory first, fall back to dataDir
-	outPath := filepath.Join(s.currentScanDir, filename)
-	if s.currentScanDir == "" {
+	outPath := filepath.Join(scanDir, filename)
+	if scanDir == "" {
 		outPath = filepath.Join(s.dataDir, filename)
 	}
 	err := pdf.OutputFileAndClose(outPath)

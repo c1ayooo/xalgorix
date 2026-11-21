@@ -37,6 +37,9 @@ type RawRequest struct {
 	// resolution (see tools.GuardDials), so a host the caller checked by
 	// name cannot resolve somewhere else when the request connects.
 	DialGuard tools.DialGuard
+	// ScanCtxID, when non-empty, stamps the run-token attribution header for
+	// the loopback traffic proxy (see trafficproxy.AttributionRoundTripper).
+	ScanCtxID string
 }
 
 // RawResponse is the structured result of SendRaw.
@@ -100,7 +103,7 @@ func SendRaw(req RawRequest) (*RawResponse, error) {
 		httpReq.Header.Set("User-Agent", defaultBrowserUA)
 	}
 
-	client, err := buildClient(timeout, req.FollowRedirects, config.Get().TLSSkipVerify, req.DialGuard)
+	client, err := buildClient(timeout, req.FollowRedirects, config.Get().TLSSkipVerify, req.DialGuard, req.ScanCtxID)
 	if err != nil {
 		return nil, err
 	}

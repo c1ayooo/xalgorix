@@ -543,6 +543,12 @@ func (a *Agent) checkDialAddr(address string) error {
 // verify tools that check a host by name before sending to it.
 func (a *Agent) sendRaw(req httpclient.RawRequest) (*httpclient.RawResponse, error) {
 	req.DialGuard = a.checkDialAddr
+	if a.scanCtx != nil {
+		// R2b: stamp the run token so replay traffic (authz matrix, verifier
+		// probes) attributes through the loopback traffic proxy like
+		// ordinary tool HTTP.
+		req.ScanCtxID = a.scanCtx.ID
+	}
 	return httpclient.SendRaw(req)
 }
 

@@ -108,6 +108,7 @@ export function RunConsole({
   const [historyLoading, setHistoryLoading] = useState(false);
   const [hasMore, setHasMore] = useState(false);
   const wsEvents = useWSStore((s) => s.events);
+  const streamingAll = useWSStore((s) => s.streaming);
   const [filter, setFilter] = useState<FeedFilter>("all");
 
   useEffect(() => {
@@ -175,6 +176,19 @@ export function RunConsole({
         ? rawEvents
         : rawEvents.filter((e) => (e.agent_id ?? "") === agentScope),
     [rawEvents, agentScope],
+  );
+
+  // 正在生成的 assistant 消息（本 Run、本视角），渲染为流尾打字气泡。
+  const streaming = useMemo(
+    () =>
+      Object.values(streamingAll)
+        .filter(
+          (m) =>
+            m.instance_id === selectedInstanceId &&
+            (agentScope === "all" || m.agent_id === agentScope),
+        )
+        .sort((a, b) => a.updatedAt - b.updatedAt),
+    [streamingAll, selectedInstanceId, agentScope],
   );
 
   const status = instance?.status ?? "";
@@ -345,6 +359,7 @@ export function RunConsole({
               onFilterChange={setFilter}
               showControls
               fillHeight
+              streaming={streaming}
               emptyTitle={t("taskDetail.noEventsTitle")}
               emptyDescription={t("taskDetail.noEventsDescription")}
             />

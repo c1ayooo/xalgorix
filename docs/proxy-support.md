@@ -1,5 +1,9 @@
 # Proxy Support
 
+## Traffic proxy (loopback MITM, default on)
+
+Since R2b, Xalgorix runs a single-process loopback MITM proxy by default (`XALGORIX_TRAFFICPROXY=1`, off with `0`/`false`): the `http_request`/`send_request` tools (including verifier re-tests), the browser, and curl/wget/python subprocesses route through a local proxy that forwards via the configured upstream pool (or directly). Go-tool traffic is attributed to its run and recorded as observed InfoItems in the run's audit journal; browser and subprocess traffic is relayed but stays system-level (no run-token channel yet). TLS interception uses a dedicated CA generated under `~/.xalgorix/ca` (`XALGORIX_CA_DIR`); the built-in HTTP tools trust it automatically, curl/wget wrappers pass `--cacert`, and Python gets `REQUESTS_CA_BUNDLE`/`SSL_CERT_FILE` injected. WebSocket/upgrade requests fall back to raw passthrough (observed as metadata only). Still NOT proxied: loopback ports a scan explicitly opted into (Chromium bypasses the proxy for provisioned targets), programs that ignore proxy env vars entirely, and operator-level system egress (LLM APIs, notifications). Set `XALGORIX_TRAFFICPROXY=0` to restore direct routing (the loopback bridge then serves only proxy-required mode, as before).
+
 Xalgorix supports **HTTP**, **HTTPS**, and **SOCKS5** upstream proxies for its built-in HTTP tools. Proxy-required mode also routes its browser and gives proxy-aware terminal/Python programs a loopback HTTP proxy. An HTTP/SOCKS5 proxy is not a whole-machine VPN: arbitrary subprocesses, raw sockets, ICMP, and UDP may bypass proxy environment variables. Enforce an OS/container outbound policy if the operator needs a guarantee that no direct target connection can leave the host.
 
 `scanner2.xalgorix.com` or any other dashboard DNS name is **inbound** configuration. Do not change its A/AAAA record to a purchased proxy IP; the proxy is only for outbound connections from the scanner.

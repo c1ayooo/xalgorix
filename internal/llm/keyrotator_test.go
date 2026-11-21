@@ -5,6 +5,23 @@ import (
 	"time"
 )
 
+func TestMarkRateLimitedKeyCoolsExactKeyNotLastPick(t *testing.T) {
+	r := NewKeyRotator([]string{"a", "b"})
+	if got := r.Pick(); got != "a" {
+		t.Fatalf("first pick = %q, want a", got)
+	}
+	if got := r.Pick(); got != "b" {
+		t.Fatalf("second pick = %q, want b", got)
+	}
+	// `b` is now the shared last cursor; cooling `a` explicitly must not cool b.
+	r.MarkRateLimitedKey("a")
+	for i := 0; i < 3; i++ {
+		if got := r.Pick(); got != "b" {
+			t.Fatalf("pick %d = %q, want b while a is cooling", i, got)
+		}
+	}
+}
+
 func TestKeyRotatorRoundRobin(t *testing.T) {
 	r := NewKeyRotator([]string{"a", "b", "c"})
 	seen := map[string]int{}

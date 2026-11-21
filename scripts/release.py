@@ -178,6 +178,13 @@ class Release:
         assert not self.assets.exists(), f"{self.assets} exists; remove it to rebuild"
         self.assets.mkdir(mode=0o755, parents=True)
 
+        # T-6: rebuild the embedded WebUI from source so a committed stale
+        # bundle cannot ship. The deterministic build must leave the tree
+        # clean; the final `git status --porcelain` assert below enforces it.
+        webui = self.source / "webui"
+        run(["npm", "ci", "--no-audit", "--no-fund"], cwd=webui)
+        run(["npm", "run", "build"], cwd=webui)
+
         manifest = []
         for system, arch in PLATFORMS:
             name = f"xalgorix-{system}-{arch}"

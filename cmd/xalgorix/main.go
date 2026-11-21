@@ -23,6 +23,7 @@ import (
 	"github.com/xalgord/xalgorix/v4/internal/proxy"
 	"github.com/xalgord/xalgorix/v4/internal/resources"
 	"github.com/xalgord/xalgorix/v4/internal/scanheaders"
+	"github.com/xalgord/xalgorix/v4/internal/trafficproxy"
 	"github.com/xalgord/xalgorix/v4/internal/tui"
 	"github.com/xalgord/xalgorix/v4/internal/web"
 )
@@ -309,8 +310,19 @@ func main() {
 		fmt.Fprintf(os.Stderr, "[proxy] init warning: %v\n", err)
 		// Non-fatal: continue without proxy rather than crashing.
 	}
+	// -------------------------------------------------------------------------
+	// Traffic proxy (R2b, REDESIGN §4/D4): single-process shared loopback
+	// MITM proxy, default ON (XALGORIX_TRAFFICPROXY=0/false turns it off and
+	// restores the pre-R2b behavior byte-for-byte). XALGORIX_CA_DIR points
+	// at the interception CA (default ~/.xalgorix/ca).
+	// -------------------------------------------------------------------------
+	if err := trafficproxy.Configure(cfg.TrafficProxy, cfg.CADir, cfg.TLSSkipVerify); err != nil {
+		fmt.Fprintf(os.Stderr, "[trafficproxy] init warning: %v\n", err)
+		// Non-fatal: a broken CA already degrades to blind forwarding inside
+		// Configure; scanning continues.
+	}
 	if cfg.ProxyRequired {
-		if _, err := proxy.LocalURL(); err != nil {
+		if _, err := trafficproxy.LocalURL(); err != nil {
 			fmt.Fprintf(os.Stderr, "[proxy] required local proxy unavailable: %v\n", err)
 			os.Exit(1)
 		}
@@ -318,7 +330,13 @@ func main() {
 	if proxy.Enabled() {
 		fmt.Fprintf(os.Stderr, "[proxy] proxy routing active\n")
 	}
-	defer func() { _ = proxy.Close() }()
+	if trafficproxy.MITMEnabled() {
+		fmt.Fprintf(os.Stderr, "[trafficproxy] loopback MITM proxy active (CA: %s)\n", trafficproxy.CAPath())
+	}
+	defer func() {
+		_ = proxy.Close()
+		_ = trafficproxy.Close()
+	}()
 
 	// Set web package version from main — single source of truth
 	web.Version = version

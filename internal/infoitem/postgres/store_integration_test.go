@@ -85,6 +85,32 @@ func TestStoreApplyQueriesAndWatermark(t *testing.T) {
 		t.Fatalf("watermark = %+v", wm)
 	}
 
+	// R2b trafficproxy: an OpObserveTraffic record carries a standalone
+	// observed InfoItem (no hypothesis) and must project identically.
+	trafficItem := infoitem.Item{
+		ID:        "traffic-ii",
+		ScanID:    scanID,
+		SourceSeq: 2,
+		Nature:    infoitem.NatureObserved,
+		Coordinates: infoitem.Coordinates{
+			Content:    infoitem.Content{Text: "GET https://target.example/ -> 200 via direct"},
+			Source:     infoitem.Source{Kind: "trafficproxy", Name: "direct", AgentID: "inst"},
+			Subject:    infoitem.Subject{Kind: "endpoint", Identifier: "GET https://target.example/"},
+			Purpose:    "traffic_observation",
+			Context:    map[string]string{"phase": "traffic"},
+			ObservedAt: now,
+		},
+		CreatedAt: now,
+	}
+	trafficRec := domainjournal.Record{
+		ScanID: scanID, Seq: 2, At: now,
+		Actor:     domainjournal.Actor{Kind: domainjournal.ActorEngine, Source: "trafficproxy"},
+		Operation: domainjournal.OpObserveTraffic, InfoItem: &trafficItem,
+	}
+	if err := store.Apply(ctx, trafficRec); err != nil {
+		t.Fatalf("apply observe_traffic record: %v", err)
+	}
+
 	item2 := testInfoItem(scanID, "ii-2", 2, infoitem.NatureInferred, []string{"ii-1"})
 	rec2 := domainjournal.Record{
 		ScanID: scanID, Seq: 2, At: now,

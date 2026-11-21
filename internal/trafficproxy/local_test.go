@@ -1,4 +1,10 @@
-package proxy
+package trafficproxy
+
+// Loopback bridge tests. The three close tests assert DETERMINISTIC manager
+// state instead of dial probes: on WSL2 a dial against a just-closed loopback
+// listener succeeds ~50% of the time (docs/KNOWN_ISSUES.md T-1), so probing
+// the port proves nothing. Assertions here inspect the Manager's own fields
+// and a listener close hook — no sleeps, no probes, no loosened guarantees.
 
 import (
 	"crypto/tls"
@@ -13,6 +19,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/xalgord/xalgorix/v4/internal/proxy"
 )
 
 func TestRequiredProxyRejectsMissingConfiguration(t *testing.T) {
@@ -24,10 +32,27 @@ func TestRequiredProxyRejectsMissingConfiguration(t *testing.T) {
 		{true, ""},
 		{true, "bad proxy"},
 	} {
-		if err := InitWithPolicy(tc.useProxy, true, tc.url, "", "roundrobin", time.Second); err == nil {
+		if err := proxy.InitWithPolicy(tc.useProxy, true, tc.url, "", "roundrobin", time.Second); err == nil {
 			t.Fatalf("expected proxy-required config rejection for useProxy=%v url=%q", tc.useProxy, tc.url)
 		}
 	}
+}
+
+// legacyBridge initializes the pre-R2b posture: proxy-required single
+// upstream + traffic proxy off (blind tunnel, byte-identical legacy
+// behavior).
+func legacyBridge(t *testing.T, upstreamURL string) {
+	t.Helper()
+	if err := proxy.InitWithPolicy(true, true, upstreamURL, "", "roundrobin", time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if err := Configure(false, "", false); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = Close()
+		_ = proxy.Close()
+	})
 }
 
 func TestLocalProxyForwardsHTTPAndAuthenticatedCONNECT(t *testing.T) {
@@ -67,12 +92,7 @@ func TestLocalProxyForwardsHTTPAndAuthenticatedCONNECT(t *testing.T) {
 	defer upstream.Close()
 
 	proxyHost := strings.TrimPrefix(upstream.URL, "http://")
-	if err := InitWithPolicy(true, true, "http://user:secret@"+proxyHost, "", "roundrobin", time.Second); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		_ = Close()
-	})
+	legacyBridge(t, "http://user:secret@"+proxyHost)
 	localURL, err := LocalURL()
 	if err != nil {
 		t.Fatal(err)
@@ -115,12 +135,7 @@ func TestLocalProxyNeverFallsBackDirect(t *testing.T) {
 	}
 	deadProxy := listener.Addr().String()
 	listener.Close()
-	if err := InitWithPolicy(true, true, "http://"+deadProxy, "", "roundrobin", time.Second); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		_ = Close()
-	})
+	legacyBridge(t, "http://"+deadProxy)
 	localURL, err := LocalURL()
 	if err != nil {
 		t.Fatal(err)
@@ -138,12 +153,7 @@ func TestLocalProxyNeverFallsBackDirect(t *testing.T) {
 }
 
 func TestEnvironmentReplacesInheritedProxySettings(t *testing.T) {
-	if err := InitWithPolicy(true, true, "http://127.0.0.1:3128", "", "roundrobin", time.Second); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		_ = Close()
-	})
+	legacyBridge(t, "http://127.0.0.1:3128")
 	localURL, err := LocalURL()
 	if err != nil {
 		t.Fatal(err)
@@ -161,6 +171,19 @@ func TestEnvironmentReplacesInheritedProxySettings(t *testing.T) {
 	}
 }
 
+func TestEnvironmentRequiresEnabledOrRequired(t *testing.T) {
+	// Off + not required: Environment must fail exactly like the pre-R2b
+	// proxy.Environment did (LocalURL was required-only).
+	if err := Configure(false, "", false); err != nil {
+		t.Fatal(err)
+	}
+	_ = proxy.Close()
+	t.Cleanup(func() { _ = Close() })
+	if _, err := Environment([]string{"PATH=/usr/bin"}); err == nil {
+		t.Fatal("Environment must be unavailable without traffic proxy or required mode")
+	}
+}
+
 func TestLocalProxyClose(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -168,9 +191,7 @@ func TestLocalProxyClose(t *testing.T) {
 	defer upstream.Close()
 
 	proxyHost := strings.TrimPrefix(upstream.URL, "http://")
-	if err := InitWithPolicy(true, true, "http://"+proxyHost, "", "roundrobin", time.Second); err != nil {
-		t.Fatal(err)
-	}
+	legacyBridge(t, "http://"+proxyHost)
 	localURL, err := LocalURL()
 	if err != nil {
 		t.Fatal(err)
@@ -188,30 +209,56 @@ func TestLocalProxyClose(t *testing.T) {
 	}
 	resp.Body.Close()
 
-	// Shut down proxy
-	if err := Close(); err != nil {
+	m := defaultManager.Load()
+	if m == nil {
+		t.Fatal("manager missing")
+	}
+	if err := m.Close(); err != nil {
 		t.Fatalf("unexpected Close error: %v", err)
 	}
 
-	if Enabled() {
-		t.Fatal("expected proxy to not be enabled after Close")
+	// T-1 (docs/KNOWN_ISSUES.md): deterministic state assertions — no dial
+	// probes, no sleeps.
+	m.mu.Lock()
+	closed := m.closed
+	listener := m.listener
+	server := m.server
+	clearedURL := m.localURL
+	m.mu.Unlock()
+	if !closed {
+		t.Fatal("manager not marked closed")
 	}
-	if Required() {
-		t.Fatal("expected proxy to not be required after Close")
+	if listener != nil {
+		t.Fatal("listener not released after Close")
+	}
+	if server != nil {
+		t.Fatal("server not released after Close")
+	}
+	if clearedURL != "" {
+		t.Fatal("local URL not cleared after Close")
+	}
+	if TunnelCount() != 0 {
+		t.Fatal("tunnels remained tracked after Close")
+	}
+	if _, err := LocalURL(); err == nil {
+		t.Fatal("LocalURL must fail on a closed manager")
 	}
 
-	// Verify local proxy listener is closed
-	_, err = net.DialTimeout("tcp", parsed.Host, 500*time.Millisecond)
-	if err == nil {
-		t.Fatalf("expected connection to %s to fail after Close, but it succeeded", parsed.Host)
+	// Swap the default away (as the package Close does) and check the
+	// policy flags the test historically pinned.
+	_ = Close()
+	_ = proxy.Close()
+	if proxy.Enabled() {
+		t.Fatal("expected proxy to not be enabled after Close")
+	}
+	if proxy.Required() {
+		t.Fatal("expected proxy to not be required after Close")
 	}
 }
 
 func TestConcurrentLocalURLAndClose(t *testing.T) {
 	for attempt := 0; attempt < 25; attempt++ {
-		if err := InitWithPolicy(true, true, "http://127.0.0.1:3128", "", "roundrobin", time.Second); err != nil {
-			t.Fatal(err)
-		}
+		legacyBridge(t, "http://127.0.0.1:3128")
 		start := make(chan struct{})
 		var wg sync.WaitGroup
 		var localURL string
@@ -234,21 +281,30 @@ func TestConcurrentLocalURLAndClose(t *testing.T) {
 		}
 		close(start)
 		wg.Wait()
-		if Enabled() || Required() {
-			t.Fatal("manager remained active after concurrent Close")
+		if m := defaultManager.Load(); m != nil {
+			t.Fatal("traffic proxy manager remained active after concurrent Close")
 		}
+		// T-1: deterministic — the manager is swapped to nil by Close, so a
+		// subsequent LocalURL must fail without racing any listener.
 		if localURL != "" {
-			parsed, err := url.Parse(localURL)
-			if err != nil {
-				t.Fatal(err)
-			}
-			conn, err := net.DialTimeout("tcp", parsed.Host, 100*time.Millisecond)
-			if err == nil {
-				conn.Close()
-				t.Fatalf("loopback proxy %s remained open after Close", parsed.Host)
+			if _, err := LocalURL(); err == nil {
+				t.Fatal("loopback proxy URL remained usable after Close")
 			}
 		}
 	}
+}
+
+// closeHookListener records whether Close was invoked, so the
+// close-before-Serve test can assert deterministic state instead of probing
+// the port (T-1).
+type closeHookListener struct {
+	net.Listener
+	closed atomic.Bool
+}
+
+func (l *closeHookListener) Close() error {
+	l.closed.Store(true)
+	return l.Listener.Close()
 }
 
 func TestManagerCloseBeforeLocalServeStarts(t *testing.T) {
@@ -256,13 +312,23 @@ func TestManagerCloseBeforeLocalServeStarts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	m := &Manager{localListener: ln, localServer: &http.Server{}}
+	hooked := &closeHookListener{Listener: ln}
+	m := &Manager{
+		listener:                   hooked,
+		tunnels:                    make(map[*tunnel]struct{}),
+		upstreamTransports:         make(map[string]*http.Transport),
+		directTransports:           make(map[string]*http.Transport),
+		insecureUpstreamTransports: make(map[string]*http.Transport),
+		insecureDirectTransports:   make(map[string]*http.Transport),
+	}
 	if err := m.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if conn, err := net.DialTimeout("tcp", ln.Addr().String(), 100*time.Millisecond); err == nil {
-		conn.Close()
-		t.Fatal("listener remained open when Close ran before Serve")
+	if !hooked.closed.Load() {
+		t.Fatal("listener Close was not invoked when Close ran before Serve")
+	}
+	if m.listener != nil {
+		t.Fatal("listener not released when Close ran before Serve")
 	}
 }
 
@@ -280,12 +346,7 @@ func TestLocalProxyStripsHopByHopHeaders(t *testing.T) {
 	defer upstream.Close()
 
 	proxyHost := strings.TrimPrefix(upstream.URL, "http://")
-	if err := InitWithPolicy(true, true, "http://"+proxyHost, "", "roundrobin", time.Second); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		_ = Close()
-	})
+	legacyBridge(t, "http://"+proxyHost)
 
 	localURL, err := LocalURL()
 	if err != nil {

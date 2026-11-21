@@ -99,7 +99,7 @@ func TestLegacyReportEmbedsUploadedLogo(t *testing.T) {
 	path, err := s.generateReport(&ScanRecord{
 		ID: "legacy-logo", Target: "example.com", Status: "finished",
 		CompanyName: "Example", LogoPath: "/uploads/logos/brand.png",
-	})
+	}, s.currentScanDir)
 	if err != nil {
 		t.Fatal(err)
 	}

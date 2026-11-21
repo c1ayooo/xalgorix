@@ -97,12 +97,7 @@ export default function LoginPage() {
               console.
             </p>
           </div>
-          <dl className="grid grid-cols-2 gap-6 border-t border-border pt-6">
-            <Stat label="Active scans" value="12" />
-            <Stat label="Findings (7d)" value="2,431" />
-            <Stat label="Mean time to detect" value="42s" />
-            <Stat label="Coverage" value="98.4%" />
-          </dl>
+
         </div>
         <p className="text-xs text-muted-foreground">© Xalgorix · Internal use only</p>
       </div>
@@ -159,15 +154,6 @@ export default function LoginPage() {
           </p>
         </div>
       </div>
-    </div>
-  )
-}
-
-function Stat({ label, value }: { label: string; value: string }) {
-  return (
-    <div>
-      <dt className="text-xs uppercase tracking-wider text-muted-foreground">{label}</dt>
-      <dd className="mt-1 font-mono text-2xl font-semibold tracking-tight">{value}</dd>
     </div>
   )
 }

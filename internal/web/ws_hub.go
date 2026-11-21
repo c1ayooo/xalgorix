@@ -169,10 +169,13 @@ func (c *wsClient) readPump() {
 			continue
 		}
 
-		scanCfg := *c.server.cfg // shallow copy
-		applyScanLLMOverrides(&scanCfg, in.ScanRequest)
+		scanCfg := c.server.configSnapshot()
+		if scanCfg == nil {
+			return
+		}
+		applyScanLLMOverrides(scanCfg, in.ScanRequest)
 
-		go c.server.runMultiScan(in.ScanRequest, &scanCfg)
+		go c.server.runMultiScan(in.ScanRequest, scanCfg)
 	}
 }
 
@@ -194,7 +197,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	ip := clientIP(r)
 	loopback := ip == "127.0.0.1" || ip == "::1" || ip == "localhost"
 	authed := false
-	if authConfigured(s.cfg) {
+	if cfg := s.configSnapshot(); authConfigured(cfg) {
 		// authMiddleware accepted this request, so the session is valid.
 		authed = true
 	} else {

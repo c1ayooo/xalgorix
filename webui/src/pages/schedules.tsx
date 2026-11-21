@@ -1,4 +1,5 @@
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
+import { toast } from "sonner";
 import { useI18n } from "@/i18n";
 import { useEffect, useMemo, useState, type FormEvent } from "react";
 import { Card, CardContent } from "@/components/ui/card";
@@ -254,8 +255,10 @@ export default function SchedulesPage() {
         id: sch.id,
         schedule: { ...sch, enabled },
       });
+      toast.success(t("toast.saved"));
     } catch (err) {
       console.error("Failed to toggle schedule status:", err);
+      toast.error(err instanceof Error ? err.message : t("toast.taskFailed"));
     }
   }
 
@@ -264,9 +267,9 @@ export default function SchedulesPage() {
     if (!window.confirm(`Trigger ad-hoc scan for "${sch.name}" now?`)) return;
     try {
       await triggerMutation.mutateAsync(sch.id);
-      alert("Scan triggered successfully!");
+      toast.success(t("toast.scheduleTriggered"));
     } catch (err) {
-      alert(err instanceof Error ? err.message : "Failed to trigger scan");
+      toast.error(err instanceof Error ? err.message : t("toast.taskFailed"));
     }
   }
 
@@ -280,8 +283,9 @@ export default function SchedulesPage() {
       return;
     try {
       await deleteMutation.mutateAsync(sch.id);
+      toast.success(t("toast.taskDeleted"));
     } catch (err) {
-      alert(err instanceof Error ? err.message : "Failed to delete schedule");
+      toast.error(err instanceof Error ? err.message : t("toast.taskFailed"));
     }
   }
 
@@ -354,6 +358,7 @@ export default function SchedulesPage() {
         await createMutation.mutateAsync(payload);
       }
       setDialogOpen(false);
+      toast.success(t("toast.saved"));
     } catch (err) {
       setFormError(
         err instanceof Error ? err.message : "Failed to save schedule",

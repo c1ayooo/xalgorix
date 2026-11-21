@@ -713,6 +713,38 @@ func (s *Store) RunsByInstanceID(ctx context.Context, instanceID string) ([]Run,
 	return scanRunRows(rows)
 }
 
+// ProjectScanIDs implements Repository.ProjectScanIDs.
+func (s *Store) ProjectScanIDs(ctx context.Context, projectID string) ([]string, error) {
+	parsed, err := parseUUID(projectID)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.query(ctx, `
+		SELECT DISTINCT id FROM (
+			SELECT r.instance_id AS id
+			FROM runs r JOIN tasks t ON t.id = r.task_id
+			WHERE t.project_id = $1 AND r.instance_id <> ''
+			UNION
+			SELECT r.legacy_scan_id AS id
+			FROM runs r JOIN tasks t ON t.id = r.task_id
+			WHERE t.project_id = $1 AND r.legacy_scan_id IS NOT NULL AND r.legacy_scan_id <> ''
+		) ids
+		ORDER BY id`, parsed)
+	if err != nil {
+		return nil, fmt.Errorf("platform/postgres: project scan ids: %w", err)
+	}
+	defer rows.Close()
+	out := []string{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("platform/postgres: project scan id: %w", err)
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
 // InstanceIDsForProject implements Repository.InstanceIDsForProject.
 func (s *Store) InstanceIDsForProject(ctx context.Context, projectID string) ([]string, error) {
 	parsed, err := parseUUID(projectID)

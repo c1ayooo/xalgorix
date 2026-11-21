@@ -458,6 +458,10 @@ type Config struct {
 	ProxyRotation string // XALGORIX_PROXY_ROTATION — "roundrobin" (default) or "random"
 	ProxyURL      string // XALGORIX_PROXY_URL — single proxy URL (overrides file)
 
+	// Traffic proxy (R2b, REDESIGN §4/D4)
+	TrafficProxy bool   // XALGORIX_TRAFFICPROXY — single-process loopback MITM proxy, default ON; "0"/"false"/"yes"-negatives turn it off
+	CADir        string // XALGORIX_CA_DIR — traffic-proxy CA directory (default ~/.xalgorix/ca)
+
 	// Paths
 	HomeDir     string // ~/.xalgorix
 	SkillsDir   string // embedded or local skills directory
@@ -682,6 +686,12 @@ func load() *Config {
 		ProxyFile:     envOr("XALGORIX_PROXY_FILE", ""),
 		ProxyRotation: envOr("XALGORIX_PROXY_ROTATION", "roundrobin"),
 		ProxyURL:      envOr("XALGORIX_PROXY_URL", ""),
+
+		// Traffic proxy (R2b): default ON; any explicitly non-truthy value
+		// ("0", "false", "off", ...) turns it off and restores the pre-R2b
+		// behavior byte-for-byte.
+		TrafficProxy: envOrBool("XALGORIX_TRAFFICPROXY", true),
+		CADir:        envOr("XALGORIX_CA_DIR", filepath.Join(xalgorixHome, "ca")),
 
 		// Paths
 		HomeDir:     xalgorixHome,

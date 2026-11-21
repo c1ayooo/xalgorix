@@ -57,6 +57,33 @@ func (ls *LedgerStore) EnableJournal(dir string) error {
 	return nil
 }
 
+// AppendTrafficObservation records one proxy-observed request/response
+// (R2b trafficproxy) as an observed InfoItem in this scan's domain journal.
+// The record is an audit entry only: it never mutates the hypothesis graph
+// and never participates in verdicts. Called from the trafficproxy sink
+// goroutine — never on the proxy request path.
+func (ls *LedgerStore) AppendTrafficObservation(item *infoitem.Item, summary string) error {
+	ls.mu.RLock()
+	j := ls.journal
+	ls.mu.RUnlock()
+	if j == nil {
+		return fmt.Errorf("scanctx: no journal for traffic observation")
+	}
+	rec := domainjournal.Record{
+		ScanID:    ls.scanID,
+		Actor:     engineActor("trafficproxy"),
+		Operation: domainjournal.OpObserveTraffic,
+		Summary:   summary,
+		InfoItem:  item,
+	}
+	// Journal.Append serializes on its own mutex and assigns scan_id/seq,
+	// so this append neither contends the ledger mutex nor mutates state.
+	if _, err := j.Append(rec); err != nil {
+		return fmt.Errorf("scanctx: append traffic observation: %w", err)
+	}
+	return nil
+}
+
 // JournalLastSeq reports the last durable audit sequence (0 without a journal).
 func (ls *LedgerStore) JournalLastSeq() uint64 {
 	ls.mu.RLock()

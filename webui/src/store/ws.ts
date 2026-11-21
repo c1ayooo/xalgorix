@@ -8,6 +8,16 @@ export type WSStatus =
   | "disconnected"
   | "reconnecting";
 
+/** 正在生成的 assistant 消息（delta 累积缓冲，done 后固化为事件）。 */
+export interface StreamingMessage {
+  id: string;
+  text: string;
+  agent_id?: string;
+  instance_id?: string;
+  done: boolean;
+  updatedAt: number;
+}
+
 export interface FeedEvent extends WSEvent {
   // client-side dedupe key + ordering
   _key: string;
@@ -19,6 +29,7 @@ interface WSState {
   lastError?: string;
   events: FeedEvent[];
   paused: boolean;
+  streaming: Record<string, StreamingMessage>;
   maxEvents: number;
   subscribedInstance?: string;
 
@@ -100,6 +111,7 @@ const WS_URL = () => {
 export const useWSStore = create<WSState>((set, get) => ({
   status: "idle",
   events: [],
+  streaming: {},
   paused: false,
   maxEvents: 1000,
   _reconnectAttempts: 0,
@@ -108,6 +120,57 @@ export const useWSStore = create<WSState>((set, get) => ({
 
   pushEvent: (e) => {
     if (get().paused) return;
+    // 对话流：assistant_delta 累积进缓冲（不进事件数组）；
+    // assistant_done 用全文固化为一条 assistant 事件（4zreco transcript 模式：
+    // 人工气泡右对齐、assistant 气泡左对齐，工具行穿插其间）。
+    if (e.type === "assistant_delta" && e.message_id) {
+      const msgId: string = e.message_id;
+      const delta = e.delta ?? "";
+      const agentId = e.agent_id;
+      const instanceId = e.instance_id;
+      set((state) => {
+        const prev = state.streaming[msgId];
+        return {
+          streaming: {
+            ...state.streaming,
+            [msgId]: {
+              id: msgId,
+              text: (prev?.text ?? "") + delta,
+              agent_id: agentId,
+              instance_id: instanceId,
+              done: false,
+              updatedAt: Date.now(),
+            },
+          },
+        };
+      });
+      return;
+    }
+    if (e.type === "assistant_done" && e.message_id) {
+      const doneId: string = e.message_id;
+      set((state) => {
+        const streaming = { ...state.streaming };
+        delete streaming[doneId];
+        return { streaming };
+      });
+      const receivedAt = Date.now();
+      const key = eventDedupeKey(e, receivedAt);
+      set((state) => {
+        // 归一 type 为 assistant：气泡渲染分支按此匹配。
+        const next: FeedEvent = {
+          ...e,
+          type: "assistant",
+          _key: key,
+          _receivedAt: receivedAt,
+        };
+        const events = [...state.events, next];
+        if (events.length > state.maxEvents) {
+          events.splice(0, events.length - state.maxEvents);
+        }
+        return { events };
+      });
+      return;
+    }
     const receivedAt = Date.now();
     const key = eventDedupeKey(e, receivedAt);
     set((state) => {
@@ -124,7 +187,7 @@ export const useWSStore = create<WSState>((set, get) => ({
     });
   },
 
-  clearEvents: () => set({ events: [] }),
+  clearEvents: () => set({ events: [], streaming: {} }),
   setPaused: (p) => set({ paused: p }),
 
   subscribe: (instanceId) => {

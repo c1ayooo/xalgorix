@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
+import { toast } from "sonner";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { Search, RefreshCw, Trash2, CheckCircle2, AlertTriangle } from "lucide-react";
 import {
@@ -415,6 +416,7 @@ export default function SettingsPage() {
     }
     await updateLLM.mutateAsync(req);
     setSavedLLM(true);
+    toast.success(t("toast.saved"));
     setTimeout(() => setSavedLLM(false), 2500);
   }
 
@@ -1057,6 +1059,7 @@ export default function SettingsPage() {
                       setSavedRate(false);
                       await updateRate.mutateAsync(rateForm);
                       setSavedRate(true);
+                      toast.success(t("toast.saved"));
                       setTimeout(() => setSavedRate(false), 2500);
                     }}
                     disabled={updateRate.isPending}
@@ -1319,6 +1322,7 @@ export default function SettingsPage() {
                       setSavedMail(false);
                       await updateMail.mutateAsync(mailForm);
                       setSavedMail(true);
+                      toast.success(t("toast.saved"));
                       setTimeout(() => setSavedMail(false), 2500);
                     }}
                     disabled={updateMail.isPending}
@@ -1375,6 +1379,7 @@ export default function SettingsPage() {
                           setEnvRestartRequired(Boolean(response.restartRequired));
                           setEnvChanges({});
                           setSavedEnvironment(true);
+                          toast.success(t("toast.saved"));
                           setTimeout(() => setSavedEnvironment(false), 2500);
                         }}
                         disabled={

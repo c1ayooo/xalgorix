@@ -228,6 +228,7 @@ type Agent struct {
 	maxIter                    int
 	stopped                    atomic.Bool
 	iterationDelayMs           atomic.Int64
+	droppedTelemetry           atomic.Int64
 	childrenMu                 sync.Mutex
 	children                   map[*Agent]struct{}
 	ctx                        context.Context
@@ -2933,10 +2934,15 @@ func (a *Agent) emit(evt Event) {
 				log.Printf("⚠️ CRITICAL: Failed sending %s event (channel closed or full for 10s)", evt.Type)
 			}
 		} else {
-			// Non-critical event: best-effort non-blocking send. A closed or
-			// full channel simply drops the event, so the boolean result is
-			// intentionally ignored.
-			_ = safeSend(a.events, evt, 0)
+			// Non-critical narration stays best-effort, but a full channel is
+			// counted and logged so telemetry loss is observable rather than
+			// silent. Durable tool/claim events use the blocking branch above.
+			if !safeSend(a.events, evt, 0) {
+				n := a.droppedTelemetry.Add(1)
+				if n == 1 || n%100 == 0 {
+					log.Printf("[agent] dropped %d narration telemetry event(s) (channel full/closed)", n)
+				}
+			}
 		}
 	}
 }

@@ -367,6 +367,42 @@ for *organization*, never a second scan-state authority.
   must not stall on pendings); `enforce` enables the pipeline. Operator
   allowlist additions: `XALGORIX_APPROVAL_ALLOWLIST`.
 
+## Traffic proxy — `internal/trafficproxy` (R2b)
+
+The single-process shared loopback MITM proxy (REDESIGN §4/D4), default ON
+(`XALGORIX_TRAFFICPROXY`, off restores the pre-R2b behavior byte-for-byte).
+
+- `internal/proxy` stays the pure upstream pool (parse/rotation/shared
+  clients); `internal/trafficproxy` owns the loopback listener, the CA
+  (`ca.go`, stdlib ECDSA P-256, persisted under `XALGORIX_CA_DIR` default
+  `~/.xalgorix/ca` via `storage.WriteAtomic`, 0600/0700, corrupt CA is
+  fail-closed for interception — never re-signed), the MITM CONNECT path
+  (`mitm.go`), and the observation sink (`observation.go`).
+- Consumers: `httpclient.buildClient` + `send_request` route via
+  `trafficproxy.LocalURL` and trust the CA when interception is active; the
+  browser points at `LocalURL`; websearch providers use the same loopback
+  route (system-level, no run token); terminal env + curl/wget wrappers
+  (`--cacert`) and python `REQUESTS_CA_BUNDLE`/`SSL_CERT_FILE` carry the CA.
+  Off mode keeps every legacy route (pool transport clients, blind tunnel).
+  WebSocket/upgrade requests fall back to raw passthrough inside the tunnel
+  (observed as `upgrade_passthrough` metadata only).
+- Attribution: `web.executeScanSession` mints a per-session run token
+  (`trafficproxy.RegisterRun`, unregistered in cleanup). The proxy resolves
+  `Proxy-Authorization: Bearer` BEFORE the hop-by-hop strip; attributed
+  traffic overrides the process dial-guard base with the scan's scopeguard
+  config (per-scan provisioned loopback ports still work; Chromium bypasses
+  the proxy for those ports).
+- Observation: request/response summaries become observed InfoItems in the
+  owning run's `domainjournal` via `OpObserveTraffic` (new operation),
+  written by a bounded single-writer sink off the request path (overflow is
+  dropped and counted). Header values never enter observations — only
+  names; sensitive query values are masked. Without a DSN the journal is
+  still written; the PG projection simply does not happen.
+- Security chain: the proxy does not take over scope (ring 1 stays
+  pre-proxy). The operator-machine dial guard (ring 3, `net.Dialer.Control`,
+  GuardDials mechanism) moves into the proxy's direct upstream dials — pool
+  addresses stay exempt like any operator proxy.
+
 ## Engine — `internal/engine` (R4 core)
 
 `internal/engine` contains the Eino v0.9.23 ADK primitives. `XALGORIX_ENGINE`

@@ -1,6 +1,9 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "./client";
 import type {
+  InfoAssociationParams,
+  InfoContextParams,
+  InfoRegionParams,
   ListParams,
   ProjectRequest,
   ScanRequest,
@@ -49,6 +52,12 @@ export const qk = {
   approvals: (filter: string, projectId?: string) =>
     ["approvals", filter, projectId ?? "all"] as const,
   approvalsSummary: ["approvals", "summary"] as const,
+  infoRegion: (params: InfoRegionParams) =>
+    ["info", "region", params] as const,
+  infoContext: (params: InfoContextParams) =>
+    ["info", "context", params] as const,
+  infoAssociation: (params: InfoAssociationParams) =>
+    ["info", "association", params] as const,
 };
 
 export function useAuthStatus() {
@@ -296,9 +305,14 @@ export function useDeleteVuln() {
   return useMutation({
     mutationFn: ({ scanId, vulnId }: { scanId: string; vulnId: string }) =>
       api.deleteVuln(scanId, vulnId),
-    onSuccess: () => {
+    onSuccess: (_data, vars) => {
       qc.invalidateQueries({ queryKey: qk.scans });
       qc.invalidateQueries({ queryKey: qk.instances });
+      // F-1: the deleted finding is also embedded in the open scan detail and
+      // in the findings list/summary caches.
+      qc.invalidateQueries({ queryKey: qk.scan(vars.scanId) });
+      qc.invalidateQueries({ queryKey: ["findings"] });
+      qc.invalidateQueries({ queryKey: ["task"] });
     },
     onError: (err) => {
       console.error("Failed to delete vulnerability:", err);
@@ -784,5 +798,39 @@ export function useSendTaskGuidance() {
     onSuccess: (_data, vars) => {
       qc.invalidateQueries({ queryKey: ["task", vars.id, "guidance"] });
     },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// R5 信息空间（只读；契约 §5）。项目切换即重新取数，过滤条件进入 query key。
+// ---------------------------------------------------------------------------
+
+export function useInfoRegion(params: InfoRegionParams, enabled = true) {
+  return useQuery({
+    queryKey: qk.infoRegion(params),
+    queryFn: () => api.infoRegion(params),
+    enabled: enabled && !!params.projectId,
+    placeholderData: (prev) => prev,
+    retry: false,
+  });
+}
+
+export function useInfoContext(params: InfoContextParams, enabled = true) {
+  return useQuery({
+    queryKey: qk.infoContext(params),
+    queryFn: () => api.infoContext(params),
+    enabled: enabled && !!params.projectId && !!params.scanId,
+    placeholderData: (prev) => prev,
+    retry: false,
+  });
+}
+
+export function useInfoAssociation(params: InfoAssociationParams, enabled = true) {
+  return useQuery({
+    queryKey: qk.infoAssociation(params),
+    queryFn: () => api.infoAssociation(params),
+    enabled: enabled && !!params.projectId && !!params.scanId && !!params.ids,
+    placeholderData: (prev) => prev,
+    retry: false,
   });
 }

@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"fmt"
-	"net"
 	"net/http"
 	"os"
 	"sync"
@@ -19,20 +18,14 @@ import (
 // Go's http.Transport to reuse idle TCP connections (Keep-Alive) and avoids
 // socket exhaustion under load.
 type Manager struct {
-	enabled        bool
-	pool           *Pool
-	rotation       string // "roundrobin" | "random"
-	required       bool
-	timeout        time.Duration
-	client         *http.Client // shared client used when proxy routing is disabled
-	mu             sync.Mutex   // guards the loopback listener and closed state
-	closed         bool
-	localOnce      sync.Once
-	localURL       string
-	localErr       error
-	localListener  net.Listener
-	localServer    *http.Server
-	localTransport *http.Transport
+	enabled  bool
+	pool     *Pool
+	rotation string // "roundrobin" | "random"
+	required bool
+	timeout  time.Duration
+	client   *http.Client // shared client used when proxy routing is disabled
+	mu       sync.Mutex   // guards the closed state
+	closed   bool
 }
 
 var defaultManager atomic.Pointer[Manager]
@@ -188,8 +181,9 @@ func (m *Manager) timeoutOrDefault() time.Duration {
 	return m.timeout
 }
 
-// Close shuts down the manager, releases any background loopback proxy server,
-// and closes idle connections in cached transports.
+// Close shuts down the manager and closes idle connections in cached
+// transports. The loopback MITM bridge lives in internal/trafficproxy and
+// owns its own lifecycle.
 func (m *Manager) Close() error {
 	if m == nil {
 		return nil
@@ -200,30 +194,10 @@ func (m *Manager) Close() error {
 		return nil
 	}
 	m.closed = true
-	var firstErr error
-	if m.localServer != nil {
-		if err := m.localServer.Close(); err != nil {
-			firstErr = err
-		}
-		m.localServer = nil
-	}
-	// Serve may not have started yet, in which case http.Server.Close has
-	// not registered the listener and cannot close it for us.
-	if m.localListener != nil {
-		_ = m.localListener.Close()
-		m.localListener = nil
-	}
-	m.localURL = ""
-	// Never reset a sync.Once while LocalURL may still be using it. A closed
-	// manager is terminal; InitWithPolicy constructs a fresh manager instead.
-	if m.localTransport != nil {
-		m.localTransport.CloseIdleConnections()
-		m.localTransport = nil
-	}
 	if m.client != nil {
 		m.client.CloseIdleConnections()
 	}
-	return firstErr
+	return nil
 }
 
 // Close shuts down the package-level default proxy manager and any background loopback proxy.

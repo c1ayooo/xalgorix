@@ -50,6 +50,15 @@ func SessionAuthForContext(contextID string) map[string]string {
 	return getSessionAuth(contextID)
 }
 
+// ClearSessionAuth releases both role stores for one scan context. Called from
+// scan-session cleanup so operator credentials do not outlive the Run.
+func ClearSessionAuth(contextID string) {
+	sessionAuthMu.Lock()
+	defer sessionAuthMu.Unlock()
+	delete(sessionAuth, contextID)
+	delete(sessionAuthB, contextID)
+}
+
 // SetSessionAuthB registers a SECOND account's headers (role B) for a scan
 // context. Passing an empty map clears any existing role-B auth. Role B is used
 // by the authorization matrix as the cross-account identity for IDOR/BOLA

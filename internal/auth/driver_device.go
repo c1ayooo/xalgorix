@@ -755,6 +755,11 @@ func (d *deviceCodeDriver) finishFlow(flow *deviceFlow, err error) {
 		default:
 		}
 		close(flow.done)
+		// The persisted Profile is the credential source of truth; the
+		// in-memory copy must not keep access/refresh tokens for the process
+		// lifetime once the flow has finalized.
+		flow.profile = Profile{}
+		flow.deviceCode = ""
 	})
 }
 

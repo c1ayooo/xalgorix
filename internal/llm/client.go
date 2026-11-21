@@ -918,11 +918,24 @@ func (c *Client) noteKeyQuotaExhausted() {
 // choosing the long quota-exhausted cooldown when the error classifies as
 // quota_exhausted and the short transient cooldown otherwise.
 func (c *Client) noteKeyRateLimitedForError(errStr string) {
+	c.noteKeyRateLimitedForErrorForKey(errStr, "")
+}
+
+// noteKeyRateLimitedForErrorForKey cools the endpoint key that actually failed.
+func (c *Client) noteKeyRateLimitedForErrorForKey(errStr, key string) {
 	if c.keyRotator == nil {
 		return
 	}
 	if ClassifyErrorString(errStr).Class == ErrorClassQuotaExhausted {
+		if key != "" {
+			c.keyRotator.MarkQuotaExhaustedKey(key)
+			return
+		}
 		c.keyRotator.MarkLastQuotaExhausted()
+		return
+	}
+	if key != "" {
+		c.keyRotator.MarkRateLimitedKey(key)
 		return
 	}
 	c.keyRotator.MarkLastRateLimited()
@@ -1779,7 +1792,7 @@ func (c *Client) ChatStream(messages []Message) <-chan StreamChunk {
 			}
 			rlErr := fmt.Sprintf("API returned %d: %s", resp.StatusCode, string(respBody))
 			if isRateLimitError(rlErr) {
-				c.noteKeyRateLimitedForError(rlErr)
+				c.noteKeyRateLimitedForErrorForKey(rlErr, ep.APIKey)
 			}
 			ch <- StreamChunk{Err: fmt.Errorf("API returned %d: %s", resp.StatusCode, string(respBody))}
 			return
@@ -2061,7 +2074,7 @@ func (c *Client) doChatWithUsage(messages []Message, tools []ToolDefinition, cal
 	if resp.StatusCode != http.StatusOK {
 		rlErr := fmt.Sprintf("API returned %d: %s", resp.StatusCode, string(respBody))
 		if isRateLimitError(rlErr) {
-			c.noteKeyRateLimitedForError(rlErr)
+			c.noteKeyRateLimitedForErrorForKey(rlErr, ep.APIKey)
 		}
 		return "", nil, fmt.Errorf("API returned %d: %s", resp.StatusCode, string(respBody))
 	}

@@ -151,16 +151,16 @@
 
 | # | 条目 | 现状证据 | 建议 |
 |---|---|---|---|
-| K-1 | sonner 已挂载无调用（见 §8）——**R3 新页面已全部走 toast**，存量页面待收敛 | `src/main.tsx:14-27`；新页面 `approvals/tasks/projects/task-detail` | 存量页面 mutation 逐步迁移 sonner，落地后升级为 [已确认] |
-| K-2 | login 页营销数字为硬编码假数据（"12 active / 2,431 findings / 98.4%"） | `src/pages/login.tsx:100-105` | 删除或接真数据；本产品是本地自托管，假统计误导 |
+| K-1 | ✅已修（2026-11-21，R5） | 批量删除与设置/定时计划 mutation 已接 sonner；存量页面继续按页收敛 | 已闭合主要高频入口 |
+| K-2 | ✅已修（2026-11-21，R5） | 删除 login 页硬编码假统计 | 已闭合 |
 | K-3 ✅已修（2026-11-21） | Overview 对每条 scan 发独立 `getScan`（N+1 fan-out），且全局口径漏进项目视图（隔离破口） | 已改为项目作用域 `/api/findings?project_id=` 投影（`useFindingsList`），fan-out 删除 | 已闭合；回归截图确认跨项目条目不再混入 |
 | K-4 ✅已修（2026-11-21） | 两处裸 fetch `/api/findings/summary` 绕过 `http()` 封装 | 收敛为集中 `useFindingsSummary(projectId?)`（`api/queries.ts`），overview/findings 共享 | 已闭合 |
-| K-5 | 批量删除顺序 `mutateAsync` 无错误处理，`void` 吞 Promise | `scans.tsx:97-99`、`findings.tsx:180-185`、`scan-detail.tsx:798-800` | try/catch + 部分失败提示 |
-| K-6 | 实时流 autoscroll 无视用户滚动位置 | `live-feed.tsx:248-252` | 距底 >N px 时停用自动滚动 |
-| K-7 | phase 磁贴仅 title+颜色传达状态（无键盘/aria） | `phase-progress.tsx:134-149` | 磁贴加 aria-label 或可聚焦 |
-| K-8 | 事件展开行缺 `aria-expanded/aria-controls` | `live-feed.tsx:134-141` | 补齐 |
-| K-9 | 声明未用依赖：`@tanstack/react-table`、`react-hook-form`+`zod`、`date-fns` | `package.json` | 要么启用要么移除；期间禁止"以为在用" |
-| K-10 | i18n 覆盖仅限 chrome，正文文案大量硬编码英文——**R3 起默认语言 = zh-CN**（`DEFAULT_LANGUAGE`），新增键 en+zh-CN 双语同步 | `src/i18n/translations.ts` | 新代码进词典；存量按页面逐步收敛 |
+| K-5 | ✅已修（2026-11-21，R5） | `scans/findings/scan-detail` 批量删除改 `Promise.allSettled` + sonner 部分失败提示 | 已闭合 |
+| K-6 | ✅已修（2026-11-21，R5） | live-feed 仅在距底 <48px 时自动滚动 | 已闭合 |
+| K-7 | ✅已修（2026-11-21，R5） | phase 条加 `role/aria-label/tabIndex/focus ring` | 已闭合 |
+| K-8 | ✅已修（2026-11-21，R5） | 事件展开行补 `aria-expanded/aria-controls` + `useId` | 已闭合 |
+| K-9 | ✅已修（2026-11-21，R5） | 移除 `@tanstack/react-table`、`react-hook-form`、`@hookform/resolvers`、`zod`、`date-fns` | 已闭合 |
+| K-10 | i18n 覆盖仅限 chrome，正文文案大量硬编码英文——**R3 起默认语言 = zh-CN**（`DEFAULT_LANGUAGE`）；R5 信息空间新页已全量双语 | `src/i18n/translations.ts` | 新代码进词典；存量按页面逐步收敛 |
 | K-11 | 22 阶段数据来自生成文件，禁手改 | `src/methodology-phases.json` | 只能经 `tools/gen-webui-phases` 从 Go 侧再生成 |
 | K-12 | WS paused 丢弃事件不缓存（契约见 §9） | `store/ws.ts:109-111` | 若要"暂停不丢"需改设计，先裁决再动 |
 
@@ -181,4 +181,7 @@
 - **2026-11-21 会话控制台证据**（用户裁决"任务详情功能也要与 4zreco 一致：对话/人在环路等所有内容"，双模式 composer 经 AskUserQuestion 确认）：`components/run-console.tsx`（Run 切换器 + 暂停/恢复/停止 + transcript + 双模式 composer）；`live-feed.tsx` guidance 气泡渲染（`WSEvent.guidance`）；mock WS 广播 `guidance_injected`（wsClients 注册表）。浏览器实测：注入意图 → WS 广播 → transcript 出现 `GUIDANCE_INJECTED` 行 + 右对齐品牌色气泡（已注入 RUN_01）混排进 agent 步骤流 + toast 确认。旁路问答（`/api/chat`）问答对 violet 卡本地展示（最近 3 对）。契约零新增（§3.1 WS 事件即为此设计）。
 - **2026-11-21 会话控制台收尾证据**（"按照这个实施"=方案剩余项）：① **停止软取消**——停止按钮改 AlertDialog（原因输入可选，文案说明"未决审批将一并取消 + 原因帮助引擎规划下次运行"），`stopInstance(id, reason?)` 落 `stop_reason`（契约 §3 增补注记；4zreco soft-cancel→planner replans 语义；mock/instances/scan-detail 调用点同步适配）；② **agent 视角切换**——RunConsole 头部第二选择器（agentScope），transcript 按 `agent_id` 收窄（"全部 agent"默认），事件维度的 `agent_id` 与 `instance_id` 正交（Run 过滤走后者、视角走前者）。浏览器实测：切 specialist 后 transcript 只剩该 agent 的 httpx 事件；停止弹窗 reason 输入 + destructive 确认。开发环境注意：**后台 dev server 必须用工具的 run_in_background 模式启动**（shell 后台子进程会被会话回收，nohup/disown 均不可靠），`VITE_MOCK_PORT=18998` 不可漏（漏了 mock 撞 8787 的 4zreco 生产端口）。
 - **2026-11-21 融合形态定稿证据**（用户裁决：设计方案信息主轴 × 4zreco 会话模式）：① `run-console.tsx` agentScope **Select 升级为会话 chips 行**（`全部 agent / ●主循环 / spec-*`，横向滚动，coordinator 绿点标记；specialist 短名去实例前缀）；② transcript 历史自管（`api.runEventsPage(offset,limit)` 分页拉取 + 「加载更早」回翻 + WS 实时叠加，不再轮询全量端点）；③ 右栏新增**「态势」Tab**（默认落地，认知层）：待审批（本任务过滤，`ApprovalInlineBar` 行内决策）+ 关键发现 top3（severityRank 排序）+ 缺口占位（依赖引擎 M3 上报，禁止编造）；④ mock 合成 16 条确定性历史（coordinator/specialist 混流，含 phase/thought/tool/http/vuln 分型）支持分页回翻。1600×900 截图验收全部到位。**主次关系定稿：会话流 = 过程明细，信息态势 = 认知状态（设计方案主轴），4zreco 只提供交互模式参考（不搬会话实体/暂停门语义）。**
-- 未覆盖区域：无 WCAG 对比度量化测量、`methodology-phases.json` 生成链细节、R5 信息全景页（点亮可视化）。
+- **2026-11-21 融合形态定稿证据**（用户裁决：设计方案信息主轴 × 4zreco 会话模式）：① `run-console.tsx` agentScope **Select 升级为会话 chips 行**（`全部 agent / ●主循环 / spec-*`，横向滚动，coordinator 绿点标记；specialist 短名去实例前缀）；② transcript 历史自管（`api.runEventsPage(offset,limit)` 分页拉取 + 「加载更早」回翻 + WS 实时叠加，不再轮询全量端点）；③ 右栏新增**「态势」Tab**（默认落地，认知层）：待审批（本任务过滤，`ApprovalInlineBar` 行内决策）+ 关键发现 top3（severityRank 排序）+ 缺口占位（依赖引擎 M3 上报，禁止编造）；④ mock 合成 16 条确定性历史（coordinator/specialist 混流，含 phase/thought/tool/http/vuln 分型）支持分页回翻。1600×900 截图验收全部到位。**主次关系定稿：会话流 = 过程明细，信息态势 = 认知状态（设计方案主轴），4zreco 只提供交互模式参考（不搬会话实体/暂停门语义）。**
+- **2026-11-21 对话流（流式 assistant 消息）证据**（用户痛点："没有 SSE、对话内容也没有"）：传输层沿用 WS（真实后端即 WS，与 SSE 同为服务器推送；缺的是**增量语义**而非传输）。**协议**：`assistant_delta {message_id, delta, agent_id, instance_id}` 增量推送 → `assistant_done {message_id, content}` 固化（`WSEvent` 扩展 `message_id/delta`）。**ws store**：delta 累积进 `streaming` 缓冲（不进事件数组），done 时归一 `type:"assistant"` 入事件流。**渲染**：完成消息 = 左对齐 agent 气泡（`rounded-tl-sm border bg-card` + agent 名 mono 标签，与右对齐品牌色人工气泡构成对话对）；生成中 = 流尾打字气泡（`typing…` + `▌` 光标，`animate-pulse` 白名单内）。mock：LLM 回合合成（文本分片每 220ms 推一片，渗透语气真实分析、不编造漏洞结论）。浏览器实测：typing 气泡 → done 固化 → assistant 气泡混排进事件流（人工右对齐 / agent 左对齐对话对）。**后端对接要点**：引擎的 LLM 文本输出按同协议走 WS 即接上（delta 粒度不限）。
+- 未覆盖区域：无 WCAG 对比度量化测量、`methodology-phases.json` 生成链细节。
+- **2026-11-21 R5 信息空间证据**：`pages/info-space.tsx`（项目级 `/info`，区域/关联/语境切片三 Tab）+ `components/info-item-card.tsx`（observed=sky / inferred=violet，confidence/scan_id mono）+ `components/association-graph.tsx`（无新图库的 SVG 分层图 + 可访问列表）。数据走 `/api/info/{region,context,association}`，disabled 显示明确 PostgreSQL 冷路径说明；截断/缺口语义用 amber 提示。新页所有 chrome 文案已进 en/zh-CN 词典。

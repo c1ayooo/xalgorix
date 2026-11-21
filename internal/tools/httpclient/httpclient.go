@@ -20,6 +20,7 @@ import (
 	"github.com/xalgord/xalgorix/v4/internal/proxy"
 	"github.com/xalgord/xalgorix/v4/internal/scanheaders"
 	"github.com/xalgord/xalgorix/v4/internal/tools"
+	"github.com/xalgord/xalgorix/v4/internal/trafficproxy"
 )
 
 const maxBodyBytes = 50 * 1024      // default cap — keeps the context window manageable
@@ -68,7 +69,7 @@ func ProbeTarget(ctx context.Context, contextID, targetURL string, dialGuard too
 	}
 	scanheaders.Apply(req.Header, config.Get().ScanHeaders)
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-	client, err := buildClient(5, false, config.Get().TLSSkipVerify, dialGuard)
+	client, err := buildClient(5, false, config.Get().TLSSkipVerify, dialGuard, contextID)
 	if err != nil {
 		return 0, err
 	}
@@ -196,7 +197,7 @@ func executeWithContext(contextID string, guard tools.RequestGuard, dialGuard to
 		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 	}
 
-	client, err := buildClient(timeout, followRedirects, config.Get().TLSSkipVerify, dialGuard)
+	client, err := buildClient(timeout, followRedirects, config.Get().TLSSkipVerify, dialGuard, contextID)
 	if err != nil {
 		return tools.Result{}, err
 	}
@@ -337,7 +338,9 @@ var testTLSInsecure bool
 
 // buildClient returns a client private to one request. dialGuard, when
 // non-nil, checks every direct connection it makes (see tools.GuardDials).
-func buildClient(timeoutSec int, followRedirects bool, tlsSkipVerify bool, dialGuard tools.DialGuard) (*http.Client, error) {
+// scanCtxID, when non-empty, stamps the run-token attribution header for the
+// loopback traffic proxy.
+func buildClient(timeoutSec int, followRedirects bool, tlsSkipVerify bool, dialGuard tools.DialGuard, scanCtxID string) (*http.Client, error) {
 	tr, ok := http.DefaultTransport.(*http.Transport)
 	if ok {
 		tr = tr.Clone()
@@ -358,7 +361,34 @@ func buildClient(timeoutSec int, followRedirects bool, tlsSkipVerify bool, dialG
 	if config.Get().ProxyRequired && !proxy.Required() {
 		return nil, fmt.Errorf("proxy-required mode is not initialized")
 	}
-	if proxy.Enabled() {
+	if trafficproxy.MITMEnabled() {
+		// R2b default posture: route through the shared loopback traffic
+		// proxy (also in proxy-required mode). The MITM owns upstream
+		// selection (pool rotation or direct) and applies the
+		// operator-machine dial guard on its own dials, so GuardDials below
+		// only ever sees the loopback proxy address — which it exempts,
+		// exactly like any operator proxy.
+		localURL, err := trafficproxy.LocalURL()
+		if err != nil {
+			return nil, fmt.Errorf("traffic proxy unavailable: %w", err)
+		}
+		localParsed, err := url.Parse(localURL)
+		if err != nil {
+			return nil, fmt.Errorf("invalid traffic proxy URL: %w", err)
+		}
+		tr.Proxy = http.ProxyURL(localParsed)
+		// RootCAs trusts the traffic-proxy CA; setting RootCAs does not
+		// trigger GuardDials' custom-TLS-dialer refusal (it only checks
+		// DialTLSContext/DialTLS).
+		if caPool := trafficproxy.RootCAs(); caPool != nil && !tlsSkipVerify && !testTLSInsecure {
+			if tr.TLSClientConfig == nil {
+				tr.TLSClientConfig = &tls.Config{} //nolint:gosec
+			} else {
+				tr.TLSClientConfig = tr.TLSClientConfig.Clone()
+			}
+			tr.TLSClientConfig.RootCAs = caPool
+		}
+	} else if proxy.Enabled() {
 		p := proxy.GetProxy()
 		if p == nil {
 			if proxy.Required() {
@@ -375,9 +405,17 @@ func buildClient(timeoutSec int, followRedirects bool, tlsSkipVerify bool, dialG
 	if err := tools.GuardDials(tr, dialGuard); err != nil {
 		return nil, err
 	}
+	// Run-token attribution rides Proxy-Authorization, which the proxy reads
+	// before stripping hop-by-hop headers. Only stamped when TLS interception
+	// is active — a blind tunnel forwards to a remote upstream that must
+	// never see the token.
+	var transport http.RoundTripper = tr
+	if stamped := trafficproxy.AttributionRoundTripper(tr, scanCtxID); stamped != http.RoundTripper(tr) {
+		transport = stamped
+	}
 
 	c := &http.Client{
-		Transport: tr,
+		Transport: transport,
 		Timeout:   time.Duration(timeoutSec) * time.Second,
 	}
 

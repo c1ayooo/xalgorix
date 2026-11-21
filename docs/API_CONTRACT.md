@@ -187,6 +187,27 @@ interface Guidance {
 
 前端 overview 页已按当前项目带参查询；后端实现前参数被忽略（行为同现状）。
 
+## 3.3 信息空间（R5，只读）
+
+项目级 InfoItem 激活入口。`project_id` 必填；`context`/`association` 的 `scan_id` 必须属于该项目。项目过滤通过 platform runs 的 `instance_id`/`legacy_scan_id` 并集实现，**不向 info_items 增加 project_id**。
+
+```text
+GET /api/info/region?project_id=&subject_kind=&subject=&purpose=&nature=&after=&before=&limit=
+→ { available: true, items: InfoItem[], truncated, incomplete, gap_reason? }
+
+GET /api/info/context?project_id=&scan_id=&subject=&subject_kind=&since=&until=&limit=
+→ { available: true, items: InfoItem[], truncated, incomplete, gap_reason? }
+
+GET /api/info/association?project_id=&scan_id=&ids=id1,id2&edge_types=supports,...&max_depth=1..3&limit=
+→ { available: true, hits: [{ item: InfoItem, path: string[], depth: number }], truncated, incomplete, gap_reason? }
+```
+
+- `limit` 默认 50、上限 200；关联深度 1..3；`truncated`/`incomplete`/`gap_reason` 必须原样透传。
+- 无 PostgreSQL 冷路径时返回 **503**：`{ available: false, reason: "cold_path_disabled", error }`，不得用空数组冒充“无数据”。
+- 有冷路径但读取失败时 `503` + `reason: "cold_path_unavailable"`。
+- InfoItem 形状沿用 `internal/infoitem.Item`：`id/scan_id/source_seq/nature/coordinates/supports/confidence/coordinate_status/...`。
+- 既有 `GET /api/scans/{id}/audit`（领域审计投影）与 `GET /api/scans/{id}/coldpath`（pending/applied/gap/failed/disabled）为同一信息空间的审计/同步状态来源，前端可复用。
+
 ## 4. 前端已实现清单（本契约的消费方）
 
 - `webui/src/types/api.ts` — Project/Task/Run/Approval 类型

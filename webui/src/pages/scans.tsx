@@ -1,4 +1,5 @@
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
+import { toast } from "sonner";
 import { useI18n } from "@/i18n";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
@@ -94,14 +95,22 @@ export default function ScansPage() {
         ? "Permanently delete this scan?"
         : `Permanently delete ${uniqueIds.length} selected scans?`;
     if (!window.confirm(label)) return;
-    for (const id of uniqueIds) {
-      await del.mutateAsync(id);
-    }
+    const settled = await Promise.allSettled(
+      uniqueIds.map((id) => del.mutateAsync(id)),
+    );
+    const succeeded = uniqueIds.filter((_, i) => settled[i].status === "fulfilled");
+    const failed = uniqueIds.length - succeeded.length;
     setSelectedIds((current) => {
       const next = new Set(current);
-      for (const id of uniqueIds) next.delete(id);
+      for (const id of succeeded) next.delete(id);
       return next;
     });
+    if (succeeded.length > 0) {
+      toast.success(`${succeeded.length} ${t("toast.deletedCount")}`);
+    }
+    if (failed > 0) {
+      toast.error(`${failed} ${t("toast.deleteFailed")}`);
+    }
   }
 
   return (

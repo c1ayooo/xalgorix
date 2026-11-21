@@ -155,7 +155,18 @@ func (r *KeyRotator) SetSticky(v bool) {
 // short transient-rate-limit cooldown so subsequent picks concentrate on the
 // remaining keys.
 func (r *KeyRotator) MarkLastRateLimited() {
-	r.markLast(keyPoolCooldown)
+	r.markKey("", keyPoolCooldown)
+}
+
+// MarkRateLimitedKey cools the exact key that failed. Concurrent requests
+// cannot then cool the wrong key through the shared `last` cursor.
+func (r *KeyRotator) MarkRateLimitedKey(key string) {
+	r.markKey(key, keyPoolCooldown)
+}
+
+// MarkQuotaExhaustedKey is MarkRateLimitedKey with the longer quota cooldown.
+func (r *KeyRotator) MarkQuotaExhaustedKey(key string) {
+	r.markKey(key, keyPoolQuotaCooldown)
 }
 
 // MarkLastQuotaExhausted puts the key most recently returned by Pick into the
@@ -163,17 +174,21 @@ func (r *KeyRotator) MarkLastRateLimited() {
 // stops routing requests to a key whose usage window is drained until it very
 // likely resets, instead of thrashing back onto it every 90s.
 func (r *KeyRotator) MarkLastQuotaExhausted() {
-	r.markLast(keyPoolQuotaCooldown)
+	r.markKey("", keyPoolQuotaCooldown)
 }
 
-// markLast cools the key most recently returned by Pick for the given duration.
-func (r *KeyRotator) markLast(d time.Duration) {
+// markKey cools the supplied key, or the most recent Pick when key is empty
+// (compatibility for callers without an endpoint in scope).
+func (r *KeyRotator) markKey(key string, d time.Duration) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.last == "" {
+	if key == "" {
+		key = r.last
+	}
+	if key == "" {
 		return
 	}
-	r.cooldown[r.last] = time.Now().Add(d)
+	r.cooldown[key] = time.Now().Add(d)
 }
 
 // Len reports how many distinct keys the pool holds.

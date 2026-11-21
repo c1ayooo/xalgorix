@@ -33,6 +33,12 @@ import type {
   WSEvent,
   Guidance,
   GuidanceSendResult,
+  InfoAssociationParams,
+  InfoAssociationResult,
+  InfoContextParams,
+  InfoContextResult,
+  InfoRegionParams,
+  InfoRegionResult,
 } from "@/types/api";
 import type { FlatFinding } from "@/lib/findings";
 import type { TokenUsageResponse } from "@/types/token-usage";
@@ -223,7 +229,8 @@ function listQuery(params: ListParams): string {
 }
 
 export const api = {
-  authStatus: () => http<AuthStatus>("/api/auth/status"),
+  authStatus: () =>
+    http<AuthStatus>("/api/auth/status", { timeoutMs: 10_000 }),
   login: (username: string, password: string) =>
     http<{ status: string }>("/api/auth/login", {
       method: "POST",
@@ -627,4 +634,40 @@ export const api = {
       "/api/approvals/batch-decision",
       { method: "POST", json: { ids, decision, reason } },
     ),
+
+  // R5 信息空间（只读；契约 §5）。项目隔离由后端 project_id 强制。
+  infoRegion: (params: InfoRegionParams) => {
+    const sp = new URLSearchParams({ project_id: params.projectId });
+    if (params.subjectKind) sp.set("subject_kind", params.subjectKind);
+    if (params.subject) sp.set("subject", params.subject);
+    if (params.purpose) sp.set("purpose", params.purpose);
+    if (params.nature) sp.set("nature", params.nature);
+    if (params.after) sp.set("after", params.after);
+    if (params.before) sp.set("before", params.before);
+    if (params.limit) sp.set("limit", String(params.limit));
+    return http<InfoRegionResult>(`/api/info/region?${sp.toString()}`);
+  },
+  infoContext: (params: InfoContextParams) => {
+    const sp = new URLSearchParams({
+      project_id: params.projectId,
+      scan_id: params.scanId,
+    });
+    if (params.subject) sp.set("subject", params.subject);
+    if (params.subjectKind) sp.set("subject_kind", params.subjectKind);
+    if (params.since) sp.set("since", params.since);
+    if (params.until) sp.set("until", params.until);
+    if (params.limit) sp.set("limit", String(params.limit));
+    return http<InfoContextResult>(`/api/info/context?${sp.toString()}`);
+  },
+  infoAssociation: (params: InfoAssociationParams) => {
+    const sp = new URLSearchParams({
+      project_id: params.projectId,
+      scan_id: params.scanId,
+      ids: params.ids,
+    });
+    if (params.edgeTypes?.length) sp.set("edge_types", params.edgeTypes.join(","));
+    if (params.maxDepth) sp.set("max_depth", String(params.maxDepth));
+    if (params.limit) sp.set("limit", String(params.limit));
+    return http<InfoAssociationResult>(`/api/info/association?${sp.toString()}`);
+  },
 };

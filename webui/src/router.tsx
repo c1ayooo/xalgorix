@@ -19,6 +19,7 @@ import ProjectsPage from "@/pages/projects"
 import TasksPage from "@/pages/tasks"
 import TaskDetailPage from "@/pages/task-detail"
 import ApprovalsPage from "@/pages/approvals"
+import InfoSpacePage from "@/pages/info-space"
 
 function Root({ children }: { children: ReactNode }) {
   return <AuthBootstrap>{children}</AuthBootstrap>
@@ -48,6 +49,7 @@ const routes: RouteObject[] = [
       { path: "tasks", element: <TasksPage /> },
       { path: "tasks/:taskId", element: <TaskDetailPage /> },
       { path: "approvals", element: <ApprovalsPage /> },
+      { path: "info", element: <InfoSpacePage /> },
       { path: "scans", element: <ScansPage /> },
       { path: "scans/new", element: <NewScanPage /> },
       { path: "scans/:scanId", element: <ScanDetailPage /> },

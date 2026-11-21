@@ -77,3 +77,7 @@ research/
 
 # AI tool local working dirs (same class as .kiro/)
 .codebuddy/
+
+# Python bytecode cache
+__pycache__/
+*.pyc

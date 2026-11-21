@@ -733,6 +733,58 @@ const server = http.createServer(async (req, res) => {
     return send(res, events);
   }
 
+  // -------- R5: Info space (project-scoped, read-only) ----------------------
+  if (method === "GET" && url.startsWith("/api/info/")) {
+    const qs = new URLSearchParams(req.url.split("?")[1] || "");
+    const projectId = qs.get("project_id") || "";
+    if (projectId === "proj-disabled" || process.env.MOCK_INFO_DISABLED === "1") {
+      return send(res, { available: false, reason: "cold_path_disabled", error: "Info space requires PostgreSQL cold path (no DSN configured)" }, 503);
+    }
+    const runId = qs.get("scan_id") || state.instances[0]?.id || "run_mock_1";
+    const now = Date.now();
+    const item = (n, nature, subject, purpose, text, supports = []) => ({
+      id: `info_${runId}_${n}`,
+      scan_id: runId,
+      source_seq: n,
+      nature,
+      coordinates: {
+        content: { text, media_type: "text/plain" },
+        source: { kind: "tool", name: n % 2 ? "httpx" : "nuclei", agent_id: runId },
+        observed_at: new Date(now - n * 60000).toISOString(),
+        subject: { kind: "host", identifier: subject },
+        purpose,
+        context: { phase: n < 3 ? "recon" : "vulnerability-testing", task: "task_mock" },
+        relation_ids: n > 1 ? [`info_${runId}_${n - 1}`] : [],
+      },
+      supports,
+      confidence: nature === "observed" ? 1 : 0.72,
+      coordinate_status: "complete",
+      created_at: new Date(now - n * 60000).toISOString(),
+    });
+    const items = [
+      item(1, "observed", "api.example.com", "endpoint inventory", "GET /api/v1/orders returned 200 with an authenticated session.", []),
+      item(2, "observed", "api.example.com", "auth boundary", "Anonymous request to /api/v1/orders returned 401.", []),
+      item(3, "inferred", "api.example.com", "authorization", "IDOR candidate: /api/v1/orders differs by user scope.", [`info_${runId}_1`]),
+      item(4, "observed", "admin.example.com", "surface mapping", "Admin console responds with a login form.", []),
+      item(5, "inferred", "admin.example.com", "weak isolation", "Admin console may share the same session cookie.", [`info_${runId}_4`]),
+      item(6, "observed", "api.example.com", "traffic", "TLS certificate CN=api.example.com, issued by mock-ca.", []),
+    ];
+    if (url.endsWith("/region")) {
+      const nature = qs.get("nature");
+      const subject = qs.get("subject");
+      const filtered = items.filter((it) => (!nature || it.nature === nature) && (!subject || it.coordinates.subject.identifier.includes(subject)));
+      return send(res, { available: true, items: filtered, truncated: false, incomplete: false });
+    }
+    if (url.endsWith("/context")) {
+      return send(res, { available: true, items: items.slice(0, 4), truncated: false, incomplete: false });
+    }
+    if (url.endsWith("/association")) {
+      const hits = items.slice(1, 4).map((it, idx) => ({ item: it, path: [`info_${runId}_1`, it.id], depth: (idx % 2) + 1 }));
+      return send(res, { available: true, hits, truncated: false, incomplete: true, gap_reason: "mock watermark pending" });
+    }
+    return send(res, { available: false, reason: "unknown_info_endpoint" }, 404);
+  }
+
   // -------- Schedules ------------------------------------------------------
   if (method === "GET" && url === "/api/schedules") {
     return send(res, state.schedules);
@@ -1096,6 +1148,37 @@ wss.on("connection", (ws) => {
       return;
     }
     const specialist = i % 3 === 2;
+    // LLM 对话回合合成：assistant 分析文本分片 delta 推送（每 ~9 tick 一次），
+    // 前端按 message_id 累积成打字气泡，done 后固化为事件行。
+    if (i % 9 === 5) {
+      const rounds = [
+        "The httpx sweep found 3 live endpoints on the api host. Combined with the 401/200 differential we recorded earlier, /api/v1/orders is the strongest IDOR candidate so far.",
+        "Nuclei came back clean on the passive set, so I'm moving the injection lane to claim the next hypothesis while the coordinator keeps widening endpoint coverage.",
+        "Two signals contradict on /admin: the role-A session got 200, but the fresh cookie replay got 401. Treating the first as stale-session noise and re-verifying before reporting.",
+      ];
+      const text = rounds[(i / 9 | 0) % rounds.length];
+      const msgId = `msg_${run.id}_${i}`;
+      const pieces = text.match(/.{1,28}/g) || [text];
+      pieces.forEach((piece, pi) => {
+        setTimeout(() => {
+          if (ws.readyState !== 1) return;
+          ws.send(
+            JSON.stringify({
+              type: pi === pieces.length - 1 ? "assistant_done" : "assistant_delta",
+              message_id: msgId,
+              delta: pi === pieces.length - 1 ? undefined : piece,
+              content: pi === pieces.length - 1 ? text : undefined,
+              agent_id: run.id,
+              instance_id: run.id,
+              timestamp: nowIso(),
+              current_phase: run.current_phase,
+            }),
+          );
+        }, pi * 220);
+      });
+      i++;
+      return;
+    }
     ws.send(
       JSON.stringify({
         type: isEmail ? "email_received" : "tool_call",

@@ -20,6 +20,7 @@ import (
 	"github.com/xalgord/xalgorix/v4/internal/scopeguard"
 	"github.com/xalgord/xalgorix/v4/internal/tools/notes"
 	"github.com/xalgord/xalgorix/v4/internal/tools/reporting"
+	"github.com/xalgord/xalgorix/v4/internal/trafficproxy"
 )
 
 // vulnNotificationDetails renders the Markdown body pushed to Telegram/Discord
@@ -210,6 +211,22 @@ func (s *Server) executeScanSession(sess *scanSession) {
 	scanctx.Activate(sctx)
 	sess.sctx = sctx
 	log.Printf("[scanctx] Activated context %s for target %s (dir=%s)", sctx.ID, sess.target, sess.scanDir)
+
+	// R2b traffic-proxy attribution (REDESIGN §4/D4): mint a fresh 128-bit
+	// run token for this session (never the session id — that embeds the
+	// target name and is not a secret) and register it so the loopback proxy
+	// can attribute observed traffic back to this Run. HTTP tools stamp the
+	// token onto their requests; the proxy resolves it before stripping
+	// hop-by-hop headers. Unregistered in sess.cleanup().
+	if s.cfg != nil {
+		sess.runToken = randomSlug()
+		trafficproxy.RegisterRun(sess.runToken, sess.instanceID, sctx.ID, scopeguard.Config{
+			BindAddr:           s.cfg.BindAddr,
+			Port:               s.port,
+			AllowLoopbackPorts: sess.allowLoopbackPorts,
+			AllowLocalTargets:  s.cfg.AllowLocalTargets,
+		})
+	}
 
 	// Panic-safe persistence: register the child→parent reporting mapping so
 	// reporting.PromoteToParent runs incrementally on every report_vulnerability

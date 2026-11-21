@@ -1,4 +1,5 @@
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
+import { toast } from "sonner";
 import { useI18n } from "@/i18n";
 import { Link } from "react-router-dom";
 import { useEffect, useMemo, useState } from "react";
@@ -172,17 +173,26 @@ export default function FindingsPage() {
         ? "Permanently delete this finding?"
         : `Permanently delete ${unique.length} selected findings?`;
     if (!window.confirm(label)) return;
-    for (const key of unique) {
-      const [scanId, vulnId] = key.split(":");
-      if (scanId && vulnId) {
-        await del.mutateAsync({ scanId, vulnId });
-      }
-    }
+    const validKeys = unique.filter((key) => key.split(":").length === 2);
+    const settled = await Promise.allSettled(
+      validKeys.map((key) => {
+        const [scanId, vulnId] = key.split(":");
+        return del.mutateAsync({ scanId, vulnId });
+      }),
+    );
+    const succeeded = validKeys.filter((_, i) => settled[i].status === "fulfilled");
+    const failed = validKeys.length - succeeded.length;
     setSelectedIds((current) => {
       const next = new Set(current);
-      for (const k of unique) next.delete(k);
+      for (const k of succeeded) next.delete(k);
       return next;
     });
+    if (succeeded.length > 0) {
+      toast.success(`${succeeded.length} ${t("toast.deletedCount")}`);
+    }
+    if (failed > 0) {
+      toast.error(`${failed} ${t("toast.deleteFailed")}`);
+    }
   }
 
   // Manual refresh: invalidate the findings list plus the summary query so

@@ -134,10 +134,16 @@ export function PhaseProgress({
         return (
           <div
             key={p.id}
+            role="img"
+            tabIndex={0}
+            aria-label={`${p.id}. ${p.name} — ${PHASE_STATUS_LABEL[visual.status]}${
+              isSelected || excludedByStatus ? "" : " (not selected)"
+            }`}
             title={`${p.id}. ${p.name}${
               isSelected || excludedByStatus ? "" : " (not selected)"
             } — ${PHASE_STATUS_LABEL[visual.status]}`}
             className={cn(
+              "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
               "h-1.5 flex-1 rounded-sm transition-colors",
               !isSelected && !excludedByStatus && "bg-muted/40",
               isSelected && visual.status === "pending" && "bg-muted",

@@ -84,7 +84,7 @@ func TestSearchGeminiReturnsNon200AsError(t *testing.T) {
 	cfg.GeminiAPIKey = "test-key"
 	defer func() { cfg.GeminiAPIKey = oldKey }()
 
-	_, err := searchGemini("query", 3)
+	_, err := searchGemini(nil, "query", 3)
 	if err == nil || !strings.Contains(err.Error(), "gemini search returned 401") {
 		t.Fatalf("searchGemini non-200 error = %v", err)
 	}
@@ -114,7 +114,7 @@ func TestSearchMiniMaxParsesResults(t *testing.T) {
 	}))
 	defer server.Close()
 
-	results, err := searchMiniMax("mm-key", server.URL, "MiniMax-M3", "xalgorix", 10)
+	results, err := searchMiniMax(nil, "mm-key", server.URL, "MiniMax-M3", "xalgorix", 10)
 	if err != nil {
 		t.Fatalf("searchMiniMax error = %v", err)
 	}
@@ -129,7 +129,7 @@ func TestSearchMiniMaxParsesResults(t *testing.T) {
 	}
 
 	// max clamps the number of returned results.
-	capped, err := searchMiniMax("mm-key", server.URL, "MiniMax-M3", "xalgorix", 1)
+	capped, err := searchMiniMax(nil, "mm-key", server.URL, "MiniMax-M3", "xalgorix", 1)
 	if err != nil {
 		t.Fatalf("searchMiniMax (max=1) error = %v", err)
 	}
@@ -144,12 +144,12 @@ func TestSearchMiniMaxNon200IsError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	if _, err := searchMiniMax("mm-key", server.URL, "MiniMax-M3", "q", 5); err == nil ||
+	if _, err := searchMiniMax(nil, "mm-key", server.URL, "MiniMax-M3", "q", 5); err == nil ||
 		!strings.Contains(err.Error(), "minimax web_search returned 401") {
 		t.Fatalf("searchMiniMax non-200 error = %v", err)
 	}
 
-	if _, err := searchMiniMax("", server.URL, "MiniMax-M3", "q", 5); err == nil {
+	if _, err := searchMiniMax(nil, "", server.URL, "MiniMax-M3", "q", 5); err == nil {
 		t.Fatalf("searchMiniMax with empty key should error")
 	}
 }
@@ -162,7 +162,7 @@ func TestSearchMiniMaxNoResultsIsError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	if _, err := searchMiniMax("mm-key", server.URL, "MiniMax-M3", "q", 5); err == nil ||
+	if _, err := searchMiniMax(nil, "mm-key", server.URL, "MiniMax-M3", "q", 5); err == nil ||
 		!strings.Contains(err.Error(), "no results") {
 		t.Fatalf("searchMiniMax no-results error = %v", err)
 	}

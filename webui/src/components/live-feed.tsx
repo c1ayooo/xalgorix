@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState, useEffect } from "react";
+import { useMemo, useRef, useState, useEffect, useId } from "react";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { ChevronRight, Download, FileText, Pause, Play, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -6,6 +6,7 @@ import { cn, menuContentClass, menuItemClass as menuItemBase } from "@/lib/utils
 import { useWSStore, type FeedEvent } from "@/store/ws";
 import { exportFeedEvents, type FeedExportFormat } from "@/lib/feed-export";
 import { EmptyState } from "./states";
+import type { StreamingMessage } from "@/store/ws";
 import { useI18n } from "@/i18n";
 import { ApprovalInlineBar } from "@/components/approval-inline-bar";
 
@@ -120,6 +121,7 @@ const TYPE_COLOR: Record<string, string> = {
   // HITL（契约 §3/§3.1）
   approval_requested: "text-amber-700 dark:text-amber-300",
   approval_decided: "text-emerald-600 dark:text-emerald-400",
+  assistant: "text-foreground",
   guidance_injected: "text-violet-600 dark:text-violet-300",
   guidance_queued: "text-violet-600 dark:text-violet-300",
   guidance_consumed: "text-emerald-600 dark:text-emerald-400",
@@ -128,6 +130,7 @@ const TYPE_COLOR: Record<string, string> = {
 export function LiveEventRow({ event }: { event: FeedEvent }) {
   const { t } = useI18n();
   const [open, setOpen] = useState(false);
+  const detailsId = useId();
   const message = event.content || event.output || event.error || event.tool_name || event.type;
   const isApprovalRequest = event.type === "approval_requested" && !!event.approval;
   const hasDetails =
@@ -145,6 +148,8 @@ export function LiveEventRow({ event }: { event: FeedEvent }) {
       <button
         type="button"
         onClick={() => hasDetails && setOpen((v) => !v)}
+        aria-expanded={hasDetails ? open : undefined}
+        aria-controls={hasDetails && open ? detailsId : undefined}
         className={cn(
           "flex w-full items-start gap-3 px-3 py-2 text-left transition-colors",
           hasDetails && "hover:bg-accent/40",
@@ -183,6 +188,16 @@ export function LiveEventRow({ event }: { event: FeedEvent }) {
           <ApprovalInlineBar approval={event.approval!} />
         </div>
       )}
+      {event.type === "assistant" && (
+        <div className="px-3 pb-2">
+          <div className="max-w-[80%] rounded-lg rounded-tl-sm border border-border bg-card px-3 py-2 text-sm [overflow-wrap:anywhere]">
+            <div className="mb-1 text-[10px] uppercase tracking-wider text-muted-foreground">
+              {event.agent_id && <span className="mono">{event.agent_id}</span>}
+            </div>
+            <div className="whitespace-pre-wrap text-foreground">{event.content}</div>
+          </div>
+        </div>
+      )}
       {event.type === "guidance_injected" && event.guidance && (
         <div className="flex justify-end px-3 pb-2">
           <div className="max-w-[70%] rounded-lg rounded-tr-sm bg-primary px-3 py-1.5 text-sm text-primary-foreground [overflow-wrap:anywhere]">
@@ -207,7 +222,7 @@ export function LiveEventRow({ event }: { event: FeedEvent }) {
         </div>
       )}
       {open && hasDetails && (
-        <div className="px-3 pb-3 -mt-1 ml-[7.5rem] space-y-2">
+        <div id={detailsId} className="px-3 pb-3 -mt-1 ml-[7.5rem] space-y-2">
           {event.error && (
             <pre className="rounded border border-red-500/30 bg-red-500/5 p-2 text-[11px] mono text-red-700 dark:text-red-300 whitespace-pre-wrap break-words">
               {event.error}
@@ -249,6 +264,7 @@ export function LiveFeed({
   // 常驻主栏模式：根元素与滚动区撑满父容器（父容器负责定高），
   // 而非默认的 max-h-[60vh] 自适应。
   fillHeight = false,
+  streaming = [],
 }: {
   events: FeedEvent[];
   filter: FeedFilter;
@@ -262,6 +278,7 @@ export function LiveFeed({
   exportFilePrefix?: string;
   exportScope?: string;
   fillHeight?: boolean;
+  streaming?: StreamingMessage[];
 }) {
   const paused = useWSStore((s) => s.paused);
   const setPaused = useWSStore((s) => s.setPaused);
@@ -287,8 +304,10 @@ export function LiveFeed({
     });
   }
 
+  const stickToBottom = useRef(true);
+
   useEffect(() => {
-    if (autoScroll && !paused && scrollRef.current) {
+    if (autoScroll && !paused && stickToBottom.current && scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
   }, [visible.length, autoScroll, paused]);
@@ -353,6 +372,11 @@ export function LiveFeed({
       )}
       <div
         ref={scrollRef}
+        onScroll={(e) => {
+          const el = e.currentTarget;
+          stickToBottom.current =
+            el.scrollHeight - el.scrollTop - el.clientHeight < 48;
+        }}
         className={cn(
           "overflow-auto bg-background/40",
           fillHeight ? "min-h-0 flex-1" : "max-h-[60vh] min-h-64",
@@ -365,7 +389,25 @@ export function LiveFeed({
             className="m-3"
           />
         ) : (
-          visible.map((e) => <LiveEventRow key={e._key} event={e} />)
+          <>
+            {visible.map((e) => (
+              <LiveEventRow key={e._key} event={e} />
+            ))}
+            {streaming.map((m) => (
+              <div key={m.id} className="px-3 pb-2">
+                <div className="max-w-[80%] rounded-lg rounded-tl-sm border border-ring/40 bg-card px-3 py-2 text-sm [overflow-wrap:anywhere]">
+                  <div className="mb-1 flex items-center gap-2 text-[10px] uppercase tracking-wider text-muted-foreground">
+                    {m.agent_id && <span className="mono">{m.agent_id}</span>}
+                    <span className="text-emerald-600 dark:text-emerald-400">typing…</span>
+                  </div>
+                  <div className="whitespace-pre-wrap text-foreground">
+                    {m.text}
+                    <span className="ml-0.5 inline-block animate-pulse text-primary">▌</span>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </>
         )}
       </div>
     </div>

@@ -71,8 +71,13 @@ func (ks *KeyStore) Set(ctx context.Context, key ProviderKey) error {
 	}
 	ks.mu.Lock()
 	defer ks.mu.Unlock()
-	ks.keys[key.ProviderID] = key
-	return ks.save()
+	next := cloneProviderKeys(ks.keys)
+	next[key.ProviderID] = key
+	if err := ks.saveKeys(next); err != nil {
+		return err
+	}
+	ks.keys = next
+	return nil
 }
 
 // SetMultiple stores multiple ProviderKeys atomically and persists.
@@ -82,10 +87,15 @@ func (ks *KeyStore) SetMultiple(ctx context.Context, keys []ProviderKey) error {
 	}
 	ks.mu.Lock()
 	defer ks.mu.Unlock()
+	next := cloneProviderKeys(ks.keys)
 	for _, k := range keys {
-		ks.keys[k.ProviderID] = k
+		next[k.ProviderID] = k
 	}
-	return ks.save()
+	if err := ks.saveKeys(next); err != nil {
+		return err
+	}
+	ks.keys = next
+	return nil
 }
 
 // Delete removes a provider's key and persists.
@@ -95,8 +105,13 @@ func (ks *KeyStore) Delete(ctx context.Context, providerID string) error {
 	}
 	ks.mu.Lock()
 	defer ks.mu.Unlock()
-	delete(ks.keys, providerID)
-	return ks.save()
+	next := cloneProviderKeys(ks.keys)
+	delete(next, providerID)
+	if err := ks.saveKeys(next); err != nil {
+		return err
+	}
+	ks.keys = next
+	return nil
 }
 
 // List returns all configured provider keys. API keys are masked
@@ -165,13 +180,23 @@ func (ks *KeyStore) load() error {
 	return nil
 }
 
-// save writes keys to the JSON file atomically.
-func (ks *KeyStore) save() error {
-	keys := make([]ProviderKey, 0, len(ks.keys))
-	for _, k := range ks.keys {
-		keys = append(keys, k)
+func cloneProviderKeys(src map[string]ProviderKey) map[string]ProviderKey {
+	out := make(map[string]ProviderKey, len(src)+1)
+	for id, key := range src {
+		out[id] = key
 	}
-	data, err := json.MarshalIndent(keys, "", "  ")
+	return out
+}
+
+// saveKeys writes a candidate map atomically. The caller commits it to ks.keys
+// only after this returns nil, so a failed write never leaves memory and disk
+// disagreeing.
+func (ks *KeyStore) saveKeys(keys map[string]ProviderKey) error {
+	list := make([]ProviderKey, 0, len(keys))
+	for _, k := range keys {
+		list = append(list, k)
+	}
+	data, err := json.MarshalIndent(list, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -179,11 +204,30 @@ func (ks *KeyStore) save() error {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return err
 	}
-	tmp := ks.filePath + ".tmp"
-	if err := os.WriteFile(tmp, data, 0600); err != nil {
+	f, err := os.CreateTemp(dir, ".llm_keys-*.tmp")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, ks.filePath)
+	tmp := f.Name()
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Chmod(0600); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, ks.filePath); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // maskKey returns a masked version of an API key, showing only

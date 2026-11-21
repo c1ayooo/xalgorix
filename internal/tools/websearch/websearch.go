@@ -2,6 +2,7 @@
 package websearch
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,7 +14,47 @@ import (
 
 	"github.com/xalgord/xalgorix/v4/internal/config"
 	"github.com/xalgord/xalgorix/v4/internal/tools"
+	"github.com/xalgord/xalgorix/v4/internal/trafficproxy"
 )
+
+// searchClient builds the outbound client for one search request. It closes
+// the third security ring on its direct dials (tools.GuardDials — post-DNS
+// operator-machine check, when a registry guard is available) and, when the
+// traffic proxy intercepts TLS, routes through the loopback MITM like every
+// other scan HTTP consumer. Search endpoints are operator-configured
+// system-level destinations: no run token is stamped, so no InfoItem is
+// produced for them (they are still observed as system metadata when the
+// proxy carries them).
+func searchClient(dialGuard tools.DialGuard, timeout time.Duration) *http.Client {
+	tr, ok := http.DefaultTransport.(*http.Transport)
+	if ok {
+		tr = tr.Clone()
+	} else {
+		tr = &http.Transport{}
+	}
+	if trafficproxy.MITMEnabled() {
+		if localURL, err := trafficproxy.LocalURL(); err == nil {
+			if parsed, perr := netURL.Parse(localURL); perr == nil {
+				tr.Proxy = http.ProxyURL(parsed)
+				if pool := trafficproxy.RootCAs(); pool != nil {
+					if tr.TLSClientConfig == nil {
+						tr.TLSClientConfig = &tls.Config{} //nolint:gosec
+					} else {
+						tr.TLSClientConfig = tr.TLSClientConfig.Clone()
+					}
+					tr.TLSClientConfig.RootCAs = pool
+				}
+			}
+		}
+	}
+	if err := tools.GuardDials(tr, dialGuard); err != nil {
+		// A transport that cannot be guarded stays direct: GuardDials only
+		// refuses transports with custom TLS dialers, which searchClient
+		// never builds — this is unreachable today and logged for safety.
+		log.Printf("[websearch] dial guard not applied: %v", err)
+	}
+	return &http.Client{Transport: tr, Timeout: timeout}
+}
 
 // Register adds web search tools to the registry.
 func Register(r *tools.Registry) {
@@ -24,7 +65,9 @@ func Register(r *tools.Registry) {
 			{Name: "query", Description: "Search query", Required: true},
 			{Name: "max_results", Description: "Maximum results (default: 10)", Required: false},
 		},
-		Execute: webSearch,
+		Execute: func(args map[string]string) (tools.Result, error) {
+			return webSearch(r.DialGuard(), args)
+		},
 	})
 	r.Register(&tools.Tool{
 		Name:        "cve_search",
@@ -32,7 +75,9 @@ func Register(r *tools.Registry) {
 		Parameters: []tools.Parameter{
 			{Name: "cve_id", Description: "CVE ID (e.g., CVE-2024-1234)", Required: true},
 		},
-		Execute: cveSearch,
+		Execute: func(args map[string]string) (tools.Result, error) {
+			return cveSearch(r.DialGuard(), args)
+		},
 	})
 	r.Register(&tools.Tool{
 		Name:        "exploit_search",
@@ -40,11 +85,13 @@ func Register(r *tools.Registry) {
 		Parameters: []tools.Parameter{
 			{Name: "query", Description: "Search query (product, version, keyword)", Required: true},
 		},
-		Execute: exploitSearch,
+		Execute: func(args map[string]string) (tools.Result, error) {
+			return exploitSearch(r.DialGuard(), args)
+		},
 	})
 }
 
-func webSearch(args map[string]string) (tools.Result, error) {
+func webSearch(dialGuard tools.DialGuard, args map[string]string) (tools.Result, error) {
 	query := args["query"]
 	if query == "" {
 		return tools.Result{}, fmt.Errorf("query is required")
@@ -58,7 +105,7 @@ func webSearch(args map[string]string) (tools.Result, error) {
 	// real-time, structured results. On any failure we fall through to the
 	// built-in scraping backends below, so search never hard-depends on it.
 	if apiKey, base, model, ok := minimaxWebSearchConfig(); ok {
-		results, err := searchMiniMax(apiKey, base, model, query, maxResults)
+		results, err := searchMiniMax(dialGuard, apiKey, base, model, query, maxResults)
 		if err == nil && len(results) > 0 {
 			return formatResults(query, results), nil
 		}
@@ -68,31 +115,31 @@ func webSearch(args map[string]string) (tools.Result, error) {
 	}
 
 	// Try Gemini first if API key is configured
-	results, err := searchGemini(query, maxResults)
+	results, err := searchGemini(dialGuard, query, maxResults)
 	if err == nil && len(results) > 0 {
 		return formatResults(query, results), nil
 	}
 
 	// Fallback to Brave
-	results, err = searchBrave(query, maxResults)
+	results, err = searchBrave(dialGuard, query, maxResults)
 	if err == nil && len(results) > 0 {
 		return formatResults(query, results), nil
 	}
 
 	// Fallback to Google scraping
-	results, err = searchGoogle(query, maxResults)
+	results, err = searchGoogle(dialGuard, query, maxResults)
 	if err == nil && len(results) > 0 {
 		return formatResults(query, results), nil
 	}
 
 	// Fallback to Bing
-	results, err = searchBing(query, maxResults)
+	results, err = searchBing(dialGuard, query, maxResults)
 	if err == nil && len(results) > 0 {
 		return formatResults(query, results), nil
 	}
 
 	// Final fallback to DuckDuckGo
-	results, err = searchDuckDuckGo(query, maxResults)
+	results, err = searchDuckDuckGo(dialGuard, query, maxResults)
 	if err != nil {
 		return tools.Result{}, fmt.Errorf("all search engines failed: %w", err)
 	}
@@ -147,11 +194,11 @@ func formatResults(query string, results []searchResult) tools.Result {
 }
 
 // searchBrave scrapes Brave Search results
-func searchBrave(query string, max int) ([]searchResult, error) {
+func searchBrave(dialGuard tools.DialGuard, query string, max int) ([]searchResult, error) {
 	// Try Brave's JSON API (more reliable)
 	url := fmt.Sprintf("https://search.brave.com/api/search?q=%s&count=%d", netURL.QueryEscape(query), max)
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := searchClient(dialGuard, 30*time.Second)
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Brave search request: %w", err)
@@ -202,10 +249,10 @@ func searchBrave(query string, max int) ([]searchResult, error) {
 }
 
 // searchGoogle scrapes Google search results
-func searchGoogle(query string, max int) ([]searchResult, error) {
+func searchGoogle(dialGuard tools.DialGuard, query string, max int) ([]searchResult, error) {
 	url := fmt.Sprintf("https://www.google.com/search?q=%s&num=%d", netURL.QueryEscape(query), max)
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := searchClient(dialGuard, 30*time.Second)
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Google search request: %w", err)
@@ -257,10 +304,10 @@ func searchGoogle(query string, max int) ([]searchResult, error) {
 }
 
 // searchBing scrapes Bing search results
-func searchBing(query string, max int) ([]searchResult, error) {
+func searchBing(dialGuard tools.DialGuard, query string, max int) ([]searchResult, error) {
 	url := fmt.Sprintf("https://www.bing.com/search?q=%s&count=%d", netURL.QueryEscape(query), max)
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := searchClient(dialGuard, 30*time.Second)
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Bing search request: %w", err)
@@ -305,11 +352,11 @@ func searchBing(query string, max int) ([]searchResult, error) {
 }
 
 // searchDuckDuckGo uses the HTML version
-func searchDuckDuckGo(query string, max int) ([]searchResult, error) {
+func searchDuckDuckGo(dialGuard tools.DialGuard, query string, max int) ([]searchResult, error) {
 	// Try JSON API first (more reliable)
 	url := fmt.Sprintf("https://api.duckduckgo.com/?q=%s&format=json&no_html=1&skip_disambig=1", netURL.QueryEscape(query))
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := searchClient(dialGuard, 30*time.Second)
 	resp, err := client.Get(url)
 	if err == nil {
 		defer resp.Body.Close()
@@ -360,7 +407,7 @@ func searchDuckDuckGo(query string, max int) ([]searchResult, error) {
 	// Fallback to HTML scraping
 	url = fmt.Sprintf("https://html.duckduckgo.com/html/?q=%s", netURL.QueryEscape(query))
 
-	clientHTML := &http.Client{Timeout: 30 * time.Second}
+	clientHTML := searchClient(dialGuard, 30*time.Second)
 	resp, err = clientHTML.Get(url)
 	if err != nil {
 		return nil, err
@@ -407,7 +454,7 @@ func searchDuckDuckGo(query string, max int) ([]searchResult, error) {
 }
 
 // searchGemini uses Google Gemini API for web search
-func searchGemini(query string, max int) ([]searchResult, error) {
+func searchGemini(dialGuard tools.DialGuard, query string, max int) ([]searchResult, error) {
 	cfg := config.Get()
 	apiKey := cfg.GeminiAPIKey
 
@@ -443,7 +490,7 @@ func searchGemini(query string, max int) ([]searchResult, error) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := searchClient(dialGuard, 30*time.Second)
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -575,7 +622,7 @@ func minimaxModelName(cfg *config.Config) string {
 // via its Anthropic-compatible Messages API. MiniMax performs the search on its
 // servers within a single request and returns the results as
 // web_search_tool_result content blocks, which we flatten into searchResults.
-func searchMiniMax(apiKey, baseURL, model, query string, max int) ([]searchResult, error) {
+func searchMiniMax(dialGuard tools.DialGuard, apiKey, baseURL, model, query string, max int) ([]searchResult, error) {
 	if apiKey == "" {
 		return nil, fmt.Errorf("MiniMax API key not configured")
 	}
@@ -609,7 +656,7 @@ func searchMiniMax(apiKey, baseURL, model, query string, max int) ([]searchResul
 
 	// Server-side search + generation runs in one request, so allow more time
 	// than a plain scrape.
-	client := &http.Client{Timeout: 45 * time.Second}
+	client := searchClient(dialGuard, 45*time.Second)
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -692,7 +739,7 @@ func normalizeCVEID(cveID string) string {
 }
 
 // cveSearch queries the NIST NVD API for CVE details
-func cveSearch(args map[string]string) (tools.Result, error) {
+func cveSearch(dialGuard tools.DialGuard, args map[string]string) (tools.Result, error) {
 	cveID := args["cve_id"]
 	if cveID == "" {
 		return tools.Result{}, fmt.Errorf("cve_id is required")
@@ -702,7 +749,7 @@ func cveSearch(args map[string]string) (tools.Result, error) {
 
 	url := fmt.Sprintf("https://services.nvd.nist.gov/rest/json/cves/2.0?cveId=%s", netURL.QueryEscape(cveID))
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := searchClient(dialGuard, 30*time.Second)
 	resp, err := client.Get(url)
 	if err != nil {
 		return tools.Result{}, fmt.Errorf("CVE search failed: %w", err)
@@ -792,7 +839,7 @@ func cveSearch(args map[string]string) (tools.Result, error) {
 }
 
 // exploitSearch provides Exploit-DB search
-func exploitSearch(args map[string]string) (tools.Result, error) {
+func exploitSearch(dialGuard tools.DialGuard, args map[string]string) (tools.Result, error) {
 	query := args["query"]
 	if query == "" {
 		return tools.Result{}, fmt.Errorf("query is required")

@@ -453,9 +453,13 @@ func TestDevice_HappyPath_PersistsProfile(t *testing.T) {
 	if prof.TokenType != "Bearer" {
 		t.Fatalf("TokenType = %q, want %q", prof.TokenType, "Bearer")
 	}
-	// flow.profile should mirror the persisted record.
-	if flow.profile.AccessToken != prof.AccessToken {
-		t.Fatalf("flow.profile.AccessToken = %q, want %q", flow.profile.AccessToken, prof.AccessToken)
+	// The finalized flow must not retain credential material in memory; the
+	// persisted Profile_Store record remains the source of truth.
+	if flow.profile.AccessToken != "" || flow.profile.RefreshToken != "" {
+		t.Fatalf("finalized flow retained tokens: %+v", flow.profile)
+	}
+	if flow.deviceCode != "" {
+		t.Fatalf("finalized flow retained device_code: %q", flow.deviceCode)
 	}
 }
 

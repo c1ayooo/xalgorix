@@ -921,17 +921,25 @@ func TestHandleQueueResumeRejectsLaunchInProgress(t *testing.T) {
 func TestQueueState_PreservesAllConfig(t *testing.T) {
 	s := newTestServer(t, nil)
 	req := ScanRequest{
-		Targets:        []string{"https://a.test", "https://b.test"},
-		Instruction:    "deep scan with custom rules",
-		ScanMode:       "wildcard",
-		Name:           "My Pentest",
-		SeverityFilter: []string{"critical", "high"},
-		Phases:         []int{1, 6, 8, 22},
-		ReconMode:      "passive",
-		ScanIntensity:  "passive",
-		CompanyName:    "ACME Corp",
-		LogoPath:       "/uploads/logos/acme.png",
-		DiscordWebhook: "https://discord.example/hook/abc123",
+		Targets:         []string{"https://a.test", "https://b.test"},
+		Instruction:     "deep scan with custom rules",
+		ScanMode:        "wildcard",
+		Name:            "My Pentest",
+		SeverityFilter:  []string{"critical", "high"},
+		Phases:          []int{1, 6, 8, 22},
+		ReconMode:       "passive",
+		ScanIntensity:   "passive",
+		CompanyName:     "ACME Corp",
+		LogoPath:        "/uploads/logos/acme.png",
+		DiscordWebhook:  "https://discord.example/hook/abc123",
+		Model:           "openai/gpt-5.6",
+		ProviderProfile: "openai:default",
+		CodeScan:        "review",
+		SourceRepo:      "https://git.example/repo.git",
+		ScanContext:     "/uploads/ctx/a.yaml",
+		ScanContextPaths: []string{
+			"/uploads/ctx/a.yaml", "/uploads/ctx/b.har",
+		},
 	}
 	activeDir := filepath.Join(s.dataDir, "a.test", "2026-05-23", "scan-active")
 	activeSubDir := filepath.Join(s.dataDir, "api.a.test", "2026-05-23", "scan-child")
@@ -981,6 +989,21 @@ func TestQueueState_PreservesAllConfig(t *testing.T) {
 	}
 	if state.DiscordWebhook != "https://discord.example/hook/abc123" {
 		t.Errorf("DiscordWebhook = %q", state.DiscordWebhook)
+	}
+	if state.Model != "openai/gpt-5.6" || state.ProviderProfile != "openai:default" {
+		t.Errorf("model/provider profile lost: %+v", state)
+	}
+	if state.CodeScan != "review" || state.SourceRepo != "https://git.example/repo.git" {
+		t.Errorf("code-scan config lost: %+v", state)
+	}
+	if state.ScanContext != "/uploads/ctx/a.yaml" || len(state.ScanContextPaths) != 2 {
+		t.Errorf("scan context lost: %+v", state)
+	}
+	restored := scanRequestFromQueueState(state, "")
+	if restored.Model != "openai/gpt-5.6" || restored.ProviderProfile != "openai:default" ||
+		restored.CodeScan != "review" || restored.SourceRepo != "https://git.example/repo.git" ||
+		len(restored.ScanContextPaths) != 2 {
+		t.Errorf("resume request lost execution config: %+v", restored)
 	}
 	if state.ActiveTarget != "https://a.test" || state.ActiveScanDir != activeDir || state.ActiveScanID != "scan-active" {
 		t.Errorf("active scan progress not preserved: %#v", state)

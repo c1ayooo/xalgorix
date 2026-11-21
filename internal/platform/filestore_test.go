@@ -525,6 +525,38 @@ func TestFileStoreScopeRejectsPortEntries(t *testing.T) {
 	}
 }
 
+func TestFileStoreProjectScanIDsUnionsInstanceAndLegacyIDs(t *testing.T) {
+	store := newTestFileStore(t)
+	ctx := context.Background()
+	project, err := store.CreateProject(ctx, "Info Scope", Scope{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := store.CreateTask(ctx, project.ID, TaskInput{Name: "Info"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateRun(ctx, task.ID, RunMount{InstanceID: "inst-info", LegacyScanID: "legacy-info"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateRun(ctx, task.ID, RunMount{InstanceID: "inst-only"}); err != nil {
+		t.Fatal(err)
+	}
+	ids, err := store.ProjectScanIDs(ctx, project.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]bool{"inst-info": true, "legacy-info": true, "inst-only": true}
+	if len(ids) != len(want) {
+		t.Fatalf("ProjectScanIDs = %v, want %d ids", ids, len(want))
+	}
+	for _, id := range ids {
+		if !want[id] {
+			t.Fatalf("unexpected scan id %q in %v", id, ids)
+		}
+	}
+}
+
 func TestFileStoreTaskContextFieldsAndRunCleanup(t *testing.T) {
 	store := newTestFileStore(t)
 	ctx := context.Background()

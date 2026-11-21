@@ -128,13 +128,17 @@ const (
 	OpResetLedger       Operation = "reset_ledger"
 	OpInfoItemEnriched  Operation = "info_item_enriched"
 	OpInfoItemProjected Operation = "info_item_projected"
+	// OpObserveTraffic records one proxy-observed request/response (R2b
+	// trafficproxy) as an observed InfoItem. It carries no hypothesis
+	// mutation — the ledger is only the InfoItem's journal host.
+	OpObserveTraffic Operation = "observe_traffic"
 )
 
 func (o Operation) Valid() bool {
 	switch o {
 	case OpSeedHypothesis, OpRecordHypothesis, OpClaimHypothesis, OpAssignHypothesis,
 		OpSetStatus, OpAddEvidence, OpRecordAttempt, OpSetVOI, OpMergeLedger, OpResetLedger,
-		OpInfoItemEnriched, OpInfoItemProjected:
+		OpInfoItemEnriched, OpInfoItemProjected, OpObserveTraffic:
 		return true
 	default:
 		return false

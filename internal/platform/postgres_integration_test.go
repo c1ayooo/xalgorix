@@ -165,6 +165,17 @@ func TestPostgresProjectTaskRunCRUDAndIsolation(t *testing.T) {
 	if len(idsA) != 1 {
 		t.Errorf("InstanceIDsForProject(A) = %v, want 1", idsA)
 	}
+	scanIDsA, err := repo.ProjectScanIDs(ctx, projA.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scanIDsA) != 1 || scanIDsA[0] != fmt.Sprintf("pg-inst-%d", stamp) {
+		t.Errorf("ProjectScanIDs(A) = %v", scanIDsA)
+	}
+	scanIDsB, err := repo.ProjectScanIDs(ctx, projB.ID)
+	if err != nil || len(scanIDsB) != 0 {
+		t.Errorf("ProjectScanIDs(B) = %v, %v; want empty", scanIDsB, err)
+	}
 
 	// Project delete cascades tasks and runs.
 	if _, err := repo.CreateRun(ctx, taskA.ID, RunMount{InstanceID: fmt.Sprintf("pg-del-%d", stamp)}); err != nil {

@@ -200,17 +200,7 @@ func (s *Server) generateReportAt(scan *ScanRecord, scanDir string) (string, err
 		language = config.NormalizeLanguage(s.cfg.Language)
 	}
 	if language != config.DefaultLanguage {
-		// The localized renderer still uses currentScanDir for its output path.
-		s.mu.Lock()
-		prevDir := s.currentScanDir
-		s.currentScanDir = scanDir
-		s.mu.Unlock()
-		defer func() {
-			s.mu.Lock()
-			s.currentScanDir = prevDir
-			s.mu.Unlock()
-		}()
-		return s.generateReport(scan)
+		return s.generateReport(scan, scanDir)
 	}
 
 	logoData, logoType := s.loadReportLogo(scan.LogoPath)

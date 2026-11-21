@@ -20,6 +20,7 @@ import (
 	"github.com/xalgord/xalgorix/v4/internal/tools"
 	"github.com/xalgord/xalgorix/v4/internal/tools/iolimit"
 	"github.com/xalgord/xalgorix/v4/internal/tools/terminal"
+	"github.com/xalgord/xalgorix/v4/internal/trafficproxy"
 )
 
 // configureProcessGroupKill starts cmd in its own process group and installs a
@@ -135,12 +136,13 @@ func executePythonForContext(contextID string, args map[string]string) (tools.Re
 	// at cmd.Dir, which is now guaranteed to be sc.ScanDir or
 	// cfg.WorkspaceRoot — both Allow_List descendants. That satisfies R8.8.
 	cmdEnv := pythonWorkspaceEnv(cmd.Dir)
-	if config.Get().ProxyRequired || egressproxy.Required() {
-		cmdEnv, err = egressproxy.Environment(cmdEnv)
+	if config.Get().ProxyRequired || egressproxy.Required() || trafficproxy.Enabled() {
+		cmdEnv, err = trafficproxy.Environment(cmdEnv)
 		if err != nil {
 			return tools.Result{}, fmt.Errorf("required proxy unavailable: %w", err)
 		}
 	}
+	cmdEnv = trafficProxyTLSBundleEnv(cmdEnv)
 	cmd.Env = cmdEnv
 	configureProcessGroupKill(cmd)
 
@@ -269,4 +271,24 @@ func pythonWorkspaceEnv(workDir string) []string {
 		"XALGORIX_WORKSPACE="+workDir,
 		"PYTHONDONTWRITEBYTECODE=1",
 	)
+}
+
+// trafficProxyTLSBundleEnv appends the TLS trust environment for the
+// traffic-proxy CA. Parent-process injection (the egressproxy.Environment
+// precedent) rather than sitecustomize: these keys are not XALGORIX_*, so
+// they survive the subprocess env strip, and both requests and stdlib urllib
+// honor them without a second generated file surface. SSL_CERT_FILE points
+// at the combined bundle (traffic CA + system store) so non-intercepted TLS
+// keeps working.
+func trafficProxyTLSBundleEnv(env []string) []string {
+	if !trafficproxy.MITMEnabled() {
+		return env
+	}
+	if bundle := trafficproxy.BundlePath(); bundle != "" {
+		env = append(env,
+			"REQUESTS_CA_BUNDLE="+bundle,
+			"SSL_CERT_FILE="+bundle,
+		)
+	}
+	return env
 }

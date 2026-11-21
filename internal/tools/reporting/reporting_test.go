@@ -3198,7 +3198,7 @@ func TestReportVuln_TimingLedgerProofMarksRCEExploitProven(t *testing.T) {
 	CleanupContext(ctx)
 	defer CleanupContext(ctx)
 
-	sc := scanctx.New(ctx, "https://example.com")
+	sc := scanctx.New(ctx, t.TempDir())
 	scanctx.Activate(sc)
 	defer scanctx.Deactivate(ctx)
 
@@ -3278,7 +3278,7 @@ func TestReportVuln_VerifierLedgerProofMarksExploitProven(t *testing.T) {
 	CleanupContext(ctx)
 	defer CleanupContext(ctx)
 
-	sc := scanctx.New(ctx, "https://example.com")
+	sc := scanctx.New(ctx, t.TempDir())
 	scanctx.Activate(sc)
 	defer scanctx.Deactivate(ctx)
 
@@ -3347,7 +3347,7 @@ func TestReportVuln_AuthzMatrixIDORExploitProven(t *testing.T) {
 	CleanupContext(ctx)
 	defer CleanupContext(ctx)
 
-	sc := scanctx.New(ctx, "https://example.com")
+	sc := scanctx.New(ctx, t.TempDir())
 	scanctx.Activate(sc)
 	defer scanctx.Deactivate(ctx)
 

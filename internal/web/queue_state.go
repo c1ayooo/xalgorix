@@ -14,6 +14,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/xalgord/xalgorix/v4/internal/storage"
 )
 
 // saveQueueState records best-effort progress updates after acceptance. The
@@ -31,21 +33,27 @@ func (s *Server) saveQueueState(idx int, req ScanRequest, progress ...queueProgr
 func (s *Server) saveQueueStateDurable(idx int, req ScanRequest, progress ...queueProgress) error {
 	normalizeScanRequestActivity(&req)
 	state := QueueState{
-		InstanceID:     req.InstanceID,
-		Targets:        req.Targets,
-		CurrentIdx:     idx,
-		Instruction:    req.Instruction,
-		ScanMode:       req.ScanMode,
-		StartedAt:      time.Now().Format(time.RFC3339),
-		Active:         true,
-		Name:           req.Name,
-		SeverityFilter: req.SeverityFilter,
-		Phases:         req.Phases,
-		ReconMode:      req.ReconMode,
-		ScanIntensity:  req.ScanIntensity,
-		CompanyName:    req.CompanyName,
-		LogoPath:       req.LogoPath,
-		DiscordWebhook: req.DiscordWebhook,
+		InstanceID:       req.InstanceID,
+		Targets:          req.Targets,
+		CurrentIdx:       idx,
+		Instruction:      req.Instruction,
+		ScanMode:         req.ScanMode,
+		StartedAt:        time.Now().Format(time.RFC3339),
+		Active:           true,
+		Name:             req.Name,
+		SeverityFilter:   req.SeverityFilter,
+		Phases:           req.Phases,
+		ReconMode:        req.ReconMode,
+		ScanIntensity:    req.ScanIntensity,
+		CompanyName:      req.CompanyName,
+		LogoPath:         req.LogoPath,
+		DiscordWebhook:   req.DiscordWebhook,
+		Model:            req.Model,
+		ProviderProfile:  req.ProviderProfile,
+		CodeScan:         req.CodeScan,
+		SourceRepo:       req.SourceRepo,
+		ScanContext:      req.ScanContext,
+		ScanContextPaths: append([]string(nil), req.ScanContextPaths...),
 	}
 	if len(progress) > 0 {
 		p := progress[0]
@@ -344,6 +352,12 @@ func scanRequestFromQueueState(state *QueueState, sourcePath string) ScanRequest
 		CompanyName:          state.CompanyName,
 		LogoPath:             state.LogoPath,
 		DiscordWebhook:       state.DiscordWebhook,
+		Model:                state.Model,
+		ProviderProfile:      state.ProviderProfile,
+		CodeScan:             state.CodeScan,
+		SourceRepo:           state.SourceRepo,
+		ScanContext:          state.ScanContext,
+		ScanContextPaths:     append([]string(nil), state.ScanContextPaths...),
 		ResumeActiveTarget:   state.ActiveTarget,
 		ResumeScanDir:        state.ActiveScanDir,
 		ResumeScanID:         state.ActiveScanID,
@@ -596,7 +610,7 @@ func (s *Server) markQueueStatePaused(instanceID string) {
 		log.Printf("Error: failed to marshal paused queue state: %v", err)
 		return
 	}
-	if err := os.WriteFile(entry.path, data, 0600); err != nil {
+	if err := storage.WriteAtomic(entry.path, data); err != nil {
 		log.Printf("Error: failed to mark queue state paused: %v", err)
 	}
 }

@@ -30,6 +30,7 @@ import (
 	"github.com/xalgord/xalgorix/v4/internal/scanctx"
 	"github.com/xalgord/xalgorix/v4/internal/tools"
 	"github.com/xalgord/xalgorix/v4/internal/tools/terminal"
+	"github.com/xalgord/xalgorix/v4/internal/trafficproxy"
 )
 
 // browserCacheDir is the on-disk root for every browser cache, extension
@@ -455,11 +456,22 @@ func ensureBrowser(ctxID, proxy string) error {
 		// operator's required outbound route. The loopback bridge handles
 		// authenticated upstream proxies without placing credentials in
 		// Chromium's process arguments.
-		localURL, err := egressproxy.LocalURL()
+		localURL, err := trafficproxy.LocalURL()
 		if err != nil {
 			return fmt.Errorf("required browser proxy unavailable: %w", err)
 		}
 		proxy = localURL
+	} else if proxy == "" && trafficproxy.Enabled() {
+		// R2b default posture: route Chromium through the shared loopback
+		// traffic proxy so browser traffic flows through the configured
+		// upstream chain and becomes observable. An explicit agent choice
+		// ("caido", a concrete URL, "none") still wins; a proxy routing
+		// failure must not hard-fail a non-required scan.
+		if localURL, err := trafficproxy.LocalURL(); err == nil {
+			proxy = localURL
+		} else {
+			log.Printf("[browser] traffic proxy unavailable, browser will dial directly: %v", err)
+		}
 	}
 
 	// 1. Get Chromium binary (auto-download if needed)
@@ -508,7 +520,13 @@ func ensureBrowser(ctxID, proxy string) error {
 	} else if proxy != "" && proxy != "none" {
 		ln = ln.Set("proxy-server", proxy).
 			Set("ignore-certificate-errors", "true")
-		if requiredProxy {
+		if bypass, ok := trafficproxy.ProxyBypassList(ctxID); ok && bypass != "" {
+			// TLS interception active: loopback stays forced through the
+			// proxy except for provisioned loopback ports this scan opted
+			// into, which Chromium dials directly (their per-scan
+			// scope-guard allowlist already vets them).
+			ln = ln.Set("proxy-bypass-list", bypass)
+		} else if requiredProxy {
 			// Chromium otherwise bypasses proxies for loopback destinations.
 			ln = ln.Set("proxy-bypass-list", "<-loopback>")
 		}
@@ -1270,15 +1288,17 @@ func selectOption(ctxID, selector, value string) (tools.Result, error) {
 		return tools.Result{}, fmt.Errorf("select element not found: %s", selector)
 	}
 
+	selectorJSON, _ := json.Marshal(selector)
+	valueJSON, _ := json.Marshal(value)
 	// Try selecting by value first, then by visible text
 	err = el.Select([]string{value}, true, rod.SelectorTypeText)
 	if err != nil {
 		// Fallback: try by value attribute
-		_, evalErr := s.page.Eval(fmt.Sprintf(`() => {
-			const el = document.querySelector('%s');
+		result, evalErr := s.page.Eval(fmt.Sprintf(`() => {
+			const el = document.querySelector(%s);
 			if (el) {
 				for (const opt of el.options) {
-					if (opt.value === '%s' || opt.text === '%s') {
+					if (opt.value === %s || opt.text === %s) {
 						el.value = opt.value;
 						el.dispatchEvent(new Event('change', { bubbles: true }));
 						return true;
@@ -1286,9 +1306,12 @@ func selectOption(ctxID, selector, value string) (tools.Result, error) {
 				}
 			}
 			return false;
-		}`, selector, value, value))
+		}`, selectorJSON, valueJSON, valueJSON))
 		if evalErr != nil {
-			return tools.Result{}, fmt.Errorf("failed to select option '%s': %w", value, err)
+			return tools.Result{}, fmt.Errorf("failed to select option '%s': %w", value, evalErr)
+		}
+		if !result.Value.Bool() {
+			return tools.Result{}, fmt.Errorf("option %q not found in %s", value, selector)
 		}
 	}
 

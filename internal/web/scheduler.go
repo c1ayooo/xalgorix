@@ -330,13 +330,16 @@ func (s *Server) checkAndRunSchedules() {
 					Model:          sch.Model,
 				}
 
-				scanCfg := *s.cfg
+				scanCfg := s.configSnapshot()
+				if scanCfg == nil {
+					return
+				}
 				if sch.Model != "" {
 					scanCfg.LLM = sch.Model
 				}
 				instanceID := randomSlug()
 
-				go s.runMultiScan(req, &scanCfg, instanceID)
+				go s.runMultiScan(req, scanCfg, instanceID)
 
 				sch.LastRun = now
 				sch.NextRun = calculateNextRun(sch, now)

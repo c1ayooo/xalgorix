@@ -41,8 +41,8 @@ type keyPoolResponse struct {
 // currentKeyPool renders the live pool (runtime config) with every key
 // masked. The response deliberately contains no secret material.
 func (s *Server) currentKeyPool() keyPoolResponse {
-	s.settingsMu.Lock()
-	defer s.settingsMu.Unlock()
+	s.settingsMu.RLock()
+	defer s.settingsMu.RUnlock()
 	pool := append([]string(nil), s.cfg.APIKeys...)
 	masked := maskedKeyPoolList(pool)
 	if masked == nil {

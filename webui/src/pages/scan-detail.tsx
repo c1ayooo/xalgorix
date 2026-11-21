@@ -7,6 +7,7 @@ import {
 } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
+import { toast } from "sonner";
 import {
   Card,
   CardContent,
@@ -736,6 +737,7 @@ function FindingsTab({
   vulns: VulnSummary[];
   scanId: string;
 }) {
+  const { t } = useI18n();
   const del = useDeleteVuln();
   const [selected, setSelected] = useState<VulnSummary | null>(null);
   const [selectedKeys, setSelectedKeys] = useState<Set<string>>(() => new Set());
@@ -795,14 +797,30 @@ function FindingsTab({
         ? "Permanently delete this finding?"
         : `Permanently delete ${unique.size} selected findings?`;
     if (!window.confirm(label)) return;
-    for (const identity of unique.values()) {
-      await del.mutateAsync(identity);
-    }
+    const identities = [...unique.values()];
+    const settled = await Promise.allSettled(
+      identities.map((identity) => del.mutateAsync(identity)),
+    );
+    const succeeded = identities.filter((_, i) => settled[i].status === "fulfilled");
+    const failed = identities.length - succeeded.length;
+    const succeededKeys = new Set(
+      [...unique.entries()]
+        .filter(([, identity]) => succeeded.includes(identity))
+        .map(([key]) => key),
+    );
     setSelectedKeys((current) => {
       const next = new Set(current);
-      for (const key of keys) next.delete(key);
+      for (const key of keys) {
+        if (succeededKeys.has(key)) next.delete(key);
+      }
       return next;
     });
+    if (succeeded.length > 0) {
+      toast.success(`${succeeded.length} ${t("toast.deletedCount")}`);
+    }
+    if (failed > 0) {
+      toast.error(`${failed} ${t("toast.deleteFailed")}`);
+    }
   }
 
   if (sorted.length === 0)

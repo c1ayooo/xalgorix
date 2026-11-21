@@ -34,6 +34,7 @@ import (
 	"github.com/xalgord/xalgorix/v4/internal/agent"
 	"github.com/xalgord/xalgorix/v4/internal/auth"
 	"github.com/xalgord/xalgorix/v4/internal/config"
+	"github.com/xalgord/xalgorix/v4/internal/infoitem"
 	"github.com/xalgord/xalgorix/v4/internal/llm"
 	"github.com/xalgord/xalgorix/v4/internal/platform"
 	"github.com/xalgord/xalgorix/v4/internal/providers"
@@ -42,12 +43,28 @@ import (
 	"github.com/xalgord/xalgorix/v4/internal/safe"
 	"github.com/xalgord/xalgorix/v4/internal/sandbox"
 	"github.com/xalgord/xalgorix/v4/internal/scanctx"
+	"github.com/xalgord/xalgorix/v4/internal/scopeguard"
 	"github.com/xalgord/xalgorix/v4/internal/storage"
 	"github.com/xalgord/xalgorix/v4/internal/tools/browser"
+	"github.com/xalgord/xalgorix/v4/internal/tools/httpclient"
 	"github.com/xalgord/xalgorix/v4/internal/tools/notes"
 	"github.com/xalgord/xalgorix/v4/internal/tools/reporting"
 	"github.com/xalgord/xalgorix/v4/internal/tools/terminal"
+	"github.com/xalgord/xalgorix/v4/internal/trafficproxy"
 )
+
+// configSnapshot returns a shallow copy of the runtime config under the
+// settings RLock. Callers that read multiple fields or copy the struct must use
+// it instead of touching s.cfg directly while settings may be updating.
+func (s *Server) configSnapshot() *config.Config {
+	if s == nil || s.cfg == nil {
+		return nil
+	}
+	s.settingsMu.RLock()
+	defer s.settingsMu.RUnlock()
+	cp := *s.cfg
+	return &cp
+}
 
 // Version is set by main.go at startup — single source of truth.
 var Version = "dev"
@@ -249,7 +266,8 @@ func isDashboardReadPath(method, path string) bool {
 		return true
 	default:
 		return strings.HasPrefix(path, "/api/scans/") ||
-			strings.HasPrefix(path, "/api/instances/")
+			strings.HasPrefix(path, "/api/instances/") ||
+			strings.HasPrefix(path, "/api/info/")
 	}
 }
 
@@ -654,6 +672,12 @@ type QueueState struct {
 	CompanyName           string   `json:"company_name,omitempty"`
 	LogoPath              string   `json:"logo_path,omitempty"`
 	DiscordWebhook        string   `json:"discord_webhook,omitempty"`
+	Model                 string   `json:"model,omitempty"`
+	ProviderProfile       string   `json:"provider_profile,omitempty"`
+	CodeScan              string   `json:"code_scan,omitempty"`
+	SourceRepo            string   `json:"source_repo,omitempty"`
+	ScanContext           string   `json:"scan_context,omitempty"`
+	ScanContextPaths      []string `json:"scan_context_paths,omitempty"`
 	Paused                bool     `json:"paused,omitempty"`
 	ActiveTarget          string   `json:"active_target,omitempty"`
 	ActiveScanDir         string   `json:"active_scan_dir,omitempty"`
@@ -800,6 +824,7 @@ var dashboardRoutes = []string{
 	"/api/legacy-import/status",
 	"/api/scans",
 	"/api/scans/",
+	"/api/info/",
 	"/api/data-dirs/",
 	"/api/schedules",
 	"/api/schedules/",
@@ -876,7 +901,7 @@ type Server struct {
 	telegramMinSeverity    string      // minimum severity to send to Telegram ("info", "low", "medium", "high", "critical")
 	notifyScanComplete     atomic.Bool // XALGORIX_NOTIFY_SCAN_COMPLETE - send the "Scan Finished" summary after every scan (default false)
 	rateLimiter            *RateLimiter
-	settingsMu             sync.Mutex
+	settingsMu             sync.RWMutex
 	instances              map[string]*ScanInstance // concurrent scan instances
 	instancesMu            sync.RWMutex
 	dispatchMu             sync.Mutex
@@ -910,6 +935,10 @@ type Server struct {
 	// which the views must report as "disabled", never "failed" (§6.6).
 	coldPathSyncerMu sync.RWMutex
 	coldPathSyncer   ColdPathSyncer
+	// infoReader is the optional InfoItem cold-path query seam (R5). nil means
+	// the request falls back to infoitem.DefaultReader(); tests inject fakes.
+	infoReaderMu sync.RWMutex
+	infoReader   infoitem.Reader
 	// platformStore backs the optional project/task/run API (R1, REDESIGN
 	// D6/D7). nil = platform endpoints surface 503; scanning is unaffected
 	// (charter §6.6). Wired via SetPlatformStore.
@@ -1032,6 +1061,15 @@ func NewServer(cfg *config.Config, port int) *Server {
 		admissionWake: make(chan struct{}, 1),
 	}
 	srv.notifyScanComplete.Store(cfg.NotifyScanComplete)
+
+	// R2b traffic proxy: the process-level operator-machine configuration for
+	// the upstream dial guard. Attributed traffic overrides this with its
+	// scan's own configuration (registered per session in executeScanSession).
+	trafficproxy.SetDialGuardBase(scopeguard.Config{
+		BindAddr:          cfg.BindAddr,
+		Port:              port,
+		AllowLocalTargets: cfg.AllowLocalTargets,
+	})
 
 	// Wire postScanChatFn now that srv exists. The closure reads
 	// srv.catalog / srv.profiles at call time so the catalog
@@ -1262,6 +1300,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/findings", s.handleFindingsList)
 	mux.HandleFunc("/api/legacy-import/status", s.handleLegacyImportStatus)
 	mux.HandleFunc("/api/scans", s.handleListScans)
+	mux.HandleFunc("/api/info/", s.handleInfoRoutes)
 	mux.HandleFunc("/api/scans/", func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "/vulns/") && r.Method == http.MethodDelete {
 			s.handleDeleteVuln(w, r)
@@ -1610,6 +1649,7 @@ func (s *Server) Start() error {
 		}
 
 		_ = proxy.Close()
+		_ = trafficproxy.Close()
 		s.rateLimiter.Stop()
 		log.Printf("[SHUTDOWN] Graceful shutdown complete")
 	}()
@@ -1736,6 +1776,7 @@ func (s *Server) restartNow(httpServer *http.Server) {
 		}
 	}
 	_ = proxy.Close()
+	_ = trafficproxy.Close()
 
 	// systemd-managed: INVOCATION_ID is set by systemd for service units.
 	// A clean exit triggers Restart=always with a freshly-loaded env file.
@@ -3305,6 +3346,12 @@ type scanSession struct {
 	// set, the session finalizes the record as "failed" (not "finished") so a
 	// force-stopped scan is never reported as a clean completion.
 	abortReason string
+
+	// runToken is the R2b traffic-proxy attribution token minted at session
+	// start (randomSlug, never the session id — that embeds the target name
+	// and is not a secret). Registered in the trafficproxy attribution
+	// registry; unregistered in cleanup.
+	runToken string
 }
 
 // cleanup tears down all per-session resources. Every sub-operation
@@ -3331,6 +3378,14 @@ func (sess *scanSession) cleanup() {
 	if sess.sctx != nil {
 		func() {
 			defer logRecover("cleanup.scanctx.close")
+			// R2b: release the traffic-proxy attribution token so the loopback
+			// proxy stops attributing traffic to this Run.
+			if sess.runToken != "" {
+				trafficproxy.UnregisterRun(sess.runToken, sess.sctx.ID)
+			}
+			// M-5: drop operator A/B session headers with the Run so
+			// plaintext credentials do not accumulate in process memory.
+			httpclient.ClearSessionAuth(sess.sctx.ID)
 			scanctx.Deactivate(sess.sctx.ID)
 			// Flush the token summary + release the records file before the
 			// wider context teardown.

@@ -62,6 +62,11 @@ type Repository interface {
 	// InstanceIDsForProject returns the instance IDs a project's runs are
 	// mounted on — the web layer's join key into scan.json projections.
 	InstanceIDsForProject(ctx context.Context, projectID string) ([]string, error)
+	// ProjectScanIDs returns the union of instance_id and legacy_scan_id for
+	// the project's runs. It is the project-scope join key for the InfoItem
+	// cold path (info_items.scan_id), including legacy scans that have no
+	// dispatch instance.
+	ProjectScanIDs(ctx context.Context, projectID string) ([]string, error)
 	// DeleteRunsByScanIdentity removes every mount record whose instance_id or
 	// legacy_scan_id matches. Retention uses it after deleting a scan
 	// directory; findings cascade with the run rows.

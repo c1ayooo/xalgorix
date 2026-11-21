@@ -22,6 +22,21 @@ if [ ! -e /data/.xalgorix.env ]; then
 fi
 ln -sf /data/.xalgorix.env /root/.xalgorix.env
 
+# Persist the traffic-proxy CA (R2b) on the /data volume the same way: the
+# interception CA (~/.xalgorix/ca, default XALGORIX_CA_DIR) is generated once
+# and pinned by every consumer trust store (curl --cacert, python bundles,
+# browser), so it must survive container recreation. -m 700 matters: the
+# engine's EnsureSecureDir does NOT tighten the mode of an already-existing
+# directory, so a loose /data/ca would stay loose across restarts.
+mkdir -m 700 -p /data/ca /root/.xalgorix
+if [ ! -L /root/.xalgorix/ca ]; then
+  if [ -d /root/.xalgorix/ca ] && [ -n "$(ls -A /root/.xalgorix/ca 2>/dev/null)" ] && [ ! -n "$(ls -A /data/ca 2>/dev/null)" ]; then
+    mv /root/.xalgorix/ca/* /data/ca/ 2>/dev/null || true
+    rmdir /root/.xalgorix/ca
+  fi
+  ln -sf /data/ca /root/.xalgorix/ca
+fi
+
 bind="${XALGORIX_BIND:-0.0.0.0}"
 
 # Is the bind address loopback (no auth required by the engine)?

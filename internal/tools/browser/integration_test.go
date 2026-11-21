@@ -704,7 +704,7 @@ func TestVerifyXSS_POST_Reflected(t *testing.T) {
 	defer srv.Close()
 
 	ctxID := "int-verifyxss-post"
-	sc := scanctx.New(ctxID, srv.URL)
+	sc := scanctx.New(ctxID, t.TempDir())
 	scanctx.Activate(sc)
 	defer scanctx.Deactivate(ctxID)
 	launchCtx(t, ctxID, "")
@@ -810,7 +810,7 @@ func TestVerifyXSS_GrafanaPathPair(t *testing.T) {
 					t.Fatalf("Grafana oracle must target loopback HTTP, got %q", tc.base)
 				}
 				ctxID := "int-grafana-path-xss-" + tc.name
-				sc := scanctx.New(ctxID, tc.base)
+				sc := scanctx.New(ctxID, t.TempDir())
 				scanctx.Activate(sc)
 				defer scanctx.Deactivate(ctxID)
 				launchCtx(t, ctxID, "")

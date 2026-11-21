@@ -3,12 +3,12 @@ package proxy
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -18,6 +18,7 @@ import (
 	"github.com/xalgord/xalgorix/v4/internal/proxy"
 	"github.com/xalgord/xalgorix/v4/internal/ratelimit"
 	"github.com/xalgord/xalgorix/v4/internal/tools"
+	"github.com/xalgord/xalgorix/v4/internal/trafficproxy"
 )
 
 // globalLimiter is initialized once from config when the package is loaded.
@@ -45,7 +46,7 @@ func initLimiter() {
 func Register(r *tools.Registry) {
 	r.Register(&tools.Tool{
 		Name:        "send_request",
-		Description: "Send an HTTP request using the configured outbound proxy when enabled. Proxy-required mode never falls back to a direct request. Large responses (>10KB) are saved to a temporary file; use terminal_execute to inspect it.",
+		Description: "Send an HTTP request using the configured outbound proxy when enabled. Proxy-required mode never falls back to a direct request. Responses are capped at 32MB; large responses (>10KB) are saved to a unique temporary file; use terminal_execute to inspect it.",
 		Parameters: []tools.Parameter{
 			{Name: "method", Description: "HTTP method (GET, POST, PUT, DELETE, etc.)", Required: true},
 			{Name: "url", Description: "Target URL", Required: true},
@@ -53,7 +54,7 @@ func Register(r *tools.Registry) {
 			{Name: "body", Description: "Request body", Required: false},
 		},
 		Execute: func(args map[string]string) (tools.Result, error) {
-			return sendRequestGuarded(r.RequestGuard(), r.DialGuard(), args)
+			return sendRequestGuarded(r.GetScanContextID(), r.RequestGuard(), r.DialGuard(), args)
 		},
 	})
 
@@ -73,10 +74,17 @@ func Register(r *tools.Registry) {
 // non-nil, checks every connection of the direct client (see
 // tools.GuardDials); the proxy pool's shared client is left as it is, since
 // the proxy resolves and connects to the destination.
-func httpClient(dialGuard tools.DialGuard) (*http.Client, error) {
+func httpClient(scanCtxID string, dialGuard tools.DialGuard) (*http.Client, error) {
 	cfg := config.Get()
 	if cfg.ProxyRequired && !proxy.Required() {
 		return nil, fmt.Errorf("proxy-required mode is not initialized")
+	}
+	// R2b default posture: with TLS interception active, send_request routes
+	// through the shared loopback traffic proxy (also in proxy-required
+	// mode) so the MITM owns upstream selection and observation. The
+	// fail-closed required checks above stay byte-identical.
+	if trafficproxy.Enabled() && trafficproxy.MITMEnabled() {
+		return trafficProxyClient(cfg, scanCtxID, dialGuard)
 	}
 	// A settings edit cannot disable the live required route before restart.
 	if proxy.Required() {
@@ -100,6 +108,45 @@ func httpClient(dialGuard tools.DialGuard) (*http.Client, error) {
 	if err := tools.GuardDials(tr, dialGuard); err != nil {
 		return nil, err
 	}
+	// Run-token attribution (a no-op unless TLS interception is active).
+	client.Transport = trafficproxy.AttributionRoundTripper(tr, scanCtxID)
+	return client, nil
+}
+
+// trafficProxyClient builds the loopback-proxy client: LocalURL routing plus
+// trust for the traffic-proxy CA plus the run-token attribution header. The
+// MITM applies the operator-machine dial guard to its own upstream dials;
+// GuardDials on this transport only ever sees the loopback proxy address,
+// which it exempts like any operator proxy.
+func trafficProxyClient(cfg *config.Config, scanCtxID string, dialGuard tools.DialGuard) (*http.Client, error) {
+	localURL, err := trafficproxy.LocalURL()
+	if err != nil {
+		return nil, fmt.Errorf("traffic proxy unavailable: %w", err)
+	}
+	localParsed, err := url.Parse(localURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid traffic proxy URL: %w", err)
+	}
+	client := proxy.NewDirectClient(cfg.TLSSkipVerify)
+	tr, ok := client.Transport.(*http.Transport)
+	if !ok {
+		return nil, fmt.Errorf("traffic proxy client transport cannot be configured")
+	}
+	tr.Proxy = http.ProxyURL(localParsed)
+	if caPool := trafficproxy.RootCAs(); caPool != nil && !cfg.TLSSkipVerify {
+		if tr.TLSClientConfig == nil {
+			tr.TLSClientConfig = &tls.Config{} //nolint:gosec
+		} else {
+			tr.TLSClientConfig = tr.TLSClientConfig.Clone()
+		}
+		tr.TLSClientConfig.RootCAs = caPool
+	}
+	if err := tools.GuardDials(tr, dialGuard); err != nil {
+		return nil, err
+	}
+	// Run-token attribution rides Proxy-Authorization, stripped by the proxy
+	// before the upstream hop; never stamped toward a remote upstream.
+	client.Transport = trafficproxy.AttributionRoundTripper(tr, scanCtxID)
 	return client, nil
 }
 
@@ -136,13 +183,13 @@ func clampRequestCount(raw string) int {
 }
 
 func sendRequest(args map[string]string) (tools.Result, error) {
-	return sendRequestGuarded(nil, nil, args)
+	return sendRequestGuarded("", nil, nil, args)
 }
 
 // sendRequestGuarded runs one send_request call. guard, when non-nil, is
 // applied to every redirect hop before it is followed; dialGuard, when
 // non-nil, to every direct connection.
-func sendRequestGuarded(guard tools.RequestGuard, dialGuard tools.DialGuard, args map[string]string) (tools.Result, error) {
+func sendRequestGuarded(scanCtxID string, guard tools.RequestGuard, dialGuard tools.DialGuard, args map[string]string) (tools.Result, error) {
 	targetURL := args["url"]
 	method := strings.ToUpper(args["method"])
 
@@ -170,7 +217,7 @@ func sendRequestGuarded(guard tools.RequestGuard, dialGuard tools.DialGuard, arg
 		}
 	}
 
-	shared, err := httpClient(dialGuard)
+	shared, err := httpClient(scanCtxID, dialGuard)
 	if err != nil {
 		return tools.Result{}, err
 	}
@@ -187,9 +234,16 @@ func sendRequestGuarded(guard tools.RequestGuard, dialGuard tools.DialGuard, arg
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
+	// Bound the in-memory read so a hostile/huge response cannot exhaust the
+	// worker. The preview file still gets the full (bounded) body.
+	const maxResponseBytes = 32 << 20
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
 		return tools.Result{}, fmt.Errorf("failed to read response body: %w", err)
+	}
+	responseTruncated := len(respBody) > maxResponseBytes
+	if responseTruncated {
+		respBody = respBody[:maxResponseBytes]
 	}
 
 	var b strings.Builder
@@ -216,19 +270,23 @@ func sendRequestGuarded(guard tools.RequestGuard, dialGuard tools.DialGuard, arg
 	bodyStr := string(respBody)
 	var savedPath string
 	if len(bodyStr) > previewLimit {
-		// Generate a deterministic filename from URL + method for caching.
-		h := sha256.Sum256([]byte(method + " " + targetURL))
-		hash := hex.EncodeToString(h[:8])
-		savedPath = "/tmp/send_request_" + hash + ".txt"
-		if err := os.WriteFile(savedPath, respBody, 0600); err != nil {
-			// If file write fails, fall back to truncation.
-			savedPath = ""
+		// Unique file per response: concurrent requests to the same URL must
+		// not overwrite each other, and a predictable path is symlink-prone.
+		f, createErr := os.CreateTemp("", "send_request_*.txt")
+		if createErr == nil {
+			if _, writeErr := f.Write(respBody); writeErr == nil {
+				savedPath = f.Name()
+			}
+			_ = f.Close()
+			if savedPath == "" {
+				_ = os.Remove(f.Name())
+			}
 		}
 	}
 
 	if savedPath != "" {
 		b.WriteString(bodyStr[:previewLimit])
-		b.WriteString(fmt.Sprintf("\n\n... [RESPONSE TOO LARGE: %d bytes total]\n", len(bodyStr)))
+		b.WriteString(fmt.Sprintf("\n\n... [RESPONSE TOO LARGE: %d bytes shown; response truncated=%v]\n", len(bodyStr), responseTruncated))
 		b.WriteString(fmt.Sprintf("💾 Full response saved to: %s\n", savedPath))
 		b.WriteString("Use terminal_execute to search it: grep -oE 'pattern' " + savedPath + "\n")
 	} else {
