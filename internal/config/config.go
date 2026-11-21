@@ -216,6 +216,13 @@ type Config struct {
 	// backend that speaks the OpenAI chat-completions tool protocol; Anthropic,
 	// Gemini and the Responses API keep using the XML path regardless.
 	// XALGORIX_NATIVE_TOOL_CALLS, default false.
+	//
+	// Engine contract (REDESIGN §6): the Eino engine speaks ONLY the native
+	// channel (the ADK has no XML tool parser), so with XALGORIX_ENGINE=eino
+	// this flag is ignored — native semantics and the tools-array prompt are
+	// forced, and endpoints whose protocol cannot carry tools fail closed at
+	// scan start. Anthropic/Gemini/Responses endpoints need
+	// XALGORIX_ENGINE=legacy until internal/llm sends tools on those protocols.
 	NativeToolCalls bool
 
 	// Runtime settings

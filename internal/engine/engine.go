@@ -1,8 +1,9 @@
 package engine
 
-// Engine is a construction skeleton for the future R4 path. Nothing in
-// internal/web or internal/agent imports this package in the current
-// milestone: legacy execution remains the only production loop.
+// Engine is the Eino ADK execution path. internal/agent bridges it into
+// Agent.Run (eino_runtime.go) and internal/web's scan_session wires the
+// checkpoint store; config defaults to this engine while
+// XALGORIX_ENGINE=legacy keeps the original loop available as rollback.
 
 import (
 	"errors"

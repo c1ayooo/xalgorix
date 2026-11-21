@@ -163,9 +163,10 @@ func (b *scanBudget) costUSD() float64 {
 }
 
 // syncBudgetTokens folds this agent client's cumulative token count into the
-// graph-wide total exactly once per delta. Each agent owns one client and only
-// advances lastBudgetTokens from its own loop, while scanBudget.tokens is
-// atomic across agents.
+// graph-wide total exactly once per delta. Each agent owns one client and the
+// per-agent delta fields are guarded by budgetMu (the eino path folds from the
+// ADK's tool goroutine as well as the scan goroutine), while scanBudget.tokens
+// is atomic across agents.
 func (a *Agent) syncBudgetTokens() int {
 	if a == nil || a.client == nil {
 		if a != nil && a.scanBudget != nil {
@@ -178,7 +179,11 @@ func (a *Agent) syncBudgetTokens() int {
 		return current
 	}
 	// The provider-reported cost rides the same per-agent delta, so the
-	// scan-wide total covers every subagent's spend.
+	// scan-wide total covers every subagent's spend. The delta bookkeeping
+	// must be serialized: the eino path folds tokens from the ADK's tool
+	// goroutine (completeWithFinish in AfterTool) while the run loop's
+	// terminal emit folds from the scan goroutine.
+	a.budgetMu.Lock()
 	if cost := int64(math.Round(a.client.GetReportedCostUSD() * 1e9)); cost > a.lastBudgetCostNanoUSD {
 		a.scanBudget.costNanoUSD.Add(cost - a.lastBudgetCostNanoUSD)
 		a.lastBudgetCostNanoUSD = cost
@@ -186,8 +191,10 @@ func (a *Agent) syncBudgetTokens() int {
 	delta := current - a.lastBudgetTokens
 	if delta > 0 {
 		a.lastBudgetTokens = current
+		a.budgetMu.Unlock()
 		return a.scanBudget.addTokens(delta)
 	}
+	a.budgetMu.Unlock()
 	return a.scanBudget.tokenCount()
 }
 

@@ -4,6 +4,11 @@ package agent
 // obligations into the ADK runtime without reimplementing those rules in
 // internal/engine. The engine stays responsible for scheduling and checkpointing;
 // this adapter remains the single place that knows the Agent's per-scan state.
+// BeforeTool replays the legacy dispatch loop's block-gate sequence
+// (activity policy → phase restriction → auth prerequisites → out-of-scope →
+// target scope) so both engines reject identical calls with identical
+// tool-result text; the ADK middleware turns a denial into the tool result
+// message, replacing legacy's appendToolOutcome plumbing.
 
 import (
 	"context"
@@ -70,11 +75,31 @@ func (o *einoObserver) BeforeTool(_ context.Context, name string, args map[strin
 	for k, v := range args {
 		merged[k] = v
 	}
-	if blocked, reason := a.shouldBlockForOutOfScope(name, merged); blocked {
-		msg := "⛔ OUT-OF-SCOPE TARGET BLOCKED — " + reason
+	// Block gates run in the exact legacy dispatch-loop order (agent.go):
+	// activity policy → phase restriction → auth prerequisites → out-of-scope
+	// → target scope. Every blocked path mirrors the legacy tool-result shape
+	// (same prefix, same escalating noteBlockedToolCall nudge) so a denial
+	// reads identically on both engines.
+	block := func(prefix, reason string) engine.GuardVerdict {
+		msg := prefix + reason + noteBlockedToolCall(a.state, name, merged)
 		a.emit(Event{Type: "tool_call", ToolName: name, ToolArgs: merged})
-		a.emit(Event{Type: "tool_result", ToolName: name, ToolResult: tools.Result{Output: msg}})
+		a.emit(Event{Type: "tool_result", ToolName: name, ToolResult: tools.Result{Output: msg}, TotalTokens: a.syncBudgetTokens()})
 		return engine.GuardVerdict{Allowed: false, Output: msg}
+	}
+	if blocked, reason := a.shouldBlockForActivityPolicy(name, merged); blocked {
+		return block("⛔ ACTIVITY POLICY BLOCKED TOOL — ", reason)
+	}
+	if blocked, reason := a.shouldBlockForPhaseRestriction(name, merged); blocked {
+		return block("⛔ PHASE RESTRICTION BLOCKED TOOL — ", reason)
+	}
+	if blocked, reason := a.shouldBlockForMissingAuthPrerequisites(name, merged); blocked {
+		return block("⛔ AUTH PREREQUISITE GUARD BLOCKED TOOL — ", reason)
+	}
+	if blocked, reason := a.shouldBlockForOutOfScope(name, merged); blocked {
+		return block("⛔ OUT-OF-SCOPE TARGET BLOCKED — ", reason)
+	}
+	if blocked, reason := a.shouldBlockForTargetScope(name, merged); blocked {
+		return block("⛔ OUTSIDE SCAN BOUNDARY — ", reason)
 	}
 	if name == "finish" {
 		finish := a.hooks.Fire(OnFinishAttempt, a.state, nil)
@@ -82,8 +107,16 @@ func (o *einoObserver) BeforeTool(_ context.Context, name string, args map[strin
 			a.state.FinishRecoveryPending = true
 			msg := fmt.Sprintf("⚠️ FINISH REJECTED — %s\n\nDO NOT call finish again until you have done more testing.\nContinue with the NEXT PHASE of testing NOW.", finish.BlockReason)
 			a.emit(Event{Type: "tool_result", ToolName: "finish", ToolResult: tools.Result{Output: msg}})
+			// Legacy's rejected-finish path switches to the deterministic
+			// validator temperature for the coverage re-verification turn.
+			a.client.SetTemperature(TempValidator)
 			return engine.GuardVerdict{Allowed: false, Output: msg}
 		}
+		// Mark the accepted finish BEFORE the tool runs: completeWithFinish
+		// fires from AfterTool, which the ADK races against the next model
+		// turn, so the runtime's StopCheck must see completion intent here to
+		// deterministically refuse that extra model call.
+		a.einoFinishAccepted.Store(true)
 	}
 	result := a.hooks.Fire(OnToolCall, a.state, merged)
 	if result.Nudge != "" {
@@ -127,6 +160,13 @@ func (o *einoObserver) AfterTool(_ context.Context, name string, args map[string
 	}})
 	if name == "finish" && callErr == nil {
 		a.completeWithFinish(output, func() int { return a.syncBudgetTokens() })
+	}
+	if name == "finish" && callErr != nil {
+		// The gate accepted this finish but the tool execution itself failed:
+		// disarm the stop probe so the next model turn — a finish retry — is
+		// allowed again. completeWithFinish never ran, so the scan is not
+		// complete; AfterTool runs before the ADK schedules the next turn.
+		a.einoFinishAccepted.Store(false)
 	}
 }
 

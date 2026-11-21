@@ -2,7 +2,8 @@ package engine
 
 // HTTP-free Eino ChatModel adapter. It forwards to the existing internal/llm
 // client so retries, KeyRotator, provider protocols and token accounting stay
-// in one place. This package is not wired into the scan loop yet.
+// in one place. This is the model seam of the live eino scan loop
+// (internal/agent/eino_runtime.go).
 
 import (
 	"context"
@@ -29,13 +30,20 @@ var _ model.ToolCallingChatModel = (*ChatModel)(nil)
 // ChatModel adapts one ChatClient to Eino's tool-calling model interface.
 // WithTools returns a copy, so a base model is safe to share across requests.
 type ChatModel struct {
-	client ChatClient
-	tools  []llm.ToolDefinition
+	client    ChatClient
+	tools     []llm.ToolDefinition
+	stopCheck func() bool
 }
 
 // NewChatModel builds an unbound adapter.
 func NewChatModel(client ChatClient) *ChatModel {
 	return &ChatModel{client: client}
+}
+
+// WithStopCheck installs a pre-request stop probe. The runtime wires it to the
+// scan's completion flag so no further model call is issued after finish.
+func (m *ChatModel) WithStopCheck(fn func() bool) *ChatModel {
+	return &ChatModel{client: m.client, tools: m.tools, stopCheck: fn}
 }
 
 // WithTools implements model.ToolCallingChatModel without mutating the base.
@@ -44,23 +52,44 @@ func (m *ChatModel) WithTools(tools []*schema.ToolInfo) (model.ToolCallingChatMo
 	if err != nil {
 		return nil, err
 	}
-	return &ChatModel{client: m.client, tools: defs}, nil
+	return &ChatModel{client: m.client, tools: defs, stopCheck: m.stopCheck}, nil
 }
 
 // Generate blocks on the legacy non-streaming client and maps the response
 // back to Eino schema messages.
-func (m *ChatModel) Generate(ctx context.Context, input []*schema.Message, _ ...model.Option) (*schema.Message, error) {
+//
+// The ChatModelAgent binds the tool surface PER CALL through model options
+// (model.WithTools in the agent's run options), not through WithTools on this
+// instance, so the bound surface must be read here on every call. Without it
+// the provider never receives the tools array, native tool calling can never
+// fire, and the ADK treats the model's prose as a final answer — the scan
+// would end after one model turn.
+func (m *ChatModel) Generate(ctx context.Context, input []*schema.Message, opts ...model.Option) (*schema.Message, error) {
 	if m == nil || m.client == nil {
 		return nil, errors.New("engine: chat client is nil")
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if m.stopCheck != nil && m.stopCheck() {
+		return nil, &ErrTurnStopped{Reason: "scan complete"}
+	}
 	messages, err := toLLMMessages(input)
 	if err != nil {
 		return nil, err
 	}
-	content, calls, usage, err := m.client.ChatWithUsageToolCalls(messages, m.tools)
+	tools := m.tools
+	if len(opts) > 0 {
+		common := model.GetCommonOptions(&model.Options{}, opts...)
+		if len(common.Tools) > 0 {
+			bound, bindErr := toolDefinitionsFromInfo(common.Tools)
+			if bindErr != nil {
+				return nil, bindErr
+			}
+			tools = bound
+		}
+	}
+	content, calls, usage, err := m.client.ChatWithUsageToolCalls(messages, tools)
 	if err != nil {
 		return nil, err
 	}

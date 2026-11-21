@@ -403,6 +403,31 @@ The single-process shared loopback MITM proxy (REDESIGN §4/D4), default ON
   GuardDials mechanism) moves into the proxy's direct upstream dials — pool
   addresses stay exempt like any operator proxy.
 
+## Tool execution, safe files and egress
+
+- `tools.Registry.ExecuteContext` is the single execution path for both the
+  legacy loop and Eino. `Execute` remains a `context.Background()` wrapper.
+  `Tool.ExecuteContext` is optional; tools without it keep the historical hard
+  timeout. `internal/agent` passes the per-call deadline into the registry, so
+  terminal, Python, HTTP and proxy tools observe cancellation. Browser remains
+  on the hard-timeout fallback (Chromium calls do not take a Go context).
+- `internal/safefile` replaces "check path, then reopen path" in fileedit.
+  On Linux each component is opened with `openat(O_NOFOLLOW)` from a directory
+  fd, writes use a same-directory temp file plus `renameat`, and exclusive
+  create uses `linkat`. Non-Linux returns `ErrNotSupported` instead of silently
+  falling back to an unsafe reopen.
+- `internal/egress` records the per-scan boundary. The default `proxy` mode
+  relies on `trafficproxy` as the only egress path; terminal/Python receive
+  `XALGORIX_EGRESS_MODE`/`XALGORIX_EGRESS_ENFORCED` markers. Linux `enforce`
+  mode requires root + `nft`, derives the loopback proxy port from
+  `trafficproxy.LocalPort`, installs an isolated `inet xalgorix_egress_<pid>`
+  table (allow only the dedicated UID to the proxy port over IPv4/IPv6, then
+  DROP), and drops terminal/Python children to that UID/GID via
+  `SysProcAttr.Credential`. Browser cannot be launched under a different UID
+  with rod's launcher, so it fails closed in enforce mode. Rules are
+  refcounted per scan and removed when the last enforced scan ends; non-Linux
+  reports unmanaged. `scan_session` prepares and forgets the status per run.
+
 ## Engine — `internal/engine` (R4 core)
 
 `internal/engine` contains the Eino v0.9.23 ADK primitives. `XALGORIX_ENGINE`
@@ -415,12 +440,28 @@ loudly to legacy.
   (legacy stays byte-for-byte available).
 - `chatmodel.go` implements Eino's `ToolCallingChatModel` over the existing
   `internal/llm.Client` (`ChatWithUsageToolCalls`), so retries, KeyRotator,
-  provider protocols and token accounting stay centralized. `WithTools` returns
-  a copy; streaming is explicitly disabled.
+  provider protocols and token accounting stay centralized. The ADK binds the
+  tool surface per call via `model.Options`; `Generate` reads that surface on
+  every call (without it the provider never receives a `tools` array). A
+  `StopCheck` refuses model requests once the scan is complete. `WithTools`
+  returns a copy; streaming is explicitly disabled.
 - `tools.go` wraps `tools.Registry` as Eino `InvokableTool`. Every invocation
-  goes through `Registry.Execute`, preserving the six-ring security chain,
-  circuit breaker and the R2 approval gate; the adapter never calls a tool
-  closure directly.
+  goes through `Registry.ExecuteContext`, preserving the six-ring security
+  chain, circuit breaker and the R2 approval gate; the adapter never calls a
+  tool closure directly. Execution failures surface to the model as a tool
+  result ("⛔ TOOL EXECUTION FAILED — …"), mirroring the legacy
+  error-into-conversation contract, so a failed call costs a retry turn
+  instead of killing the graph.
+- Native tool calling is REQUIRED on the eino path: the ADK has no XML tool
+  parser, and the llm client attaches `tools` only on the OpenAI-compatible
+  chat-completions branch. `Agent.Run` forces native prompt semantics for
+  engine=eino regardless of `XALGORIX_NATIVE_TOOL_CALLS`, and `runEinoLoop`
+  fails closed (`eino_init_failed`, rollback named) when the endpoint protocol
+  cannot carry tools. **Anthropic, Gemini and Responses endpoints stay
+  legacy-only until `internal/llm` sends tools on those protocols.** Known
+  parity gaps around the dispatch loop (OnStuckCheck, pre-gate terminal
+  command normalization, AfterTool result metadata, per-role temperature
+  switching) are tracked in REDESIGN.md §6「已知对等缺口」.
 - `runtime.go` builds `adk.ChatModelAgent` + `adk.Runner`, forces
   `ExecuteSequentially` (report/verifier calls cannot overlap), and installs a
   construction-time tool guard middleware for scope/safety decisions.
@@ -443,9 +484,22 @@ loudly to legacy.
 - `checkpoint.go`, `checkpoint_file.go`, `checkpoint_pg.go` implement Eino's
   `CheckPointStore` with PostgreSQL (`engine_checkpoints`, migration 0005) or
   atomic files under `<dataDir>/_engine/checkpoints` when no DSN exists.
-- Remaining R4 gap: full golden scheduling parity and broader Verifier timing
-  evidence. The engine is live by default; `XALGORIX_ENGINE=legacy` is the
-  rollback until those gates are extended.
+- R4 gates are closed (2026-11-21): golden scheduling parity
+  (`TestGoldenSchedulingParityAcrossEngines` — one ledger.json snapshot and one
+  scripted LLM sequence drive both engines to identical claim order, tool_call
+  sequences, finish semantics and turn counts; the factory-default form —
+  `XALGORIX_NATIVE_TOOL_CALLS` unset plus eino — is pinned by
+  `TestGoldenSchedulingParityFactoryDefaultEino` with a tools-array-on-the-wire
+  check) and Verifier timing evidence
+  (`TestGate45VerifierChainStaysSerialInsideToolNode` plus the agent-package
+  eino-path tests keep the whole report→verify chain serial with
+  maxInFlight==1; `TestRuntimeToolsNodeConfigPinsVerifierSerialExecution`
+  pins `ExecuteSequentially=true`). The eino observer's BeforeTool replays the
+  legacy block-gate sequence (activity → phase → auth → out-of-scope → target
+  scope) with legacy denial text; a finish whose gate accepts but whose tool
+  execution fails disarms the stop probe so the model can retry
+  (`TestEinoFinishAcceptedThenToolFailureAllowsRetry`). `XALGORIX_ENGINE=legacy`
+  remains the documented rollback.
 
 ## Providers, LLM & auth — `internal/llm`, `internal/providers`, `internal/auth`
 

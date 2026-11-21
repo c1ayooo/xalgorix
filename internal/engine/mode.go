@@ -5,9 +5,10 @@ import (
 	"strings"
 )
 
-// Mode selects the scan-loop implementation. Legacy remains the only wired
-// production path in this milestone; Eino is a compiled-but-unused skeleton
-// until the R4 parity gate passes.
+// Mode selects the scan-loop implementation. Eino is the default production
+// engine (config.go); legacy is the documented rollback via
+// XALGORIX_ENGINE=legacy. ParseMode's empty-value default exists for callers
+// that construct an engine Config directly without going through config.go.
 type Mode string
 
 const (

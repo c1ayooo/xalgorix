@@ -221,7 +221,9 @@ type Agent struct {
 	einoCheckpointStore        adk.CheckPointStore
 	einoApprovalBroker         engine.ApprovalBroker
 	einoFinished               atomic.Bool
-	scanCtx                    *scanctx.ScanContext // per-session state (vulns, notes, terminal, browser)
+	einoFinishAccepted         atomic.Bool                        // set when the finish gate accepts a finish call; the eino StopCheck reads it because AfterTool (completeWithFinish) can race the ADK's next model turn
+	einoRunCancel              atomic.Pointer[context.CancelFunc] // set by runEinoLoop; completeWithFinish cancels it so the ADK graph stops before another model call
+	scanCtx                    *scanctx.ScanContext               // per-session state (vulns, notes, terminal, browser)
 	messages                   []llm.Message
 	msgMu                      sync.Mutex
 	events                     chan Event
@@ -304,8 +306,11 @@ type Agent struct {
 	scanBudget        *scanBudget
 	lastBudgetTokens  int
 	// lastBudgetCostNanoUSD is this agent's reported cost already folded
-	// into scanBudget.costNanoUSD.
+	// into scanBudget.costNanoUSD. Both deltas are guarded by budgetMu: on the
+	// eino path completeWithFinish folds tokens from the ADK's tool goroutine
+	// while the run loop's terminal emit folds from the scan goroutine.
 	lastBudgetCostNanoUSD int64
+	budgetMu              sync.Mutex
 	compactionCount       int
 	rateLimitBackoffFn    func(int) time.Duration
 
@@ -1798,6 +1803,14 @@ func (a *Agent) Run(targets []string, instruction string) {
 	// prompt differs depending on which one is active.
 	a.nativeToolCalling = a.cfg != nil && a.cfg.NativeToolCalls &&
 		a.client != nil && a.client.NativeToolCallingSupported()
+	if a.cfg != nil && strings.EqualFold(strings.TrimSpace(a.cfg.Engine), "eino") {
+		// The eino loop has no XML tool parser: the ADK speaks only the native
+		// channel, so the system prompt and tool surface must use native
+		// semantics regardless of XALGORIX_NATIVE_TOOL_CALLS (REDESIGN D3:
+		// native is the primary path). Protocol capability is fail-closed in
+		// runEinoLoop before any request is issued.
+		a.nativeToolCalling = a.client != nil && a.client.NativeToolCallingSupported()
+	}
 	if a.nativeToolCalling {
 		a.nativeToolDefs = buildNativeToolDefinitions(a.registry)
 	}
@@ -2831,6 +2844,13 @@ func (a *Agent) completeWithFinish(output string, tokenCount func() int) {
 		}
 	}
 	a.einoFinished.Store(true)
+	// The eino graph runs ahead of its event consumer: without this cancel it
+	// would issue one more model call after a completed finish and discard the
+	// result — a paid call the scan can never use (legacy returns immediately
+	// here, so cancelling keeps both engines ending at the same turn).
+	if cancel := a.einoRunCancel.Load(); cancel != nil {
+		(*cancel)()
+	}
 	a.emit(Event{Type: "finished", Content: content, TotalTokens: tokenCount()})
 }
 

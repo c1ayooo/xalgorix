@@ -37,6 +37,15 @@ func (a *Agent) runEinoLoop(systemPrompt string, tokenCount func() int) {
 		a.emit(Event{Type: "finished", Content: "Scan stopped: scan context is unavailable for Eino.", Aborted: true, AbortReason: "eino_init_failed", TotalTokens: tokenCount()})
 		return
 	}
+	// Fail closed on protocol capability: the ADK speaks only the native
+	// tool-calling channel and the llm client attaches the tools array on the
+	// OpenAI-compatible branch only. Anthropic, Gemini and Responses endpoints
+	// would run a deterministic one-turn empty scan here; legacy remains their
+	// engine until internal/llm sends tools on those protocols.
+	if a.client != nil && !a.client.NativeToolCallingSupported() {
+		a.emit(Event{Type: "finished", Content: "Scan stopped: the configured provider protocol does not support native tool calling, which the Eino engine requires. Set XALGORIX_ENGINE=legacy for this endpoint.", Aborted: true, AbortReason: "eino_init_failed", TotalTokens: tokenCount()})
+		return
+	}
 	rt, err := engine.NewRuntime(a.ctx, engine.RuntimeConfig{
 		Client:          a.client,
 		Registry:        a.registry,
@@ -47,6 +56,7 @@ func (a *Agent) runEinoLoop(systemPrompt string, tokenCount func() int) {
 		Approvals:       a.einoApprovalBroker,
 		InstanceID:      a.scanCtx.ID,
 		ScanContextID:   a.scanCtx.ID,
+		StopCheck:       func() bool { return a.einoFinished.Load() || a.einoFinishAccepted.Load() },
 	})
 	if err != nil {
 		log.Printf("[eino] runtime construction failed for %s: %v", a.scanCtx.ID, err)
@@ -61,6 +71,11 @@ func (a *Agent) runEinoLoop(systemPrompt string, tokenCount func() int) {
 	}
 	runCtx, cancelRun := context.WithCancel(a.ctx)
 	defer cancelRun()
+	// Publish the run cancel so completeWithFinish can stop the ADK graph the
+	// moment the scan is complete; the graph otherwise runs ahead of the event
+	// consumer and issues one extra model call whose result is discarded.
+	cancelFunc := context.CancelFunc(cancelRun)
+	a.einoRunCancel.Store(&cancelFunc)
 	iter := rt.Run(runCtx, a.einoMessages(), checkpointID)
 	for {
 		ev, ok := iter.Next()

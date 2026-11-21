@@ -54,12 +54,20 @@ type RuntimeConfig struct {
 	Approvals       ApprovalBroker
 	InstanceID      string
 	ScanContextID   string
+	// StopCheck is consulted before every model request. The scan sets it to
+	// "scan complete" so the graph cannot issue another paid model call after
+	// a completed finish: the ADK's tool-node completion and the next model
+	// turn can overlap, so a context cancellation alone races that hand-off.
+	StopCheck func() bool
 }
 
 // Runtime owns one ADK agent + runner for an explicit eino scan.
 type Runtime struct {
 	agent  *adk.ChatModelAgent
 	runner *adk.Runner
+	// toolsNode is the exact ToolsNodeConfig the agent was built with, kept so
+	// tests can pin the verifier-serial binding (see ToolsNodeConfig).
+	toolsNode compose.ToolsNodeConfig
 }
 
 // NewRuntime constructs the Eino path. It fails closed when required
@@ -109,11 +117,15 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 	if maxIterations <= 0 {
 		maxIterations = 20
 	}
+	chatModel := NewChatModel(cfg.Client)
+	if cfg.StopCheck != nil {
+		chatModel = chatModel.WithStopCheck(cfg.StopCheck)
+	}
 	agent, err := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
 		Name:          "xalgorix-eino",
 		Description:   "Xalgorix security assessment agent",
 		Instruction:   cfg.Instruction,
-		Model:         NewChatModel(cfg.Client),
+		Model:         chatModel,
 		ToolsConfig:   toolConfig,
 		Handlers:      handlers,
 		MaxIterations: maxIterations,
@@ -125,7 +137,7 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 		Agent:           agent,
 		CheckPointStore: cfg.CheckpointStore,
 	})
-	return &Runtime{agent: agent, runner: runner}, nil
+	return &Runtime{agent: agent, runner: runner, toolsNode: toolConfig.ToolsNodeConfig}, nil
 }
 
 // Run starts a fresh agent execution. The checkpoint ID must be stable across a
@@ -157,6 +169,16 @@ func (r *Runtime) Agent() *adk.ChatModelAgent {
 		return nil
 	}
 	return r.agent
+}
+
+// ToolsNodeConfig returns the exact tool-node configuration the agent was
+// built with. ExecuteSequentially is load-bearing: report_vulnerability's
+// Gate 4.5 blocks inside the tool node while the independent Verifier runs
+// its own LLM turns on the SHARED client (verifier.go's timing invariant), so
+// parallel tool execution would race those turns. Pinned by
+// TestRuntimeToolsNodeConfigPinsVerifierSerialExecution.
+func (r *Runtime) ToolsNodeConfig() compose.ToolsNodeConfig {
+	return r.toolsNode
 }
 
 func toBaseTools(tools []einoTool.InvokableTool) []einoTool.BaseTool {
@@ -195,11 +217,39 @@ func (m *toolGuardMiddleware) WrapInvokableToolCall(_ context.Context, endpoint 
 			}
 		}
 		output, callErr := endpoint(callCtx, argumentsInJSON, opts...)
+		// Approval interrupts are control flow, not failures: they must reach
+		// the graph verbatim or ResumeWithParams loses its target, and they
+		// must not be converted into tool results below.
+		isInterrupt := interruptError(callErr)
 		if m.observer != nil {
 			m.observer.AfterTool(callCtx, tCtx.Name, args, output, callErr)
 		}
+		if callErr != nil && !isInterrupt {
+			// Legacy surfaces execution failures as tool results the model can
+			// recover from (result.Error flows into the conversation and the
+			// loop continues) — never as a graph-killing error. Mirror that: a
+			// failed execution is a tool result, the same rule the GuardVerdict
+			// contract applies to denials.
+			if strings.TrimSpace(output) == "" {
+				output = "⛔ TOOL EXECUTION FAILED — " + callErr.Error()
+			}
+			return output, nil
+		}
 		return output, callErr
 	}, nil
+}
+
+// interruptError recognizes both the first interrupt signal and the rerun
+// error Eino produces after ResumeWithParams. The first signal has no exported
+// type in this module, so its stable "interrupt signal:" prefix is used.
+func interruptError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if _, ok := compose.IsInterruptRerunError(err); ok {
+		return true
+	}
+	return strings.HasPrefix(err.Error(), "interrupt signal:")
 }
 
 func denyOutput(verdict GuardVerdict, fallback string) string {
