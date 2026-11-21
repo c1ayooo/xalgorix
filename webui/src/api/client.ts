@@ -1,4 +1,7 @@
 import type {
+  Approval,
+  ApprovalsResponse,
+  ApprovalsSummary,
   AuthProfile,
   AuthStatus,
   AgentMailSettings,
@@ -10,8 +13,11 @@ import type {
   ListParams,
   OAuthStartResponse,
   Paginated,
+  Project,
+  ProjectRequest,
   QueueStatus,
   RateLimitSettings,
+  Run,
   ScanEventsPage,
   ScanInstance,
   ScanListItem,
@@ -21,8 +27,12 @@ import type {
   SettingsBackup,
   SettingsImportResult,
   StatusResponse,
+  Task,
+  TaskRequest,
   VersionInfo,
   WSEvent,
+  Guidance,
+  GuidanceSendResult,
 } from "@/types/api";
 import type { FlatFinding } from "@/lib/findings";
 import type { TokenUsageResponse } from "@/types/token-usage";
@@ -225,6 +235,15 @@ export const api = {
   status: () => http<StatusResponse>("/api/status"),
   version: () => http<VersionInfo>("/api/version"),
   listScans: () => http<ScanListItem[] | null>("/api/scans"),
+  // 服务端汇总的发现计数（契约 §3.2 支持可选 project_id）。
+  findingsSummary: (projectId?: string) =>
+    http<{
+      totals: { critical: number; high: number; medium: number; low: number; info: number };
+      as_of: string;
+      etag: string;
+    }>(
+      `/api/findings/summary${projectId ? `?project_id=${encodeURIComponent(projectId)}` : ""}`,
+    ),
   // Server-side paginated + filtered scan list. Returns the envelope shape
   // { items, total, page, size }.
   listScansPage: (params: ListParams) =>
@@ -241,7 +260,11 @@ export const api = {
     http<TokenUsageResponse>(`/api/scans/${id}/token-usage`),
   // Flattened + deduped findings across all scans, computed server-side in a
   // single walk. Replaces the previous per-scan getScan() fan-out.
-  listFindings: () => http<FlatFinding[] | null>("/api/findings"),
+  // project_id 可选过滤（契约 §3.2）：缺省 = 全部（兼容旧行为）。
+  listFindings: (projectId?: string) =>
+    http<FlatFinding[] | null>(
+      `/api/findings${projectId ? `?project_id=${encodeURIComponent(projectId)}` : ""}`,
+    ),
   deleteScan: (id: string) =>
     http<{ status: string }>(`/api/scans/${id}`, { method: "DELETE" }),
   deleteVuln: (scanId: string, vulnId: string) =>
@@ -250,7 +273,10 @@ export const api = {
       { method: "DELETE" },
     ),
 
-  instances: () => http<InstancesResponse>("/api/instances"),
+  instances: (projectId?: string) =>
+    http<InstancesResponse>(
+      `/api/instances${projectId ? `?project_id=${encodeURIComponent(projectId)}` : ""}`,
+    ),
   // Server-side paginated + filtered instances list. Resources and the
   // distinct `modes` list are returned alongside the paged `instances`.
   instancesPage: (params: ListParams) =>
@@ -258,8 +284,17 @@ export const api = {
   instance: (id: string) => http<ScanInstance>(`/api/instances/${id}`),
   instanceEvents: (id: string) =>
     http<WSEvent[]>(`/api/instances/${id}/events`),
-  stopInstance: (id: string) =>
-    http<{ status: string }>(`/api/instances/${id}/stop`, { method: "POST" }),
+  // 分页历史（会话控制台"加载更早"回翻；契约同 instances events 端点）。
+  runEventsPage: (id: string, offset: number, limit = 100) =>
+    http<WSEvent[]>(
+      `/api/instances/${id}/events?offset=${offset}&limit=${limit}`,
+    ),
+  // reason 可选（契约 §3 停止带 reason 增补）：软取消语义，供引擎下一 Run 参考。
+  stopInstance: (id: string, reason?: string) =>
+    http<{ status: string }>(`/api/instances/${id}/stop`, {
+      method: "POST",
+      json: reason ? { reason } : undefined,
+    }),
   pauseInstance: (id: string) =>
     http<{ status: string }>(`/api/instances/${id}/pause`, { method: "POST" }),
   resumeInstance: (id: string) =>
@@ -385,8 +420,9 @@ export const api = {
       { method: "POST" },
     ),
 
+  // 旁路提问（in-scan chat 通道，永不进 loop）。真实后端回 response，mock 回 reply。
   chat: (message: string, instanceId?: string) =>
-    http<{ response: string }>("/api/chat", {
+    http<{ response?: string; reply?: string }>("/api/chat", {
       method: "POST",
       json: { message, instance_id: instanceId },
     }),
@@ -515,4 +551,80 @@ export const api = {
     http<void>(`/api/auth/profiles/${encodeURIComponent(key)}`, {
       method: "DELETE",
     }),
+
+  // ---------------------------------------------------------------
+  // Projects / Tasks / Runs / Approvals — R3 二开（docs/API_CONTRACT.md）。
+  // 后端未就绪时这些调用 404，页面以 ErrorState 呈现，不影响既有功能。
+  // ---------------------------------------------------------------
+
+  listProjects: () => http<{ projects: Project[] }>("/api/projects"),
+  createProject: (req: ProjectRequest) =>
+    http<Project>("/api/projects", { method: "POST", json: req }),
+  updateProject: (
+    id: string,
+    req: Partial<{ name: string; scope: ProjectRequest["scope"]; archived: boolean }>,
+  ) => http<Project>(`/api/projects/${id}`, { method: "PATCH", json: req }),
+  deleteProject: (id: string) =>
+    http<{ status: string }>(`/api/projects/${id}`, { method: "DELETE" }),
+
+  listTasks: (projectId: string) =>
+    http<{ tasks: Task[] }>(`/api/projects/${projectId}/tasks`),
+  getTask: (id: string) => http<Task>(`/api/tasks/${id}`),
+  createTask: (projectId: string, req: TaskRequest) =>
+    http<Task>(`/api/projects/${projectId}/tasks`, { method: "POST", json: req }),
+  updateTask: (id: string, req: Partial<TaskRequest>) =>
+    http<Task>(`/api/tasks/${id}`, { method: "PATCH", json: req }),
+  deleteTask: (id: string) =>
+    http<{ status: string }>(`/api/tasks/${id}`, { method: "DELETE" }),
+  startTaskRun: (id: string, overrides?: Partial<ScanRequest>) =>
+    http<{ status: string; run_id: string; instance_id: string }>(
+      `/api/tasks/${id}/runs`,
+      { method: "POST", json: overrides ?? {} },
+    ),
+  taskRuns: (id: string, page = 1, size = 50) =>
+    http<Paginated<Run>>(
+      `/api/tasks/${id}/runs?page=${page}&size=${size}`,
+    ),
+  taskFindings: (id: string) =>
+    http<FlatFinding[]>(`/api/tasks/${id}/findings`),
+
+  taskGuidance: (id: string, limit = 50) =>
+    http<{ items: Guidance[] }>(`/api/tasks/${id}/guidance?limit=${limit}`),
+  sendTaskGuidance: (id: string, message: string, requestId: string, instanceId?: string) =>
+    http<GuidanceSendResult>(`/api/tasks/${id}/guidance`, {
+      method: "POST",
+      json: {
+        message,
+        request_id: requestId,
+        ...(instanceId ? { instance_id: instanceId } : {}),
+      },
+    }),
+
+  listApprovals: (
+    opts: { status?: "pending" | "decided" | "all"; projectId?: string; taskId?: string; page?: number; size?: number } = {},
+  ) => {
+    const sp = new URLSearchParams();
+    if (opts.status && opts.status !== "all") sp.set("status", opts.status);
+    if (opts.projectId) sp.set("project_id", opts.projectId);
+    if (opts.taskId) sp.set("task_id", opts.taskId);
+    if (opts.page) sp.set("page", String(opts.page));
+    if (opts.size) sp.set("size", String(opts.size));
+    const qs = sp.toString();
+    return http<ApprovalsResponse>(`/api/approvals${qs ? `?${qs}` : ""}`);
+  },
+  approvalsSummary: () => http<ApprovalsSummary>("/api/approvals/summary"),
+  decideApproval: (id: string, decision: "approved" | "rejected", reason?: string) =>
+    http<Approval>(`/api/approvals/${id}/decision`, {
+      method: "POST",
+      json: { decision, reason },
+    }),
+  batchDecideApprovals: (
+    ids: string[],
+    decision: "approved" | "rejected",
+    reason?: string,
+  ) =>
+    http<{ approved: number; rejected: number; skipped: number }>(
+      "/api/approvals/batch-decision",
+      { method: "POST", json: { ids, decision, reason } },
+    ),
 };

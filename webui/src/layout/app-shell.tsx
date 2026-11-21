@@ -3,6 +3,7 @@ import { Outlet, useLocation } from "react-router-dom";
 import * as DialogPrimitive from "@radix-ui/react-dialog";
 import { Sidebar } from "./sidebar";
 import { Topbar } from "./topbar";
+import { OpsPulse } from "@/components/ops-pulse";
 import { ConnectionBanner } from "@/components/connection-status";
 import { LegacyImportBanner } from "@/components/legacy-import-banner";
 import { CommandPalette } from "@/components/command-palette";
@@ -49,8 +50,9 @@ export function AppShell() {
   // motif behind the shell stays visible through transparent regions.
   return (
     <div className="flex h-screen overflow-hidden text-foreground">
-      {/* Desktop sidebar */}
-      <div className="hidden md:block">
+      {/* Desktop sidebar — floating variant (4zrec 变体)：外壳留 8px 间隙，
+          侧栏面板圆角 + 完整边框 + 轻阴影，不再通栏贴边。 */}
+      <div className="hidden shrink-0 md:block md:p-2 md:pr-0">
         <Sidebar />
       </div>
 
@@ -63,7 +65,7 @@ export function AppShell() {
           <DialogPrimitive.Content
             id={MOBILE_NAV_ID}
             aria-describedby={undefined}
-            className="drawer-in fixed inset-y-0 left-0 z-50 w-60 focus:outline-none md:hidden"
+            className="drawer-in fixed inset-y-2 left-2 z-50 w-60 rounded-xl border border-border bg-card focus:outline-none md:hidden"
           >
             <DialogPrimitive.Title className="sr-only">
               {t("sidebar.navigation")}
@@ -79,6 +81,7 @@ export function AppShell() {
           menuOpen={sidebarOpen}
           menuControls={MOBILE_NAV_ID}
         />
+        <OpsPulse />
         <ConnectionBanner />
         <LegacyImportBanner />
         <main className="min-h-0 flex-1 overflow-y-auto">

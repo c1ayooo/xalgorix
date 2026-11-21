@@ -350,6 +350,11 @@ func (s *Server) runRegisteredMultiScan(run *multiScanRun, scanCfg *config.Confi
 		instance.sctx = nil
 		instance.mu.Unlock()
 
+		// Pending approvals of this run flip to cancelled (REDESIGN §5.3):
+		// the run's terminal finalize is the last line of defense for rows
+		// whose gate waiter already exited without a verdict.
+		s.cancelPendingApprovalsForInstance(instanceID, "run finished or interrupted")
+
 		// Decide queue retention now, but do not unlink anything until the exact
 		// terminal aggregate has been durably committed below. A failed snapshot
 		// must leave enough state for a later GET retry or process restart.
@@ -992,6 +997,7 @@ func (s *Server) runSingleTarget(ctx context.Context, scanCfg *config.Config, re
 		targetAuthB:        req.TargetAuthSecondary,
 		sourceRepo:         req.SourceRepo,
 		scanContext:        req.ScanContext,
+		scanContextPaths:   append([]string(nil), req.ScanContextPaths...),
 		llmClient:          s.scanLLMClientForRequest(req, scanCfg),
 	}
 	s.executeScanSession(sess)
@@ -1065,6 +1071,7 @@ func (s *Server) runDASTTarget(ctx context.Context, scanCfg *config.Config, req 
 		targetAuthB:        req.TargetAuthSecondary,
 		sourceRepo:         req.SourceRepo,
 		scanContext:        req.ScanContext,
+		scanContextPaths:   append([]string(nil), req.ScanContextPaths...),
 		llmClient:          s.scanLLMClientForRequest(req, scanCfg),
 	}
 	s.executeScanSession(sess)
@@ -1219,6 +1226,7 @@ func (s *Server) runWildcardTarget(ctx context.Context, scanCfg *config.Config, 
 			targetAuthB:        req.TargetAuthSecondary,
 			sourceRepo:         req.SourceRepo,
 			scanContext:        req.ScanContext,
+			scanContextPaths:   append([]string(nil), req.ScanContextPaths...),
 			llmClient:          s.scanLLMClientForRequest(req, scanCfg),
 		}
 		s.executeScanSession(discoverySess)
@@ -1577,6 +1585,7 @@ func (s *Server) runWildcardTarget(ctx context.Context, scanCfg *config.Config, 
 				targetAuthB:          req.TargetAuthSecondary,
 				sourceRepo:           req.SourceRepo,
 				scanContext:          req.ScanContext,
+				scanContextPaths:     append([]string(nil), req.ScanContextPaths...),
 				llmClient:            s.scanLLMClientForRequest(req, scanCfg),
 			}
 			s.executeScanSession(subSess)

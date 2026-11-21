@@ -117,6 +117,14 @@ func New(id, scanDir string) *ScanContext {
 		// the scan directory so diagnostics survive completion and restarts.
 		tokens.SetPersistDir(scanDir)
 	}
+	ledger := NewLedgerStore()
+	ledger.SetScanID(id)
+	if scanDir != "" {
+		// Domain audit is separate from best-effort telemetry. Failure here
+		// disables the journal for this process but must not prevent scanning;
+		// JournalLastSeq/health surface the absence explicitly.
+		_ = ledger.EnableJournal(scanDir)
+	}
 	return &ScanContext{
 		ID:          id,
 		ScanDir:     scanDir,
@@ -124,7 +132,7 @@ func New(id, scanDir string) *ScanContext {
 		Notes:       NewNoteStore(),
 		Terminal:    NewTerminalState(),
 		Browser:     NewBrowserState(),
-		Ledger:      NewLedgerStore(),
+		Ledger:      ledger,
 		Coverage:    NewCoverageStore(),
 		Tokens:      tokens,
 		ToolOutputs: NewToolArchive(scanDir),

@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -12,7 +13,9 @@ import (
 	"unicode/utf8"
 
 	"github.com/xalgord/xalgorix/v4/internal/agent"
+	"github.com/xalgord/xalgorix/v4/internal/engine"
 	"github.com/xalgord/xalgorix/v4/internal/llm"
+	"github.com/xalgord/xalgorix/v4/internal/platform"
 	"github.com/xalgord/xalgorix/v4/internal/scanctx"
 	"github.com/xalgord/xalgorix/v4/internal/scopeguard"
 	"github.com/xalgord/xalgorix/v4/internal/tools/notes"
@@ -198,6 +201,9 @@ func (s *Server) executeScanSession(sess *scanSession) {
 	// 0. Create and activate a per-session ScanContext for isolation.
 	//    This must happen BEFORE any tool state is touched.
 	sctx := scanctx.New(sess.id, sess.scanDir)
+	if s.cfg != nil {
+		sctx.Ledger.SetVOIWeight(s.cfg.VOIWeight)
+	}
 	// Resume continuity: reload compact per-request token records persisted
 	// before a restart so attribution aggregates continue across restarts.
 	sctx.Tokens.LoadPersisted()
@@ -271,12 +277,52 @@ func (s *Server) executeScanSession(sess *scanSession) {
 	if sess.llmClient != nil {
 		agentOpts = append(agentOpts, agent.WithLLMClient(sess.llmClient))
 	}
+	// HITL approval gate (R2a, REDESIGN §5.2): one gate bound to this scan
+	// instance + ScanContext. nil when the pipeline is disabled (mode=off is
+	// the default) so the registry keeps its byte-identical legacy behavior.
+	// Eino installs the interrupt-aware broker instead; installing both would
+	// park the same call twice. Both adapters bind the agent's secret-value
+	// registry AFTER construction (HIGH-1: by-value payload redaction before
+	// persistence — the secrets register during Run's prepareScanEnvironment).
+	einoMode := sess.cfg != nil && strings.EqualFold(strings.TrimSpace(sess.cfg.Engine), "eino")
+	var legacyGate *registryGate
+	var einoBroker *einoApprovalBroker
+	if einoMode {
+		store, err := engine.OpenCheckpointStore(context.Background(), s.dataDir, s.cfg.DatabaseURL)
+		if err != nil {
+			// PG is a cold-path capability: a database outage must not disable
+			// scanning. Fall back to the atomic file checkpoint, loudly.
+			log.Printf("[eino] PostgreSQL checkpoint unavailable for %s: %v — using file fallback", sess.instanceID, err)
+			store, err = engine.NewFileCheckpointStore(s.dataDir)
+			if err != nil {
+				log.Printf("[eino] file checkpoint unavailable for %s: %v", sess.instanceID, err)
+				sess.abortReason = "eino_checkpoint_unavailable"
+				return
+			}
+		}
+		defer engine.CloseCheckpointStore(store)
+		einoBroker = s.einoApprovalBroker(sess.instanceID, sctx)
+		agentOpts = append(agentOpts, agent.WithEinoRuntime(store, einoBroker))
+	} else if gate := s.approvalGateFor(sess.instanceID, sctx); gate != nil {
+		legacyGate = gate
+		agentOpts = append(agentOpts, agent.WithApprovalGate(gate))
+	}
 	agnt := agent.NewAgent(sess.cfg, "XalgorixAgent", events, scopeguard.Config{
 		BindAddr:           s.cfg.BindAddr,
 		Port:               s.port,
 		AllowLoopbackPorts: sess.allowLoopbackPorts,
 		AllowLocalTargets:  s.cfg.AllowLocalTargets,
 	}, agentOpts...)
+	// Bind the operator-secret registry into whichever approval adapter was
+	// installed (HIGH-1): approval payloads are by-value redacted with the
+	// same credentials the event stream redacts, before they reach the
+	// store, the WS stream, or the API.
+	if legacyGate != nil {
+		legacyGate.BindSecrets(agnt.SecretValues)
+	}
+	if einoBroker != nil {
+		einoBroker.BindSecrets(agnt.SecretValues)
+	}
 	agnt.SetPhaseRestrictions(sess.phases)
 	agnt.SetActivityPolicy(sess.reconMode, sess.scanIntensity, []string{sess.target, sess.parentTarget})
 	if sess.discoveryMode || isReconReportOnlyPhaseSelection(sess.phases) {
@@ -299,7 +345,9 @@ func (s *Server) executeScanSession(sess *scanSession) {
 	if sess.sourceRepo != "" {
 		agnt.SetSourceRepo(sess.sourceRepo)
 	}
-	if sess.scanContext != "" {
+	if len(sess.scanContextPaths) > 0 {
+		agnt.SetScanContexts(sess.scanContextPaths)
+	} else if sess.scanContext != "" {
 		agnt.SetScanContext(sess.scanContext)
 	}
 	if sess.codeScanMode != agent.CodeScanNone {
@@ -370,6 +418,12 @@ func (s *Server) executeScanSession(sess *scanSession) {
 	if len(sess.severityFilter) > 0 {
 		instruction = buildSeverityPrefix(sess.severityFilter) + "\n\n" + instruction
 	}
+	// Operator guidance queued while no run was active (API_CONTRACT §3.1)
+	// merges into this session's instruction as a [OPERATOR GUIDANCE]
+	// section — human intent (source=human) entering the loop's field of
+	// view before the first iteration. Session start only, never an
+	// iteration hot path.
+	instruction = s.mergeQueuedGuidance(sess, instruction)
 
 	// 7. Run agent (blocks until finished or stopped). Recheck the parent after
 	// record setup; a stop racing this point either makes this check fail or
@@ -1297,4 +1351,61 @@ func (s *Server) finalizeScanSessionRecord(sess *scanSession) bool {
 	// to guarantee panic-safe persistence.
 	s.saveScanRecordTo(sess.record, sess.scanDir)
 	return true
+}
+
+// mergeQueuedGuidance folds guidance turns queued while no run was active
+// (API_CONTRACT §3.1) into the session's instruction, flipping each row to
+// injected and broadcasting guidance_injected. Called once per session start
+// (not an iteration hot path); a platform-less or unmapped-instance session
+// passes the instruction through untouched. Order is chronological (oldest
+// operator intent first).
+//
+// consumed is NOT derived here: no reliable observation chain exists yet to
+// prove the engine acted on a specific turn (no observer on the message
+// path), so rows stay injected until a cold-path observer flips them via
+// UpdateGuidanceStatus (R2a decision, documented in the platform repository).
+func (s *Server) mergeQueuedGuidance(sess *scanSession, instruction string) string {
+	store := s.currentPlatformStore()
+	if store == nil || sess.instanceID == "" {
+		return instruction
+	}
+	ctx := context.Background()
+	runs, err := store.RunsByInstanceID(ctx, sess.instanceID)
+	if err != nil || len(runs) == 0 {
+		return instruction
+	}
+	items, err := store.ListGuidance(ctx, runs[0].TaskID, 50)
+	if err != nil || len(items) == 0 {
+		return instruction
+	}
+	var queued []platform.Guidance
+	for i := len(items) - 1; i >= 0; i-- { // newest-first list → chronological
+		if items[i].Status == platform.GuidanceQueued {
+			queued = append(queued, items[i])
+		}
+	}
+	if len(queued) == 0 {
+		return instruction
+	}
+	var b strings.Builder
+	b.WriteString(strings.TrimRight(instruction, "\n"))
+	b.WriteString("\n\n[OPERATOR GUIDANCE]:\n")
+	for _, g := range queued {
+		fmt.Fprintf(&b, "- %s\n", g.Message)
+	}
+	b.WriteString("The operator left the guidance above for this task: fold it into your plan as human-provided intent and act on it alongside the original goal.")
+	for i := range queued {
+		g := &queued[i]
+		if _, err := store.UpdateGuidanceStatus(ctx, g.ID, platform.GuidanceInjected); err != nil {
+			log.Printf("[platform] guidance %s flip to injected failed: %v", g.ID, err)
+			continue
+		}
+		g.Status = platform.GuidanceInjected
+		s.broadcastToInstance(sess.instanceID, WSEvent{
+			Type:     "guidance_injected",
+			Content:  "Queued operator guidance merged into this run",
+			Guidance: g,
+		})
+	}
+	return b.String()
 }

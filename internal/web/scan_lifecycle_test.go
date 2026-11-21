@@ -439,3 +439,66 @@ func TestSingleTargetScanInterruptedOnShutdown_PreservesQueueStateAndResumesOnRe
 		t.Errorf("instance %s was not found in autoResumeQueueEntries", instID)
 	}
 }
+
+// Regression: "Stop All" (POST /api/stop) must stop every live instance via
+// the per-instance signal (status flip + context cancel + queue-state clear)
+// WITHOUT setting the global stopReq flag. stopReq means "the process is
+// shutting down" and is never cleared; handleStop setting it used to poison
+// every scan started afterwards: the multi-target queue stalled after the
+// first target (orchestrator.go's shouldAdvanceQueueAfterTarget read point),
+// sessions were finalized as "stopped/server_shutdown" instead of finished
+// (scan_session.go), and report generation was skipped. A NEW instance started
+// after Stop All must run and advance its queue normally.
+func TestHandleStopAll_DoesNotSetGlobalShutdownFlag(t *testing.T) {
+	s := newTestServer(t, nil)
+
+	canceled := false
+	running := &ScanInstance{ID: "run-1", Targets: "a.com", Status: "running"}
+	running.cancel = func() { canceled = true }
+	pending := &ScanInstance{ID: "pend-1", Status: "pending"}
+	s.instancesMu.Lock()
+	s.instances["run-1"] = running
+	s.instances["pend-1"] = pending
+	s.instancesMu.Unlock()
+
+	rr := httptest.NewRecorder()
+	s.handleStop(rr, httptest.NewRequest(http.MethodPost, "/api/stop", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("stop-all code = %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	if !canceled {
+		t.Error("stop-all must cancel the running instance's context")
+	}
+	s.instancesMu.RLock()
+	gotRunning := s.instances["run-1"]
+	gotPending := s.instances["pend-1"]
+	s.instancesMu.RUnlock()
+	for id, inst := range map[string]*ScanInstance{"run-1": gotRunning, "pend-1": gotPending} {
+		if inst == nil {
+			t.Fatalf("instance %s missing after stop-all", id)
+		}
+		inst.mu.RLock()
+		status, reason := inst.Status, inst.StopReason
+		inst.mu.RUnlock()
+		if status != "stopped" {
+			t.Errorf("instance %s status = %q, want \"stopped\"", id, status)
+		}
+		if reason != "user_stopped" {
+			t.Errorf("instance %s stop reason = %q, want \"user_stopped\"", id, reason)
+		}
+	}
+
+	// The core regression: Stop All is a per-instance action, not a process
+	// shutdown. The global flag must stay false so later instances are clean.
+	if s.stopReq.Load() {
+		t.Error("stop-all must NOT set the global stopReq flag (process-shutdown only)")
+	}
+
+	// And a fresh multi-target queue started after Stop All advances normally:
+	// the queue-advance decision reads no stale global stop and a new running
+	// instance is not considered interrupted.
+	if !shouldAdvanceQueueAfterTarget(s.stopReq.Load(), "running") {
+		t.Error("a new instance's queue must advance after Stop All (no global stop pollution)")
+	}
+}

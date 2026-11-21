@@ -2,7 +2,10 @@ import { NavLink } from "react-router-dom";
 import {
   Activity,
   AlertOctagon,
+  BadgeCheck,
   Clock,
+  FolderKanban,
+  ListChecks,
   FileText,
   LayoutGrid,
   Mail,
@@ -18,28 +21,56 @@ import {
 import { cn } from "@/lib/utils";
 import { useVersion } from "@/api/queries";
 import { useI18n } from "@/i18n";
+import { ProjectSwitcher } from "@/components/project-switcher";
 
 const GITHUB_REPO = "xalgorix/xalgorix";
 
-const NAV: { to: string; labelKey: string; icon: typeof LayoutGrid; end?: boolean }[] = [
-  { to: "/", labelKey: "nav.overview", icon: LayoutGrid, end: true },
-  { to: "/scans/new", labelKey: "nav.newScan", icon: Plus },
-  { to: "/scans", labelKey: "nav.scans", icon: Target },
-  { to: "/schedules", labelKey: "nav.schedules", icon: Clock },
-  { to: "/instances", labelKey: "nav.instances", icon: Server },
-  { to: "/findings", labelKey: "nav.findings", icon: ShieldAlert },
-  { to: "/live", labelKey: "nav.live", icon: Radio },
-  { to: "/email", labelKey: "nav.email", icon: Mail },
-  { to: "/reports", labelKey: "nav.reports", icon: FileText },
-  { to: "/integrations", labelKey: "nav.integrations", icon: Plug },
-  { to: "/settings", labelKey: "nav.settings", icon: Settings },
+// Nav groups around the Project→Task→Run model:
+// 1) unlabeled = the project-scoped work surfaces (what the operator lives in);
+// 2) "execution" = run lifecycle views (scans ARE runs since R1, rename per
+//    docs/REDESIGN.md D6; schedules is a transitional standalone page until
+//    its backend becomes a task attribute);
+// 3) "system" = low-frequency management.
+const NAV_GROUPS: {
+  labelKey?: string;
+  items: { to: string; labelKey: string; icon: typeof LayoutGrid; end?: boolean }[];
+}[] = [
+  {
+    // 主组顺序 = 实体层级：项目（作用域）→ 任务（目标）→ 审批（约束）→ 发现（产出）。
+    items: [
+      { to: "/", labelKey: "nav.overview", icon: LayoutGrid, end: true },
+      { to: "/projects", labelKey: "nav.projects", icon: FolderKanban },
+      { to: "/tasks", labelKey: "nav.tasks", icon: ListChecks },
+      { to: "/approvals", labelKey: "nav.approvals", icon: BadgeCheck },
+      { to: "/findings", labelKey: "nav.findings", icon: ShieldAlert },
+    ],
+  },
+  {
+    labelKey: "nav.groupExecution",
+    items: [
+      { to: "/scans", labelKey: "nav.scans", icon: Target },
+      { to: "/instances", labelKey: "nav.instances", icon: Server },
+      { to: "/live", labelKey: "nav.live", icon: Radio },
+      { to: "/scans/new", labelKey: "nav.newScan", icon: Plus },
+    ],
+  },
+  {
+    labelKey: "nav.groupSystem",
+    items: [
+      { to: "/schedules", labelKey: "nav.schedules", icon: Clock },
+      { to: "/reports", labelKey: "nav.reports", icon: FileText },
+      { to: "/email", labelKey: "nav.email", icon: Mail },
+      { to: "/integrations", labelKey: "nav.integrations", icon: Plug },
+      { to: "/settings", labelKey: "nav.settings", icon: Settings },
+    ],
+  },
 ];
 
 export function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
   const { t } = useI18n();
   const { data: version } = useVersion();
   return (
-    <aside className="flex h-full w-60 shrink-0 flex-col border-r border-border bg-card">
+    <aside className="flex h-full w-60 shrink-0 flex-col overflow-hidden rounded-xl border border-border bg-card shadow-sm">
       <div className="flex h-14 items-center gap-2 border-b border-border px-4">
         <div className="flex h-8 w-8 items-center justify-center overflow-hidden rounded-md border border-border bg-background">
           <img src="/logo.png" alt="" className="h-full w-full object-cover" aria-hidden />
@@ -51,32 +82,42 @@ export function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
           </span>
         </div>
       </div>
-      <nav className="flex-1 overflow-y-auto py-3" aria-label="Primary">
-        <ul className="space-y-0.5 px-2">
-          {NAV.map((item) => {
-            const Icon = item.icon;
-            return (
-              <li key={item.to}>
-                <NavLink
-                  to={item.to}
-                  end={item.end}
-                  onClick={onNavigate}
-                  className={({ isActive }) =>
-                    cn(
-                      "flex items-center gap-2.5 rounded-md px-2.5 py-1.5 text-sm transition-colors",
-                      isActive
-                        ? "bg-accent text-accent-foreground"
-                        : "text-muted-foreground hover:bg-accent/40 hover:text-foreground",
-                    )
-                  }
-                >
-                  <Icon className="h-3.5 w-3.5" aria-hidden />
-                  <span>{t(item.labelKey)}</span>
-                </NavLink>
-              </li>
-            );
-          })}
-        </ul>
+      <ProjectSwitcher />
+      <nav className="flex-1 overflow-y-auto py-2" aria-label="Primary">
+        {NAV_GROUPS.map((group, gi) => (
+          <div key={gi} className={cn(gi > 0 && "mt-3 border-t border-border pt-3")}>
+            {group.labelKey && (
+              <div className="px-4 pb-1 pt-0.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+                {t(group.labelKey)}
+              </div>
+            )}
+            <ul className="space-y-0.5 px-2">
+              {group.items.map((item) => {
+                const Icon = item.icon;
+                return (
+                  <li key={item.to}>
+                    <NavLink
+                      to={item.to}
+                      end={item.end}
+                      onClick={onNavigate}
+                      className={({ isActive }) =>
+                        cn(
+                          "flex items-center gap-2.5 rounded-md px-2.5 py-1.5 text-sm transition-colors",
+                          isActive
+                            ? "bg-accent text-accent-foreground"
+                            : "text-muted-foreground hover:bg-accent/40 hover:text-foreground",
+                        )
+                      }
+                    >
+                      <Icon className="h-3.5 w-3.5" aria-hidden />
+                      <span>{t(item.labelKey)}</span>
+                    </NavLink>
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
+        ))}
       </nav>
       <div className="px-2 pb-2 pt-1">
         <a

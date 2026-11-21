@@ -131,6 +131,9 @@ type Registry struct {
 	// dialGuard is consulted by the HTTP tools for every direct connection
 	// (see request_guard.go).
 	dialGuard DialGuard
+	// approvalGate is consulted at the very top of Execute — the HITL
+	// approval obligation ("第 0.5 环", see approval_gate.go). nil = unset.
+	approvalGate ApprovalGate
 }
 
 // NewRegistry creates a new tool registry.
@@ -356,6 +359,29 @@ func (r *Registry) Execute(name string, args map[string]string) (Result, error) 
 		)
 	}
 
+	// ── HITL approval gate (REDESIGN §5.2 R2) ──
+	// The LAST step before tool.Execute — after the circuit breaker, tool
+	// lookup and required-parameter validation — so a breaker-OPEN or
+	// malformed call never burns an approval slot (charter review L2).
+	// A denial short-circuits with Success=false and an empty Error, so the
+	// breaker is untouched — expected rejections must never open a circuit
+	// on a healthy tool (the failure semantics are pinned by
+	// registry_test.go). Gate nil → the legacy path above is byte-identical
+	// to the pre-gate behavior.
+	if gate := r.ApprovalGate(); gate != nil {
+		gateArgs := make(map[string]string, len(localArgs))
+		for k, v := range localArgs {
+			gateArgs[k] = v
+		}
+		if verdict := gate.BeforeExecute(ApprovalRequest{
+			ToolName:      name,
+			Args:          gateArgs,
+			ScanContextID: r.GetScanContextID(),
+		}); !verdict.Allowed {
+			return Result{Output: verdict.Output, Success: false}, nil
+		}
+	}
+
 	result, err := tool.Execute(localArgs)
 	if err != nil {
 		// Record failure in circuit breaker
@@ -365,6 +391,17 @@ func (r *Registry) Execute(name string, args map[string]string) (Result, error) 
 			Error:   err.Error(),
 			Success: false,
 		}, nil
+	}
+
+	// A tool that reports failure through Result.Error with a nil error is a
+	// FAILURE, not a success: mark it and feed the circuit breaker, otherwise
+	// a persistently-failing tool keeps resetting its own failure count and
+	// the breaker can never open. Error text stays on the result either way —
+	// the model already sees it.
+	if result.Error != "" {
+		r.circuitBreaker.RecordFailure(name)
+		result.Success = false
+		return result, nil
 	}
 
 	// Record success - reset failure count

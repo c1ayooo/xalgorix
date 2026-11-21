@@ -160,6 +160,7 @@ func (a *Agent) verifyAuthBypassTool(args map[string]string) (tools.Result, erro
 		l.AddEvidence(h.ID, scanctx.Evidence{
 			Kind: "exploit",
 			// Source marks this as engine-written exploit evidence (Evidence.Source,
+			Nature: scanctx.EvidenceObserved,
 			// which the model's add_hypothesis_evidence can never set). It is what
 			// makes ledgerVerifierProof treat this differential as authoritative
 			// proof and what keeps the hypothesis from being auto-exhausted.

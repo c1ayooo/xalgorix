@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestLedgerUpsertAssignsIDAndStatus(t *testing.T) {
@@ -489,8 +490,8 @@ func TestLedgerLoadRederivesLegacyLowercaseKeys(t *testing.T) {
 	delete(ls.byDedup, ls.hyps[h.ID].DedupKey)
 	ls.hyps[h.ID].DedupKey = "idor|/api/orders||" // legacy shape
 	data, path := ls.marshalLocked()
-	ls.mu.Unlock()
 	ls.writeFile(data, path)
+	ls.mu.Unlock()
 
 	fresh := NewLedgerStore()
 	fresh.SetPersistPath(dir)
@@ -499,5 +500,88 @@ func TestLedgerLoadRederivesLegacyLowercaseKeys(t *testing.T) {
 	}
 	if got := fresh.Upsert(Hypothesis{VulnClass: "idor", Endpoint: "/Api/Orders"}); got.ID != h.ID || fresh.Len() != 1 {
 		t.Fatalf("legacy key not re-derived: got %s (len %d), want merge into %s", got.ID, fresh.Len(), h.ID)
+	}
+}
+
+// TestLedgerConcurrentMutationFinalSnapshotMatchesMemory pins the snapshot
+// write-ordering contract: the durable write happens INSIDE the state-lock
+// critical section, so once a mutation returns, the on-disk snapshot is at
+// least as new as that mutation. Marshaling under mu while writing outside it
+// let two mutations marshal ordered snapshots A then B yet hit the file
+// B-first-then-A, leaving a stale snapshot on disk even though every mutation
+// had returned — a resume then loaded lost evidence/status.
+func TestLedgerConcurrentMutationFinalSnapshotMatchesMemory(t *testing.T) {
+	dir := t.TempDir()
+	ls := NewLedgerStore()
+	ls.SetPersistPath(dir)
+	seed := ls.Upsert(Hypothesis{VulnClass: "sqli", Endpoint: "/items"})
+	if seed.Status != HypothesisQueued {
+		t.Fatalf("precondition: seed status = %q, want queued", seed.Status)
+	}
+
+	// Attempts is monotonic, so any stale snapshot overwrite regresses it.
+	const workers = 8
+	const rounds = 10
+	stopPolling := make(chan struct{})
+	pollErr := make(chan error, 1)
+	go func() {
+		poll := NewLedgerStore()
+		poll.SetPersistPath(dir)
+		highWater := 0
+		for {
+			select {
+			case <-stopPolling:
+				close(pollErr)
+				return
+			default:
+			}
+			poll.LoadFromDisk()
+			if h, ok := poll.Get(seed.ID); ok {
+				if h.Attempts < highWater {
+					pollErr <- fmt.Errorf("disk attempts regressed: %d → %d (stale snapshot overwrite)", highWater, h.Attempts)
+					return
+				}
+				highWater = h.Attempts
+			}
+			time.Sleep(50 * time.Microsecond)
+		}
+	}()
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for r := 0; r < rounds; r++ {
+				ls.SetStatus(seed.ID, HypothesisTesting, "")
+				ls.RecordAttempt(seed.ID)
+				ls.SetStatus(seed.ID, HypothesisQueued, "")
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(stopPolling)
+	if err := <-pollErr; err != nil {
+		t.Fatal(err)
+	}
+
+	// Every mutation has returned (happens-before via wg): the file must now
+	// equal the final in-memory state, never an intermediate snapshot.
+	want, _ := ls.Get(seed.ID)
+	fresh := NewLedgerStore()
+	fresh.SetPersistPath(dir)
+	if n := fresh.LoadFromDisk(); n != 1 {
+		t.Fatalf("loaded %d hypotheses, want 1", n)
+	}
+	got, ok := fresh.Get(seed.ID)
+	if !ok {
+		t.Fatal("seed hypothesis missing from disk snapshot")
+	}
+	if got.Status != want.Status || got.Attempts != want.Attempts {
+		t.Fatalf("disk snapshot stale after all mutations returned: status=%q attempts=%d, want status=%q attempts=%d",
+			got.Status, got.Attempts, want.Status, want.Attempts)
 	}
 }

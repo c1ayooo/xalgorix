@@ -245,6 +245,7 @@ func (a *Agent) analyzeAuthzMatrix(u *url.URL, method, parameter, expect string,
 			})
 			l.AddEvidence(h.ID, scanctx.Evidence{
 				Kind:       "exploit",
+				Nature:     scanctx.EvidenceObserved,
 				Summary:    fmt.Sprintf("%s; %s got status %d / %d bytes for the same request — %s", baselineDesc, r.identity.label, r.resp.StatusCode, r.resp.BodyLen, verdict),
 				Request:    fmt.Sprintf("%s %s  (identity: %s)", method, u.String(), r.identity.label),
 				Response:   truncateForEvidence(r.resp.Body),

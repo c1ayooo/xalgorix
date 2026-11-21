@@ -105,6 +105,7 @@ func (a *Agent) probeHypothesisTool(args map[string]string) (tools.Result, error
 	if sErr != nil {
 		l.AddEvidence(id, scanctx.Evidence{
 			Kind:    "probe",
+			Nature:  scanctx.EvidenceObserved,
 			Summary: "Baseline probe could not connect: " + sErr.Error(),
 			Request: reqLine,
 			AgentID: a.ledgerOrigin(),
@@ -116,6 +117,7 @@ func (a *Agent) probeHypothesisTool(args map[string]string) (tools.Result, error
 	summary, status, nextAction, conf := interpretProbe(resp, authed)
 	l.AddEvidence(id, scanctx.Evidence{
 		Kind:       "probe",
+		Nature:     scanctx.EvidenceObserved,
 		Summary:    summary,
 		Request:    reqLine,
 		Response:   probeResponseEvidence(resp),

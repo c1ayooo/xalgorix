@@ -36,7 +36,13 @@ import {
   PAGE_SIZE_OPTIONS,
   Pagination,
 } from "@/components/Pagination";
-import { useDeleteVuln, useScansList, useFindingsList, qk } from "@/api/queries";
+import {
+  useDeleteVuln,
+  useFindingsList,
+  useFindingsSummary,
+  useScansList,
+} from "@/api/queries";
+import { useActiveProjectId } from "@/lib/use-active-project";
 import type { FindingsSummaryResponse } from "@/types/api";
 import { dedupFindings, type FlatFinding } from "@/lib/findings";
 import {
@@ -65,7 +71,8 @@ export default function FindingsPage() {
   // getScan() request per scan; they come from a single server-side walk.
   const ids = useMemo(() => (scans ?? []).map((s) => s.id), [scans]);
 
-  const findingsQuery = useFindingsList();
+  const projectId = useActiveProjectId();
+  const findingsQuery = useFindingsList(projectId ?? undefined);
   const isLoading = findingsQuery.isLoading;
 
   const findings = useMemo<FlatFinding[]>(
@@ -79,20 +86,8 @@ export default function FindingsPage() {
   // and used both for the totals row and for the "updated Xs ago"
   // indicator (sourced from the response's `as_of` field). The shared
   // qk.findingsSummary key means /overview reads the same cache entry.
-  const summary = useQuery<FindingsSummaryResponse>({
-    queryKey: qk.findingsSummary,
-    queryFn: async () => {
-      const res = await fetch("/api/findings/summary", {
-        credentials: "same-origin",
-        headers: { Accept: "application/json" },
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      return (await res.json()) as FindingsSummaryResponse;
-    },
-    refetchInterval: 10_000,
-    staleTime: 5_000,
-    placeholderData: keepPreviousData,
-  });
+  // 项目作用域汇总（契约 §3.2）；useFindingsSummary 内含 10s 轮询与占位数据。
+  const summary = useFindingsSummary(projectId ?? undefined);
 
   const [query, setQuery] = useState("");
   const [severity, setSeverity] = useState<string>("all");
@@ -193,8 +188,8 @@ export default function FindingsPage() {
   // Manual refresh: invalidate the findings list plus the summary query so
   // the totals row and the list re-fetch in lockstep.
   function refreshAll() {
-    qc.invalidateQueries({ queryKey: qk.findingsList });
-    qc.invalidateQueries({ queryKey: qk.findingsSummary });
+    // 前缀失效：["findings"] 命中 list/summary 的全部项目作用域条目。
+    qc.invalidateQueries({ queryKey: ["findings"] });
   }
 
   // Prefer the stable on-disk totals from /api/findings/summary. Fall

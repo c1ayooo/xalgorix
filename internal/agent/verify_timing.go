@@ -210,6 +210,7 @@ func (a *Agent) verifyTimingTool(args map[string]string) (tools.Result, error) {
 	})
 	l.AddEvidence(h.ID, scanctx.Evidence{
 		Kind:       "exploit",
+		Nature:     scanctx.EvidenceObserved,
 		Summary:    confirm + " " + proof,
 		Request:    fmt.Sprintf("%s %s (baseline/probe bodies stored only as SHA-256 prefixes)", method, absURL),
 		Response:   proof,

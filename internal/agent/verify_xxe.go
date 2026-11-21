@@ -215,6 +215,7 @@ func (a *Agent) verifyXXETool(args map[string]string) (tools.Result, error) {
 	})
 	l.AddEvidence(h.ID, scanctx.Evidence{
 		Kind:       "exploit",
+		Nature:     scanctx.EvidenceObserved,
 		Summary:    confirm,
 		Request:    probeResp.RequestLine,
 		Response:   probeExcerpt,
@@ -682,6 +683,7 @@ func (a *Agent) blindXXEVerify(method, absURL string, headers map[string]string,
 		})
 		l.AddEvidence(h.ID, scanctx.Evidence{
 			Kind:       "exploit",
+			Nature:     scanctx.EvidenceObserved,
 			Summary:    confirm,
 			Request:    fmt.Sprintf("%s %s (blind external-entity payload, OAST token %s)", method, absURL, token),
 			Response:   firstHitSummary(hits),

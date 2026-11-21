@@ -95,6 +95,55 @@ func isAndroidArchive(p string) bool {
 // LoadFromPath parses a single artifact file or every file in a directory,
 // merging the results. Unparseable files are skipped (best-effort).
 func LoadFromPath(path string) (*Result, error) {
+	return LoadFromPaths([]string{path})
+}
+
+// LoadFromPaths parses every supplied artifact file/directory and merges them
+// into one attack surface. This is the multi-upload form used by task-level
+// context_paths: each upload directory can contain several artifacts, and an
+// operator may attach more than one upload to a task. Unusable individual
+// paths are skipped when another path still yields usable context.
+func LoadFromPaths(paths []string) (*Result, error) {
+	cleaned := make([]string, 0, len(paths))
+	seen := make(map[string]struct{}, len(paths))
+	for _, raw := range paths {
+		path := strings.TrimSpace(raw)
+		if path == "" {
+			continue
+		}
+		if _, dup := seen[path]; dup {
+			continue
+		}
+		seen[path] = struct{}{}
+		cleaned = append(cleaned, path)
+	}
+	if len(cleaned) == 0 {
+		return nil, nil
+	}
+	combined := &Result{AuthHeaders: map[string]string{}}
+	var failures []error
+	for _, path := range cleaned {
+		res, err := loadOnePath(path)
+		if err != nil {
+			failures = append(failures, err)
+			continue
+		}
+		combined.merge(res)
+	}
+	combined.finalize()
+	if len(combined.Endpoints) == 0 && len(combined.AuthHeaders) == 0 &&
+		len(combined.BaseURLs) == 0 && len(combined.TextContext) == 0 {
+		if len(failures) > 0 {
+			return combined, fmt.Errorf("scan context paths: %w", errors.Join(failures...))
+		}
+		return combined, fmt.Errorf("%w in supplied context paths", ErrNoUsableContext)
+	}
+	return combined, nil
+}
+
+// loadOnePath parses one file or directory. It returns the per-path result and
+// leaves cross-path deduplication to LoadFromPaths.
+func loadOnePath(path string) (*Result, error) {
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return nil, nil

@@ -251,6 +251,7 @@ func (a *Agent) finalizeOOBVerdict(token, class, endpoint, parameter, role, exec
 		}
 		l.AddEvidence(h.ID, scanctx.Evidence{
 			Kind:       "exploit",
+			Nature:     scanctx.EvidenceObserved,
 			Summary:    summary,
 			Request:    requestEvidence,
 			Response:   firstHitSummary(hits),

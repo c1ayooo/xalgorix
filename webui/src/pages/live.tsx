@@ -11,12 +11,14 @@ import { LiveFeed, type FeedFilter } from "@/components/live-feed"
 import { ConnectionStatus } from "@/components/connection-status"
 import { api } from "@/api/client"
 import { qk, useInstances } from "@/api/queries"
+import { useActiveProjectId } from "@/lib/use-active-project"
 
 export default function LivePage() {
   const { t } = useI18n()
   const events = useWSStore((s) => s.events)
   const clearEvents = useWSStore((s) => s.clearEvents)
-  const { data: instances } = useInstances()
+  const projectId = useActiveProjectId()
+  const { data: instances } = useInstances(projectId ?? undefined)
   const [filter, setFilter] = useState<FeedFilter>("all")
   const [clearedAt, setClearedAt] = useState<number | null>(null)
   const activeInstanceIds = useMemo(

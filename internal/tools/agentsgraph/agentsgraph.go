@@ -229,7 +229,13 @@ func (g *Graph) onAgentDone() {
 		next.Status = "running"
 		next.StartedAt = time.Now()
 		if err := g.persistLocked(); err != nil {
+			// Mirror ResumeCheckpointedWork's rollback: the agent did not
+			// start, so it must not stay "running" — that ghost never
+			// completes and hangs wait_agent plus the finish gate. Requeue it
+			// at the front so a later completion retries the start.
 			g.activeAgents--
+			next.Status = "queued"
+			g.queue = append([]*subAgentState{next}, g.queue...)
 			return
 		}
 		g.wg.Add(1)
@@ -268,6 +274,12 @@ func (g *Graph) createAgent(args map[string]string) (tools.Result, error) {
 	g.agents[agentID] = state
 	state.Status = "queued"
 	if err := g.persistLocked(); err != nil {
+		// Roll the admission back out: without a durable checkpoint the
+		// delegation never happened. Leaving the state or the budget behind
+		// would strand a ghost agent (queued forever) in PendingSummary,
+		// UncollectedCount and the finish gate.
+		delete(g.agents, agentID)
+		g.delegated--
 		g.mu.Unlock()
 		return tools.Result{Error: "Cannot create agent: delegation checkpoint could not be saved."}, nil
 	}
@@ -338,6 +350,10 @@ func (g *Graph) spawnAgent(args map[string]string) (tools.Result, error) {
 	g.agents[agentID] = state
 	state.Status = "queued"
 	if err := g.persistLocked(); err != nil {
+		// Same rollback as createAgent: no durable checkpoint means no
+		// delegation — free the identity and the lifetime budget slot.
+		delete(g.agents, agentID)
+		g.delegated--
 		g.mu.Unlock()
 		return tools.Result{Error: "Cannot spawn agent: delegation checkpoint could not be saved."}, nil
 	}

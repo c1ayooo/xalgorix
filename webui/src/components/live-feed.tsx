@@ -6,6 +6,8 @@ import { cn, menuContentClass, menuItemClass as menuItemBase } from "@/lib/utils
 import { useWSStore, type FeedEvent } from "@/store/ws";
 import { exportFeedEvents, type FeedExportFormat } from "@/lib/feed-export";
 import { EmptyState } from "./states";
+import { useI18n } from "@/i18n";
+import { ApprovalInlineBar } from "@/components/approval-inline-bar";
 
 export type FeedFilter =
   | "all"
@@ -115,11 +117,19 @@ const TYPE_COLOR: Record<string, string> = {
   resumed: "text-emerald-600 dark:text-emerald-300",
   instance_started: "text-emerald-600 dark:text-emerald-300",
   instance_updated: "text-neutral-600 dark:text-neutral-400",
+  // HITL（契约 §3/§3.1）
+  approval_requested: "text-amber-700 dark:text-amber-300",
+  approval_decided: "text-emerald-600 dark:text-emerald-400",
+  guidance_injected: "text-violet-600 dark:text-violet-300",
+  guidance_queued: "text-violet-600 dark:text-violet-300",
+  guidance_consumed: "text-emerald-600 dark:text-emerald-400",
 };
 
 export function LiveEventRow({ event }: { event: FeedEvent }) {
+  const { t } = useI18n();
   const [open, setOpen] = useState(false);
   const message = event.content || event.output || event.error || event.tool_name || event.type;
+  const isApprovalRequest = event.type === "approval_requested" && !!event.approval;
   const hasDetails =
     !!event.output ||
     !!event.tool_args ||
@@ -168,6 +178,34 @@ export function LiveEventRow({ event }: { event: FeedEvent }) {
           />
         )}
       </button>
+      {isApprovalRequest && (
+        <div className="px-3 pb-2 ml-[7.5rem]">
+          <ApprovalInlineBar approval={event.approval!} />
+        </div>
+      )}
+      {event.type === "guidance_injected" && event.guidance && (
+        <div className="flex justify-end px-3 pb-2">
+          <div className="max-w-[70%] rounded-lg rounded-tr-sm bg-primary px-3 py-1.5 text-sm text-primary-foreground [overflow-wrap:anywhere]">
+            {event.guidance.message}
+            <div className="mt-1 flex items-center gap-1.5 text-[10px] uppercase tracking-wider opacity-80">
+              {t("guidance.status.injected")}
+              {event.guidance.run_id && (
+                <span className="mono">{event.guidance.run_id}</span>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+      {event.type === "guidance_queued" && event.guidance && (
+        <div className="flex justify-end px-3 pb-2">
+          <div className="max-w-[70%] rounded-lg rounded-tr-sm border border-violet-500/40 bg-violet-500/10 px-3 py-1.5 text-sm text-foreground [overflow-wrap:anywhere]">
+            {event.guidance.message}
+            <div className="mt-1 flex items-center gap-1.5 text-[10px] uppercase tracking-wider text-muted-foreground">
+              {t("guidance.status.queued")}
+            </div>
+          </div>
+        </div>
+      )}
       {open && hasDetails && (
         <div className="px-3 pb-3 -mt-1 ml-[7.5rem] space-y-2">
           {event.error && (
@@ -208,6 +246,9 @@ export function LiveFeed({
   onClearEvents,
   exportFilePrefix,
   exportScope,
+  // 常驻主栏模式：根元素与滚动区撑满父容器（父容器负责定高），
+  // 而非默认的 max-h-[60vh] 自适应。
+  fillHeight = false,
 }: {
   events: FeedEvent[];
   filter: FeedFilter;
@@ -220,6 +261,7 @@ export function LiveFeed({
   onClearEvents?: () => void;
   exportFilePrefix?: string;
   exportScope?: string;
+  fillHeight?: boolean;
 }) {
   const paused = useWSStore((s) => s.paused);
   const setPaused = useWSStore((s) => s.setPaused);
@@ -252,7 +294,13 @@ export function LiveFeed({
   }, [visible.length, autoScroll, paused]);
 
   return (
-    <div className={cn("rounded-md border border-border bg-card", className)}>
+    <div
+      className={cn(
+        "rounded-md border border-border bg-card",
+        fillHeight && "flex h-full min-h-0 flex-col",
+        className,
+      )}
+    >
       {showControls && (
         <div className="flex flex-wrap items-center gap-1 border-b border-border px-2 py-1.5">
           {FILTERS.map((f) => (
@@ -305,7 +353,10 @@ export function LiveFeed({
       )}
       <div
         ref={scrollRef}
-        className="max-h-[60vh] min-h-64 overflow-auto bg-background/40"
+        className={cn(
+          "overflow-auto bg-background/40",
+          fillHeight ? "min-h-0 flex-1" : "max-h-[60vh] min-h-64",
+        )}
       >
         {visible.length === 0 ? (
           <EmptyState

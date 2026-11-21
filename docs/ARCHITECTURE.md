@@ -55,11 +55,17 @@ After the v4.5.44 decomposition this package is split into cohesive files
 | `ws_hub.go` | WebSocket client pumps + event broadcast |
 | `orchestrator.go` | scan orchestration: single / DAST / wildcard / multi + subdomain collection |
 | `scan_session.go` | run one scan session + event processing + phase inference |
+| `scan_audit.go` | read-only domain audit projection and cold-path sync state APIs |
 | `queue_state.go` | scan-queue persistence, resume, admission control |
 | `scan_record.go` / `scan_query.go` / `scan_list.go` | scan-record assembly, lookup, listing/caching |
+| `scan_audit.go` | read-only domain audit projection + cold-path sync views (`/api/scans/{id}/audit`, `/api/scans/{id}/coldpath`) |
 | `notify.go` | Discord + Telegram notifications (severity-gated) |
 | `chat.go` | in-scan / post-scan chat with the agent |
 | `schedules.go` / `scheduler.go` | scheduled scans |
+| `handlers_platform.go` | projects/tasks/runs REST API (`/api/projects`, `/api/tasks`), run mounting, project-scope target validation, §3.2 `project_id` filters |
+| `handlers_approvals.go` | approvals + guidance REST (`/api/approvals`, `/api/tasks/{id}/guidance`); decisions are session/CSRF-guarded state changes |
+| `approvals_gate.go` | `ApprovalService`: per-run slot queue, timeout=reject timers, startup reconciliation, WS emission, payload redaction |
+| `platform_legacy_import.go` | startup import of existing scans → Run mounts + schedules → tasks under the `default` project (idempotent, read-only) |
 | `uploads.go` | target/instruction/logo/context uploads |
 | `report.go` | report delivery API |
 | `settings_env.go`, `handlers_profiles.go` | settings, provider keys, credential profiles, OAuth |
@@ -171,6 +177,8 @@ capability:
 - `browser` + `pageagent` — headless browser automation (JS-heavy apps, auth flows)
 - `httpclient` — direct HTTP requests
 - `websearch`, `codesearch`, `fileedit`, `notes`, `python` — research / analysis helpers
+- `search_info` (registered by `internal/agent`) — read-only region/association/
+  context activation over the optional InfoItem cold path; no verdict role
 - `reporting` — the `report_vulnerability` tool + findings store (see below)
 - `agentmail`, `agentsgraph` — email/OOB interaction and sub-agent graphs
 - `proxy`, `oob`, `finish`, `iolimit`, `skills` — proxying, out-of-band callbacks, termination, IO limits, methodology corpus
@@ -193,10 +201,215 @@ finding carries exactly one verification tag:
 
 `internal/reporting` renders the branded PDF from the persisted findings.
 
-## Knowledge — `internal/tools/skills`
+## Information model, domain audit & cold path
 
-The methodology corpus / skills content that guides the agent, embedded in the
-binary.
+The CORE v2.1 information model is implemented as additive layers; it does not
+replace scan state or the report/verifier authority chain.
+
+- `internal/infoitem` — InfoItem model (seven coordinate dimensions, stable ID,
+  observed/inferred nature, supports, relations) and the bounded
+  region/association/context `Reader` contract.
+- `internal/domainjournal` — per-scan `domain_journal.jsonl` with monotonic
+  `seq`, fsync on append, trailing-line repair, duplicate/gap/disorder
+  projection, and non-blocking append observers used for cold-path wakeups.
+- `internal/storage.AppendSync` — the shared append+fsync primitive used by the
+  domain journal.
+- `internal/infoitem/postgres` — optional PostgreSQL replica for InfoItems,
+  relation edges, audit records and contiguous sync watermarks. It implements
+  the three activation queries and never participates in verdicts.
+- `internal/jobs` — pinned River v0.51.2 client/workers. Jobs only carry bounded
+  cold-path journal ranges; they do not own scan lifecycle, HITL, agentsgraph,
+  or WebSocket work.
+- `internal/coldpath` — composes PostgreSQL, River, the low-latency journal
+  observer, and a periodic reconciler that compares local journals with the
+  applied watermark and re-enqueues missing ranges.
+- `scanctx.Ledger` projects ledger Evidence into the journal (and therefore the
+  cold path) using `evidence:<scan_id>:<evidence_id>`. Evidence retains its
+  existing `Kind` role classification and has a separate `Nature`
+  (`observed`/`inferred`). Missing/legacy values normalize to `inferred`.
+- `scanctx` also records hypothesis mutations (record/claim/assign/status/
+  evidence/attempt/VOI/reset/merge) with an explicit actor before committing.
+- `search_info` is the Agent-facing read-only activation consumer. It is
+  registered in every agent, returns an explanatory result when no DSN is
+  configured, and never feeds finding acceptance.
+- Two engine-side M4 consumers annotate the ledger tools
+  (`internal/agent/ledger_cross_scan.go`): region =
+  `read_ledger(filter=schedulable)` per-entry same-endpoint cross-scan note,
+  association = `claim_next_hypothesis` same-subject cross-scan section plus a
+  current-scan edge traversal rooted at this scan's items (relation edges are
+  per-scan; cross-scan edge graphs are charter §13 research). Both are
+  output-only, capped by a per-call query budget, and degrade to unchanged
+  output without a cold-path reader; reader errors and §6.4 sync gaps surface
+  as visible notes (never silent). Contract tests pin the shapes, degradation,
+  budget and gap passthrough in `internal/agent/ledger_cross_scan_test.go`,
+  and real-store bridges in `ledger_cross_scan_pg_test.go`. The cross-scan
+  region query uses `RegionQuery.AllScans` (mutually exclusive with ScanIDs).
+- Two read-only HTTP views expose the audit surfaces (charter §5.2/§6.4 and
+  the §4.3 human audit view): `GET /api/scans/{id}/audit` serves the domain
+  audit projection (claim history, duplicate/gap/disorder detection, explicit
+  `incomplete`), and `GET /api/scans/{id}/coldpath` reports the per-scan sync
+  state (`pending`/`applied`/`gap`/`failed`, or `disabled` without a DSN —
+  never `failed`). Both live in `web/scan_audit.go`; the projection never
+  mutates ledger state and never participates in verdicts.
+
+Hot-path mutations remain in memory + `ledger.json`; the journal is the durable
+domain audit. PostgreSQL is a readable replica and can be absent. When present,
+`XALGORIX_DATABASE_URL` enables startup migrations, River, and reconciliation;
+PostgreSQL errors disable the cold path and never gate a scan.
+
+The InfoItem `Reader` is process-global because it is infrastructure, not
+per-scan state. Every query is still scoped by the caller's current `scan_id`.
+
+## Platform layer — projects, tasks & runs (`internal/platform`)
+
+The Project → Task → Run model (REDESIGN D6/D7) is a cold-path system-of-record
+for *organization*, never a second scan-state authority.
+
+- `internal/platform` — `Project`/`Task`/`Run` models, a `Repository` interface
+  and two implementations: PostgreSQL (`pgxpool` opened from
+  `XALGORIX_DATABASE_URL`) and a file fallback (`<dataDir>/_platform/platform.json`,
+  full snapshot via `storage.WriteAtomic`, registered in
+  `reservedTopLevelNames`). Every list/filter query takes an explicit
+  `projectID` parameter (D7 row-level isolation; raw SQL bypasses do not exist
+  — platform SQL lives only in `platform/postgres.go` and
+  `platform/postgres_findings.go`). Migrations are shared with the InfoItem
+  migrator (`infoitem/postgres/migrations/0002_...` and `0004_...`; the
+  `migrate.go` engine is untouched). Explicit `project_id` with no wired store
+  fails closed with 503 instead of returning an unfiltered cross-project view.
+- **Runs are mount records, not state.** A run row stores only `task_id`,
+  `instance_id` (unique), `legacy_scan_id`, `mode`, `trigger`, `created_at`.
+  Status/started/finished/vuln/token numbers are projected at read time from
+  `findAllScanSummaries` keyed by `instance_id` (fallback
+  `legacy_scan_id == rec.ID`) — `scan.json` remains the single authority
+  (charter §6). Nothing status-like is persisted in either store.
+- **Degradation** (charter §6): no DSN → file store, platform API fully
+  usable, implicit `default` project (fixed id, not deletable). DSN set but
+  PostgreSQL unreachable → store stays nil, platform endpoints answer 503
+  (`requirePlatformStore`), scanning is unaffected — assembly failure is
+  log-only in `cmd/xalgorix/main.go`, mirroring the `coldpath` posture.
+- `POST /api/tasks/{id}/runs` reuses the exact `/api/scan` dispatch sequence
+  (reserve → queue ownership → pending-dispatch snapshot → durable queue
+  state → `runMultiScan`) plus the same pre-dispatch guards
+  (`checkScanRequestDestinations`, `resolveScanCredentials` fail-fast, blocked
+  target rejection). Targets must fall inside the project scope (exact,
+  domain-suffix or explicit `*.domain` match; `allow_ports` covers explicit and
+  HTTP/HTTPS default ports; scope entries carrying an explicit `:port` are
+  rejected at create/patch — port control lives in `allow_ports`).
+- Task `context_paths` are persistent Context attachments: every path (plus an
+  explicit request `scan_context`) is passed to the Run and merged by
+  `attacksurface.LoadFromPaths`; the single-path Agent setter remains a
+  compatibility wrapper.
+- Legacy import (startup, idempotent by either `legacy_scan_id` or
+  `instance_id` / `context.legacy_schedule_id`, partial unique expression
+  indexes guard concurrent first starts): existing scans mount as runs under an
+  umbrella "imported" task in the `default` project; existing schedules become
+  tasks with a `schedule` property (legacy-only fields recorded in task
+  `context`, which never reaches the wire). Original scan directories are never
+  modified — pinned by a whole-tree content+mtime hash test.
+- **Task findings** are a cold-path projection of already-accepted scan.json
+  findings. With a DSN, `run_findings` stores one row per `(run_id, dedup_key)`
+  and task reads use `DISTINCT ON` (newest run wins); without one, the web
+  layer pages through every run and applies the same deterministic dedup.
+  Projection writes happen after scan finalization with startup backfill; they
+  never participate in acceptance or verification.
+- A mount whose `scan.json` disappeared without a durable pending-dispatch
+  snapshot projects as `missing`, not `pending`, so it neither counts as an
+  active run nor blocks project deletion. Retention and manual scan deletion
+  remove the corresponding mount (findings cascade).
+- Existing endpoints accept an optional `project_id` query parameter
+  (`/api/instances`, `/api/findings`, `/api/findings/summary`, `/api/scans`);
+  without the parameter behavior is byte-identical to before.
+- **Transitional fact**: scans triggered by the legacy scheduler (including
+  imported schedule tasks) still dispatch through the original
+  scheduler→`runMultiScan` path and do not pass project-scope validation;
+  that wiring closes in R2.
+
+## HITL approvals & guidance — `internal/approval`, `internal/web/approvals_gate.go`
+
+- `internal/approval` — pure classifiers: tool category (`command` /
+  `http` / none), the read-only recon allowlist ("best-effort classifier;
+  when in doubt it pends" — segments with `$()`, unquoted redirects,
+  `system(`/`eval(`, inline `PATH=`/`LD_PRELOAD=`-style assignment, or nmap
+  output flags are never allowlisted; awk/sed/sort are not in the default
+  list) and `AssessHTTP` (write methods with admin-path / destructive-payload
+  / auth-mutation signatures pend; GET/HEAD/OPTIONS pass with an audit trail
+  in the existing tool_call events — no approval row). R2b's trafficproxy
+  reuses `AssessHTTP` as its second consumer.
+- The gate lives in `tools.Registry` (`SetApprovalGate`, modeled after
+  `RequestGuard`): consulted after the circuit-breaker/parameter checks and
+  before `tool.Execute` — the last pre-execution ring. A denial returns
+  `Result{Success:false}` and never touches `RecordFailure` (expected
+  rejections are not tool failures); a nil gate keeps legacy behavior
+  byte-identical. The **verifier registry is exempt** (documented): an
+  approval stall inside the report gate would race the 15-minute watchdog,
+  and the gate's synchronous blocking preserves the verifier timing
+  invariant rather than breaking it.
+- `web.ApprovalService` owns the runtime state: per-run pending slot queue
+  (default 1; overflow waits in FIFO for a freed slot), timeout=reject
+  timers (`XALGORIX_APPROVAL_TIMEOUT`, default 600s), scanctx-cancellation
+  (stop/pause/delete flip pending rows to `cancelled`), startup
+  reconciliation for orphaned pending rows, and store-call deadlines (3s →
+  fail-open, per charter §6.1 PostgreSQL must never block tool execution).
+  Approval payloads are value-redacted through the agent's secret registry
+  plus header-name masking **before** persistence, WS emission and API
+  response — keys never leave the process.
+- Storage: `platform.Repository` approvals/guidance sections, dual
+  implementation (`0003_approvals_guidance.sql` + `_platform/platform.json`);
+  `pending_total` in list/summary responses is always cross-project (the
+  one D7 exception, for OpsPulse). WS events (`approval_requested`,
+  `approval_decided`, `guidance_*`) are emitted only from the web layer.
+- Guidance: `POST /api/tasks/{id}/guidance` injects into a running agent
+  via `Agent.SendMessage` (`status=injected`) or persists as `queued`;
+  queued guidance is merged into the next session's instruction at
+  `executeScanSession` startup (flipped to `injected` there). `consumed`
+  has no automatic heuristic yet (`UpdateGuidanceStatus` is the seam).
+- `XALGORIX_APPROVAL_MODE` defaults to **off** (headless scheduled scans
+  must not stall on pendings); `enforce` enables the pipeline. Operator
+  allowlist additions: `XALGORIX_APPROVAL_ALLOWLIST`.
+
+## Engine — `internal/engine` (R4 core)
+
+`internal/engine` contains the Eino v0.9.23 ADK primitives. `XALGORIX_ENGINE`
+is parsed in `internal/config`; the configured default is **eino**, while
+`XALGORIX_ENGINE=legacy` is the immediate rollback. Unknown values fall back
+loudly to legacy.
+
+- `mode.go` defines `legacy` / `eino` parsing. `config.Engine` exposes
+  `XALGORIX_ENGINE`; `scan_session` selects the runtime only for explicit eino
+  (legacy stays byte-for-byte available).
+- `chatmodel.go` implements Eino's `ToolCallingChatModel` over the existing
+  `internal/llm.Client` (`ChatWithUsageToolCalls`), so retries, KeyRotator,
+  provider protocols and token accounting stay centralized. `WithTools` returns
+  a copy; streaming is explicitly disabled.
+- `tools.go` wraps `tools.Registry` as Eino `InvokableTool`. Every invocation
+  goes through `Registry.Execute`, preserving the six-ring security chain,
+  circuit breaker and the R2 approval gate; the adapter never calls a tool
+  closure directly.
+- `runtime.go` builds `adk.ChatModelAgent` + `adk.Runner`, forces
+  `ExecuteSequentially` (report/verifier calls cannot overlap), and installs a
+  construction-time tool guard middleware for scope/safety decisions.
+- `approval.go` wraps each tool with `tool.StatefulInterrupt`: the first call
+  creates a pending approval through the broker, and
+  `Runner.ResumeWithParams` delivers `ApprovalDecision`. Denials return a normal
+  tool result; approval rows/REST/WS remain the R2 contract.
+- `obligation.go` defines the per-turn/tool observer seam. ADK middleware applies
+  nudges before each model call and lets the observer block `finish`/other tools.
+  `internal/agent/eino_observer.go` fills it from the existing hook registry,
+  budget, liveness and finish gate.
+- `internal/agent/eino_runtime.go` runs the ADK runner from `Agent.Run` after
+  the shared legacy prelude (prompt/state/checkpoint/budget). An interrupt is
+  resolved by the web `einoApprovalBroker`, which creates the ordinary R2
+  approval row and polls `WaitApproval` until REST/WS decision, timeout, or
+  cancel; the same scan goroutine then calls `Runner.ResumeWithParams`.
+- `scan_session` opens the checkpoint backend per run and installs the broker
+  only in eino mode, so registry and callback approval never double-park a
+  call. `XALGORIX_ENGINE=legacy` restores the old loop and registry gate.
+- `checkpoint.go`, `checkpoint_file.go`, `checkpoint_pg.go` implement Eino's
+  `CheckPointStore` with PostgreSQL (`engine_checkpoints`, migration 0005) or
+  atomic files under `<dataDir>/_engine/checkpoints` when no DSN exists.
+- Remaining R4 gap: full golden scheduling parity and broader Verifier timing
+  evidence. The engine is live by default; `XALGORIX_ENGINE=legacy` is the
+  rollback until those gates are extended.
 
 ## Providers, LLM & auth — `internal/llm`, `internal/providers`, `internal/auth`
 
@@ -224,8 +437,11 @@ target + instruction
    → web: create scan instance (own goroutine + scanctx)
    → coordinator: recon → decompose hypotheses → parallel specialist agents
    → each agent: reason → tool call → observe (events stream over WebSocket live)
+   → ledger mutation: domain_journal.jsonl append + fsync, then ledger.json
    → reporting: gated + verified findings persisted to the scan record
    → storage: atomic scan.json per scan dir
+   → optional cold path: journal observer/reconciler → River → PostgreSQL
+   → search_info: bounded region/association/context reads (no verdict role)
    → report.go / internal/reporting: branded PDF on demand
    → notify.go: Discord/Telegram lifecycle + finding notifications
                  (completion summaries are opt-in)
@@ -239,6 +455,12 @@ target + instruction
   concurrent scans and parallel specialists are isolated.
 - Each scan record (metadata, events, findings) is a `scan.json` under its own
   scan directory in the data dir; finished records are immutable and cached.
+- Each scan also writes `domain_journal.jsonl` (durable domain audit) and
+  `ledger.json` (current hypothesis/evidence state). The journal is not the
+  state authority and is not reconstructed from best-effort telemetry.
+- PostgreSQL, when configured, stores InfoItem/edge/audit projections and sync
+  watermarks. It is a replica: `(scan_id, seq)` makes replay idempotent and a
+  reconciler fills gaps after crashes. No DSN means file-only mode.
 
 ## Configuration
 
@@ -252,6 +474,9 @@ Read from `~/.xalgorix.env` (and process env). Key variables:
 | `XALGORIX_BIND` | dashboard listen address, default `127.0.0.1` (set `0.0.0.0` to expose; port defaults to `9137`) |
 | `XALGORIX_PASSWORD` / `XALGORIX_PASSWORD_HASH` | dashboard auth |
 | `XALGORIX_DATA_DIR` | where scan records are stored |
+| `XALGORIX_DATABASE_URL` | optional PostgreSQL InfoItem/audit cold path; empty = file-only |
+| `XALGORIX_COLDPATH_RECONCILE_SECONDS` | journal-to-PostgreSQL gap reconcile interval, default 30 |
+| `XALGORIX_VOI_WEIGHT` | deterministic VOI ranking weight, clamped to `[0,0.30]`; default 0 |
 | `XALGORIX_MAX_ITERATIONS` / `_MAX_DURATION` / `_MAX_TOKENS` / `_MAX_TOOL_CALLS` | per-scan budgets |
 | `XALGORIX_MAX_NON_PROGRESS` | active seconds without validated assessment evidence; default 3600, 0 disables the clock |
 | `XALGORIX_MAX_INSTANCES` | authoritative concurrent scan capacity when set; otherwise capacity is derived from live RAM headroom |

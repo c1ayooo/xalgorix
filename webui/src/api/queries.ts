@@ -1,6 +1,12 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "./client";
-import type { ListParams, ScanRequest, ScanSchedule } from "@/types/api";
+import type {
+  ListParams,
+  ProjectRequest,
+  ScanRequest,
+  ScanSchedule,
+  TaskRequest,
+} from "@/types/api";
 
 export const qk = {
   authStatus: ["auth", "status"] as const,
@@ -33,6 +39,16 @@ export const qk = {
   findingsSummary: ["findings", "summary"] as const,
   // Flattened + deduped findings list, computed server-side in one walk.
   findingsList: ["findings", "list"] as const,
+  // R3: projects / tasks / runs / approvals. Tasks/runs/findings carry the
+  // projectId so switching projects re-keys every cache entry.
+  projects: ["projects"] as const,
+  tasks: (projectId: string) => ["projects", projectId, "tasks"] as const,
+  task: (id: string) => ["task", id] as const,
+  taskRuns: (id: string) => ["task", id, "runs"] as const,
+  taskFindings: (id: string) => ["task", id, "findings"] as const,
+  approvals: (filter: string, projectId?: string) =>
+    ["approvals", filter, projectId ?? "all"] as const,
+  approvalsSummary: ["approvals", "summary"] as const,
 };
 
 export function useAuthStatus() {
@@ -71,11 +87,24 @@ export function useScansList() {
 // in a single server-side walk. Replaces the per-scan getScan() fan-out the
 // findings page used to do (an N+1 that shipped every scan's full event log
 // to the browser just to render the findings table).
-export function useFindingsList() {
+export function useFindingsList(projectId?: string) {
   return useQuery({
-    queryKey: qk.findingsList,
-    queryFn: api.listFindings,
+    queryKey: ["findings", "list", projectId ?? "all"],
+    queryFn: () => api.listFindings(projectId),
     refetchInterval: 15000,
+    placeholderData: (prev) => prev,
+  });
+}
+
+// 服务端稳定计数（契约 §3.2 可选 project_id）。集中于此让 /overview 与
+// /findings 共享同一缓存条目并消掉两处裸 fetch（UI_DESIGN K-4）。
+export function useFindingsSummary(projectId?: string) {
+  return useQuery({
+    queryKey: ["findings", "summary", projectId ?? "all"],
+    queryFn: () => api.findingsSummary(projectId),
+    refetchInterval: 10_000,
+    staleTime: 5_000,
+    placeholderData: (prev) => prev,
   });
 }
 
@@ -118,11 +147,13 @@ export function useScan(id?: string) {
   });
 }
 
-export function useInstances() {
+export function useInstances(projectId?: string) {
   return useQuery({
-    queryKey: qk.instances,
-    queryFn: api.instances,
+    // 项目作用域 key（["instances"] 前缀失效仍命中全部作用域）。
+    queryKey: ["instances", projectId ?? "all"],
+    queryFn: () => api.instances(projectId),
     refetchInterval: 8000,
+    placeholderData: (prev) => prev,
   });
 }
 
@@ -208,8 +239,12 @@ export function useStopAll() {
 export function useStopInstance() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (id: string) => api.stopInstance(id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: qk.instances }),
+    mutationFn: ({ id, reason }: { id: string; reason?: string }) =>
+      api.stopInstance(id, reason),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: qk.instances });
+      qc.invalidateQueries({ queryKey: ["instances"] });
+    },
   });
 }
 
@@ -515,6 +550,239 @@ export function useDeleteAuthProfile() {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: qk.authProfiles });
       qc.invalidateQueries({ queryKey: qk.llmSettings });
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// R3: projects / tasks / runs / approvals hooks.
+//
+// 这些端点在后端 R1/R2 落地前会 404：查询统一 retry:false，让页面立刻
+// 进入 ErrorState 而不是退避重试刷屏。审批单轮询自适应：有待审单 5s，
+// 无单 30s —— OpsPulse 倒计时的实时性只花在有单时的成本上。
+// ---------------------------------------------------------------------------
+
+export function useProjects() {
+  return useQuery({
+    queryKey: qk.projects,
+    queryFn: api.listProjects,
+    retry: false,
+    refetchInterval: 15000,
+  });
+}
+
+export function useCreateProject() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: api.createProject,
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.projects }),
+  });
+}
+
+export function useUpdateProject() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      id,
+      req,
+    }: {
+      id: string;
+      req: Partial<{ name: string; scope: ProjectRequest["scope"]; archived: boolean }>;
+    }) => api.updateProject(id, req),
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.projects }),
+  });
+}
+
+export function useDeleteProject() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: api.deleteProject,
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.projects }),
+  });
+}
+
+export function useTasks(projectId?: string) {
+  return useQuery({
+    queryKey: projectId ? qk.tasks(projectId) : ["projects", "none", "tasks"],
+    queryFn: () => api.listTasks(projectId!),
+    enabled: !!projectId,
+    retry: false,
+    refetchInterval: 15000,
+    placeholderData: (prev) => prev,
+  });
+}
+
+export function useTask(id?: string) {
+  return useQuery({
+    queryKey: id ? qk.task(id) : ["task", "none"],
+    queryFn: () => api.getTask(id!),
+    enabled: !!id,
+    retry: false,
+    refetchInterval: 10000,
+  });
+}
+
+export function useCreateTask() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ projectId, req }: { projectId: string; req: TaskRequest }) =>
+      api.createTask(projectId, req),
+    onSuccess: (_data, vars) =>
+      qc.invalidateQueries({ queryKey: qk.tasks(vars.projectId) }),
+  });
+}
+
+export function useUpdateTask() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, req }: { id: string; req: Partial<TaskRequest> }) =>
+      api.updateTask(id, req),
+    onSuccess: (_data, vars) => {
+      qc.invalidateQueries({ queryKey: ["task", vars.id] });
+      qc.invalidateQueries({ queryKey: ["projects"] });
+    },
+  });
+}
+
+export function useDeleteTask() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: api.deleteTask,
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["projects"] });
+    },
+  });
+}
+
+export function useStartTaskRun() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      id,
+      overrides,
+    }: { id: string; overrides?: Partial<ScanRequest> }) =>
+      api.startTaskRun(id, overrides),
+    onSuccess: (_data, vars) => {
+      qc.invalidateQueries({ queryKey: ["projects"] });
+      qc.invalidateQueries({ queryKey: ["task", vars.id, "runs"] });
+      qc.invalidateQueries({ queryKey: ["task", vars.id] });
+      qc.invalidateQueries({ queryKey: qk.instances });
+      qc.invalidateQueries({ queryKey: qk.status });
+    },
+  });
+}
+
+export function useTaskRuns(id?: string) {
+  return useQuery({
+    queryKey: id ? qk.taskRuns(id) : ["task", "none", "runs"],
+    queryFn: () => api.taskRuns(id!),
+    enabled: !!id,
+    retry: false,
+    refetchInterval: 8000,
+    placeholderData: (prev) => prev,
+  });
+}
+
+export function useTaskFindings(id?: string) {
+  return useQuery({
+    queryKey: id ? qk.taskFindings(id) : ["task", "none", "findings"],
+    queryFn: () => api.taskFindings(id!),
+    enabled: !!id,
+    retry: false,
+    refetchInterval: 15000,
+    placeholderData: (prev) => prev,
+  });
+}
+
+export function useApprovals(
+  opts: { status?: "pending" | "decided" | "all"; projectId?: string } = {},
+) {
+  const filter = opts.status ?? "pending";
+  return useQuery({
+    queryKey: qk.approvals(filter, opts.projectId),
+    queryFn: () => api.listApprovals(opts),
+    retry: false,
+    // 自适应轮询在组件层用 refetchInterval 函数表达：pending>0 → 5s。
+    refetchInterval: (query) => {
+      const data = query.state.data as
+        | { approvals: { status: string }[]; pending_total: number }
+        | undefined;
+      return data && data.pending_total > 0 ? 5000 : 30000;
+    },
+    placeholderData: (prev) => prev,
+  });
+}
+
+export function useApprovalsSummary() {
+  return useQuery({
+    queryKey: qk.approvalsSummary,
+    queryFn: api.approvalsSummary,
+    retry: false,
+    refetchInterval: (query) => {
+      const data = query.state.data;
+      return data && data.pending_total > 0 ? 5000 : 30000;
+    },
+  });
+}
+
+export function useDecideApproval() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      id,
+      decision,
+      reason,
+    }: { id: string; decision: "approved" | "rejected"; reason?: string }) =>
+      api.decideApproval(id, decision, reason),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["approvals"] });
+    },
+  });
+}
+
+export function useBatchDecideApprovals() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      ids,
+      decision,
+      reason,
+    }: { ids: string[]; decision: "approved" | "rejected"; reason?: string }) =>
+      api.batchDecideApprovals(ids, decision, reason),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["approvals"] });
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Guidance：人工在环插入意图（契约 §3.1）。4zreco 模式：发送即同步接受，
+// 无乐观回显——列表从服务端 refetch 渲染；request_id 幂等由调用方生成并持有。
+// ---------------------------------------------------------------------------
+
+export function useTaskGuidance(id?: string) {
+  return useQuery({
+    queryKey: id ? ["task", id, "guidance"] : ["task", "none", "guidance"],
+    queryFn: () => api.taskGuidance(id!),
+    enabled: !!id,
+    retry: false,
+    refetchInterval: 8000,
+    placeholderData: (prev) => prev,
+  });
+}
+
+export function useSendTaskGuidance() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      id,
+      message,
+      requestId,
+      instanceId,
+    }: { id: string; message: string; requestId: string; instanceId?: string }) =>
+      api.sendTaskGuidance(id, message, requestId, instanceId),
+    onSuccess: (_data, vars) => {
+      qc.invalidateQueries({ queryKey: ["task", vars.id, "guidance"] });
     },
   });
 }

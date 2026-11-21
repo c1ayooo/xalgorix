@@ -32,11 +32,14 @@ import { mergeFeedEvents, toFeedEvent, useWSStore } from "@/store/ws";
 import { api } from "@/api/client";
 import {
   qk,
+  useFindingsList,
+  useFindingsSummary,
   useInstances,
   useQueueStatus,
   useScansList,
   useStatus,
 } from "@/api/queries";
+import { useActiveProjectId } from "@/lib/use-active-project";
 import {
   normalizeSeverity,
   severityRank,
@@ -47,28 +50,12 @@ import {
 export default function OverviewPage() {
   const { t } = useI18n();
   const { data: status } = useStatus();
+  const projectId = useActiveProjectId();
   const { data: instances, isLoading: instancesLoading, error: instancesError } =
-    useInstances();
+    useInstances(projectId ?? undefined);
   const { data: scanList } = useScansList();
   const { data: queue } = useQueueStatus();
   const events = useWSStore((s) => s.events);
-  const scanDetailIds = useMemo(
-    () => (scanList ?? []).map((s) => s.id),
-    [scanList],
-  );
-  const scanDetailQueries = useQueries({
-    queries: scanDetailIds.map((id) => ({
-      queryKey: ["scan", id],
-      queryFn: () => api.getScan(id),
-      staleTime: 30_000,
-      // Retain the previous successful result while a refetch is in
-      // flight. Without this the reducer below would see `data ===
-      // undefined` for every query that re-enters `isFetching`, causing
-      // the totals widget to flicker as scans take turns refetching.
-      placeholderData: keepPreviousData,
-    })),
-  });
-
   const allInstances = instances?.instances ?? [];
   const runningInstances = allInstances.filter((i) => i.status === "running");
   const activeInstance = runningInstances[0];
@@ -101,55 +88,27 @@ export default function OverviewPage() {
     return mergeFeedEvents(persisted, events).slice(-80);
   }, [activeEventInstanceIds, eventHistoryQueries, events]);
 
+  // 项目作用域发现投影（契约 §3.2）：单一数据源，替代原 getScan N+1 fan-out
+  //（UI_DESIGN K-3）——同时消除全局扫描发现漏进当前项目视图的隔离破口。
+  const findingsQuery = useFindingsList(projectId ?? undefined);
   const aggregateVulns = useMemo(() => {
-    const map = new Map<string, { vuln: VulnSummary; instanceId: string }>();
-    const add = (v: VulnSummary, instanceId: string) => {
-      const key = v.id || `${instanceId}:${v.title}:${v.endpoint}:${v.severity}`;
-      if (!map.has(key)) map.set(key, { vuln: v, instanceId });
-    };
-    for (const inst of allInstances) {
-      for (const v of inst.vulns || []) {
-        add(v, inst.id);
-      }
-    }
-    for (const q of scanDetailQueries) {
-      const rec = q.data as ScanRecord | null | undefined;
-      // Skip ONLY on initial-load `undefined`. Once a scan has produced
-      // any data, `placeholderData: keepPreviousData` keeps `q.data`
-      // populated across refetches so the contribution does not drop to
-      // zero. An empty `vulns` array is a legitimate value and must not
-      // be treated as missing.
-      if (!rec) continue;
-      const vulns = rec.vulns ?? [];
-      for (const v of vulns) {
-        add(v, rec.instance_id || rec.id);
-      }
-    }
-    return Array.from(map.values());
-  }, [allInstances, scanDetailQueries]);
+    return (findingsQuery.data ?? []).map((f) => ({
+      vuln: f as VulnSummary,
+      instanceId: f.scan_id,
+    }));
+  }, [findingsQuery.data]);
 
   // Stable on-disk totals from /api/findings/summary. Polled every 10s
   // and used to drive the Overview totals widget so the count never
   // drops during refetch. Shared qk.findingsSummary key means
   // /findings reads the same cache entry.
-  const summary = useQuery<FindingsSummaryResponse>({
-    queryKey: qk.findingsSummary,
-    queryFn: async () => {
-      const res = await fetch("/api/findings/summary", {
-        credentials: "same-origin",
-        headers: { Accept: "application/json" },
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      return (await res.json()) as FindingsSummaryResponse;
-    },
-    refetchInterval: 10_000,
-    staleTime: 5_000,
-    placeholderData: keepPreviousData,
-  });
+  // 项目作用域汇总（契约 §3.2）；useFindingsSummary 内含 10s 轮询与占位数据。
+  const summary = useFindingsSummary(projectId ?? undefined);
 
+  // 回退计数：项目化实例的 vuln_count 合计（scanList 为全局口径，不再参与）。
   const scanListFindings = useMemo(
-    () => (scanList ?? []).reduce((sum, s) => sum + (s.vuln_count ?? 0), 0),
-    [scanList],
+    () => allInstances.reduce((sum, i) => sum + (i.vuln_count ?? 0), 0),
+    [allInstances],
   );
   // Prefer the stable on-disk total from /api/findings/summary when it
   // resolves; fall back to the in-memory tally on initial load so the
@@ -182,9 +141,7 @@ export default function OverviewPage() {
     return counts;
   }, [aggregateVulns]);
   const severityLoading =
-    totalFindings > 0 &&
-    aggregateVulns.length === 0 &&
-    scanDetailQueries.some((q) => q.isLoading || q.isFetching);
+    totalFindings > 0 && aggregateVulns.length === 0 && findingsQuery.isFetching;
 
   // ScanInstance.targets is a comma-separated string; trim each entry so we
   // collapse "a.com, b.com" and "a.com,b.com" to the same logical target.

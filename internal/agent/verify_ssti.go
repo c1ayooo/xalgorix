@@ -183,6 +183,7 @@ func (a *Agent) verifySSTITool(args map[string]string) (tools.Result, error) {
 		})
 		l.AddEvidence(h.ID, scanctx.Evidence{
 			Kind:       "exploit",
+			Nature:     scanctx.EvidenceObserved,
 			Summary:    confirm,
 			Request:    probeReqLine,
 			Response:   excerpt,

@@ -35,6 +35,7 @@ import (
 	"github.com/xalgord/xalgorix/v4/internal/auth"
 	"github.com/xalgord/xalgorix/v4/internal/config"
 	"github.com/xalgord/xalgorix/v4/internal/llm"
+	"github.com/xalgord/xalgorix/v4/internal/platform"
 	"github.com/xalgord/xalgorix/v4/internal/providers"
 	"github.com/xalgord/xalgorix/v4/internal/proxy"
 	"github.com/xalgord/xalgorix/v4/internal/resources"
@@ -411,6 +412,11 @@ type ScanRequest struct {
 	// The engine parses them into a seeded attack surface (real endpoints +
 	// params) and harvests any captured auth. Empty = crawl-only discovery.
 	ScanContext string `json:"scan_context"`
+	// ScanContextPaths is the internal multi-path form assembled by the task
+	// Run entry (task context_paths + the explicit scan_context above). It is
+	// never wire-settable; ScanContext remains the single-path compatibility
+	// field and mirrors the first entry.
+	ScanContextPaths []string `json:"-"`
 	// ProviderProfile is the optional "<provider>:<profileId>" key
 	// (e.g. "openai:default") that selects an Auth_Profile from
 	// Profile_Store for this scan. When set on a request from an
@@ -488,6 +494,13 @@ type WSEvent struct {
 	// duplicate / verifier_rejected / saved receipt ids) so audit consumers
 	// never have to parse prose to classify a report attempt's outcome.
 	ResultMeta map[string]any `json:"result_meta,omitempty"`
+	// Approval/Guidance carry the HITL payloads (R2a, API_CONTRACT §3/§3.1):
+	// approval_requested / approval_decided embed the full Approval row;
+	// guidance_injected / guidance_queued / guidance_consumed embed the
+	// Guidance. Emitted only from the web layer (gate service + handlers) —
+	// never synthesized by agents or tools (event flow is one-way).
+	Approval *platform.Approval `json:"approval,omitempty"`
+	Guidance *platform.Guidance `json:"guidance,omitempty"`
 }
 
 // VulnSummary is a simplified vulnerability for the UI.
@@ -825,6 +838,16 @@ var dashboardRoutes = []string{
 	"/api/auth/profiles/oauth/start",
 	"/api/auth/profiles/oauth/complete",
 	"/api/auth/profiles/",
+
+	// R1 platform surface (projects/tasks/runs, REDESIGN D6/D7).
+	"/api/projects",
+	"/api/projects/",
+	"/api/tasks/",
+
+	// R2a HITL approval surface (REDESIGN §5, API_CONTRACT §3). Guidance
+	// lives under the existing "/api/tasks/" prefix (contract §3.1).
+	"/api/approvals",
+	"/api/approvals/",
 }
 
 // Server is the web UI server.
@@ -882,7 +905,23 @@ type Server struct {
 	// arrived while it ran.
 	scanSummaryWalkMu      sync.Mutex
 	scanSummaryWalkRunning *scanSummaryWalk
-	scanSummaryWalkNext    *scanSummaryWalk
+	// coldPathSyncer reports the optional PostgreSQL cold-path watermark for
+	// the read-only audit/sync views (scan_audit.go). nil = cold path disabled,
+	// which the views must report as "disabled", never "failed" (§6.6).
+	coldPathSyncerMu sync.RWMutex
+	coldPathSyncer   ColdPathSyncer
+	// platformStore backs the optional project/task/run API (R1, REDESIGN
+	// D6/D7). nil = platform endpoints surface 503; scanning is unaffected
+	// (charter §6.6). Wired via SetPlatformStore.
+	platformStoreMu sync.RWMutex
+	platformStore   platform.Repository
+	// approvalSvc drives the HITL approval gate (R2a, REDESIGN §5) — policy,
+	// slot accounting, WS broadcasting. nil (mode off / not constructed)
+	// leaves registries ungated. Constructed in NewServer; replaceable via
+	// SetApprovalService.
+	approvalSvcMu       sync.RWMutex
+	approvalSvc         *ApprovalService
+	scanSummaryWalkNext *scanSummaryWalk
 	// scanSummaryWalkHook, when set, runs at the end of every summary walk,
 	// before its results are shared. Tests use it to count and pace walks.
 	scanSummaryWalkHook func()
@@ -1021,6 +1060,12 @@ func NewServer(cfg *config.Config, port int) *Server {
 		return client.Chat(messages)
 	}
 
+	// HITL approval gate service (R2a, REDESIGN §5): policy comes from
+	// config (XALGORIX_APPROVAL_*), the store is read at call time so the
+	// PG/file mode chosen at startup is honored. mode=off (the default)
+	// keeps every registry ungated — byte-identical legacy behavior.
+	srv.approvalSvc = newApprovalService(srv)
+
 	// Import legacy data dir (pre-migration ~/xalgorix-data/) into the
 	// active dataDir on first start. Idempotent (sentinel-gated) and
 	// non-fatal — failures are logged and the server still starts. Must
@@ -1139,6 +1184,13 @@ func queueResumeEntryKey(entry queueStateEntry) string {
 func (s *Server) Start() error {
 	s.initDataDir()
 
+	// R1 legacy import: mount existing scan records and schedules into the
+	// default project. Best-effort, idempotent, and asynchronous — it must
+	// never delay or block startup (charter §6.6 posture).
+	if s.currentPlatformStore() != nil {
+		go s.importLegacyPlatformRecords()
+	}
+
 	// Start the background scheduler
 	go s.startScheduler()
 
@@ -1228,6 +1280,19 @@ func (s *Server) Start() error {
 			s.handleScanEvents(w, r)
 			return
 		}
+		// GET /api/scans/{id}/audit — read-only domain audit projection (claim
+		// history, gaps/duplicates, explicit incomplete). Must be checked
+		// before the generic detail handler.
+		if strings.HasSuffix(r.URL.Path, "/audit") && r.Method == http.MethodGet {
+			s.handleScanAudit(w, r)
+			return
+		}
+		// GET /api/scans/{id}/coldpath — read-only cold-path sync state
+		// (pending/applied/gap/failed, "disabled" without a DSN).
+		if strings.HasSuffix(r.URL.Path, "/coldpath") && r.Method == http.MethodGet {
+			s.handleScanColdPath(w, r)
+			return
+		}
 		s.handleGetScan(w, r)
 	})
 	// DELETE /api/data-dirs/{name} — delete one top-level Scan_Folder under
@@ -1267,6 +1332,18 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/stop-notify", s.handleStopNotify)
 	mux.HandleFunc("/api/instances", s.handleInstances)
 	mux.HandleFunc("/api/instances/", s.handleInstanceAction)
+
+	// R1 platform routes (projects/tasks/runs). Same middleware stack as the
+	// rest of /api/* (auth + CSRF + rate limit) via the outer wrappers below.
+	mux.HandleFunc("/api/projects", s.handleProjects)
+	mux.HandleFunc("/api/projects/", s.handleProjectDetail)
+	mux.HandleFunc("/api/tasks/", s.handleTaskDetail)
+
+	// R2a HITL approval routes (REDESIGN §5, API_CONTRACT §3). Decision
+	// endpoints are state-changing and ride the same CSRF middleware as
+	// every other POST.
+	mux.HandleFunc("/api/approvals", s.handleApprovals)
+	mux.HandleFunc("/api/approvals/", s.handleApprovalDetail)
 
 	mux.HandleFunc("/api/chat", s.handleChat)
 
@@ -1487,6 +1564,7 @@ func (s *Server) Start() error {
 
 		// Stop all instances
 		s.instancesMu.RLock()
+		var signalStopped []string
 		for _, inst := range s.instances {
 			inst.mu.Lock()
 			if inst.Status == "running" {
@@ -1498,10 +1576,16 @@ func (s *Server) Start() error {
 				if inst.agent != nil {
 					inst.agent.Stop()
 				}
+				signalStopped = append(signalStopped, inst.ID)
 			}
 			inst.mu.Unlock()
 		}
 		s.instancesMu.RUnlock()
+		// Pending approvals of every signal-stopped run flip to cancelled
+		// (REDESIGN §5.3) — nothing may pend across a process shutdown.
+		for _, id := range signalStopped {
+			s.cancelPendingApprovalsForInstance(id, "process shutdown")
+		}
 
 		terminal.KillAllProcesses()
 
@@ -1971,7 +2055,17 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
-	s.stopReq.Store(true)
+	// NOTE: this user-facing "Stop All" deliberately does NOT set the global
+	// stopReq flag. stopReq means "the process is shutting down" (SIGTERM/
+	// SIGINT only) and is never cleared, so setting it here polluted every
+	// scan started afterwards: their queues stalled after the first target
+	// (shouldAdvanceQueueAfterTarget), sessions were finalized as
+	// "stopped/server_shutdown" instead of finished, and reports were skipped.
+	// The per-instance signal below (flip every live instance to stopped +
+	// cancel its context + clear persisted queue state) is the complete stop
+	// mechanism; the admission/target loops consult instanceInterrupted, not
+	// the global flag. A NEW instance started after Stop All therefore runs
+	// cleanly, which is the operator expectation.
 
 	// Cancel the current scan session context (interrupts LLM calls, tool execution)
 	s.mu.Lock()
@@ -2012,6 +2106,11 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 		inst.mu.Unlock()
 	}
 	s.instancesMu.Unlock()
+	// Pending approvals of every stopped run flip to cancelled (REDESIGN
+	// §5.3) so any tool call parked in the gate wakes immediately.
+	for _, inst := range stopped {
+		s.cancelPendingApprovalsForInstance(inst.ID, "run stopped by operator")
+	}
 	// Paused and rebuilt instances have no session left to write scan.json.
 	for _, inst := range stopped {
 		s.persistIdleInstanceStop(inst)
@@ -2237,6 +2336,13 @@ func (s *Server) handleFindingsSummary(w http.ResponseWriter, r *http.Request) {
 		"info":     0,
 	}
 
+	// §3.2 optional project filter: absent param → unchanged behavior.
+	projectMatch, projectFiltered, projErr := s.projectScanMatcher(r.Context(), r)
+	if projErr != nil {
+		writeProjectFilterError(w, projErr)
+		return
+	}
+
 	// Wrap the iteration in safe.Recover so a corrupt scan record cannot
 	// kill the handler. (defer + named recover keeps response writing in
 	// scope even when the walk panics.)
@@ -2244,6 +2350,9 @@ func (s *Server) handleFindingsSummary(w http.ResponseWriter, r *http.Request) {
 		defer safe.Recover("findings-summary", "")
 		seen := make(map[string]struct{})
 		for _, entry := range s.findAllScanSummaries() {
+			if projectFiltered && !projectMatch(entry.rec.InstanceID, entry.rec.ID) {
+				continue
+			}
 			for _, v := range entry.rec.Vulns {
 				key := dedupFindingKey(entry.rec.Target, v)
 				if _, dup := seen[key]; dup {
@@ -2319,9 +2428,19 @@ func severityRankValue(severity string) int {
 func (s *Server) handleFindingsList(w http.ResponseWriter, r *http.Request) {
 	deduped := make(map[string]flatFinding)
 
+	// §3.2 optional project filter: absent param → unchanged behavior.
+	projectMatch, projectFiltered, projErr := s.projectScanMatcher(r.Context(), r)
+	if projErr != nil {
+		writeProjectFilterError(w, projErr)
+		return
+	}
+
 	func() {
 		defer safe.Recover("findings-list", "")
 		for _, entry := range s.findAllScanSummaries() {
+			if projectFiltered && !projectMatch(entry.rec.InstanceID, entry.rec.ID) {
+				continue
+			}
 			rec := entry.rec
 			for _, v := range rec.Vulns {
 				key := dedupFindingKey(rec.Target, v)
@@ -2495,6 +2614,21 @@ func (s *Server) handleInstances(w http.ResponseWriter, r *http.Request) {
 	sort.Strings(modes)
 
 	// Optional server-side filtering (no-ops when the params are absent).
+	// §3.2 project_id first: absent param → unchanged behavior.
+	projectMatch, projectFiltered, projErr := s.projectScanMatcher(r.Context(), r)
+	if projErr != nil {
+		writeProjectFilterError(w, projErr)
+		return
+	}
+	if projectFiltered {
+		filtered := make([]*ScanInstance, 0, len(instances))
+		for _, inst := range instances {
+			if projectMatch(inst.ID, inst.ID) {
+				filtered = append(filtered, inst)
+			}
+		}
+		instances = filtered
+	}
 	if q := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("q"))); q != "" {
 		filtered := make([]*ScanInstance, 0, len(instances))
 		for _, inst := range instances {
@@ -2792,12 +2926,14 @@ func (s *Server) handleInstanceAction(w http.ResponseWriter, r *http.Request) {
 	// POST /api/instances/{id}/stop — stop specific instance
 	if len(parts) >= 2 && parts[1] == "stop" && r.Method == http.MethodPost {
 		inst.mu.Lock()
+		wasActive := false
 		// Queued scans are stoppable too, even before they acquire resources.
 		if inst.Status == "running" || inst.Status == "pending" || inst.Status == "paused" {
 			inst.Status = "stopped"
 			inst.StopReason = "user_stopped"
 			inst.FinishedAt = time.Now().Format(time.RFC3339Nano)
 			normalizeTerminalWildcardInstanceLocked(inst)
+			wasActive = true
 			if inst.cancel != nil {
 				inst.cancel()
 			}
@@ -2806,6 +2942,11 @@ func (s *Server) handleInstanceAction(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		inst.mu.Unlock()
+		// Pending approvals of this run flip to cancelled so the gate's
+		// waiting tool call wakes immediately (REDESIGN §5.3).
+		if wasActive {
+			s.cancelPendingApprovalsForInstance(instanceID, "run stopped by operator")
+		}
 
 		// Drop the persisted resume file now so the dashboard's queue counter
 		// clears immediately and the startup auto-resume never replays it. A
@@ -2975,6 +3116,11 @@ func (s *Server) handleInstanceAction(w http.ResponseWriter, r *http.Request) {
 		}
 		inst.mu.Unlock()
 
+		// Pausing cancels pending approvals (R2a decision): the paused run's
+		// gate waiters wake immediately and no approval lingers while the
+		// run sits idle. Resuming issues fresh approvals for new calls.
+		s.cancelPendingApprovalsForInstance(instanceID, "run paused")
+
 		s.broadcastToInstance(instanceID, WSEvent{Type: "paused", Content: "Scan paused by user"})
 		s.broadcastDashboard(WSEvent{Type: "instance_updated", Content: instanceID})
 		s.notifyAdmissionWake()
@@ -3134,7 +3280,8 @@ type scanSession struct {
 	targetAuth          string               // per-scan authenticated-scanning material (see ScanRequest.TargetAuth)
 	targetAuthB         string               // per-scan second account for IDOR/BOLA (see ScanRequest.TargetAuthSecondary)
 	sourceRepo          string               // per-scan whitebox source repo/path (see ScanRequest.SourceRepo)
-	scanContext         string               // per-scan attack-surface context path (see ScanRequest.ScanContext)
+	scanContext         string               // per-scan attack-surface context path (single-path compatibility)
+	scanContextPaths    []string             // task-level + request-level context paths (see ScanRequest.ScanContextPaths)
 	codeScanMode        agent.CodeScanMode   // code-first scan mode (see ScanRequest.CodeScan)
 	allowLoopbackPorts  []int                // per-scan loopback allowlist for provision scans (scope-guard exemption)
 
@@ -3232,6 +3379,12 @@ func (sess *scanSession) cleanup() {
 			// including findings hidden from live broadcasts by severity filters.
 			// This runs before runMultiScan publishes its terminal snapshot.
 			sess.server.mirrorPersistedSessionVulnerabilities(sess.instanceID, sess.record.Vulns)
+			// Root sessions own the task Run projection. Wildcard children share
+			// the parent instance ID and must not overwrite the parent's final
+			// finding set with their slice.
+			if sess.parentTarget == "" && !sess.discoveryMode {
+				sess.server.queueRunFindingProjection(sess.instanceID, sess.record)
+			}
 		}()
 
 		// Wildcard vuln accumulation: merge this session's vulns into
@@ -3722,7 +3875,9 @@ func (s *Server) handleGetScan(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 				if isChildOfScan(rec, &entry.rec) && s.safeToDeleteScanDir(entry.dir) {
-					_ = os.RemoveAll(entry.dir)
+					if err := os.RemoveAll(entry.dir); err == nil {
+						s.deletePlatformRunsForScan("", entry.rec.ID)
+					}
 				}
 			}
 		}
@@ -3745,11 +3900,13 @@ func (s *Server) handleGetScan(w http.ResponseWriter, r *http.Request) {
 			// consuming tokens after deletion (issue #239).
 			if inst := s.instances[id]; inst != nil {
 				inst.mu.Lock()
+				halted := false
 				if inst.Status == "running" || inst.Status == "pending" || inst.Status == "paused" {
 					inst.Status = "stopped"
 					inst.StopReason = "user_deleted"
 					inst.FinishedAt = time.Now().Format(time.RFC3339Nano)
 					normalizeTerminalWildcardInstanceLocked(inst)
+					halted = true
 				}
 				if inst.cancel != nil {
 					inst.cancel()
@@ -3758,6 +3915,9 @@ func (s *Server) handleGetScan(w http.ResponseWriter, r *http.Request) {
 					inst.agent.Stop()
 				}
 				inst.mu.Unlock()
+				if halted {
+					s.cancelPendingApprovalsForInstance(id, "run deleted")
+				}
 			}
 			// Remove the persisted resume file so the startup auto-resume
 			// goroutine never replays this queue (previously the only fix was
@@ -3766,6 +3926,16 @@ func (s *Server) handleGetScan(w http.ResponseWriter, r *http.Request) {
 			delete(s.instances, id)
 		}
 		s.instancesMu.Unlock()
+		// Purged scan history must not leave an orphan mount (or its finding
+		// projection). Wildcard children do not own a separate mount.
+		if rec == nil || rec.ParentTarget == "" {
+			instanceID, legacyScanID := scanID, scanID
+			if rec != nil {
+				instanceID = rec.InstanceID
+				legacyScanID = rec.ID
+			}
+			s.deletePlatformRunsForScan(instanceID, legacyScanID)
+		}
 		s.invalidateScanListCache()
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"status":"deleted"}`))

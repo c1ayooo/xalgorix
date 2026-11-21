@@ -1,10 +1,114 @@
 package tools
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
+
+// TestExecute_ResultErrorIsFailureForCircuitBreaker pins the Error/Success
+// contract: a tool that reports failure through Result.Error with a nil Go
+// error must be treated as a failure — Success stays false and the circuit
+// breaker records the failure — instead of resetting its own failure count
+// via RecordSuccess and reporting Success=true. Without this, a persistently
+// failing tool can never trip the breaker.
+func TestExecute_ResultErrorIsFailureForCircuitBreaker(t *testing.T) {
+	r := NewRegistry()
+	r.Register(&Tool{
+		Name: "soft-fail",
+		Execute: func(args map[string]string) (Result, error) {
+			return Result{Output: "partial", Error: "disk write failed"}, nil
+		},
+	})
+
+	res, err := r.Execute("soft-fail", nil)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if res.Success {
+		t.Error("Result.Error must imply Success=false")
+	}
+	if res.Error != "disk write failed" {
+		t.Errorf("error text lost: %q", res.Error)
+	}
+	if res.Output != "partial" {
+		t.Errorf("output lost: %q", res.Output)
+	}
+	if got := r.circuitBreaker.failures["soft-fail"]; got != 1 {
+		t.Errorf("circuit breaker failures = %d, want 1 (Result.Error is a failure)", got)
+	}
+	if r.circuitBreaker.IsOpen("soft-fail") {
+		t.Error("circuit must stay closed after a single failure")
+	}
+}
+
+// TestExecute_CircuitBreakerOpensOnConsecutiveResultErrors verifies the
+// breaker opens once the failure limit is reached via Result.Error-only
+// failures, and that a genuine success resets the count.
+func TestExecute_CircuitBreakerOpensOnConsecutiveResultErrors(t *testing.T) {
+	r := NewRegistry()
+	fail := true
+	r.Register(&Tool{
+		Name: "flaky",
+		Execute: func(args map[string]string) (Result, error) {
+			if fail {
+				return Result{Error: "boom"}, nil
+			}
+			return Result{Output: "ok"}, nil
+		},
+	})
+
+	for i := 0; i < 5; i++ {
+		res, err := r.Execute("flaky", nil)
+		if err != nil {
+			t.Fatalf("execute: %v", err)
+		}
+		if res.Success {
+			t.Fatalf("attempt %d: Result.Error must imply Success=false", i+1)
+		}
+	}
+	if !r.circuitBreaker.IsOpen("flaky") {
+		t.Error("circuit must open after the failure limit of Result.Error failures")
+	}
+
+	// Recovery window passes → retry allowed; success resets the count.
+	r.circuitBreaker.lastFailure["flaky"] = r.circuitBreaker.lastFailure["flaky"].Add(-2 * time.Minute)
+	fail = false
+	res, err := r.Execute("flaky", nil)
+	if err != nil {
+		t.Fatalf("execute after recovery: %v", err)
+	}
+	if !res.Success || res.Error != "" {
+		t.Errorf("recovered call must be a clean success, got %+v", res)
+	}
+	if got := r.circuitBreaker.failures["flaky"]; got != 0 {
+		t.Errorf("success must reset failure count, got %d", got)
+	}
+}
+
+// TestExecute_GoErrorRemainsFailure keeps the pre-existing behavior intact:
+// a tool returning a non-nil error is still a recorded failure with Success=false.
+func TestExecute_GoErrorRemainsFailure(t *testing.T) {
+	r := NewRegistry()
+	r.Register(&Tool{
+		Name: "hard-fail",
+		Execute: func(args map[string]string) (Result, error) {
+			return Result{}, fmt.Errorf("hard crash")
+		},
+	})
+	res, err := r.Execute("hard-fail", nil)
+	if err != nil {
+		t.Fatalf("execute must swallow tool errors into the result: %v", err)
+	}
+	if res.Success || res.Error != "hard crash" {
+		t.Errorf("got %+v, want Success=false with error text", res)
+	}
+	if got := r.circuitBreaker.failures["hard-fail"]; got != 1 {
+		t.Errorf("circuit breaker failures = %d, want 1", got)
+	}
+}
 
 // TestExecute_DoesNotMutateCallerArgs verifies the defensive-copy fix:
 // callers (e.g. the agent's tool-call logger) hand a map to Execute and

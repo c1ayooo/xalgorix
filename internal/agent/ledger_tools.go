@@ -19,6 +19,12 @@
 //     blocked/exhausted), assign an owner, set the next-best action, or record
 //     an exploit attempt.
 //   - read_ledger: read the current hypotheses (all / schedulable / open).
+//     The schedulable listing carries an output-only same-endpoint cross-scan
+//     history note per entry when the optional cold-path reader is available
+//     (M4 region consumer, see ledger_cross_scan.go), and claim_next_hypothesis
+//     appends a same-subject cross-scan history section after a successful
+//     claim (M4 association consumer). Both degrade to the unchanged output
+//     when the reader is absent or a query fails.
 //
 // Like plan_tools.go, the tools are deliberately tolerant of malformed input —
 // they return a corrective tool result rather than erroring out of the loop.
@@ -27,6 +33,7 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 
@@ -43,7 +50,7 @@ func (a *Agent) ledger() *scanctx.LedgerStore {
 	return a.scanCtx.Ledger
 }
 
-// registerLedgerTools adds the four ledger tools. The agent is captured by
+// registerLedgerTools adds the five ledger tools. The agent is captured by
 // closure so the tools operate on the shared ScanContext ledger.
 func (a *Agent) registerLedgerTools(reg *tools.Registry) {
 	reg.Register(&tools.Tool{
@@ -65,9 +72,10 @@ func (a *Agent) registerLedgerTools(reg *tools.Registry) {
 			{Name: "data_flow", Description: "For whitebox: source->sink path, e.g. 'req.query.id -> db.query'.", Required: false},
 			{Name: "required_privilege", Description: "Privilege needed to test (e.g. 'authenticated user').", Required: false},
 			{Name: "baseline", Description: "Control/baseline result that distinguishes a real bug from intended behavior.", Required: false},
-			{Name: "preconditions", Description: "Preconditions before testing: a JSON array or a comma-separated list.", Required: false},
+			{Name: "preconditions", Description: "REQUIRED. Preconditions before testing as a JSON array or comma-separated list. If they are not known yet, pass [\"unknown\"]; never silently omit them.", Required: true},
 			{Name: "next_action", Description: "The next concrete step to attempt.", Required: false},
 			{Name: "confidence", Description: "0.0-1.0 belief this is exploitable (default 0.5).", Required: false},
+			{Name: "voi", Description: "Optional 0.0-1.0 information-decision value; used only as a bounded ranking weight, never as evidence.", Required: false},
 			{Name: "status", Description: "Optional initial status: queued (default), testing, blocked.", Required: false},
 		},
 		Execute: a.recordHypothesisTool,
@@ -83,7 +91,9 @@ func (a *Agent) registerLedgerTools(reg *tools.Registry) {
 		Parameters: []tools.Parameter{
 			{Name: "hypothesis_id", Description: "The hypothesis id from record_hypothesis (e.g. H-3).", Required: true},
 			{Name: "kind", Description: "One of: baseline, probe, exploit, artifact, finding_ref.", Required: false},
-			{Name: "summary", Description: "What was observed and why it matters.", Required: true},
+			{Name: "nature", Description: "observed (raw request/response/tool output) or inferred (your interpretation; default). observed requires request or response.", Required: false},
+			{Name: "supports", Description: "For inferred evidence: JSON array or comma-separated Evidence IDs in this hypothesis that substantiate the inference.", Required: false},
+			{Name: "summary", Description: "What was observed and why it matters. Avoid presenting interpretation as raw observation.", Required: true},
 			{Name: "request", Description: "Optional raw request evidence (bounded).", Required: false},
 			{Name: "response", Description: "Optional raw response evidence (bounded).", Required: false},
 			{Name: "finding_id", Description: "When kind=finding_ref, the reported finding id (e.g. XALG-3).", Required: false},
@@ -105,6 +115,7 @@ func (a *Agent) registerLedgerTools(reg *tools.Registry) {
 			{Name: "next_action", Description: "The next concrete step to attempt.", Required: false},
 			{Name: "assigned_to", Description: "Owner (agent/delegation id) taking this hypothesis.", Required: false},
 			{Name: "record_attempt", Description: "Set to true to increment the exploit-attempt counter.", Required: false},
+			{Name: "voi", Description: "Optional 0.0-1.0 information-decision value for deterministic ranking.", Required: false},
 		},
 		Execute: a.updateHypothesisTool,
 	})
@@ -152,6 +163,14 @@ func (a *Agent) recordHypothesisTool(args map[string]string) (tools.Result, erro
 			conf = f
 		}
 	}
+	voi, voiEstimated, err := parseVOIArg(args["voi"])
+	if err != nil {
+		return tools.Result{Error: err.Error()}, nil
+	}
+	preconditions := parsePreconditions(args["preconditions"])
+	if len(preconditions) == 0 {
+		return tools.Result{Error: "preconditions is required. Pass the concrete prerequisites as a JSON array, or [\"unknown\"] when they are not yet known."}, nil
+	}
 	h := scanctx.Hypothesis{
 		VulnClass:         vc,
 		Endpoint:          strings.TrimSpace(args["endpoint"]),
@@ -163,14 +182,20 @@ func (a *Agent) recordHypothesisTool(args map[string]string) (tools.Result, erro
 		RequiredPrivilege: strings.TrimSpace(args["required_privilege"]),
 		Baseline:          strings.TrimSpace(args["baseline"]),
 		NextAction:        strings.TrimSpace(args["next_action"]),
-		Preconditions:     parsePreconditions(args["preconditions"]),
+		Preconditions:     preconditions,
 		Confidence:        conf,
+		VOI:               voi,
+		VOIEstimated:      voiEstimated,
 		Origin:            a.ledgerOrigin(),
 	}
 	if st := strings.TrimSpace(args["status"]); st != "" {
 		h.Status = scanctx.NormalizeHypothesisStatus(st)
 	}
-	stored := l.Upsert(h)
+	actor := scanctx.AuditActorForAgent(a.ledgerOrigin())
+	stored, err := l.UpsertAs(h, actor)
+	if err != nil {
+		return tools.Result{Error: "hypothesis audit/persistence failed: " + err.Error()}, nil
+	}
 	return tools.Result{
 		Output: fmt.Sprintf("Hypothesis %s recorded [%s] %s%s (confidence %.2f). Update it as you gather evidence.",
 			stored.ID, stored.Status, stored.VulnClass, formatLoc(stored), stored.Confidence),
@@ -211,8 +236,34 @@ func (a *Agent) addHypothesisEvidenceTool(args map[string]string) (tools.Result,
 			conf = f
 		}
 	}
+	nature := scanctx.NormalizeEvidenceNature(scanctx.EvidenceNature(strings.ToLower(strings.TrimSpace(args["nature"]))))
+	supports := parsePreconditions(args["supports"])
+	current, ok := l.Get(id)
+	if !ok {
+		return tools.Result{Error: fmt.Sprintf("unknown hypothesis id %q — call record_hypothesis first or read_ledger to list ids", id)}, nil
+	}
+	if nature == scanctx.EvidenceObserved {
+		if len(supports) > 0 {
+			return tools.Result{Error: "supports is only valid for inferred evidence; observed evidence must carry its own request/response"}, nil
+		}
+		if strings.TrimSpace(args["request"]) == "" && strings.TrimSpace(args["response"]) == "" {
+			return tools.Result{Error: "observed evidence requires at least one raw request or response field; use nature=inferred for an interpretation without raw data"}, nil
+		}
+	} else {
+		existing := make(map[string]bool, len(current.Evidence))
+		for _, prior := range current.Evidence {
+			existing[prior.ID] = true
+		}
+		for _, support := range supports {
+			if !existing[support] {
+				return tools.Result{Error: fmt.Sprintf("unknown support evidence %q for %s — use read_ledger to list existing Evidence IDs", support, id)}, nil
+			}
+		}
+	}
 	ev := scanctx.Evidence{
 		Kind:       kind,
+		Nature:     nature,
+		Supports:   supports,
 		Summary:    summary,
 		Request:    args["request"],
 		Response:   args["response"],
@@ -220,13 +271,15 @@ func (a *Agent) addHypothesisEvidenceTool(args map[string]string) (tools.Result,
 		AgentID:    a.ledgerOrigin(),
 		Confidence: conf,
 	}
-	if !l.AddEvidence(id, ev) {
-		return tools.Result{Error: fmt.Sprintf("unknown hypothesis id %q — call record_hypothesis first or read_ledger to list ids", id)}, nil
+	if err := l.AddEvidenceAs(id, ev, scanctx.AuditActorForAgent(a.ledgerOrigin())); err != nil {
+		return tools.Result{Error: "evidence audit/persistence failed: " + err.Error()}, nil
 	}
 	got, _ := l.Get(id)
-	return tools.Result{
-		Output: fmt.Sprintf("Evidence added to %s (%d total, confidence now %.2f).", id, len(got.Evidence), got.Confidence),
-	}, nil
+	summaryOut := fmt.Sprintf("Evidence added to %s (%d total, nature=%s, confidence now %.2f).", id, len(got.Evidence), nature, got.Confidence)
+	if nature == scanctx.EvidenceInferred && len(supports) == 0 {
+		summaryOut += " It is unsubstantiated and cannot be used as proof until supporting Evidence IDs are linked."
+	}
+	return tools.Result{Output: summaryOut}, nil
 }
 
 func (a *Agent) updateHypothesisTool(args map[string]string) (tools.Result, error) {
@@ -241,28 +294,47 @@ func (a *Agent) updateHypothesisTool(args map[string]string) (tools.Result, erro
 	if _, ok := l.Get(id); !ok {
 		return tools.Result{Error: fmt.Sprintf("unknown hypothesis id %q — use read_ledger to list ids", id)}, nil
 	}
+	actor := scanctx.AuditActorForAgent(a.ledgerOrigin())
 	var applied []string
 	if st := strings.TrimSpace(args["status"]); st != "" {
 		status := scanctx.NormalizeHypothesisStatus(st)
-		l.SetStatus(id, status, strings.TrimSpace(args["next_action"]))
+		if err := l.SetStatusAs(id, status, strings.TrimSpace(args["next_action"]), actor); err != nil {
+			return tools.Result{Error: "status audit/persistence failed: " + err.Error()}, nil
+		}
 		applied = append(applied, "status="+string(status))
 	} else if na := strings.TrimSpace(args["next_action"]); na != "" {
 		// next_action without a status change still updates the field.
 		if cur, ok := l.Get(id); ok {
-			l.SetStatus(id, cur.Status, na)
+			if err := l.SetStatusAs(id, cur.Status, na, actor); err != nil {
+				return tools.Result{Error: "next_action audit/persistence failed: " + err.Error()}, nil
+			}
 			applied = append(applied, "next_action")
 		}
 	}
 	if owner := strings.TrimSpace(args["assigned_to"]); owner != "" {
-		l.Assign(id, owner)
+		if err := l.AssignAs(id, owner, actor); err != nil {
+			return tools.Result{Error: "assignment audit/persistence failed: " + err.Error()}, nil
+		}
 		applied = append(applied, "assigned_to="+owner)
 	}
 	if isTrue(args["record_attempt"]) {
-		l.RecordAttempt(id)
+		if err := l.RecordAttemptAs(id, actor); err != nil {
+			return tools.Result{Error: "attempt audit/persistence failed: " + err.Error()}, nil
+		}
 		applied = append(applied, "attempt+1")
 	}
+	if raw := strings.TrimSpace(args["voi"]); raw != "" {
+		voi, estimated, err := parseVOIArg(raw)
+		if err != nil {
+			return tools.Result{Error: err.Error()}, nil
+		}
+		if err := l.SetVOIAs(id, voi, estimated, actor); err != nil {
+			return tools.Result{Error: "VOI audit/persistence failed: " + err.Error()}, nil
+		}
+		applied = append(applied, "voi")
+	}
 	if len(applied) == 0 {
-		return tools.Result{Error: "nothing to update — pass status, next_action, assigned_to, or record_attempt"}, nil
+		return tools.Result{Error: "nothing to update — pass status, next_action, assigned_to, record_attempt, or voi"}, nil
 	}
 	got, _ := l.Get(id)
 	return tools.Result{
@@ -294,12 +366,19 @@ func (a *Agent) readLedgerTool(args map[string]string) (tools.Result, error) {
 		}
 		var b strings.Builder
 		b.WriteString(fmt.Sprintf("Top %d hypotheses to work next (highest confidence first):\n", len(sched)))
+		// M4 region consumer (output-only): per-entry same-endpoint cross-scan
+		// history. nil cache (no cold-path reader) keeps the output unchanged.
+		regionNotes := newCrossScanRegionCache(a)
 		for _, h := range sched {
-			b.WriteString(fmt.Sprintf("• %s [%s] %s%s conf=%.2f", h.ID, h.Status, h.VulnClass, formatLoc(h), h.Confidence))
+			b.WriteString(fmt.Sprintf("• %s [%s] %s%s conf=%.2f pre=%s", h.ID, h.Status, h.VulnClass, formatLoc(h), h.Confidence, preconditionSummary(h)))
+			if h.VOIEstimated {
+				b.WriteString(fmt.Sprintf(" voi=%.2f", h.VOI))
+			}
 			if h.NextAction != "" {
 				b.WriteString(" → " + h.NextAction)
 			}
 			b.WriteString("\n")
+			regionNotes.writeTo(&b, h.Endpoint)
 		}
 		return tools.Result{Output: b.String()}, nil
 	case "all":
@@ -313,7 +392,11 @@ func (a *Agent) readLedgerTool(args map[string]string) (tools.Result, error) {
 			len(all), counts[scanctx.HypothesisQueued], counts[scanctx.HypothesisTesting], counts[scanctx.HypothesisProven],
 			counts[scanctx.HypothesisRejected], counts[scanctx.HypothesisBlocked], counts[scanctx.HypothesisExhausted]))
 		for _, h := range all {
-			b.WriteString(fmt.Sprintf("• %s [%s] %s%s conf=%.2f evidence=%d\n", h.ID, h.Status, h.VulnClass, formatLoc(h), h.Confidence, len(h.Evidence)))
+			b.WriteString(fmt.Sprintf("• %s [%s] %s%s conf=%.2f evidence=%d pre=%s\n", h.ID, h.Status, h.VulnClass, formatLoc(h), h.Confidence, len(h.Evidence), preconditionSummary(h)))
+			if h.VOIEstimated {
+				b.WriteString(fmt.Sprintf("    voi=%.2f estimated\n", h.VOI))
+			}
+			writeEvidenceRefs(&b, h.Evidence)
 		}
 		return tools.Result{Output: b.String()}, nil
 	default: // "open"
@@ -351,7 +434,10 @@ func (a *Agent) claimNextHypothesisTool(args map[string]string) (tools.Result, e
 	classFilter := strings.ToLower(strings.TrimSpace(args["vuln_class"]))
 
 	owner := a.ledgerOrigin()
-	got, claimed := l.ClaimNext(classFilter, owner)
+	got, claimed, claimErr := l.ClaimNextAs(classFilter, owner, scanctx.AuditActorForAgent(owner))
+	if claimErr != nil {
+		return tools.Result{Error: "claim audit/persistence failed: " + claimErr.Error()}, nil
+	}
 	if !claimed {
 		if classFilter != "" {
 			return tools.Result{Output: fmt.Sprintf("No queued %q hypotheses to claim. Use read_ledger(filter=schedulable) to see other classes, or record new ones from recon with record_hypothesis.", classFilter)}, nil
@@ -362,13 +448,25 @@ func (a *Agent) claimNextHypothesisTool(args map[string]string) (tools.Result, e
 	var b strings.Builder
 	fmt.Fprintf(&b, "Claimed %s — now [%s], owner %s: %s%s (confidence %.2f).\n",
 		got.ID, got.Status, owner, got.VulnClass, formatLoc(got), got.Confidence)
+	if got.VOIEstimated {
+		fmt.Fprintf(&b, "VOI estimate: %.2f\n", got.VOI)
+	}
 	if got.NextAction != "" {
 		fmt.Fprintf(&b, "Next action: %s\n", got.NextAction)
 	}
 	if got.Baseline != "" {
 		fmt.Fprintf(&b, "Baseline/control: %s\n", got.Baseline)
 	}
+	fmt.Fprintf(&b, "Preconditions: %s\n", preconditionSummary(got))
+	if len(got.Evidence) > 0 {
+		b.WriteString("Existing evidence (reference these IDs in supports when recording an inference):\n")
+		writeEvidenceRefs(&b, got.Evidence)
+	}
 	b.WriteString("Work this hypothesis, record evidence with add_hypothesis_evidence, then set its final status with update_hypothesis: proven (link the finding via kind=finding_ref) or rejected (with the baseline that ruled it out).")
+	// M4 association consumer (output-only): same-subject cross-scan history
+	// appended at the end. Reader absence or any query error keeps the output
+	// unchanged; claim semantics above are untouched.
+	a.appendCrossScanAssociationNote(&b, got)
 	return tools.Result{
 		Output:   b.String(),
 		Metadata: map[string]any{"hypothesis_id": got.ID, "vuln_class": got.VulnClass, "status": string(got.Status)},
@@ -400,6 +498,40 @@ func formatLoc(h scanctx.Hypothesis) string {
 		return ""
 	}
 	return " " + strings.Join(parts, " ")
+}
+
+func preconditionSummary(h scanctx.Hypothesis) string {
+	if len(h.Preconditions) == 0 {
+		return "unknown"
+	}
+	return strings.Join(h.Preconditions, "; ")
+}
+
+func writeEvidenceRefs(b *strings.Builder, evidence []scanctx.Evidence) {
+	for _, ev := range evidence {
+		nature := scanctx.NormalizeEvidenceNature(ev.Nature)
+		fmt.Fprintf(b, "    - %s [%s/%s] %s", ev.ID, ev.Kind, nature, ev.Summary)
+		if len(ev.Supports) > 0 {
+			fmt.Fprintf(b, " supports=%s", strings.Join(ev.Supports, ","))
+		}
+		if len(ev.Supports) == 0 && nature == scanctx.EvidenceInferred && ev.Kind != scanctx.EvidenceFindingRef {
+			b.WriteString(" unsubstantiated")
+		}
+		b.WriteString("\n")
+	}
+}
+
+// parseVOIArg validates an optional bounded VOI estimate.
+func parseVOIArg(raw string) (float64, bool, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, false, nil
+	}
+	value, err := strconv.ParseFloat(raw, 64)
+	if err != nil || math.IsNaN(value) || math.IsInf(value, 0) || value < 0 || value > 1 {
+		return 0, false, fmt.Errorf("voi must be a number within [0,1]")
+	}
+	return value, true, nil
 }
 
 // parsePreconditions accepts either a JSON array or a comma-separated list.

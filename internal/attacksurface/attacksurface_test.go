@@ -460,3 +460,26 @@ func TestPostmanEnvironmentDetectionAndAuthRendering(t *testing.T) {
 		t.Fatalf("basic auth not rendered: %q %q (want %q)", name, val, want)
 	}
 }
+
+func TestLoadFromPathsMergesAllUploads(t *testing.T) {
+	first := t.TempDir()
+	second := t.TempDir()
+	if err := os.WriteFile(filepath.Join(first, "a.yaml"), []byte(
+		"openapi: 3.0.1\npaths:\n  /one:\n    get: {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(second, "b.yaml"), []byte(
+		"openapi: 3.0.1\npaths:\n  /two:\n    post: {}\n  /one:\n    get: {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	res, err := LoadFromPaths([]string{first, second, first})
+	if err != nil {
+		t.Fatalf("LoadFromPaths: %v", err)
+	}
+	if findEndpoint(res, "GET", "/one") == nil || findEndpoint(res, "POST", "/two") == nil {
+		t.Fatalf("multi-path merge lost endpoints: %+v", res.Endpoints)
+	}
+	if len(res.Endpoints) != 2 {
+		t.Fatalf("duplicate endpoint not deduped across paths: %+v", res.Endpoints)
+	}
+}

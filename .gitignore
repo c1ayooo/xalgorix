@@ -74,3 +74,6 @@ webui/.turbo/
 .kiro/
 node_modules
 research/
+
+# AI tool local working dirs (same class as .kiro/)
+.codebuddy/

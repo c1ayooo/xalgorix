@@ -307,7 +307,7 @@ export default function ScanDetailPage() {
             <Button
               variant="outline"
               size="sm"
-              onClick={() => stop.mutate(scan.instance_id || scan.id)}
+              onClick={() => stop.mutate({ id: scan.instance_id || scan.id })}
               disabled={stop.isPending}
             >
               <X className="mr-1 h-4 w-4" /> Stop

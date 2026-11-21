@@ -114,6 +114,7 @@ func (a *Agent) verifyPathTraversalTool(args map[string]string) (tools.Result, e
 		})
 		l.AddEvidence(h.ID, scanctx.Evidence{
 			Kind:       "exploit",
+			Nature:     scanctx.EvidenceObserved,
 			Summary:    confirm,
 			Request:    "GET " + probeURL,
 			Response:   excerpt,

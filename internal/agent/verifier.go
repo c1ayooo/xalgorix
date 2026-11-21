@@ -20,6 +20,8 @@
 package agent
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -41,8 +43,12 @@ const (
 	// confirmation pass, not a second full scan. The previous 24-turn/10-minute
 	// budget could consume most of a provider window for one report.
 	verifierMaxTurns = 8
-	verifierDeadline = 3 * time.Minute
 )
+
+// verifierDeadline bounds the whole verification pass: 3 minutes, safely
+// under report_vulnerability's 15-minute tool watchdog. A var so tests can
+// shorten it; production callers never change it.
+var verifierDeadline = 3 * time.Minute
 
 // verifyFinding is the FindingVerifier installed into the reporting package.
 // It builds a restricted, read-only registry and runs a bounded adversarial
@@ -56,6 +62,13 @@ func (a *Agent) verifyFinding(req reporting.VerificationRequest) reporting.Verif
 	}
 
 	// Restricted, read-only tool registry — no reporting, no agent spawning.
+	// Deliberately NO HITL approval gate (REDESIGN §5.2): the verifier runs
+	// inside report_vulnerability's gate pipeline while the main loop is
+	// blocked on it; an approval wait here would race the 15-minute tool
+	// watchdog on the shared LLM client and could wedge the report path
+	// (verifier.go header: the timing invariant depends on the main loop
+	// blocking inside report_vulnerability). Verifier re-tests are read-only
+	// by construction — the restricted tool surface IS the authorization.
 	vreg := tools.NewRegistry()
 	vreg.SetScanContextID(a.scanCtx.ID)
 	vreg.SetRequestGuard(a.checkHTTPHop)
@@ -116,6 +129,22 @@ func (a *Agent) verifyFinding(req reporting.VerificationRequest) reporting.Verif
 	a.client.SetTemperature(TempValidator)
 
 	deadline := time.Now().Add(verifierDeadline)
+
+	// Bind the deadline to the client's request context. The turn loop only
+	// checks the clock BETWEEN LLM calls, so without a request-scoped context
+	// a hung provider request runs unbounded past the verifier budget and
+	// races report_vulnerability's watchdog. The shared client's context is
+	// wired to a.ctx by Run/startSemanticWatchdog, and the main loop stays
+	// blocked inside report_vulnerability for the whole verification (the
+	// timing invariant in this file's header), so scoping it here cannot
+	// affect any concurrent caller. Restore on every exit path.
+	vctx, vcancel := context.WithDeadline(a.ctx, deadline)
+	a.client.SetContext(vctx)
+	defer func() {
+		a.client.SetContext(a.ctx)
+		vcancel()
+	}()
+
 	hasRetest := false
 	for turn := 0; turn < verifierMaxTurns && verdict == nil; turn++ {
 		if a.stopped.Load() {
@@ -137,6 +166,9 @@ func (a *Agent) verifyFinding(req reporting.VerificationRequest) reporting.Verif
 				a.recordTokenAttribution(usage, msgs, turn, scanctx.CategoryVerifier, retry+1)
 			}
 			if err != nil {
+				if errors.Is(err, context.DeadlineExceeded) {
+					return reporting.VerificationVerdict{Inconclusive: true, Reason: "verification exceeded time budget"}
+				}
 				return reporting.VerificationVerdict{Inconclusive: true, Reason: "verifier LLM error: " + err.Error()}
 			}
 		}

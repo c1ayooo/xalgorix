@@ -49,6 +49,10 @@ export interface WSEvent {
   sub_target_total?: number;
   parent_target?: string;
   current_phase?: number;
+  // HITL（契约 §3/§3.1）：approval_requested 事件携带完整审批单，
+  // guidance_* 事件携带人工意图记录。事件流据此渲染行内决策条。
+  approval?: Approval;
+  guidance?: Guidance;
 }
 
 export interface AssessmentOutcome {
@@ -602,4 +606,168 @@ export interface SettingsImportResult {
   llm_key_warnings?: string[];
   restart_required?: boolean;
   general_warnings?: string[];
+}
+
+// ---------------------------------------------------------------------------
+// Projects / Tasks / Runs / Approvals — R3 二开契约。
+// 形状以 docs/API_CONTRACT.md 为唯一权威；后端实现见 internal/platform（R1/R2）。
+// ---------------------------------------------------------------------------
+
+export interface ProjectScope {
+  targets: string[];
+  allow_ports?: number[];
+}
+
+export interface Project {
+  id: string;
+  name: string;
+  slug: string;
+  scope: ProjectScope;
+  created_at: string;
+  archived_at?: string;
+  task_count?: number;
+  active_runs?: number;
+}
+
+export interface TaskPhasePolicy {
+  phases?: number[];
+  severity_filter?: string[];
+  scan_mode?: "single" | "wildcard" | "dast";
+  intensity?: "active" | "passive";
+}
+
+export interface TaskSchedule {
+  interval: "hourly" | "daily" | "weekly" | "monthly";
+  time?: string; // "HH:MM"
+  timezone?: string; // IANA
+}
+
+export interface Task {
+  id: string;
+  project_id: string;
+  name: string;
+  goal: string;
+  instruction?: string;
+  phase_policy?: TaskPhasePolicy;
+  schedule?: TaskSchedule;
+  context_paths?: string[];
+  created_at: string;
+  updated_at?: string;
+  archived_at?: string;
+  run_count?: number;
+  last_run_at?: string;
+  last_run_status?: string;
+  finding_count?: number;
+}
+
+export interface Run {
+  id: string;
+  task_id: string;
+  legacy_scan_id?: string;
+  instance_id?: string;
+  mode: string;
+  status: string;
+  started_at?: string;
+  finished_at?: string;
+  vuln_count: number;
+  total_tokens: number;
+  trigger?: "manual" | "schedule" | "rerun";
+}
+
+/** 语境切片：审批单附带的场景化信息全景（宪章 §4 的第一个一等消费者）。 */
+export interface SliceFact {
+  content: string;
+  kind: "observed" | "inferred" | "human";
+  confidence?: number;
+}
+
+export interface ApprovalSlice {
+  subject?: string;
+  purpose?: string;
+  facts: SliceFact[];
+  contradiction_count?: number;
+}
+
+export interface ApprovalPayload {
+  // kind = command
+  command?: string;
+  workdir?: string;
+  // kind = http
+  method?: string;
+  url?: string;
+  headers?: Record<string, string>;
+  body_excerpt?: string;
+  // 命中高危判定的原因（规则名/特征），两种 kind 都可能有
+  reason?: string;
+}
+
+export type ApprovalStatus =
+  | "pending"
+  | "approved"
+  | "rejected"
+  | "timeout"
+  | "cancelled";
+
+export interface Approval {
+  id: string;
+  project_id: string;
+  project_name?: string;
+  task_id?: string;
+  task_name?: string;
+  run_id?: string;
+  instance_id?: string;
+  kind: "command" | "http";
+  payload: ApprovalPayload;
+  slice?: ApprovalSlice;
+  status: ApprovalStatus;
+  created_at: string;
+  deadline_at: string;
+  decided_at?: string;
+  decided_by?: string;
+  reason?: string;
+}
+
+export interface ApprovalsResponse {
+  approvals: Approval[];
+  /** 全项目待审批数（跨项目过滤不改变该总数），供 OpsPulse 显示。 */
+  pending_total: number;
+}
+
+export interface ApprovalsSummary {
+  pending_total: number;
+  nearest_deadline?: string;
+}
+
+export interface TaskRequest {
+  name: string;
+  goal: string;
+  instruction?: string;
+  phase_policy?: TaskPhasePolicy;
+  schedule?: TaskSchedule | null;
+}
+
+export interface ProjectRequest {
+  name: string;
+  scope: ProjectScope;
+}
+
+/** 人工在环插入意图（source=human 的 InfoItem；契约 §3.1）。 */
+export type GuidanceStatus = "injected" | "queued" | "consumed";
+
+export interface Guidance {
+  id: string;
+  task_id: string;
+  run_id?: string;
+  instance_id?: string;
+  message: string;
+  status: GuidanceStatus;
+  created_at: string;
+  consumed_at?: string;
+}
+
+export interface GuidanceSendResult {
+  status: "injected" | "queued";
+  guidance_id: string;
+  run_id?: string;
+  accepted?: boolean; // false = 重复 request_id（幂等命中）
 }

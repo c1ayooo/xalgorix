@@ -223,10 +223,46 @@ type Config struct {
 	Workspace      string // XALGORIX_WORKSPACE — workspace root dir
 	DataDir        string // Active per-installation data root. Defaults to ~/.xalgorix/data/. Override via XALGORIX_DATA_DIR.
 	WorkspaceRoot  string // Resolution root used by Filesystem_Tools when no Scan_Context.ScanDir is in effect. Equals DataDir.
-	legacyCWD      string // Captured os.Getwd() at config load time. Used only by the migration warning.
-	DisableBrowser bool   // XALGORIX_DISABLE_BROWSER
-	MaxIterations  int    // XALGORIX_MAX_ITERATIONS — 0 = unlimited
-	MinIterations  int    // XALGORIX_MIN_ITERATIONS — minimum testing floor (default 50)
+	// DatabaseURL enables the optional PostgreSQL InfoItem cold path. Empty
+	// means pure file mode; scanning must never require a database.
+	DatabaseURL string // XALGORIX_DATABASE_URL
+	// Engine selects the scan loop implementation: eino (default) or legacy.
+	// Unknown values are logged and fall back to legacy so a typo cannot
+	// silently change execution semantics. Set XALGORIX_ENGINE=legacy to roll
+	// back; the new engine is guarded by the checkpoint/approval wiring and the
+	// legacy path remains available byte-for-byte.
+	Engine string
+	// ColdPathReconcileSeconds controls how often the reconciler scans local
+	// domain journals for sequences that have not reached PostgreSQL.
+	ColdPathReconcileSeconds int // XALGORIX_COLDPATH_RECONCILE_SECONDS, default 30
+	// VOIWeight controls deterministic VOI ranking weight, clamped to [0,0.30].
+	// Zero preserves the pre-VOI confidence ordering.
+	VOIWeight float64 // XALGORIX_VOI_WEIGHT, default 0
+	legacyCWD string  // Captured os.Getwd() at config load time. Used only by the migration warning.
+
+	// HITL approval pipeline (REDESIGN §5 / D5).
+	//
+	// ApprovalMode defaults to "off": enforce is an operator choice, not a
+	// factory default — a headless scheduled scan would otherwise stall on
+	// every non-allowlisted command until someone answers (each pending
+	// approval parks its tool call for up to ApprovalTimeoutSeconds).
+	ApprovalMode string // XALGORIX_APPROVAL_MODE: off|enforce, default off
+	// ApprovalTimeoutSeconds is how long a pending approval waits before the
+	// server flips it to timeout (= rejection, D5). Keep it below the tool
+	// hard ceilings (browser_action 10m + 30s grace) or the agent's own tool
+	// timeout fires first and the approval verdict arrives too late to
+	// matter. XALGORIX_APPROVAL_TIMEOUT, default 600.
+	ApprovalTimeoutSeconds int // XALGORIX_APPROVAL_TIMEOUT, default 600
+	// ApprovalAllowlist appends read-only recon program names to the
+	// built-in allowlist (comma-separated; see internal/approval policy).
+	ApprovalAllowlist string // XALGORIX_APPROVAL_ALLOWLIST, default empty
+	// ApprovalMaxPending caps concurrently pending approvals per run
+	// (anti-storm, REDESIGN §5.3). Overflowing requests queue for a free
+	// slot instead of failing. XALGORIX_APPROVAL_MAX_PENDING, default 1.
+	ApprovalMaxPending int  // XALGORIX_APPROVAL_MAX_PENDING, default 1
+	DisableBrowser     bool // XALGORIX_DISABLE_BROWSER
+	MaxIterations      int  // XALGORIX_MAX_ITERATIONS — 0 = unlimited
+	MinIterations      int  // XALGORIX_MIN_ITERATIONS — minimum testing floor (default 50)
 	// IterationDelaySec optionally pauses (in seconds) between agent reasoning
 	// iterations to pace LLM request velocity and conserve provider rolling-window
 	// quotas. 0 = disabled (default). XALGORIX_ITERATION_DELAY.
@@ -547,10 +583,21 @@ func load() *Config {
 		GeminiSafetyThreshold: envOr("XALGORIX_GEMINI_SAFETY", "BLOCK_NONE"),
 
 		// Runtime
-		RuntimeBackend:          "native", // Always native in Go version
-		Workspace:               workspace,
-		DataDir:                 dataDir,
-		WorkspaceRoot:           dataDir,
+		RuntimeBackend:           "native", // Always native in Go version
+		Workspace:                workspace,
+		DataDir:                  dataDir,
+		WorkspaceRoot:            dataDir,
+		DatabaseURL:              envOr("XALGORIX_DATABASE_URL", ""),
+		ColdPathReconcileSeconds: envOrInt("XALGORIX_COLDPATH_RECONCILE_SECONDS", 30),
+		Engine:                   normalizeEngineMode(envOr("XALGORIX_ENGINE", "eino")),
+
+		// HITL approval pipeline (REDESIGN §5 / D5). Mode default "off":
+		// enforce requires an explicit operator choice (see struct comment).
+		ApprovalMode:            normalizeApprovalMode(envOr("XALGORIX_APPROVAL_MODE", "off")),
+		ApprovalTimeoutSeconds:  envOrInt("XALGORIX_APPROVAL_TIMEOUT", 600),
+		ApprovalAllowlist:       envOr("XALGORIX_APPROVAL_ALLOWLIST", ""),
+		ApprovalMaxPending:      envOrInt("XALGORIX_APPROVAL_MAX_PENDING", 1),
+		VOIWeight:               envOrFloat("XALGORIX_VOI_WEIGHT", 0),
 		legacyCWD:               cwd,
 		DisableBrowser:          envOrBool("XALGORIX_DISABLE_BROWSER", false),
 		MaxIterations:           envOrInt("XALGORIX_MAX_ITERATIONS", 0),
@@ -853,6 +900,38 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// normalizeApprovalMode clamps XALGORIX_APPROVAL_MODE onto off|enforce.
+// Unknown values fall back to off — approval is fail-open by configuration
+// mistake (REDESIGN §5: mode is an operator choice; a typo must not silently
+// park headless scans), while enforce semantics stay opt-in and explicit.
+// normalizeEngineMode clamps XALGORIX_ENGINE onto eino|legacy. The configured
+// default is eino; an unknown value is loudly downgraded to legacy so a typo
+// cannot activate the new engine silently. Operators can force the old path
+// with XALGORIX_ENGINE=legacy.
+func normalizeEngineMode(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "eino":
+		return "eino"
+	case "", "legacy":
+		return "legacy"
+	default:
+		log.Printf("[config] WARN unknown XALGORIX_ENGINE=%q; falling back to legacy", v)
+		return "legacy"
+	}
+}
+
+func normalizeApprovalMode(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "enforce":
+		return "enforce"
+	case "", "off":
+		return "off"
+	default:
+		log.Printf("[config] WARN unknown XALGORIX_APPROVAL_MODE=%q; falling back to off (enforce is opt-in and must be spelled exactly)", v)
+		return "off"
+	}
 }
 
 func envOrInt(key string, fallback int) int {

@@ -188,6 +188,7 @@ func (a *Agent) verifySQLiTool(args map[string]string) (tools.Result, error) {
 	})
 	l.AddEvidence(h.ID, scanctx.Evidence{
 		Kind:       "exploit",
+		Nature:     scanctx.EvidenceObserved,
 		Summary:    confirm,
 		Request:    brokenReqLine,
 		Response:   brokenExcerpt,

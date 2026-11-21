@@ -3,7 +3,11 @@ package agent
 
 import (
 	"context"
+
+	"github.com/cloudwego/eino/adk"
+
 	"fmt"
+	"github.com/xalgord/xalgorix/v4/internal/engine"
 	"log"
 	"os"
 	"os/exec"
@@ -204,9 +208,19 @@ type Agent struct {
 	// nativeToolCalling selects the OpenAI-style tool channel instead of the
 	// XML-in-text dialect. Resolved once at the start of Run from the operator
 	// flag plus the resolved endpoint, so it is stable for the whole scan.
-	nativeToolCalling          bool
-	nativeToolDefs             []llm.ToolDefinition
-	registry                   *tools.Registry
+	nativeToolCalling bool
+	nativeToolDefs    []llm.ToolDefinition
+	registry          *tools.Registry
+	// approvalGate is the HITL approval hook installed on the registry via
+	// WithApprovalGate (REDESIGN §5.2 R2). nil (default) = ungated. Child
+	// agents spawned through agentsgraph inherit it so delegated lanes go
+	// through the same obligation as the coordinator.
+	approvalGate tools.ApprovalGate
+	// einoCheckpointStore/einoApprovalBroker are set only when the operator
+	// explicitly selected the Eino engine. They remain nil on the legacy path.
+	einoCheckpointStore        adk.CheckPointStore
+	einoApprovalBroker         engine.ApprovalBroker
+	einoFinished               atomic.Bool
 	scanCtx                    *scanctx.ScanContext // per-session state (vulns, notes, terminal, browser)
 	messages                   []llm.Message
 	msgMu                      sync.Mutex
@@ -242,12 +256,13 @@ type Agent struct {
 	// be overridden PER SCAN via SetTargetAuth/SetSourceRepo before Run() so a
 	// multi-tenant host never shares one target's credentials/source with
 	// another target's scan.
-	targetAuth   string
-	targetAuthB  string // optional SECOND account, for horizontal IDOR/BOLA proof
-	sourceRepo   string
-	scanContext  string       // path to OpenAPI/HAR/Postman artifact(s) seeding the attack surface
-	codeScanMode CodeScanMode // code-first scan mode (source review / provision), see SetCodeScanMode
-	secretValues []string     // auth values to redact from emitted telemetry
+	targetAuth       string
+	targetAuthB      string // optional SECOND account, for horizontal IDOR/BOLA proof
+	sourceRepo       string
+	scanContext      string       // path to OpenAPI/HAR/Postman artifact(s) seeding the attack surface
+	scanContextPaths []string     // all task-level + request-level context paths (multi-upload)
+	codeScanMode     CodeScanMode // code-first scan mode (source review / provision), see SetCodeScanMode
+	secretValues     []string     // auth values to redact from emitted telemetry
 
 	// scanContextBriefing is built from scanContext in prepareScanEnvironment
 	// and injected as a high-priority user message at the start of Run.
@@ -323,6 +338,23 @@ func WithLLMClient(c *llm.Client) AgentOption {
 	return func(a *Agent) {
 		if c != nil {
 			a.client = c
+		}
+	}
+}
+
+// WithApprovalGate installs the HITL approval gate (REDESIGN §5.2 R2, the
+// "第 0.5 环") on the agent's tool registry, next to the SetRequestGuard/
+// SetDialGuard installation above. The gate runs at the very top of
+// registry.Execute and blocks until the operator decides, the deadline
+// elapses (timeout = rejection), or the scan context is cancelled. nil (the
+// default) leaves the registry ungated — the verifier's restricted registry
+// is deliberately never given one (verifier.go: a report-gate approval could
+// deadlock the 15-minute watchdog race on the shared LLM client).
+func WithApprovalGate(g tools.ApprovalGate) AgentOption {
+	return func(a *Agent) {
+		a.approvalGate = g
+		if a.registry != nil {
+			a.registry.SetApprovalGate(g)
 		}
 	}
 }
@@ -535,6 +567,10 @@ func NewAgent(cfg *config.Config, name string, events chan Event, localGuard sco
 	// it persists across restart/resume.
 	a.registerLedgerTools(reg)
 
+	// Read-only InfoItem activation over the optional PostgreSQL cold path.
+	// This tool never participates in verdict or finding acceptance.
+	a.registerInfoTools(reg)
+
 	// Register the multi-role authorization matrix (authz_matrix). It replays a
 	// request as role A / role B / anonymous and records the access-control
 	// differential to the ledger. Agent-bound because it needs both configured
@@ -659,8 +695,19 @@ func NewAgent(cfg *config.Config, name string, events chan Event, localGuard sco
 			for _, opt := range delegatedAgentOptions(ctx, a.agentGraph, a.scanBudget, agentID, a.benchmarkIsolated) {
 				subArgs = append(subArgs, opt)
 			}
+			// Specialists run the same engine as the coordinator. Their unique
+			// delegatedAgentID gives them a per-agent checkpoint namespace.
+			if a.einoCheckpointStore != nil {
+				subArgs = append(subArgs, WithEinoRuntime(a.einoCheckpointStore, a.einoApprovalBroker))
+			}
 			if a.client != nil {
 				subArgs = append(subArgs, WithLLMClient(a.client.Clone()))
+			}
+			// Delegated lanes inherit the HITL approval gate: a specialist
+			// running terminal/browser/HTTP tools carries the same operator
+			// obligation as the coordinator (REDESIGN §5.2).
+			if a.approvalGate != nil {
+				subArgs = append(subArgs, WithApprovalGate(a.approvalGate))
 			}
 			subAgent := NewAgent(cfg, subName, subEvents, a.localGuard, subArgs...)
 			a.registerChildAgent(subAgent)
@@ -1884,6 +1931,14 @@ func (a *Agent) Run(targets []string, instruction string) {
 	// Running total of tool calls, for the optional resource budget.
 	toolCallsTotal := 0
 
+	// R4: an explicit eino selection runs the ADK loop. Any construction error
+	// is reported as an aborted terminal outcome; it never silently falls back
+	// to legacy (that would hide a configuration/checkpoint failure).
+	if a.cfg != nil && strings.EqualFold(strings.TrimSpace(a.cfg.Engine), "eino") {
+		a.runEinoLoop(systemPrompt, tokenCount)
+		return
+	}
+
 	iter := a.initialIter
 	for ; (a.scanBudget != nil || a.maxIter == 0 || iter < a.maxIter) && !a.stopped.Load() && (a.ctx == nil || a.ctx.Err() == nil); iter++ {
 		// Reset activity watchdog on each iteration — IMMEDIATELY, no delay
@@ -2668,28 +2723,7 @@ func (a *Agent) Run(targets []string, instruction string) {
 					a.client.SetTemperature(TempValidator)
 					continue
 				}
-				content := result.Output
-				if !a.state.DelegatedAgent {
-					count := 0
-					if a.scanCtx != nil {
-						count = len(reporting.GetVulnerabilitiesForContext(a.scanCtx.ID))
-					}
-					content = authoritativeFinishSummary(content, count)
-					// ── Honest completion assessment ──
-					// The gates release a finish after the bounded rejection
-					// ceiling; that must never read as "full assessment
-					// completed". Compute the explicit terminal state, make it
-					// visible in the final summary, and emit one compact
-					// telemetry block for post-scan debugging.
-					status, reasons := settleCompletion(a.state)
-					if status != CompletionStatusCompleted {
-						content += "\n\n" + formatIncompleteSummary(status, reasons)
-					}
-					if summary := scanTelemetrySummary(a.state, status, reasons); summary != "" {
-						a.emit(Event{Type: "message", Content: summary, TotalTokens: tokenCount()})
-					}
-				}
-				a.emit(Event{Type: "finished", Content: content, TotalTokens: tokenCount()})
+				a.completeWithFinish(result.Output, tokenCount)
 				return
 			}
 
@@ -2769,6 +2803,34 @@ func (a *Agent) Run(targets []string, instruction string) {
 		finishReason = "Scan ended"
 	}
 	a.emit(Event{Type: "finished", Content: finishReason, TotalTokens: tokenCount(), Aborted: abortReason != "", AbortReason: abortReason, Resumable: abortReason == ""})
+}
+
+// completeWithFinish emits the terminal finish event with the same honest
+// completion assessment and telemetry used by the legacy loop. The Eino
+// observer calls it after an allowed finish tool; keeping one implementation
+// prevents the two engines from drifting.
+func (a *Agent) completeWithFinish(output string, tokenCount func() int) {
+	content := output
+	if !a.state.DelegatedAgent {
+		count := 0
+		if a.scanCtx != nil {
+			count = len(reporting.GetVulnerabilitiesForContext(a.scanCtx.ID))
+		}
+		content = authoritativeFinishSummary(content, count)
+		// ── Honest completion assessment ──
+		// The gates release a finish after the bounded rejection ceiling; that
+		// must never read as "full assessment completed". Compute the explicit
+		// terminal state and make it visible in the final summary.
+		status, reasons := settleCompletion(a.state)
+		if status != CompletionStatusCompleted {
+			content += "\n\n" + formatIncompleteSummary(status, reasons)
+		}
+		if summary := scanTelemetrySummary(a.state, status, reasons); summary != "" {
+			a.emit(Event{Type: "message", Content: summary, TotalTokens: tokenCount()})
+		}
+	}
+	a.einoFinished.Store(true)
+	a.emit(Event{Type: "finished", Content: content, TotalTokens: tokenCount()})
 }
 
 // Stop signals the agent to stop and kills all running processes.
@@ -2859,8 +2921,14 @@ func (a *Agent) emit(evt Event) {
 		}
 	}
 	if a.events != nil {
-		// Critical events (finished, error) must never be dropped — use blocking send with timeout
-		if evt.Type == "finished" || evt.Type == "error" {
+		// Critical events (finished, error) must never be dropped — use blocking send with timeout.
+		// tool_call/tool_result are the durable domain-audit substrate until
+		// dedicated audit records exist: they are what carries ledger claims,
+		// hypothesis status transitions and report outcomes into the per-scan
+		// events.jsonl journal, and a silently dropped claim event makes
+		// "who claimed what, when" unreconstructable. They get the same
+		// blocking send. Only narration/telemetry stays best-effort.
+		if evt.Type == "finished" || evt.Type == "error" || evt.Type == "tool_call" || evt.Type == "tool_result" {
 			if !safeSend(a.events, evt, 10*time.Second) {
 				log.Printf("⚠️ CRITICAL: Failed sending %s event (channel closed or full for 10s)", evt.Type)
 			}
@@ -2910,6 +2978,21 @@ func (a *Agent) redactSecrets(s string) string {
 		}
 	}
 	return s
+}
+
+// SecretValues returns a snapshot of the operator-supplied auth values
+// registered for redaction (targetAuth/targetAuthB headers, whitebox source
+// URL credentials, HAR-harvested auth — registered during
+// prepareScanEnvironment at Run start). The HITL approval gate binds this
+// accessor at scan-session wiring and applies the same by-value redaction to
+// approval payloads BEFORE they reach the store, the WS stream, and the API:
+// targetAuthB is designed for the model to send the second account's
+// credentials manually, and exactly that traffic is what approvals display.
+// A copy is returned; callers cannot mutate the registry.
+func (a *Agent) SecretValues() []string {
+	out := make([]string, len(a.secretValues))
+	copy(out, a.secretValues)
+	return out
 }
 
 // credentialsInURL extracts embedded clone credentials from a git/HTTP URL of
@@ -2983,7 +3066,33 @@ func (a *Agent) SetSourceRepo(s string) { a.sourceRepo = strings.TrimSpace(s) }
 
 // SetScanContext sets the per-scan context artifact path (OpenAPI/HAR/Postman
 // file or directory) used to seed the attack surface. Call before Run().
-func (a *Agent) SetScanContext(s string) { a.scanContext = strings.TrimSpace(s) }
+func (a *Agent) SetScanContext(s string) {
+	a.SetScanContexts([]string{s})
+}
+
+// SetScanContexts sets every context artifact path for this scan. Task-level
+// context_paths and an explicit request scan_context are additive; each path
+// may be a file or a directory of artifacts. Call before Run().
+func (a *Agent) SetScanContexts(paths []string) {
+	cleaned := make([]string, 0, len(paths))
+	seen := make(map[string]struct{}, len(paths))
+	for _, raw := range paths {
+		path := strings.TrimSpace(raw)
+		if path == "" {
+			continue
+		}
+		if _, dup := seen[path]; dup {
+			continue
+		}
+		seen[path] = struct{}{}
+		cleaned = append(cleaned, path)
+	}
+	a.scanContextPaths = cleaned
+	a.scanContext = ""
+	if len(cleaned) > 0 {
+		a.scanContext = cleaned[0]
+	}
+}
 
 // SetInitialIteration sets the starting iteration index for resumed runs. Call before Run().
 func (a *Agent) SetInitialIteration(iter int) {
@@ -3122,10 +3231,14 @@ func (a *Agent) prepareScanEnvironment() {
 	// Attack-surface seeding (OpenAPI / HAR / Postman). Parse the operator's
 	// context artifacts into a real endpoint surface + any captured auth, so the
 	// scan starts informed instead of blindly crawling.
-	if a.scanContext != "" && a.scanContextBriefing == "" {
-		if res, err := attacksurface.LoadFromPath(a.scanContext); err != nil {
+	contextPaths := a.scanContextPaths
+	if len(contextPaths) == 0 && a.scanContext != "" {
+		contextPaths = []string{a.scanContext}
+	}
+	if len(contextPaths) > 0 && a.scanContextBriefing == "" {
+		if res, err := attacksurface.LoadFromPaths(contextPaths); err != nil {
 			a.emit(Event{Type: "error", Content: "Scan context unavailable: " + err.Error() + " — continuing without seeded surface."})
-			log.Printf("[agent] scan context unavailable (%s): %v", a.scanContext, err)
+			log.Printf("[agent] scan context unavailable (%s): %v", strings.Join(contextPaths, ", "), err)
 		} else if res != nil {
 			a.scanContextBriefing = res.Briefing()
 			// Harvest auth captured in real requests (HAR/Postman) when the

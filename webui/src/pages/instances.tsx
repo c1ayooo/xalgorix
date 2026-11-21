@@ -391,7 +391,7 @@ function InstanceCard({ instance }: { instance: ScanInstance }) {
               size="sm"
               variant="outline"
               disabled={stop.isPending}
-              onClick={() => stop.mutate(instance.id)}
+              onClick={() => stop.mutate({ id: instance.id })}
             >
               <Square className="mr-1 h-3.5 w-3.5" /> Stop
             </Button>

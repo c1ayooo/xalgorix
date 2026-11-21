@@ -2,6 +2,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -16,7 +17,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/xalgord/xalgorix/v4/internal/coldpath"
 	"github.com/xalgord/xalgorix/v4/internal/config"
+	"github.com/xalgord/xalgorix/v4/internal/platform"
 	"github.com/xalgord/xalgorix/v4/internal/proxy"
 	"github.com/xalgord/xalgorix/v4/internal/resources"
 	"github.com/xalgord/xalgorix/v4/internal/scanheaders"
@@ -224,6 +227,66 @@ func main() {
 	cfg := config.Get()
 	resources.ProtectCurrentProcess()
 
+	// Optional PostgreSQL InfoItem cold path. An empty DSN leaves the scanner
+	// in pure-file mode; any startup failure is non-fatal and never gates a
+	// scan or the dashboard.
+	var coldSvc *coldpath.Service
+	if strings.TrimSpace(cfg.DatabaseURL) != "" {
+		svc, err := coldpath.New(context.Background(), coldpath.Config{
+			DSN:               cfg.DatabaseURL,
+			DataDir:           cfg.DataDir,
+			ReconcileInterval: time.Duration(cfg.ColdPathReconcileSeconds) * time.Second,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[coldpath] disabled after startup error: %v\n", err)
+		} else if svc.Enabled() {
+			if err := svc.Start(context.Background()); err != nil {
+				fmt.Fprintf(os.Stderr, "[coldpath] disabled after start error: %v\n", err)
+				stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				_ = svc.Stop(stopCtx)
+				cancel()
+			} else {
+				coldSvc = svc
+			}
+		}
+	}
+	if coldSvc != nil {
+		defer func() {
+			stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := coldSvc.Stop(stopCtx); err != nil {
+				log.Printf("[coldpath] shutdown warning: %v", err)
+			}
+		}()
+	}
+
+	// -------------------------------------------------------------------------
+	// R1 platform store (projects/tasks/runs, REDESIGN D6/D7). Same degradation
+	// posture as the cold path: with a DSN it owns its own clamped pgxpool and
+	// any startup failure logs to stderr and leaves the platform endpoints at
+	// 503; without a DSN the JSON snapshot file store keeps the API usable.
+	// Assembly must never block or gate a scan (charter §6.6).
+	// -------------------------------------------------------------------------
+	var platformStore platform.Repository
+	if strings.TrimSpace(cfg.DatabaseURL) != "" {
+		store, err := platform.Open(context.Background(), platform.Config{
+			DSN:     cfg.DatabaseURL,
+			DataDir: cfg.DataDir,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[platform] disabled after startup error: %v\n", err)
+		} else {
+			platformStore = store
+		}
+	} else {
+		store, err := platform.Open(context.Background(), platform.Config{DataDir: cfg.DataDir})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[platform] file store disabled: %v\n", err)
+		} else {
+			platformStore = store
+		}
+	}
+
 	// -------------------------------------------------------------------------
 	// Proxy initialisation — must run before any outbound HTTP requests.
 	// Reads XALGORIX_USE_PROXY, XALGORIX_PROXY_URL, XALGORIX_PROXY_FILE and
@@ -288,6 +351,15 @@ func main() {
 		web.StartDebugServerFromEnv()
 
 		srv := web.NewServer(cfg, port)
+		// Expose the cold-path watermark to the read-only audit/sync views.
+		// nil (no DSN / startup failure) keeps the views reporting "disabled".
+		if coldSvc != nil {
+			srv.SetColdPathSyncer(coldPathSyncAdapter{svc: coldSvc})
+		}
+		// Wire the platform store (nil keeps /api/projects|tasks at 503).
+		if platformStore != nil {
+			srv.SetPlatformStore(platformStore)
+		}
 		if err := srv.Start(); err != nil {
 			fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
 			os.Exit(1)
@@ -1139,4 +1211,25 @@ func installBinary(url, destPath string) error {
 
 	_ = os.Chmod(destPath, 0755) //nolint:gosec // G302: installed binary must be executable
 	return nil
+}
+
+// coldPathSyncAdapter adapts the optional cold path service to the web layer's
+// ColdPathSyncer interface. It only reads the durable watermark; the
+// pending/applied/gap/failed derivation lives in the web layer so it stays
+// contract-testable without a database (CORE v2.1 §6.4).
+type coldPathSyncAdapter struct {
+	svc *coldpath.Service
+}
+
+func (a coldPathSyncAdapter) SyncState(ctx context.Context, scanID string) (web.ColdPathPosition, error) {
+	wm, err := a.svc.Store().Watermark(ctx, scanID)
+	if err != nil {
+		return web.ColdPathPosition{}, err
+	}
+	return web.ColdPathPosition{
+		AppliedSeq: wm.AppliedSeq,
+		Status:     wm.Status,
+		LastError:  wm.LastError,
+		UpdatedAt:  wm.UpdatedAt,
+	}, nil
 }

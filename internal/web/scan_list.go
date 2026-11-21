@@ -41,6 +41,9 @@ type scanListItem struct {
 	SubScanCompleted int    `json:"sub_scan_completed,omitempty"`
 	SubScanRunning   int    `json:"sub_scan_running,omitempty"`
 	SubScanRemaining int    `json:"sub_scan_remaining,omitempty"`
+	// InstanceID carries the record's dispatch instance for the §3.2
+	// project_id filter. json:"-": the wire shape is unchanged.
+	InstanceID string `json:"-"`
 }
 
 // scanListCacheTTL bounds how long a built scan list is reused. Building the
@@ -101,6 +104,7 @@ func (s *Server) cachedScanList() []scanListItem {
 			SubScanCompleted: rec.SubScanCompleted,
 			SubScanRunning:   rec.SubScanRunning,
 			SubScanRemaining: rec.SubScanRemaining,
+			InstanceID:       rec.InstanceID,
 		})
 	}
 	// Sort newest first.
@@ -127,6 +131,21 @@ func (s *Server) handleListScans(w http.ResponseWriter, r *http.Request) {
 	// Optional server-side filtering. These are no-ops when the query params
 	// are absent, so the default GET /api/scans response is unchanged. Build
 	// new slices so the shared cache is never mutated.
+	// §3.2 project_id first: absent param → unchanged behavior.
+	projectMatch, projectFiltered, projErr := s.projectScanMatcher(r.Context(), r)
+	if projErr != nil {
+		writeProjectFilterError(w, projErr)
+		return
+	}
+	if projectFiltered {
+		filtered := make([]scanListItem, 0, len(scans))
+		for _, sc := range scans {
+			if projectMatch(sc.InstanceID, sc.ID) {
+				filtered = append(filtered, sc)
+			}
+		}
+		scans = filtered
+	}
 	if q := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("q"))); q != "" {
 		filtered := make([]scanListItem, 0, len(scans))
 		for _, sc := range scans {

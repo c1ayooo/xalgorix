@@ -15,6 +15,10 @@ import SettingsPage from "@/pages/settings"
 import LoginPage from "@/pages/login"
 import NotFoundPage from "@/pages/not-found"
 import SchedulesPage from "@/pages/schedules"
+import ProjectsPage from "@/pages/projects"
+import TasksPage from "@/pages/tasks"
+import TaskDetailPage from "@/pages/task-detail"
+import ApprovalsPage from "@/pages/approvals"
 
 function Root({ children }: { children: ReactNode }) {
   return <AuthBootstrap>{children}</AuthBootstrap>
@@ -40,6 +44,10 @@ const routes: RouteObject[] = [
     ),
     children: [
       { index: true, element: <OverviewPage /> },
+      { path: "projects", element: <ProjectsPage /> },
+      { path: "tasks", element: <TasksPage /> },
+      { path: "tasks/:taskId", element: <TaskDetailPage /> },
+      { path: "approvals", element: <ApprovalsPage /> },
       { path: "scans", element: <ScansPage /> },
       { path: "scans/new", element: <NewScanPage /> },
       { path: "scans/:scanId", element: <ScanDetailPage /> },

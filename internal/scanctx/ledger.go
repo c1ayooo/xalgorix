@@ -11,6 +11,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/xalgord/xalgorix/v4/internal/domainjournal"
+	"github.com/xalgord/xalgorix/v4/internal/infoitem"
 	"github.com/xalgord/xalgorix/v4/internal/storage"
 )
 
@@ -79,6 +81,26 @@ const (
 	EvidenceFindingRef = "finding_ref"
 )
 
+// EvidenceNature distinguishes a raw observation from an interpretation.
+// It is deliberately separate from Kind: Kind describes the evidence's role in
+// the hypothesis (baseline/probe/exploit/...), while Nature describes whether
+// the content is observed or inferred.
+type EvidenceNature string
+
+const (
+	EvidenceObserved EvidenceNature = "observed"
+	EvidenceInferred EvidenceNature = "inferred"
+)
+
+// NormalizeEvidenceNature defaults unknown or legacy values to inferred. An
+// absent value must never be promoted to an observation.
+func NormalizeEvidenceNature(n EvidenceNature) EvidenceNature {
+	if n == EvidenceObserved {
+		return EvidenceObserved
+	}
+	return EvidenceInferred
+}
+
 // Evidence is a single append-only observation attached to a hypothesis.
 // Specialists accumulate observations (baselines, probes, exploit attempts,
 // artifacts); confirmed findings are referenced by the authoritative reporting
@@ -103,6 +125,14 @@ type Evidence struct {
 	// itself (add_hypothesis_evidence) never carries one, so proof gates can
 	// tell an engine confirmation from model-written text.
 	Source string `json:"source,omitempty"`
+	// Nature separates raw observation from inference. Missing/legacy values
+	// normalize to inferred.
+	Nature EvidenceNature `json:"nature,omitempty"`
+	// Supports lists Evidence IDs in the same hypothesis that substantiate an
+	// inferred item. It is empty for observed items.
+	Supports []string `json:"supports,omitempty"`
+	// InfoItemID links this projection to the global InfoItem cold path.
+	InfoItemID string `json:"info_item_id,omitempty"`
 	// Confidence is the quality of THIS observation in [0,1].
 	Confidence float64   `json:"confidence,omitempty"`
 	CreatedAt  time.Time `json:"created_at"`
@@ -138,6 +168,10 @@ type Hypothesis struct {
 	Status HypothesisStatus `json:"status"`
 	// Confidence is the current belief (in [0,1]) that this is exploitable.
 	Confidence float64 `json:"confidence"`
+	// VOI is an optional information-decision-value estimate in [0,1].
+	// VOIEstimated distinguishes a real zero from "not estimated".
+	VOI          float64 `json:"voi,omitempty"`
+	VOIEstimated bool    `json:"voi_estimated,omitempty"`
 	// AssignedTo is the delegation/agent ID that currently owns the work.
 	AssignedTo string `json:"assigned_to,omitempty"`
 	// NextAction is the next-best concrete step for whoever picks this up.
@@ -162,6 +196,11 @@ func (h *Hypothesis) clone() Hypothesis {
 	}
 	if h.Evidence != nil {
 		cp.Evidence = append([]Evidence(nil), h.Evidence...)
+		for i := range cp.Evidence {
+			if h.Evidence[i].Supports != nil {
+				cp.Evidence[i].Supports = append([]string(nil), h.Evidence[i].Supports...)
+			}
+		}
 	}
 	return cp
 }
@@ -171,9 +210,13 @@ func (h *Hypothesis) clone() Hypothesis {
 // the same *ScanContext), persists to <scanDir>/ledger.json via atomic writes,
 // and survives process restart/resume.
 //
-// It mirrors NoteStore's locking discipline: mutations serialize on mu, the
-// on-disk snapshot is marshaled under mu, and the actual file write happens
-// outside mu (serialized by writeMu) so disk I/O never blocks readers.
+// It mirrors NoteStore's locking discipline: mutations serialize on mu and the
+// durable file write happens INSIDE the same critical section, so snapshots
+// reach disk in exactly the order they were taken. Writing outside mu (a
+// separate writeMu) is not enough: two mutations could marshal ordered
+// snapshots A then B, yet reach the file out of order, leaving a stale
+// snapshot as the final on-disk state. Readers taking mu.RLock pause briefly
+// during the fsync, which NoteStore accepted for the same durability reason.
 type LedgerStore struct {
 	mu      sync.RWMutex
 	hyps    map[string]*Hypothesis
@@ -182,10 +225,10 @@ type LedgerStore struct {
 	seq     int               // hypothesis ID sequence
 	evSeq   int               // evidence ID sequence
 
+	scanID      string
 	persistPath string
-
-	// writeMu serializes disk writes only; see NoteStore for rationale.
-	writeMu sync.Mutex
+	journal     *domainjournal.Journal
+	voiWeight   float64
 }
 
 // NewLedgerStore creates an empty ledger with no persistence configured.
@@ -212,6 +255,15 @@ func (ls *LedgerStore) SetPersistPath(dir string) {
 	}
 }
 
+// SetScanID configures the scan identity used for stable InfoItem IDs. It is
+// separate from the persistence directory so callers never have to infer a
+// scan ID from a filesystem path.
+func (ls *LedgerStore) SetScanID(scanID string) {
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
+	ls.scanID = truncate(strings.TrimSpace(scanID), maxHypothesisFieldLen)
+}
+
 // Upsert inserts a new hypothesis or merges into an existing one that shares
 // the same dedup key. It returns a copy of the stored hypothesis.
 //
@@ -223,6 +275,16 @@ func (ls *LedgerStore) SetPersistPath(dir string) {
 // model-recorded lead merging into an engine seed, which may only raise them
 // (see mergeFrom).
 func (ls *LedgerStore) Upsert(in Hypothesis) Hypothesis {
+	out, err := ls.UpsertAs(in, engineActor("ledger"))
+	if err != nil {
+		log.Printf("[ledger] Warning: upsert not committed: %v", err)
+	}
+	return out
+}
+
+// UpsertAs records the mutation with an explicit actor and returns an error if
+// the durable audit append or ledger snapshot fails.
+func (ls *LedgerStore) UpsertAs(in Hypothesis, actor domainjournal.Actor) (Hypothesis, error) {
 	now := time.Now().UTC()
 	in.sanitize()
 	key := in.DedupKey
@@ -231,19 +293,28 @@ func (ls *LedgerStore) Upsert(in Hypothesis) Hypothesis {
 	}
 
 	ls.mu.Lock()
-	var stored *Hypothesis
+	defer ls.mu.Unlock()
+
+	var existing *Hypothesis
 	if id, ok := ls.byDedup[key]; ok {
-		if existing := ls.hyps[id]; existing != nil {
-			existing.mergeFrom(in)
-			existing.UpdatedAt = now
-			stored = existing
-		}
+		existing = ls.hyps[id]
 	}
-	if stored == nil {
+	var (
+		working *Hypothesis
+		before  *domainjournal.State
+		newID   string
+	)
+	if existing != nil {
+		before = existing.auditState()
+		cp := existing.clone()
+		cp.mergeFrom(in)
+		cp.UpdatedAt = now
+		working = &cp
+	} else {
 		ls.seq++
-		id := fmt.Sprintf("H-%d", ls.seq)
+		newID = fmt.Sprintf("H-%d", ls.seq)
 		h := in
-		h.ID = id
+		h.ID = newID
 		h.DedupKey = key
 		if h.Status == "" {
 			h.Status = HypothesisQueued
@@ -252,23 +323,51 @@ func (ls *LedgerStore) Upsert(in Hypothesis) Hypothesis {
 			h.CreatedAt = now
 		}
 		h.UpdatedAt = now
-		ls.hyps[id] = &h
-		ls.order = append(ls.order, id)
-		ls.byDedup[key] = id
-		stored = &h
+		working = &h
 	}
-	out := stored.clone()
-	data, path := ls.marshalLocked()
-	ls.mu.Unlock()
 
-	ls.writeFile(data, path)
-	return out
+	op := domainjournal.OpSeedHypothesis
+	if IsModelOrigin(working.Origin) {
+		op = domainjournal.OpRecordHypothesis
+	}
+	if err := ls.appendAuditLocked(domainjournal.Record{
+		Actor:        actor,
+		Operation:    op,
+		HypothesisID: working.ID,
+		Summary:      fmt.Sprintf("%s %s", op, formatHypothesisBrief(working)),
+		Before:       before,
+		After:        working.auditState(),
+	}); err != nil {
+		if existing == nil {
+			ls.seq--
+		}
+		return Hypothesis{}, err
+	}
+
+	if existing != nil {
+		*existing = *working
+	} else {
+		ls.hyps[newID] = working
+		ls.order = append(ls.order, newID)
+		ls.byDedup[key] = newID
+	}
+	out := working.clone()
+	if err := ls.persistLocked(); err != nil {
+		return out, err
+	}
+	return out, nil
 }
 
 // AddEvidence appends an observation to a hypothesis and lightly nudges the
 // hypothesis's confidence toward the evidence's own confidence. Returns false
 // if the hypothesis does not exist.
 func (ls *LedgerStore) AddEvidence(hypID string, ev Evidence) bool {
+	return ls.AddEvidenceAs(hypID, ev, engineActor("ledger")) == nil
+}
+
+// AddEvidenceAs appends evidence and durably audits it before committing the
+// in-memory mutation.
+func (ls *LedgerStore) AddEvidenceAs(hypID string, ev Evidence, actor domainjournal.Actor) error {
 	now := time.Now().UTC()
 	ev.sanitize()
 	if ev.CreatedAt.IsZero() {
@@ -276,58 +375,86 @@ func (ls *LedgerStore) AddEvidence(hypID string, ev Evidence) bool {
 	}
 
 	ls.mu.Lock()
+	defer ls.mu.Unlock()
 	h := ls.hyps[hypID]
 	if h == nil {
-		ls.mu.Unlock()
-		return false
+		return fmt.Errorf("scanctx: unknown hypothesis %q", hypID)
 	}
-	ls.evSeq++
-	ev.ID = fmt.Sprintf("EV-%d", ls.evSeq)
-	h.Evidence = append(h.Evidence, ev)
-	capEvidence(h)
+	before := h.auditState()
+	cp := h.clone()
+	nextSeq := ls.evSeq + 1
+	ev.ID = fmt.Sprintf("EV-%d", nextSeq)
+	if ls.scanID != "" {
+		ev.InfoItemID = infoitem.StableEvidenceID(ls.scanID, ev.ID)
+	}
+	// Supports may only point at evidence already stored on this hypothesis.
+	// Unknown references are ignored here; the model-facing tool validates and
+	// reports them before calling the store.
+	existing := make(map[string]bool, len(cp.Evidence))
+	for _, prior := range cp.Evidence {
+		existing[prior.ID] = true
+	}
+	ev.Supports = validSupportIDs(ev.Supports, existing)
+	cp.Evidence = append(cp.Evidence, ev)
+	capEvidence(&cp)
 	// Evidence quality raises belief but never lowers it here; rejection is an
 	// explicit status transition, not a side effect of adding an observation.
-	if ev.Confidence > h.Confidence {
-		h.Confidence = clampConfidence(ev.Confidence)
+	if ev.Confidence > cp.Confidence {
+		cp.Confidence = clampConfidence(ev.Confidence)
 	}
-	h.UpdatedAt = now
-	data, path := ls.marshalLocked()
-	ls.mu.Unlock()
+	cp.UpdatedAt = now
 
-	ls.writeFile(data, path)
-	return true
+	committed := ev
+	for _, stored := range cp.Evidence {
+		if stored.ID == ev.ID {
+			committed = stored
+			break
+		}
+	}
+	item, relations := ls.evidenceInfoItemLocked(&cp, committed)
+	if err := ls.appendAuditLocked(domainjournal.Record{
+		Actor:        actor,
+		Operation:    domainjournal.OpAddEvidence,
+		HypothesisID: hypID,
+		EvidenceID:   ev.ID,
+		Summary:      fmt.Sprintf("evidence %s [%s/%s]", ev.ID, ev.Kind, ev.Nature),
+		Before:       before,
+		After:        cp.auditState(),
+		InfoItem:     item,
+		Relations:    relations,
+	}); err != nil {
+		return err
+	}
+
+	*h = cp
+	ls.evSeq = nextSeq
+	return ls.persistLocked()
 }
 
 // SetStatus transitions a hypothesis's lifecycle state and optionally records
 // the next-best action. Returns false if the hypothesis does not exist.
 func (ls *LedgerStore) SetStatus(hypID string, status HypothesisStatus, nextAction string) bool {
+	return ls.SetStatusAs(hypID, status, nextAction, engineActor("ledger")) == nil
+}
+
+// SetStatusAs transitions lifecycle state with an explicit audit actor.
+func (ls *LedgerStore) SetStatusAs(hypID string, status HypothesisStatus, nextAction string, actor domainjournal.Actor) error {
 	if !validHypothesisStatuses[status] {
 		status = NormalizeHypothesisStatus(string(status))
 	}
-	now := time.Now().UTC()
-
-	ls.mu.Lock()
-	h := ls.hyps[hypID]
-	if h == nil {
-		ls.mu.Unlock()
-		return false
-	}
-	h.Status = status
-	if strings.TrimSpace(nextAction) != "" {
-		h.NextAction = truncate(nextAction, maxSummaryLen)
-	}
-	if status == HypothesisProven && h.Confidence < 1.0 {
-		h.Confidence = 1.0
-	}
-	if status == HypothesisRejected {
-		h.Confidence = 0
-	}
-	h.UpdatedAt = now
-	data, path := ls.marshalLocked()
-	ls.mu.Unlock()
-
-	ls.writeFile(data, path)
-	return true
+	_, err := ls.mutateHypothesisAs(hypID, actor, domainjournal.OpSetStatus, "set status "+string(status), func(h *Hypothesis) {
+		h.Status = status
+		if strings.TrimSpace(nextAction) != "" {
+			h.NextAction = truncate(nextAction, maxSummaryLen)
+		}
+		if status == HypothesisProven && h.Confidence < 1.0 {
+			h.Confidence = 1.0
+		}
+		if status == HypothesisRejected {
+			h.Confidence = 0
+		}
+	})
+	return err
 }
 
 // MarkAssigned records lane ownership WITHOUT claiming: the hypothesis stays
@@ -337,42 +464,34 @@ func (ls *LedgerStore) SetStatus(hypID string, status HypothesisStatus, nextActi
 // lane seeding; the owning agent still claims via Claim/Assign when it starts
 // the work. Returns false if the hypothesis does not exist.
 func (ls *LedgerStore) MarkAssigned(hypID, agentID string) bool {
-	now := time.Now().UTC()
-	ls.mu.Lock()
-	h := ls.hyps[hypID]
-	if h == nil {
-		ls.mu.Unlock()
-		return false
-	}
-	h.AssignedTo = truncate(strings.TrimSpace(agentID), maxHypothesisFieldLen)
-	h.UpdatedAt = now
-	data, path := ls.marshalLocked()
-	ls.mu.Unlock()
+	return ls.MarkAssignedAs(hypID, agentID, engineActor("ledger")) == nil
+}
 
-	ls.writeFile(data, path)
-	return true
+// MarkAssignedAs records lane ownership with an explicit actor.
+func (ls *LedgerStore) MarkAssignedAs(hypID, agentID string, actor domainjournal.Actor) error {
+	owner := truncate(strings.TrimSpace(agentID), maxHypothesisFieldLen)
+	_, err := ls.mutateHypothesisAs(hypID, actor, domainjournal.OpAssignHypothesis, "mark assigned "+owner, func(h *Hypothesis) {
+		h.AssignedTo = owner
+	})
+	return err
 }
 
 // Assign records the owning agent/delegation ID and moves a queued hypothesis
 // into "testing". Returns false if the hypothesis does not exist.
 func (ls *LedgerStore) Assign(hypID, agentID string) bool {
-	now := time.Now().UTC()
-	ls.mu.Lock()
-	h := ls.hyps[hypID]
-	if h == nil {
-		ls.mu.Unlock()
-		return false
-	}
-	h.AssignedTo = truncate(strings.TrimSpace(agentID), maxHypothesisFieldLen)
-	if h.Status == HypothesisQueued {
-		h.Status = HypothesisTesting
-	}
-	h.UpdatedAt = now
-	data, path := ls.marshalLocked()
-	ls.mu.Unlock()
+	return ls.AssignAs(hypID, agentID, engineActor("ledger")) == nil
+}
 
-	ls.writeFile(data, path)
-	return true
+// AssignAs records ownership and queued→testing with an explicit actor.
+func (ls *LedgerStore) AssignAs(hypID, agentID string, actor domainjournal.Actor) error {
+	owner := truncate(strings.TrimSpace(agentID), maxHypothesisFieldLen)
+	_, err := ls.mutateHypothesisAs(hypID, actor, domainjournal.OpAssignHypothesis, "assign "+owner, func(h *Hypothesis) {
+		h.AssignedTo = owner
+		if h.Status == HypothesisQueued {
+			h.Status = HypothesisTesting
+		}
+	})
+	return err
 }
 
 // ClaimNext atomically selects the highest-confidence queued hypothesis that
@@ -381,11 +500,22 @@ func (ls *LedgerStore) Assign(hypID, agentID string) bool {
 // observe the same queued item and overwrite one another's ownership.
 // An empty vulnClass matches every class.
 func (ls *LedgerStore) ClaimNext(vulnClass, agentID string) (Hypothesis, bool) {
+	got, claimed, err := ls.ClaimNextAs(vulnClass, agentID, modelActor(agentID))
+	if err != nil {
+		log.Printf("[ledger] Warning: claim not committed: %v", err)
+		return Hypothesis{}, false
+	}
+	return got, claimed
+}
+
+// ClaimNextAs atomically claims with an explicit actor and audits the claim
+// before committing ownership.
+func (ls *LedgerStore) ClaimNextAs(vulnClass, agentID string, actor domainjournal.Actor) (Hypothesis, bool, error) {
 	classFilter := strings.ToLower(strings.TrimSpace(vulnClass))
 	owner := truncate(strings.TrimSpace(agentID), maxHypothesisFieldLen)
-	now := time.Now().UTC()
 
 	ls.mu.Lock()
+	defer ls.mu.Unlock()
 	var picked *Hypothesis
 	for _, id := range ls.order {
 		h := ls.hyps[id]
@@ -395,42 +525,49 @@ func (ls *LedgerStore) ClaimNext(vulnClass, agentID string) (Hypothesis, bool) {
 		if classFilter != "" && h.VulnClass != classFilter {
 			continue
 		}
-		// Strictly greater replaces the candidate; equal confidence keeps the
+		// Strictly better score replaces the candidate; equal scores keep the
 		// earlier insertion, matching Schedulable's stable ordering.
-		if picked == nil || h.Confidence > picked.Confidence {
+		if betterHypothesis(h, picked, ls.voiWeight) {
 			picked = h
 		}
 	}
 	if picked == nil {
-		ls.mu.Unlock()
-		return Hypothesis{}, false
+		return Hypothesis{}, false, nil
 	}
-	picked.AssignedTo = owner
-	picked.Status = HypothesisTesting
-	picked.UpdatedAt = now
+	before := picked.auditState()
+	cp := picked.clone()
+	cp.AssignedTo = owner
+	cp.Status = HypothesisTesting
+	cp.UpdatedAt = time.Now().UTC()
+	if err := ls.appendAuditLocked(domainjournal.Record{
+		Actor:        actor,
+		Operation:    domainjournal.OpClaimHypothesis,
+		HypothesisID: cp.ID,
+		Summary:      "claim " + formatHypothesisBrief(&cp),
+		Before:       before,
+		After:        cp.auditState(),
+	}); err != nil {
+		return Hypothesis{}, false, err
+	}
+	*picked = cp
 	out := picked.clone()
-	data, path := ls.marshalLocked()
-	ls.mu.Unlock()
-
-	ls.writeFile(data, path)
-	return out, true
+	if err := ls.persistLocked(); err != nil {
+		return out, true, err
+	}
+	return out, true, nil
 }
 
 // RecordAttempt increments the exploit-attempt counter (economics/exhaustion).
 func (ls *LedgerStore) RecordAttempt(hypID string) bool {
-	ls.mu.Lock()
-	h := ls.hyps[hypID]
-	if h == nil {
-		ls.mu.Unlock()
-		return false
-	}
-	h.Attempts++
-	h.UpdatedAt = time.Now().UTC()
-	data, path := ls.marshalLocked()
-	ls.mu.Unlock()
+	return ls.RecordAttemptAs(hypID, engineActor("ledger")) == nil
+}
 
-	ls.writeFile(data, path)
-	return true
+// RecordAttemptAs increments attempts with an explicit actor.
+func (ls *LedgerStore) RecordAttemptAs(hypID string, actor domainjournal.Actor) error {
+	_, err := ls.mutateHypothesisAs(hypID, actor, domainjournal.OpRecordAttempt, "record attempt", func(h *Hypothesis) {
+		h.Attempts++
+	})
+	return err
 }
 
 // Get returns a copy of a hypothesis by ID.
@@ -462,6 +599,7 @@ func (ls *LedgerStore) All() []Hypothesis {
 // insertion order. "testing" is excluded because it is already owned.
 func (ls *LedgerStore) Schedulable(limit int) []Hypothesis {
 	ls.mu.RLock()
+	weight := ls.voiWeight
 	cands := make([]Hypothesis, 0, len(ls.order))
 	for _, id := range ls.order {
 		h := ls.hyps[id]
@@ -475,10 +613,12 @@ func (ls *LedgerStore) Schedulable(limit int) []Hypothesis {
 	ls.mu.RUnlock()
 
 	sort.SliceStable(cands, func(i, j int) bool {
-		if cands[i].Confidence != cands[j].Confidence {
-			return cands[i].Confidence > cands[j].Confidence
+		si := hypothesisRankScore(&cands[i], weight)
+		sj := hypothesisRankScore(&cands[j], weight)
+		if si != sj {
+			return si > sj
 		}
-		// Queued before blocked when confidence ties (blocked needs a
+		// Queued before blocked when score ties (blocked needs a
 		// precondition that may not be met yet).
 		if cands[i].Status != cands[j].Status {
 			return cands[i].Status == HypothesisQueued
@@ -513,15 +653,29 @@ func (ls *LedgerStore) Len() int {
 
 // Reset clears all hypotheses (used when a scan is explicitly reset).
 func (ls *LedgerStore) Reset() {
+	if err := ls.ResetAs(domainjournal.Actor{Kind: domainjournal.ActorSystem, Source: "ledger.reset"}); err != nil {
+		log.Printf("[ledger] Warning: reset not committed: %v", err)
+	}
+}
+
+// ResetAs audits the reset before clearing in-memory state.
+func (ls *LedgerStore) ResetAs(actor domainjournal.Actor) error {
 	ls.mu.Lock()
+	defer ls.mu.Unlock()
+	count := len(ls.hyps)
+	if err := ls.appendAuditLocked(domainjournal.Record{
+		Actor:     actor,
+		Operation: domainjournal.OpResetLedger,
+		Summary:   fmt.Sprintf("reset ledger (%d hypotheses)", count),
+	}); err != nil {
+		return err
+	}
 	ls.hyps = make(map[string]*Hypothesis)
 	ls.byDedup = make(map[string]string)
 	ls.order = nil
 	ls.seq = 0
 	ls.evSeq = 0
-	data, path := ls.marshalLocked()
-	ls.mu.Unlock()
-	ls.writeFile(data, path)
+	return ls.persistLocked()
 }
 
 // Merge folds another ledger's hypotheses into this one (child -> parent
@@ -535,6 +689,8 @@ func (ls *LedgerStore) Merge(other *LedgerStore) int {
 	}
 	src := other.All()
 	merged := 0
+	var mergedItems []infoitem.Item
+	var mergedRelations []infoitem.Relation
 	for _, s := range src {
 		key := s.DedupKey
 		if key == "" {
@@ -551,23 +707,65 @@ func (ls *LedgerStore) Merge(other *LedgerStore) int {
 			if s.Confidence > dst.Confidence {
 				dst.Confidence = s.Confidence
 			}
+			remap := make(map[string]string, len(s.Evidence))
 			for _, ev := range s.Evidence {
 				ls.evSeq++
-				ev.ID = fmt.Sprintf("EV-%d", ls.evSeq)
+				remap[ev.ID] = fmt.Sprintf("EV-%d", ls.evSeq)
+			}
+			for _, ev := range s.Evidence {
+				ev.ID = remap[ev.ID]
+				ev.Supports = remapSupportIDs(ev.Supports, remap)
+				ev.Nature = NormalizeEvidenceNature(ev.Nature)
+				if ls.scanID != "" {
+					ev.InfoItemID = infoitem.StableEvidenceID(ls.scanID, ev.ID)
+				}
 				dst.Evidence = append(dst.Evidence, ev)
 			}
 			capEvidence(dst)
 			dst.UpdatedAt = time.Now().UTC()
+			present := make(map[string]bool, len(dst.Evidence))
+			for _, ev := range dst.Evidence {
+				present[ev.ID] = true
+			}
+			for _, ev := range s.Evidence {
+				newID := remap[ev.ID]
+				if !present[newID] {
+					continue
+				}
+				ev.ID = newID
+				ev.Supports = remapSupportIDs(ev.Supports, remap)
+				if item, rels := ls.evidenceInfoItemLocked(dst, ev); item != nil {
+					mergedItems = append(mergedItems, *item)
+					mergedRelations = append(mergedRelations, rels...)
+				}
+			}
 		} else {
 			ls.seq++
 			id := fmt.Sprintf("H-%d", ls.seq)
 			h := s
 			h.ID = id
 			h.DedupKey = key
-			// Re-ID evidence into this store's sequence.
+			// Re-ID evidence into this store's sequence and remap supports so an
+			// inferred item never points at a foreign/old evidence ID.
+			remap := make(map[string]string, len(h.Evidence))
 			for i := range h.Evidence {
 				ls.evSeq++
+				oldID := h.Evidence[i].ID
 				h.Evidence[i].ID = fmt.Sprintf("EV-%d", ls.evSeq)
+				remap[oldID] = h.Evidence[i].ID
+			}
+			for i := range h.Evidence {
+				h.Evidence[i].Supports = remapSupportIDs(h.Evidence[i].Supports, remap)
+				h.Evidence[i].Nature = NormalizeEvidenceNature(h.Evidence[i].Nature)
+				if ls.scanID != "" {
+					h.Evidence[i].InfoItemID = infoitem.StableEvidenceID(ls.scanID, h.Evidence[i].ID)
+				}
+			}
+			for i := range h.Evidence {
+				if item, rels := ls.evidenceInfoItemLocked(&h, h.Evidence[i]); item != nil {
+					mergedItems = append(mergedItems, *item)
+					mergedRelations = append(mergedRelations, rels...)
+				}
 			}
 			ls.hyps[id] = &h
 			ls.order = append(ls.order, id)
@@ -577,9 +775,22 @@ func (ls *LedgerStore) Merge(other *LedgerStore) int {
 		ls.mu.Unlock()
 	}
 	ls.mu.Lock()
+	if merged > 0 {
+		if err := ls.appendAuditLocked(domainjournal.Record{
+			Actor:     engineActor("ledger.merge"),
+			Operation: domainjournal.OpMergeLedger,
+			Summary:   fmt.Sprintf("merge ledger (%d hypotheses, %d evidence items)", merged, len(mergedItems)),
+			InfoItems: mergedItems,
+			Relations: mergedRelations,
+		}); err != nil {
+			log.Printf("[ledger] Warning: merge audit failed: %v", err)
+		}
+	}
 	data, path := ls.marshalLocked()
+	if err := ls.writeFile(data, path); err != nil {
+		log.Printf("[ledger] Warning: merged ledger snapshot failed: %v", err)
+	}
 	ls.mu.Unlock()
-	ls.writeFile(data, path)
 	return merged
 }
 
@@ -670,6 +881,12 @@ func (ls *LedgerStore) LoadFromDisk() int {
 			ls.seq++
 			h.ID = fmt.Sprintf("H-%d", ls.seq)
 		}
+		for i := range h.Evidence {
+			h.Evidence[i].Nature = NormalizeEvidenceNature(h.Evidence[i].Nature)
+			if h.Evidence[i].InfoItemID == "" && ls.scanID != "" {
+				h.Evidence[i].InfoItemID = infoitem.StableEvidenceID(ls.scanID, h.Evidence[i].ID)
+			}
+		}
 		ls.hyps[h.ID] = h
 		ls.order = append(ls.order, h.ID)
 		ls.byDedup[key] = h.ID
@@ -692,6 +909,7 @@ func (ls *LedgerStore) LoadFromDisk() int {
 type ledgerSnapshot struct {
 	Seq        int           `json:"seq"`
 	EvSeq      int           `json:"ev_seq"`
+	DomainSeq  uint64        `json:"domain_seq,omitempty"`
 	Order      []string      `json:"order"`
 	Hypotheses []*Hypothesis `json:"hypotheses"`
 }
@@ -707,6 +925,9 @@ func (ls *LedgerStore) marshalLocked() ([]byte, string) {
 		EvSeq: ls.evSeq,
 		Order: append([]string(nil), ls.order...),
 	}
+	if ls.journal != nil {
+		snap.DomainSeq = ls.journal.LastSeq()
+	}
 	for _, id := range ls.order {
 		if h := ls.hyps[id]; h != nil {
 			snap.Hypotheses = append(snap.Hypotheses, h)
@@ -720,18 +941,22 @@ func (ls *LedgerStore) marshalLocked() ([]byte, string) {
 	return data, ls.persistPath
 }
 
-// writeFile persists serialized data atomically. Safe to call without holding
-// mu; writeMu serializes concurrent writers. Uses storage.WriteAtomic so a
-// crash mid-write can never leave a torn ledger.json.
-func (ls *LedgerStore) writeFile(data []byte, path string) {
+// writeFile persists serialized data atomically. Must be called with ls.mu
+// held, as part of the same critical section as the mutation it accompanies:
+// that ordering guarantee is what keeps an older snapshot from overwriting a
+// newer one (see the LedgerStore doc comment). Uses storage.WriteAtomic so a
+// crash mid-write can never leave a torn ledger.json. A failed write logs a
+// warning and leaves the in-memory state authoritative for this process —
+// the next successful mutation re-persists the full snapshot.
+func (ls *LedgerStore) writeFile(data []byte, path string) error {
 	if data == nil || path == "" {
-		return
+		return nil
 	}
-	ls.writeMu.Lock()
-	defer ls.writeMu.Unlock()
 	if err := storage.WriteAtomic(path, data); err != nil {
 		log.Printf("[ledger] Warning: failed to save ledger to %s: %v", path, err)
+		return err
 	}
+	return nil
 }
 
 // --- helpers ---
@@ -791,6 +1016,10 @@ func (h *Hypothesis) mergeFrom(src Hypothesis) {
 	if src.NextAction != "" {
 		h.NextAction = src.NextAction
 	}
+	if src.VOIEstimated && (!h.VOIEstimated || src.VOI > h.VOI) {
+		h.VOI = src.VOI
+		h.VOIEstimated = true
+	}
 	if len(src.Preconditions) > 0 {
 		h.Preconditions = mergeStringSet(h.Preconditions, src.Preconditions)
 	}
@@ -837,6 +1066,10 @@ func (h *Hypothesis) sanitize() {
 	h.NextAction = truncate(strings.TrimSpace(h.NextAction), maxSummaryLen)
 	h.Origin = truncate(strings.TrimSpace(h.Origin), maxHypothesisFieldLen)
 	h.Confidence = clampConfidence(h.Confidence)
+	h.VOI = clampConfidence(h.VOI)
+	if !h.VOIEstimated {
+		h.VOI = 0
+	}
 	if h.Status != "" {
 		h.Status = NormalizeHypothesisStatus(string(h.Status))
 	}
@@ -862,7 +1095,21 @@ func (ev *Evidence) sanitize() {
 	ev.FindingID = truncate(strings.TrimSpace(ev.FindingID), maxHypothesisFieldLen)
 	ev.AgentID = truncate(strings.TrimSpace(ev.AgentID), maxHypothesisFieldLen)
 	ev.Source = truncate(strings.TrimSpace(ev.Source), maxHypothesisFieldLen)
+	ev.Nature = NormalizeEvidenceNature(ev.Nature)
+	ev.InfoItemID = truncate(strings.TrimSpace(ev.InfoItemID), maxHypothesisFieldLen)
 	ev.Confidence = clampConfidence(ev.Confidence)
+	if len(ev.Supports) > 0 {
+		seen := make(map[string]bool, len(ev.Supports))
+		cleaned := make([]string, 0, len(ev.Supports))
+		for _, id := range ev.Supports {
+			id = truncate(strings.TrimSpace(id), maxHypothesisFieldLen)
+			if id != "" && !seen[id] {
+				seen[id] = true
+				cleaned = append(cleaned, id)
+			}
+		}
+		ev.Supports = cleaned
+	}
 }
 
 // EngineExploit reports whether this is exploit evidence written by an engine
@@ -905,6 +1152,56 @@ func capEvidence(h *Hypothesis) {
 		kept = kept[len(kept)-maxEvidencePerHypothesis:]
 	}
 	h.Evidence = kept
+	pruneSupportIDs(h)
+}
+
+// validSupportIDs keeps only references to currently present evidence.
+func validSupportIDs(supports []string, existing map[string]bool) []string {
+	if len(supports) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(supports))
+	for _, id := range supports {
+		if existing[id] {
+			out = append(out, id)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func remapSupportIDs(supports []string, remap map[string]string) []string {
+	if len(supports) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(supports))
+	for _, id := range supports {
+		if mapped, ok := remap[id]; ok {
+			out = append(out, mapped)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// pruneSupportIDs removes references to evidence evicted by the per-hypothesis
+// cap. An inferred item with no remaining supports becomes explicitly
+// unsubstantiated rather than retaining a dangling reference.
+func pruneSupportIDs(h *Hypothesis) {
+	present := make(map[string]bool, len(h.Evidence))
+	for _, ev := range h.Evidence {
+		present[ev.ID] = true
+	}
+	for i := range h.Evidence {
+		if len(h.Evidence[i].Supports) == 0 {
+			continue
+		}
+		h.Evidence[i].Supports = validSupportIDs(h.Evidence[i].Supports, present)
+	}
 }
 
 // dedupKey builds a normalized identity for a hypothesis.

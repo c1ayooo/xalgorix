@@ -21,6 +21,8 @@ var reservedTopLevelNames = map[string]struct{}{
 	"logos":      {},
 	"_schedules": {},
 	"_saved":     {},
+	// Platform repository snapshot (projects/tasks/runs, REDESIGN §3.3).
+	"_platform": {},
 	// Uploaded scan-context artifacts (uploads.go) and extracted source
 	// archives (uploads_source.go). Scans and schedules reference them by
 	// path, so they must outlive any one scan.
@@ -204,6 +206,10 @@ func (s *Server) pruneExpiredScans(days int) int {
 		removed++
 		log.Printf("[RETENTION] Deleted scan %s (%s), last activity %s",
 			entry.rec.ID, entry.rec.Target, ref.Format(time.RFC3339))
+		// The authoritative scan.json is gone: remove the mount so a purged
+		// historical run cannot remain "pending" forever and block project
+		// deletion. Findings cascade with the run row.
+		s.deletePlatformRunsForScan(entry.rec.InstanceID, entry.rec.ID)
 
 		// Remove child (wildcard subdomain) scan dirs of this parent.
 		for _, child := range entries {
@@ -211,7 +217,11 @@ func (s *Server) pruneExpiredScans(days int) int {
 				continue
 			}
 			if isChildOfScan(&entry.rec, &child.rec) && s.safeToDeleteScanDir(child.dir) {
-				_ = os.RemoveAll(child.dir)
+				if err := os.RemoveAll(child.dir); err == nil {
+					// Remove the child's own imported mount by its record ID;
+					// never reuse a shared parent instance ID here.
+					s.deletePlatformRunsForScan("", child.rec.ID)
+				}
 			}
 		}
 	}
