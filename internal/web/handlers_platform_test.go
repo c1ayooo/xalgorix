@@ -58,6 +58,10 @@ func doJSON(t *testing.T, s *Server, method, path, body string) *httptest.Respon
 		s.handleFindingsSummary(rr, req)
 	case routePath == "/api/scans":
 		s.handleListScans(rr, req)
+	case routePath == "/api/schedules":
+		s.handleSchedules(rr, req)
+	case strings.HasPrefix(routePath, "/api/schedules"):
+		s.handleScheduleDetail(rr, req)
 	default:
 		t.Fatalf("no handler routed for %s %s", method, path)
 	}

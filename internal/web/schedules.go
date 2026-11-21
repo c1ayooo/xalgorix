@@ -1,7 +1,9 @@
 package web
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"regexp"
@@ -69,6 +71,10 @@ func (s *Server) handleSchedules(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "failed to save schedule: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
+		// Link the fresh schedule to its schedule task immediately (idempotent
+		// find-or-create): without it the scheduler-entry scope check would
+		// skip every tick of this schedule until the next restart re-imports.
+		s.ensureScheduleTask(&req)
 		_ = json.NewEncoder(w).Encode(req)
 		return
 	}
@@ -106,29 +112,44 @@ func (s *Server) handleScheduleDetail(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Manually trigger the scan
-		req := ScanRequest{
-			Targets:        sch.Targets,
-			Instruction:    sch.Instruction,
-			ScanMode:       sch.ScanMode,
-			SeverityFilter: sch.SeverityFilter,
-			Phases:         sch.Phases,
-			ReconMode:      sch.ReconMode,
-			ScanIntensity:  sch.ScanIntensity,
-			CompanyName:    sch.CompanyName,
-			LogoPath:       sch.LogoPath,
-			DiscordWebhook: sch.DiscordWebhook,
-			Name:           sch.Name + " (Scheduled)",
-			Model:          sch.Model,
+		// Snapshot the schedule under the read lock; everything below runs
+		// lock-free so the platform work (task reverse-lookup, scope check,
+		// run mount) cannot hold /api/schedules hostage.
+		s.schedulesMu.RLock()
+		snapshot := *sch
+		s.schedulesMu.RUnlock()
+
+		// Same scheduler-entry closure as the tick: schedule targets must
+		// fall inside the linked project's scope (D7). The authorization
+		// runs on a detached context (handleTaskRunStart mount precedent): a
+		// client that disconnects mid-request must not cancel the store
+		// lookups and turn the decision into whatever the error fallback
+		// would answer. Unlike the tick there is no retry storm to damp, so
+		// a refusal is a synchronous 400 and LastRun stays untouched; a
+		// transient store failure is 503 (retryable, not a config error).
+		authCtx, authCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		taskID, authErr := s.authorizeScheduledScan(authCtx, &snapshot)
+		authCancel()
+		if authErr != nil {
+			if errors.Is(authErr, errScheduleLinkUnavailable) {
+				http.Error(w, authErr.Error(), http.StatusServiceUnavailable)
+				return
+			}
+			http.Error(w, authErr.Error(), http.StatusBadRequest)
+			return
 		}
 
-		scanCfg := *s.cfg
-		if sch.Model != "" {
-			scanCfg.LLM = sch.Model
+		req := scanRequestForSchedule(&snapshot)
+		scanCfg := s.configSnapshot()
+		if scanCfg == nil {
+			http.Error(w, "server configuration unavailable", http.StatusServiceUnavailable)
+			return
 		}
-		instanceID := randomSlug()
+		if snapshot.Model != "" {
+			scanCfg.LLM = snapshot.Model
+		}
 
-		go s.runMultiScan(req, &scanCfg, instanceID)
+		instanceID := s.dispatchScheduledScan(req, scanCfg, &snapshot, taskID, "schedule")
 
 		s.schedulesMu.Lock()
 		sch.LastRun = time.Now()
@@ -201,6 +222,10 @@ func (s *Server) handleScheduleDetail(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "failed to save schedule: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
+		// Re-link after every update (idempotent find-or-create): the task's
+		// legacy fields mirror the schedule, and an update that landed while
+		// the linkage was missing heals here instead of skipping forever.
+		s.ensureScheduleTask(&diskCopy)
 		_ = json.NewEncoder(w).Encode(&diskCopy)
 		return
 

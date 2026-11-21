@@ -3,6 +3,7 @@ package platform
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -738,19 +739,40 @@ func (s *FileStore) ImportScheduleTask(_ context.Context, projectID string, in T
 	if _, ok := s.projectLocked(projectID); !ok {
 		return nil, false, fmt.Errorf("%w: project %s not found", ErrNotFound, projectID)
 	}
-	for i := range s.data.Tasks {
-		t := &s.data.Tasks[i]
-		if t.ProjectID == projectID && t.Context["legacy_schedule_id"] == legacyScheduleID {
-			returned := t.Task
-			returned.Context = t.Context
-			return &returned, false, nil
-		}
+	if existing, err := s.taskByLegacyScheduleIDLocked(projectID, legacyScheduleID); err == nil {
+		return existing, false, nil
+	} else if !errors.Is(err, ErrNotFound) {
+		return nil, false, err
 	}
 	created, err := s.createTaskLocked(projectID, in, map[string]any{"legacy_schedule_id": legacyScheduleID})
 	if err != nil {
 		return nil, false, err
 	}
 	return created, true, nil
+}
+
+// taskByLegacyScheduleIDLocked resolves the task created from a legacy
+// schedule (tasks.context.legacy_schedule_id) within one project; ErrNotFound
+// on a miss. Callers hold s.mu. Shared by ImportScheduleTask (write path) and
+// TaskByLegacyScheduleID (read-only reverse lookup for the scheduler→run
+// mount).
+func (s *FileStore) taskByLegacyScheduleIDLocked(projectID, legacyScheduleID string) (*Task, error) {
+	for i := range s.data.Tasks {
+		t := &s.data.Tasks[i]
+		if t.ProjectID == projectID && t.Context["legacy_schedule_id"] == legacyScheduleID {
+			returned := t.Task
+			returned.Context = t.Context
+			return &returned, nil
+		}
+	}
+	return nil, ErrNotFound
+}
+
+// TaskByLegacyScheduleID implements Repository.TaskByLegacyScheduleID.
+func (s *FileStore) TaskByLegacyScheduleID(_ context.Context, projectID, legacyScheduleID string) (*Task, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.taskByLegacyScheduleIDLocked(projectID, legacyScheduleID)
 }
 
 // createTaskLocked is CreateTask with an extra context seed. Callers hold s.mu.

@@ -906,3 +906,14 @@ func (s *Store) taskByContextKey(ctx context.Context, projectID uuid.UUID, key, 
 		 WHERE project_id = $1 AND context->>$2 = $3
 		 ORDER BY created_at, id LIMIT 1`, projectID, key, value))
 }
+
+// TaskByLegacyScheduleID implements Repository.TaskByLegacyScheduleID: one
+// delegated context-key SELECT, miss → ErrNotFound (pgx.ErrNoRows mapped by
+// scanTaskRow).
+func (s *Store) TaskByLegacyScheduleID(ctx context.Context, projectID, legacyScheduleID string) (*Task, error) {
+	parsed, err := parseUUID(projectID)
+	if err != nil {
+		return nil, err
+	}
+	return s.taskByContextKey(ctx, parsed, "legacy_schedule_id", legacyScheduleID)
+}

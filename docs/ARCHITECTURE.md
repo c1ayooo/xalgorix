@@ -61,7 +61,7 @@ After the v4.5.44 decomposition this package is split into cohesive files
 | `scan_audit.go` | read-only domain audit projection + cold-path sync views (`/api/scans/{id}/audit`, `/api/scans/{id}/coldpath`) |
 | `notify.go` | Discord + Telegram notifications (severity-gated) |
 | `chat.go` | in-scan / post-scan chat with the agent |
-| `schedules.go` / `scheduler.go` | scheduled scans |
+| `schedules.go` / `scheduler.go` | scheduled scans; the tick snapshots due schedules + advances timing under `schedulesMu` and does task reverse-lookup / project-scope validation / run mounting lock-free (`dispatchScheduledScan`) |
 | `handlers_platform.go` | projects/tasks/runs REST API (`/api/projects`, `/api/tasks`), run mounting, project-scope target validation, §3.2 `project_id` filters |
 | `handlers_approvals.go` | approvals + guidance REST (`/api/approvals`, `/api/tasks/{id}/guidance`); decisions are session/CSRF-guarded state changes |
 | `approvals_gate.go` | `ApprovalService`: per-run slot queue, timeout=reject timers, startup reconciliation, WS emission, payload redaction |
@@ -319,10 +319,29 @@ for *organization*, never a second scan-state authority.
 - Existing endpoints accept an optional `project_id` query parameter
   (`/api/instances`, `/api/findings`, `/api/findings/summary`, `/api/scans`);
   without the parameter behavior is byte-identical to before.
-- **Transitional fact**: scans triggered by the legacy scheduler (including
-  imported schedule tasks) still dispatch through the original
-  scheduler→`runMultiScan` path and do not pass project-scope validation;
-  that wiring closes in R2.
+- **Scheduler→Run closure** (formerly the "transitional fact"): schedule
+  dispatches — the 30s tick and the manual trigger endpoint alike — resolve
+  the schedule task read-only (`TaskByLegacyScheduleID` on
+  `context.legacy_schedule_id`, default project) and enforce the linked
+  project's scope with the same `validateTargetsInScope` rule as task runs.
+  The linkage is maintained at write time too: POST /api/schedules and every
+  PUT re-link idempotently via `ensureScheduleTask`
+  (`ImportScheduleTask` find-or-create), so runtime-created schedules never
+  wait for the next importer pass. An empty project scope (the
+  default-import state) keeps the schedule's own targets as the authorization
+  source (operator's explicit pre-platform configuration); a nil store is
+  the same posture plus legacy direct dispatch with no run mount (charter
+  §6.6). With a store configured, every unexpected state is a **skip, not a
+  bypass**: missing task, missing project or transient store error skips the
+  cycle (tick) / answers 400 or 503 (trigger endpoint, `503` reserved for
+  `errScheduleLinkUnavailable` transient failures) — a broken linkage must
+  never widen target authorization to "whatever the schedule says". Skipped
+  cycles still advance `LastRun`/`NextRun` (the 30s tick must not
+  retry-storm). The run mounts with `trigger="schedule"` synchronously
+  before the dispatch goroutine, so the mount is visible without racing the
+  scan. `schedulesMu` covers only the due-snapshot + `LastRun`/`NextRun`
+  advance; validation, mount and dispatch all run on the lock-free snapshot
+  — a PG-backed mount can never stall `/api/schedules`.
 
 ## HITL approvals & guidance — `internal/approval`, `internal/web/approvals_gate.go`
 
@@ -409,8 +428,10 @@ The single-process shared loopback MITM proxy (REDESIGN §4/D4), default ON
   legacy loop and Eino. `Execute` remains a `context.Background()` wrapper.
   `Tool.ExecuteContext` is optional; tools without it keep the historical hard
   timeout. `internal/agent` passes the per-call deadline into the registry, so
-  terminal, Python, HTTP and proxy tools observe cancellation. Browser remains
-  on the hard-timeout fallback (Chromium calls do not take a Go context).
+  terminal, Python, HTTP and proxy tools observe cancellation. `browser_action`
+  binds `rod.Page.Context` for the duration of one action under the existing
+  `actionMu`; cancellation aborts that CDP operation without closing Chromium or
+  losing page state.
 - `internal/safefile` replaces "check path, then reopen path" in fileedit.
   On Linux each component is opened with `openat(O_NOFOLLOW)` from a directory
   fd, writes use a same-directory temp file plus `renameat`, and exclusive
@@ -427,6 +448,20 @@ The single-process shared loopback MITM proxy (REDESIGN §4/D4), default ON
   with rod's launcher, so it fails closed in enforce mode. Rules are
   refcounted per scan and removed when the last enforced scan ends; non-Linux
   reports unmanaged. `scan_session` prepares and forgets the status per run.
+
+## Platform capabilities — `internal/platformutil`
+
+- `ConfigureProcessGroup` / `KillProcessTree`: Unix uses `Setpgid` and negative
+  PID SIGKILL with the self-process-group guard; Windows is explicitly a
+  single-process kill (no process-group claim).
+- `DiskAvailable`: Unix `Statfs`; Windows `GetDiskFreeSpaceEx`.
+- `TryLockFile` / `UnlockFile`: Unix non-blocking `flock`; Windows
+  `LockFileEx`/`UnlockFileEx`. No in-process mutex fallback is used.
+- `OpenReadNoFollow`: Unix `O_NOFOLLOW`; Windows opens read-only (callers that
+  need reparse-point rejection must add an explicit check).
+- Consumers: `scanctx/termstate`, `tools/terminal`, `tools/python`,
+  `web/server.go`, `web/queue_state.go`, `auth/store.go`, and
+  `resources.readDiskFree`. This is what makes the Windows build target work.
 
 ## Engine — `internal/engine` (R4 core)
 

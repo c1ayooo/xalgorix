@@ -650,3 +650,45 @@ func TestPostgresGuidanceIdempotentConcurrent(t *testing.T) {
 		t.Errorf("replay created=%v row=%v message=%q; want false/%s/%q", created, replay.ID, replay.Message, ids[0], in.Message)
 	}
 }
+
+// TestPostgresTaskByLegacyScheduleID mirrors the file-store reverse-lookup
+// contract on PG: hit, miss → ErrNotFound, and cross-project isolation.
+func TestPostgresTaskByLegacyScheduleID(t *testing.T) {
+	repo, pool := integrationRepo(t)
+	ctx := context.Background()
+
+	stamp := time.Now().UnixNano()
+	projectA, err := repo.CreateProject(ctx, fmt.Sprintf("SchedLookup A %d", stamp), Scope{Targets: []string{"a.example"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanupProject(t, pool, projectA.ID)
+	projectB, err := repo.CreateProject(ctx, fmt.Sprintf("SchedLookup B %d", stamp), Scope{Targets: []string{"b.example"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanupProject(t, pool, projectB.ID)
+
+	converted, _, err := repo.ImportScheduleTask(ctx, projectA.ID,
+		TaskInput{Name: fmt.Sprintf("PG lookup %d", stamp), Schedule: &TaskSchedule{Interval: "hourly"}},
+		fmt.Sprintf("pg-sched-lookup-%d", stamp))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = repo.DeleteTask(context.Background(), converted.ID) })
+
+	hit, err := repo.TaskByLegacyScheduleID(ctx, projectA.ID, fmt.Sprintf("pg-sched-lookup-%d", stamp))
+	if err != nil {
+		t.Fatalf("hit: %v", err)
+	}
+	if hit.ID != converted.ID {
+		t.Errorf("hit task = %s, want %s", hit.ID, converted.ID)
+	}
+
+	if _, err := repo.TaskByLegacyScheduleID(ctx, projectA.ID, "pg-sched-lookup-miss"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("miss = %v, want ErrNotFound", err)
+	}
+	if _, err := repo.TaskByLegacyScheduleID(ctx, projectB.ID, fmt.Sprintf("pg-sched-lookup-%d", stamp)); !errors.Is(err, ErrNotFound) {
+		t.Errorf("cross-project lookup = %v, want ErrNotFound", err)
+	}
+}

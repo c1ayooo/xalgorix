@@ -1,7 +1,9 @@
 package web
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -15,6 +17,8 @@ import (
 	// resolve even on minimal container images that ship without tzdata.
 	_ "time/tzdata"
 
+	"github.com/xalgord/xalgorix/v4/internal/config"
+	"github.com/xalgord/xalgorix/v4/internal/platform"
 	"github.com/xalgord/xalgorix/v4/internal/safe"
 )
 
@@ -300,54 +304,225 @@ func (s *Server) startScheduler() {
 }
 
 // checkAndRunSchedules evaluates all schedules and launches due scans.
+//
+// Lock discipline (R2 scheduler→run closure): schedulesMu is held only to
+// snapshot due schedules and advance LastRun/NextRun — never across the
+// launch work (task reverse-lookup, project-scope validation, run mount,
+// dispatch). The mount can block on the platform store (PostgreSQL, bounded
+// by a 5s timeout); holding the lock across it would stall /api/schedules and
+// the schedule writers for that long on every 30s tick. The advance happens
+// in the locked snapshot phase, so a refused (out-of-scope) or skipped
+// (missing task / transient store failure) launch still moves NextRun
+// forward — the tick must not retry-storm a permanently broken schedule, it
+// only logs the refusal.
 func (s *Server) checkAndRunSchedules() {
 	defer safe.Recover("scheduler.tick", "")
+	for _, sch := range s.collectDueSchedules(time.Now()) {
+		s.launchDueSchedule(sch)
+	}
+}
+
+// collectDueSchedules snapshots and advances every enabled schedule whose
+// NextRun has arrived. Callers process each returned copy outside
+// schedulesMu. The struct copy (diskCopy := *sch pattern) detaches the
+// snapshot from concurrent PUT mutations; the Targets backing array is never
+// mutated in place, so reading it lock-free is safe.
+func (s *Server) collectDueSchedules(now time.Time) []ScanSchedule {
 	s.schedulesMu.Lock()
 	defer s.schedulesMu.Unlock()
-
-	now := time.Now()
+	var due []ScanSchedule
 	for _, sch := range s.schedules {
-		func(sch *ScanSchedule) {
-			defer safe.Recover("scheduler."+sch.ID, "")
-			if !sch.Enabled {
-				return
-			}
-			if now.After(sch.NextRun) || now.Equal(sch.NextRun) {
-				log.Printf("[SCHEDULER] Triggering scheduled scan: %s (Targets: %v)", sch.Name, sch.Targets)
-
-				req := ScanRequest{
-					Targets:        sch.Targets,
-					Instruction:    sch.Instruction,
-					ScanMode:       sch.ScanMode,
-					SeverityFilter: sch.SeverityFilter,
-					Phases:         sch.Phases,
-					ReconMode:      sch.ReconMode,
-					ScanIntensity:  sch.ScanIntensity,
-					CompanyName:    sch.CompanyName,
-					LogoPath:       sch.LogoPath,
-					DiscordWebhook: sch.DiscordWebhook,
-					Name:           sch.Name + " (Scheduled)",
-					Model:          sch.Model,
-				}
-
-				scanCfg := s.configSnapshot()
-				if scanCfg == nil {
-					return
-				}
-				if sch.Model != "" {
-					scanCfg.LLM = sch.Model
-				}
-				instanceID := randomSlug()
-
-				go s.runMultiScan(req, scanCfg, instanceID)
-
-				sch.LastRun = now
-				sch.NextRun = calculateNextRun(sch, now)
-
-				if err := s.saveScheduleToDisk(sch); err != nil {
-					log.Printf("[SCHEDULER] Error saving triggered schedule %s: %v", sch.ID, err)
-				}
-			}
-		}(sch)
+		if sch == nil || !sch.Enabled {
+			continue
+		}
+		if now.After(sch.NextRun) || now.Equal(sch.NextRun) {
+			log.Printf("[SCHEDULER] Triggering scheduled scan: %s (Targets: %v)", sch.Name, sch.Targets)
+			sch.LastRun = now
+			sch.NextRun = calculateNextRun(sch, now)
+			due = append(due, *sch)
+		}
 	}
+	return due
+}
+
+// launchDueSchedule processes one due schedule snapshot outside schedulesMu:
+// persist the tick advance (file I/O moved out of the lock), enforce the
+// project scope (D7), then dispatch and mount. The per-schedule recover keeps
+// one bad schedule from derailing the rest of the tick (same semantics as the
+// previous in-lock closure).
+func (s *Server) launchDueSchedule(sch ScanSchedule) {
+	defer safe.Recover("scheduler."+sch.ID, "")
+
+	if err := s.saveScheduleToDisk(&sch); err != nil {
+		log.Printf("[SCHEDULER] Error saving triggered schedule %s: %v", sch.ID, err)
+	}
+
+	authCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	taskID, authErr := s.authorizeScheduledScan(authCtx, &sch)
+	cancel()
+	if authErr != nil {
+		// NextRun already advanced in collectDueSchedules — nothing left to
+		// bookkeep, the refusal only needs to be visible in the log.
+		log.Printf("[SCHEDULER] %v (NextRun already advanced)", authErr)
+		return
+	}
+
+	req := scanRequestForSchedule(&sch)
+	scanCfg := s.configSnapshot()
+	if scanCfg == nil {
+		log.Printf("[SCHEDULER] schedule %s skipped: config snapshot unavailable", sch.ID)
+		return
+	}
+	if sch.Model != "" {
+		scanCfg.LLM = sch.Model
+	}
+	s.dispatchScheduledScan(req, scanCfg, &sch, taskID, "schedule")
+}
+
+// scanRequestForSchedule maps a schedule onto the dispatch request — the same
+// field mapping the tick and the manual trigger endpoint have always used.
+func scanRequestForSchedule(sch *ScanSchedule) ScanRequest {
+	return ScanRequest{
+		Targets:        sch.Targets,
+		Instruction:    sch.Instruction,
+		ScanMode:       sch.ScanMode,
+		SeverityFilter: sch.SeverityFilter,
+		Phases:         sch.Phases,
+		ReconMode:      sch.ReconMode,
+		ScanIntensity:  sch.ScanIntensity,
+		CompanyName:    sch.CompanyName,
+		LogoPath:       sch.LogoPath,
+		DiscordWebhook: sch.DiscordWebhook,
+		Name:           sch.Name + " (Scheduled)",
+		Model:          sch.Model,
+	}
+}
+
+// errScheduleLinkUnavailable marks a transient platform-store failure during
+// the scheduler-entry scope check — distinct from a definitive refusal: the
+// tick skips the cycle (fail-closed; NextRun already advanced so no retry
+// storm), the trigger endpoint answers 503 so the operator retries instead
+// of reconfiguring.
+var errScheduleLinkUnavailable = errors.New("schedule linkage unavailable")
+
+// authorizeScheduledScan enforces the project-scope boundary for one
+// schedule-driven dispatch (REDESIGN §3.3 D7 — closes the transitional
+// direct-dispatch path documented in the R1 landing notes).
+//
+// Authorization source: the schedule task (tasks.context.legacy_schedule_id,
+// linked by the startup importer and by every create/update on
+// /api/schedules via ensureScheduleTask) ties the schedule to a project.
+// When that project's scope has targets, every schedule target must fall
+// inside it — the same fail-closed rule as POST /api/tasks/{id}/runs. A
+// project with an empty scope (the default-import state) keeps the
+// schedule's own targets as the authorization source: they are the
+// operator's explicit configuration that predates the platform.
+//
+// With NO platform store the schedule's targets stay the authorization
+// source and no run mounts (legacy direct dispatch, charter §6.6 — scanning
+// never depends on the platform store). With a store configured, every
+// unexpected state is a skip, not a bypass: a missing task, a missing
+// project or a transient store error returns a non-nil error and the caller
+// skips this cycle — a broken linkage must never silently widen the target
+// authorization to "whatever the schedule says".
+//
+// It returns the task ID to mount the run on ("" only for the nil-store
+// direct dispatch) and a non-nil error when the dispatch must be skipped
+// (scope violation, broken linkage, transient store failure).
+func (s *Server) authorizeScheduledScan(ctx context.Context, sch *ScanSchedule) (string, error) {
+	store := s.currentPlatformStore()
+	if store == nil {
+		return "", nil
+	}
+	defaultProject, err := store.EnsureDefaultProject(ctx)
+	if err != nil {
+		log.Printf("[platform] scheduler scope check: resolve default project: %v", err)
+		return "", fmt.Errorf("%w: resolve default project: %v", errScheduleLinkUnavailable, err)
+	}
+	task, err := store.TaskByLegacyScheduleID(ctx, defaultProject.ID, sch.ID)
+	if errors.Is(err, platform.ErrNotFound) {
+		log.Printf("[platform] scheduler scope check: schedule %s task missing — run skipped, will retry next cycle", sch.ID)
+		return "", fmt.Errorf("schedule %q has no linked schedule task (scope cannot be validated) — run skipped", sch.Name)
+	}
+	if err != nil {
+		log.Printf("[platform] scheduler scope check: task lookup for schedule %s: %v", sch.ID, err)
+		return "", fmt.Errorf("%w: task lookup for schedule %s: %v", errScheduleLinkUnavailable, sch.ID, err)
+	}
+	project, err := store.GetProject(ctx, task.ProjectID)
+	if errors.Is(err, platform.ErrNotFound) {
+		// The task outlived its project (deleted outside the cascade
+		// contract): the authorization source is gone, so nothing may run.
+		log.Printf("[platform] scheduler scope check: project %s for schedule %s missing — run skipped, will retry next cycle", task.ProjectID, sch.ID)
+		return "", fmt.Errorf("schedule %q project %s is missing — run skipped", sch.Name, task.ProjectID)
+	}
+	if err != nil {
+		log.Printf("[platform] scheduler scope check: project %s for schedule %s: %v", task.ProjectID, sch.ID, err)
+		return "", fmt.Errorf("%w: project lookup for schedule %s: %v", errScheduleLinkUnavailable, sch.ID, err)
+	}
+	if len(project.Scope.Targets) == 0 {
+		// Default-import state: the schedule's targets are the operator's
+		// own authorization fact (empty-scope compatibility ruling).
+		return task.ID, nil
+	}
+	targets := flattenPlatformTargets(sch.Targets)
+	if err := validateTargetsInScope(targets, project.Scope); err != nil {
+		return "", fmt.Errorf("schedule %q refused: %v", sch.Name, err)
+	}
+	return task.ID, nil
+}
+
+// ensureScheduleTask links a schedule to its schedule task at write time
+// (POST /api/schedules create, PUT update): the startup importer only runs
+// once, so a schedule created at runtime would otherwise have no task for
+// the scheduler→run mount to resolve and every tick would skip it. The
+// lookup is the idempotent find-or-create ImportScheduleTask contract, so a
+// full re-link on PUT is harmless. Failure is logged, never fatal — the
+// schedule file itself is already persisted, and the tick's skip-on-missing
+// posture keeps an unlinked schedule from dispatching unscooped (charter
+// §6.6 parity with the rest of the platform write paths).
+func (s *Server) ensureScheduleTask(sch *ScanSchedule) {
+	store := s.currentPlatformStore()
+	if store == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	project, err := store.EnsureDefaultProject(ctx)
+	if err != nil {
+		log.Printf("[platform] schedule task link: resolve default project: %v", err)
+		return
+	}
+	if _, _, err := store.ImportScheduleTask(ctx, project.ID, legacyScheduleToTaskInput(sch), sch.ID); err != nil {
+		log.Printf("[platform] schedule task link for %s (%s): %v", sch.ID, sch.Name, err)
+	}
+}
+
+// dispatchScheduledScan launches one schedule-driven scan and, when a task
+// linkage exists, mounts the run record synchronously BEFORE the dispatch
+// goroutine — the mount is part of the tick's /api/schedules-facing work and
+// callers can assert it without racing the scan goroutine. The mount uses a
+// detached context with a short timeout (handleTaskRunStart precedent): a
+// wedged store must not cancel the dispatch, and a mount failure must not
+// undo it — the scan runs, the failure is logged. The queue-ownership shape
+// stays the legacy direct-dispatch one (registerMultiScan acquires it
+// internally); the reserve/persist/saveQueueState sequence of POST
+// /api/tasks/{id}/runs is deliberately not copied here.
+func (s *Server) dispatchScheduledScan(req ScanRequest, scanCfg *config.Config, sch *ScanSchedule, taskID, trigger string) string {
+	instanceID := randomSlug()
+	if taskID != "" {
+		if store := s.currentPlatformStore(); store != nil {
+			mountCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_, err := store.CreateRun(mountCtx, taskID, platform.RunMount{
+				InstanceID: instanceID,
+				Mode:       sch.ScanMode,
+				Trigger:    trigger,
+			})
+			cancel()
+			if err != nil {
+				log.Printf("[platform] scheduled scan %s accepted but run mount on task %s failed: %v", instanceID, taskID, err)
+			}
+		}
+	}
+	go s.runMultiScan(req, scanCfg, instanceID)
+	return instanceID
 }

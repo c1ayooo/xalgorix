@@ -87,6 +87,12 @@ type Repository interface {
 	// ImportScheduleTask idempotently converts a legacy schedule into a task
 	// keyed by context.legacy_schedule_id; returns (task, created).
 	ImportScheduleTask(ctx context.Context, projectID string, in TaskInput, legacyScheduleID string) (*Task, bool, error)
+	// TaskByLegacyScheduleID is the read-only reverse lookup of that mapping:
+	// the task created from a legacy schedule within projectID, ErrNotFound
+	// when none. The scheduler→run mount uses it to attach schedule-triggered
+	// runs to the imported task; it never writes — ImportScheduleTask keeps
+	// the implicit-create role.
+	TaskByLegacyScheduleID(ctx context.Context, projectID, legacyScheduleID string) (*Task, error)
 
 	// ── approvals (R2a HITL, REDESIGN §5, API_CONTRACT §3) ──────────────────
 	// CreateApproval inserts a pending obligation row. The caller computes

@@ -632,3 +632,45 @@ func TestFileStoreImportIdempotentByInstanceOrLegacyID(t *testing.T) {
 		t.Fatalf("modern run remounted under import task: %+v, %v", runs, err)
 	}
 }
+
+// TestFileStoreTaskByLegacyScheduleID pins the read-only reverse lookup the
+// scheduler→run mount depends on: hit returns the imported task with its
+// context, a miss and a same-key task in another project both yield
+// ErrNotFound (D7 project isolation), and the lookup never creates anything.
+func TestFileStoreTaskByLegacyScheduleID(t *testing.T) {
+	store := newTestFileStore(t)
+	ctx := context.Background()
+	projectA, err := store.EnsureDefaultProject(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	projectB, err := store.CreateProject(ctx, "Other", Scope{Targets: []string{"other.example"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	converted, _, err := store.ImportScheduleTask(ctx, projectA.ID,
+		TaskInput{Name: "Nightly perimeter", Schedule: &TaskSchedule{Interval: "daily"}}, "sched-lookup-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hit, err := store.TaskByLegacyScheduleID(ctx, projectA.ID, "sched-lookup-1")
+	if err != nil {
+		t.Fatalf("hit: %v", err)
+	}
+	if hit.ID != converted.ID {
+		t.Errorf("hit task = %s, want %s", hit.ID, converted.ID)
+	}
+	if hit.Context["legacy_schedule_id"] != "sched-lookup-1" {
+		t.Errorf("hit context lost: %+v", hit.Context)
+	}
+
+	if _, err := store.TaskByLegacyScheduleID(ctx, projectA.ID, "sched-lookup-miss"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("miss = %v, want ErrNotFound", err)
+	}
+	// Same key in another project must not resolve (row-level isolation).
+	if _, err := store.TaskByLegacyScheduleID(ctx, projectB.ID, "sched-lookup-1"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("cross-project lookup = %v, want ErrNotFound", err)
+	}
+}
