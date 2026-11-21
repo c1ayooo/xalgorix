@@ -92,8 +92,8 @@ export default function ScansPage() {
     if (!uniqueIds.length) return;
     const label =
       uniqueIds.length === 1
-        ? "Permanently delete this scan?"
-        : `Permanently delete ${uniqueIds.length} selected scans?`;
+        ? t("scans.confirmDeleteOne")
+        : `${t("scans.confirmDeleteManyBefore")}${uniqueIds.length}${t("scans.confirmDeleteManyAfter")}`;
     if (!window.confirm(label)) return;
     const settled = await Promise.allSettled(
       uniqueIds.map((id) => del.mutateAsync(id)),
@@ -134,7 +134,7 @@ export default function ScansPage() {
               <Input
                 value={q}
                 onChange={(e) => setQ(e.target.value)}
-                placeholder="Search target or scan id…"
+                placeholder={t("scans.searchPlaceholder")}
                 className="pl-9"
               />
             </div>
@@ -161,10 +161,10 @@ export default function ScansPage() {
                 variant="outline"
                 onClick={allVisibleSelected ? clearSelection : selectAllVisible}
               >
-                {allVisibleSelected ? "Clear selection" : "Select all"}
+                {allVisibleSelected ? t("common.clearSelection") : t("scans.selectAll")}
               </Button>
               <span className="text-xs text-muted-foreground">
-                {selectedIds.size} selected
+                {selectedIds.size} {t("scans.selectedCount")}
               </span>
               <BulkActionMenu
                 disabled={selectedIds.size === 0 || del.isPending}
@@ -178,11 +178,11 @@ export default function ScansPage() {
 
       {error ? (
         <ErrorState
-          title="Could not load scans"
-          description={error instanceof Error ? error.message : "Unknown error"}
+          title={t("scans.error.title")}
+          description={error instanceof Error ? error.message : t("common.somethingWrong")}
           action={
             <Button size="sm" variant="outline" onClick={() => refetch()}>
-              Retry
+              {t("common.retry")}
             </Button>
           }
         />
@@ -190,12 +190,12 @@ export default function ScansPage() {
         <ScanListSkeleton />
       ) : scans.length === 0 ? (
         <EmptyState
-          title="No scans match"
-          description="Adjust filters or kick off a new engagement."
+          title={t("scans.empty.title")}
+          description={t("scans.empty.description")}
           action={
             <Button onClick={() => setNewOpen(true)}>
               <Plus className="mr-1 h-4 w-4" />
-              New scan
+              {t("scans.newScan")}
             </Button>
           }
         />
@@ -264,11 +264,11 @@ function ScanTable({
                     checked={allSelected}
                     indeterminate={partiallySelected}
                     onCheckedChange={onSelectAll}
-                    label="Select all visible scans"
+                    label={t("scans.selectVisibleAria")}
                   />
                 </Th>
                 <Th className="pl-4">
-                  Target{" "}
+                  {t("scans.col.target")}{" "}
                   <ArrowUpDown className="ml-1 inline h-3 w-3 opacity-60" />
                 </Th>
                 <Th>{t("scans.col.status")}</Th>
@@ -291,7 +291,7 @@ function ScanTable({
                     <SelectCheckbox
                       checked={selectedIds.has(s.id)}
                       onCheckedChange={(checked) => onSelect(s.id, checked)}
-                      label={`Select scan ${s.target}`}
+                      label={`${t("scans.selectRunAria")} ${s.target}`}
                     />
                   </Td>
                   <Td className="pl-4">
@@ -304,17 +304,17 @@ function ScanTable({
                       </div>
                       {!!s.sub_scan_total && (
                         <div className="mt-1 flex flex-wrap gap-1.5 text-[11px] text-muted-foreground">
-                          <span>{s.sub_scan_total} subdomains</span>
+                          <span>{s.sub_scan_total} {t("scans.subdomains")}</span>
                           <span>·</span>
-                          <span>{s.sub_scan_completed ?? 0} scanned</span>
+                          <span>{s.sub_scan_completed ?? 0} {t("scans.subScanned")}</span>
                           {!!s.sub_scan_running && (
                             <>
                               <span>·</span>
-                              <span>{s.sub_scan_running} running</span>
+                              <span>{s.sub_scan_running} {t("scans.subRunning")}</span>
                             </>
                           )}
                           <span>·</span>
-                          <span>{s.sub_scan_remaining ?? 0} remaining</span>
+                          <span>{s.sub_scan_remaining ?? 0} {t("scans.subRemaining")}</span>
                         </div>
                       )}
                     </Link>
@@ -418,18 +418,19 @@ function BulkActionMenu({
   selectedCount: number;
   onDelete: () => void;
 }) {
+  const { t } = useI18n();
   return (
     <DropdownMenu.Root>
       <DropdownMenu.Trigger asChild>
         <Button size="sm" variant="secondary" disabled={disabled}>
-          Actions
+          {t("scans.col.actions")}
           <MoreHorizontal className="h-3.5 w-3.5" />
         </Button>
       </DropdownMenu.Trigger>
       <DropdownMenu.Portal>
         <DropdownMenu.Content align="start" className={menuContentClass}>
           <DropdownMenu.Label className="px-2 py-1.5 text-xs text-muted-foreground">
-            {selectedCount} selected
+            {selectedCount} {t("scans.selectedCount")}
           </DropdownMenu.Label>
           <DropdownMenu.Separator className="-mx-1 my-1 h-px bg-border" />
           <DropdownMenu.Item
@@ -440,7 +441,7 @@ function BulkActionMenu({
             }}
           >
             <Trash2 className="h-3.5 w-3.5" />
-            Delete selected
+            {t("scans.deleteSelected")}
           </DropdownMenu.Item>
         </DropdownMenu.Content>
       </DropdownMenu.Portal>
@@ -457,13 +458,14 @@ function RowActionMenu({
   deleting: boolean;
   onDelete: () => void;
 }) {
+  const { t } = useI18n();
   return (
     <DropdownMenu.Root>
       <DropdownMenu.Trigger asChild>
         <Button
           size="icon"
           variant="ghost"
-          aria-label={`Actions for ${scan.target}`}
+          aria-label={`${t("scans.actionsForAria")} ${scan.target}`}
         >
           <MoreHorizontal className="h-4 w-4" />
         </Button>
@@ -473,13 +475,13 @@ function RowActionMenu({
           <DropdownMenu.Item asChild className={menuItemClass}>
             <Link to={`/scans/${scan.id}`}>
               <ExternalLink className="h-3.5 w-3.5" />
-              Open details
+              {t("scans.openDetails")}
             </Link>
           </DropdownMenu.Item>
           <DropdownMenu.Item asChild className={menuItemClass}>
             <a href={`/api/report/${scan.id}`} target="_blank" rel="noreferrer">
               <Download className="h-3.5 w-3.5" />
-              Download PDF
+              {t("scans.downloadPdf")}
             </a>
           </DropdownMenu.Item>
           <DropdownMenu.Separator className="-mx-1 my-1 h-px bg-border" />
@@ -495,7 +497,7 @@ function RowActionMenu({
             }}
           >
             <Trash2 className="h-3.5 w-3.5" />
-            Delete scan
+            {t("scans.deleteScan")}
           </DropdownMenu.Item>
         </DropdownMenu.Content>
       </DropdownMenu.Portal>

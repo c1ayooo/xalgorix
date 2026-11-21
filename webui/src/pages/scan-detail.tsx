@@ -1328,8 +1328,8 @@ function ScanGuidanceComposer({ instanceId }: { instanceId: string }) {
                 void sendGuidance();
               }
             }}
-            placeholder="Example: Re-check the admin API with the second account before moving on."
-            aria-label="Message to the running scan agent"
+            placeholder={t("scanDetail.guidancePlaceholder")}
+            aria-label={t("scanDetail.guidanceAriaLabel")}
             rows={3}
             maxLength={4000}
             disabled={sending}

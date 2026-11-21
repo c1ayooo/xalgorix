@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/xalgord/xalgorix/v4/internal/infoitem"
@@ -16,6 +18,7 @@ type fakeInfoReader struct {
 	regionQ    infoitem.RegionQuery
 	contextQ   infoitem.ContextQuery
 	assocQ     infoitem.AssociationQuery
+	assocCalls []infoitem.AssociationQuery
 	regionRes  infoitem.RegionResult
 	contextRes infoitem.ContextResult
 	assocRes   infoitem.AssociationResult
@@ -28,6 +31,7 @@ func (f *fakeInfoReader) Region(_ context.Context, q infoitem.RegionQuery) (info
 }
 
 func (f *fakeInfoReader) Associate(_ context.Context, q infoitem.AssociationQuery) (infoitem.AssociationResult, error) {
+	f.assocCalls = append(f.assocCalls, q)
 	f.assocQ = q
 	return f.assocRes, f.err
 }
@@ -141,5 +145,127 @@ func TestInfoAssociationValidatesProjectAndPassesFilters(t *testing.T) {
 		reader.assocQ.MaxDepth != 2 || reader.assocQ.Limit != 5 ||
 		len(reader.assocQ.EdgeTypes) != 1 || reader.assocQ.EdgeTypes[0] != infoitem.RelationSupports {
 		t.Fatalf("association query = %+v", reader.assocQ)
+	}
+	// Single-scan responses keep their contract shape: no aggregation fields.
+	if strings.Contains(rr.Body.String(), "scans_consulted") {
+		t.Fatalf("single-scan response leaks scans_consulted: %s", rr.Body.String())
+	}
+}
+
+func TestInfoAssociationRejectsCrossProjectScan(t *testing.T) {
+	s, projectA, _ := infoTestServer(t)
+	reader := &fakeInfoReader{}
+	s.SetInfoReader(reader)
+	rr := infoRequest(t, s, "/api/info/association?project_id="+projectA.ID+"&scan_id=inst-b&ids=i1")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("cross-project scan = %d body=%s", rr.Code, rr.Body.String())
+	}
+	if len(reader.assocCalls) != 0 {
+		t.Fatalf("reader called for cross-project scan: %+v", reader.assocCalls)
+	}
+}
+
+// A project with two runs: the project-wide form queries both whitelisted
+// scans and merges their hits on the item id dimension.
+func TestInfoAssociationProjectFormAggregatesWhitelistedScans(t *testing.T) {
+	s, projectA, _ := infoTestServer(t)
+	store := s.currentPlatformStore()
+	ctx := context.Background()
+	task, err := store.CreateTask(ctx, projectA.ID, platform.TaskInput{Name: "Second run"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateRun(ctx, task.ID, platform.RunMount{InstanceID: "inst-a2", Mode: "single"}); err != nil {
+		t.Fatal(err)
+	}
+	reader := &fakeInfoReader{assocRes: infoitem.AssociationResult{
+		// Same hit id returned by both scans — the merge must dedupe it.
+		Hits: []infoitem.AssociationHit{{Item: infoitem.Item{ID: "i2"}, Path: []string{"i1", "i2"}, Depth: 1}},
+	}}
+	s.SetInfoReader(reader)
+	rr := infoRequest(t, s, "/api/info/association?project_id="+projectA.ID+"&ids=i1&max_depth=3&limit=10")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if len(reader.assocCalls) != 2 {
+		t.Fatalf("associate calls = %d (%+v)", len(reader.assocCalls), reader.assocCalls)
+	}
+	for _, q := range reader.assocCalls {
+		if q.ScanID != "inst-a" && q.ScanID != "inst-a2" {
+			t.Fatalf("query outside project whitelist: %+v", q)
+		}
+		if q.MaxDepth != 3 || q.Limit != 10 || len(q.StartIDs) != 1 || q.StartIDs[0] != "i1" {
+			t.Fatalf("bounded traversal params not preserved: %+v", q)
+		}
+	}
+	var body struct {
+		Available      bool `json:"available"`
+		ScansConsulted int  `json:"scans_consulted"`
+		Hits           []struct {
+			Item struct {
+				ID string `json:"id"`
+			} `json:"item"`
+		} `json:"hits"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if !body.Available || body.ScansConsulted != 2 {
+		t.Fatalf("response = %+v", body)
+	}
+	if len(body.Hits) != 1 || body.Hits[0].Item.ID != "i2" {
+		t.Fatalf("merged hits not deduped on item id: %+v", body.Hits)
+	}
+}
+
+func TestInfoAssociationProjectFormRequiresStartIDs(t *testing.T) {
+	s, projectA, _ := infoTestServer(t)
+	reader := &fakeInfoReader{}
+	s.SetInfoReader(reader)
+	rr := infoRequest(t, s, "/api/info/association?project_id="+projectA.ID)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("missing ids = %d body=%s", rr.Code, rr.Body.String())
+	}
+	if len(reader.assocCalls) != 0 {
+		t.Fatalf("reader called without start ids: %+v", reader.assocCalls)
+	}
+}
+
+// The aggregation fan-out is capped so one request cannot turn into one
+// cold-path query per run of a large project; the cap is disclosed via
+// truncated=true and scans_consulted.
+func TestInfoAssociationProjectFormCapsScanFanOut(t *testing.T) {
+	s, projectB, _ := infoTestServer(t)
+	store := s.currentPlatformStore()
+	ctx := context.Background()
+	task, err := store.CreateTask(ctx, projectB.ID, platform.TaskInput{Name: "Many runs"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const totalRuns = 25
+	for i := 0; i < totalRuns; i++ {
+		id := fmt.Sprintf("inst-b-%02d", i)
+		if _, err := store.CreateRun(ctx, task.ID, platform.RunMount{InstanceID: id, Mode: "single"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reader := &fakeInfoReader{}
+	s.SetInfoReader(reader)
+	rr := infoRequest(t, s, "/api/info/association?project_id="+projectB.ID+"&ids=i1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if len(reader.assocCalls) != maxProjectAssociationScans {
+		t.Fatalf("associate calls = %d, want cap %d", len(reader.assocCalls), maxProjectAssociationScans)
+	}
+	var body struct {
+		Truncated      bool `json:"truncated"`
+		ScansConsulted int  `json:"scans_consulted"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if !body.Truncated || body.ScansConsulted != maxProjectAssociationScans {
+		t.Fatalf("cap disclosure = %+v", body)
 	}
 }

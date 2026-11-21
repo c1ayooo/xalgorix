@@ -785,6 +785,29 @@ const server = http.createServer(async (req, res) => {
     return send(res, { available: false, reason: "unknown_info_endpoint" }, 404);
   }
 
+  // -------- R5: Cold-path sync state (contract §3.3 reuse) ------------------
+  // disabled = no-DSN normal state (not a failure); failed 才是红色。
+  if (method === "GET" && url.startsWith("/api/scans/") && url.endsWith("/coldpath")) {
+    const scanId = decodeURIComponent(url.slice("/api/scans/".length, -"/coldpath".length));
+    if (!scanId) return send(res, { error: "scan id is required" }, 400);
+    const known =
+      state.instances.some((inst) => inst.id === scanId) ||
+      state.scans.some((sc) => sc.id === scanId);
+    if (!known) return send(res, { error: "scan not found" }, 404);
+    if (process.env.MOCK_INFO_DISABLED === "1") {
+      return send(res, { scan_id: scanId, cold_path: "disabled", source_seq: 0, applied_seq: 0, state: "disabled" });
+    }
+    const nowIso2 = new Date().toISOString();
+    return send(res, {
+      scan_id: scanId,
+      cold_path: "enabled",
+      source_seq: 24,
+      applied_seq: 24,
+      state: "applied",
+      updated_at: nowIso2,
+    });
+  }
+
   // -------- Schedules ------------------------------------------------------
   if (method === "GET" && url === "/api/schedules") {
     return send(res, state.schedules);

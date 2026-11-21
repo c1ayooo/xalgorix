@@ -3,7 +3,9 @@ package web
 // Project-scoped, read-only InfoItem activation endpoints (R5 / CORE §4).
 //
 // GET /api/info/region       — property filter across the project's scans
-// GET /api/info/association  — bounded relation traversal within one scan
+// GET /api/info/association  — bounded relation traversal: within one
+//                              whitelisted scan (scan_id form) or aggregated
+//                              across the project's scans (project-wide form)
 // GET /api/info/context      — fixed-dimension context slice within one scan
 //
 // Project isolation is enforced before any infoitem query: the requested
@@ -54,7 +56,17 @@ type infoContextResponse struct {
 type infoAssociationResponse struct {
 	Available bool `json:"available"`
 	infoitem.AssociationResult
+	// ScansConsulted is set only for the project-wide form and discloses how
+	// many whitelisted scans the aggregation actually queried.
+	ScansConsulted int `json:"scans_consulted,omitempty"`
 }
+
+// maxProjectAssociationScans bounds the per-scan fan-out of the project-wide
+// association form. Aggregation cost is one Reader.Associate call per scan, so
+// a project with hundreds of runs would turn one UI request into hundreds of
+// cold-path round-trips. Runs beyond the cap are not queried and the omission
+// is disclosed honestly via truncated=true plus the scans_consulted count.
+const maxProjectAssociationScans = 20
 
 func writeInfoDisabled(w http.ResponseWriter) {
 	writeJSONStatus(w, http.StatusServiceUnavailable, map[string]any{
@@ -274,11 +286,32 @@ func (s *Server) handleInfoAssociation(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// Two request shapes (CORE v2.1 §4.2):
+	//   scan_id present    — bounded traversal within that one whitelisted
+	//                        scan (contract §3.3 single-scan form, unchanged);
+	//   scan_id absent     — project-wide form: the same bounded traversal
+	//                        aggregated over every whitelisted scan of the
+	//                        project, merged/deduped on the item id dimension.
+	// Cross-scan aggregation never widens the whitelist: the scan set comes
+	// from platform.ProjectScanIDs for the requested project only.
 	scanID := strings.TrimSpace(r.URL.Query().Get("scan_id"))
-	if scanID == "" || !containsString(scanIDs, scanID) {
-		writeJSONStatus(w, http.StatusBadRequest, map[string]string{"error": "scan_id is not in this project"})
+	if scanID != "" {
+		if !containsString(scanIDs, scanID) {
+			writeJSONStatus(w, http.StatusBadRequest, map[string]string{"error": "scan_id is not in this project"})
+			return
+		}
+		s.associationQuery(w, r, []string{scanID}, false)
 		return
 	}
+	s.associationQuery(w, r, scanIDs, true)
+}
+
+// associationQuery runs the shared bounded-traversal parameter parsing and,
+// for the project-wide form, the per-scan aggregation loop. The infoitem
+// Reader interface stays untouched: aggregation is plain sequential
+// Reader.Associate calls plus an id-dimension merge (no recursive CTE, no
+// cross-store transaction).
+func (s *Server) associationQuery(w http.ResponseWriter, r *http.Request, scanIDs []string, projectWide bool) {
 	reader := s.currentInfoReader()
 	if reader == nil {
 		writeInfoDisabled(w)
@@ -302,23 +335,73 @@ func (s *Server) handleInfoAssociation(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	q := infoitem.AssociationQuery{
-		ScanID:    scanID,
-		StartIDs:  infoQueryIDs(r, "ids"),
-		EdgeTypes: edgeTypes,
-		MaxDepth:  depth,
-		Limit:     limit,
-	}
-	res, err := reader.Associate(r.Context(), q)
-	if err != nil {
-		if s.infoReaderUnavailable(err) {
-			writeInfoUnavailable(w, err)
-			return
-		}
-		writeJSONStatus(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+	startIDs := infoQueryIDs(r, "ids")
+	if projectWide && len(startIDs) == 0 {
+		// Without explicit start ids a fan-out would query every scan with an
+		// invalid traversal; the Reader would reject it anyway, so fail fast.
+		writeJSONStatus(w, http.StatusBadRequest, map[string]string{"error": "ids is required"})
 		return
 	}
-	writeJSONStatus(w, http.StatusOK, infoAssociationResponse{Available: true, AssociationResult: res})
+	// The per-scan queries receive the raw limit (0 lets the Reader normalize
+	// it); the merged result set is capped by the effective budget here.
+	budget := infoitem.NormalizeLimit(limit)
+	consulted := scanIDs
+	capped := false
+	if len(consulted) > maxProjectAssociationScans {
+		consulted = consulted[:maxProjectAssociationScans]
+		capped = true
+	}
+	merged := infoitem.AssociationResult{}
+	seen := map[string]struct{}{}
+	for _, scan := range consulted {
+		q := infoitem.AssociationQuery{
+			ScanID:    scan,
+			StartIDs:  startIDs,
+			EdgeTypes: edgeTypes,
+			MaxDepth:  depth,
+			Limit:     limit,
+		}
+		res, err := reader.Associate(r.Context(), q)
+		if err != nil {
+			if s.infoReaderUnavailable(err) {
+				writeInfoUnavailable(w, err)
+				return
+			}
+			writeJSONStatus(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		for _, hit := range res.Hits {
+			if _, dup := seen[hit.Item.ID]; dup {
+				continue
+			}
+			if len(merged.Hits) >= budget {
+				merged.Truncated = true
+				break
+			}
+			seen[hit.Item.ID] = struct{}{}
+			merged.Hits = append(merged.Hits, hit)
+		}
+		if res.Truncated {
+			merged.Truncated = true
+		}
+		if res.Incomplete {
+			merged.Incomplete = true
+		}
+		if merged.GapReason == "" {
+			merged.GapReason = res.GapReason
+		}
+		if len(merged.Hits) >= budget {
+			break
+		}
+	}
+	if capped {
+		merged.Truncated = true
+	}
+	resp := infoAssociationResponse{Available: true, AssociationResult: merged}
+	if projectWide {
+		resp.ScansConsulted = len(consulted)
+	}
+	writeJSONStatus(w, http.StatusOK, resp)
 }
 
 // infoReaderUnavailable distinguishes a missing cold-path backend (503) from

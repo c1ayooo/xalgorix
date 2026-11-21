@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "./client";
 import type {
+  ColdPathSyncState,
   InfoAssociationParams,
   InfoContextParams,
   InfoRegionParams,
@@ -58,6 +59,7 @@ export const qk = {
     ["info", "context", params] as const,
   infoAssociation: (params: InfoAssociationParams) =>
     ["info", "association", params] as const,
+  coldPathSync: (scanId: string) => ["info", "coldpath", scanId] as const,
 };
 
 export function useAuthStatus() {
@@ -829,8 +831,22 @@ export function useInfoAssociation(params: InfoAssociationParams, enabled = true
   return useQuery({
     queryKey: qk.infoAssociation(params),
     queryFn: () => api.infoAssociation(params),
-    enabled: enabled && !!params.projectId && !!params.scanId && !!params.ids,
+    // scanId 缺省 = 项目级聚合形态；单扫描形态由调用方传入。
+    enabled: enabled && !!params.projectId && !!params.ids,
     placeholderData: (prev) => prev,
+    retry: false,
+  });
+}
+
+// Cold-path sync state for one run. Polls at the shared 15s cadence; endpoint
+// failures surface through `error` so the page can degrade to hiding the
+// badge instead of blocking the three tabs.
+export function useColdPathSync(scanId: string, enabled = true) {
+  return useQuery({
+    queryKey: qk.coldPathSync(scanId),
+    queryFn: (): Promise<ColdPathSyncState> => api.coldPathSync(scanId),
+    enabled: enabled && !!scanId,
+    refetchInterval: 15000,
     retry: false,
   });
 }

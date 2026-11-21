@@ -265,7 +265,7 @@ export default function FindingsPage() {
               variant="outline"
               onClick={refreshAll}
               disabled={isRefreshing}
-              aria-label="Refresh findings"
+              aria-label={t("findings.refresh")}
             >
               <RefreshCw
                 className={cn("h-3.5 w-3.5", isRefreshing && "animate-spin")}
@@ -283,7 +283,7 @@ export default function FindingsPage() {
             <Input
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              placeholder="Search by title, endpoint, host, or CVE…"
+              placeholder={t("findings.searchPlaceholder")}
               className="pl-8"
             />
           </div>
@@ -334,8 +334,8 @@ export default function FindingsPage() {
         ) : filtered.length === 0 ? (
           <EmptyState
             icon={<ShieldAlert className="h-6 w-6" />}
-            title="No matching findings"
-            description="Try widening your filters or run a new scan."
+            title={t("findings.emptyTitle")}
+            description={t("findings.emptyDescription")}
           />
         ) : (
           <>

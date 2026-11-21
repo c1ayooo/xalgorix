@@ -13,12 +13,15 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
 import { api, type ProviderKeyStatus } from "@/api/client";
+import { useI18n } from "@/i18n";
 
 interface ProviderKeysManagerProps {
   className?: string;
 }
 
 export default function ProviderKeysManager({ className }: ProviderKeysManagerProps) {
+  const { t } = useI18n();
+
   const [providers, setProviders] = useState<ProviderKeyStatus[]>([]);
   const [configuredCount, setConfiguredCount] = useState(0);
   const [routerEnabled, setRouterEnabled] = useState(false);
@@ -201,7 +204,7 @@ export default function ProviderKeysManager({ className }: ProviderKeysManagerPr
                   </div>
                   <Input
                     className="max-w-48 font-mono text-xs"
-                    placeholder="New key to replace..."
+                    placeholder={t("providerKeys.replacePlaceholder")}
                     value={keyInputs[provider.provider_id] || ""}
                     onChange={(e) =>
                       updateKeyInput(provider.provider_id, e.target.value)
@@ -276,7 +279,7 @@ export default function ProviderKeysManager({ className }: ProviderKeysManagerPr
           <div className="flex gap-2">
             <Input
               className="max-w-sm font-mono text-sm"
-              placeholder="e.g., gpt-5.6, claude-fable-5, gemini-3.5-flash"
+              placeholder={t("providerKeys.modelPlaceholder")}
               value={testModel}
               onChange={(e) => setTestModel(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && testRoute()}

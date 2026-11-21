@@ -433,7 +433,7 @@ export default function SettingsPage() {
           {t("settings.title")}
         </h1>
         <p className="text-sm text-muted-foreground">
-          LLM provider, environment variables, integrations, and account access.
+          {t("settings.subtitle")}
         </p>
       </header>
 
@@ -452,11 +452,11 @@ export default function SettingsPage() {
             <Skeleton className="h-96" />
           ) : llm.error ? (
             <ErrorState
-              title="Failed to load LLM settings"
-              description={llm.error instanceof Error ? llm.error.message : "Unknown error"}
+              title={t("settings.error.llm")}
+              description={llm.error instanceof Error ? llm.error.message : t("common.somethingWrong")}
               action={
                 <Button size="sm" variant="outline" onClick={() => llm.refetch()}>
-                  Retry
+                  {t("common.retry")}
                 </Button>
               }
             />
@@ -465,13 +465,13 @@ export default function SettingsPage() {
               <CardHeader>
                 <CardTitle>{t("settings.card.llmProvider")}</CardTitle>
                 <CardDescription>
-                  Saved to {llmForm.envFile || "~/.xalgorix.env"} and used by new scans.
+                  {t("settings.llm.savedToBefore")}{llmForm.envFile || "~/.xalgorix.env"}{t("settings.llm.savedToAfter")}
                 </CardDescription>
               </CardHeader>
               <CardContent className="space-y-5">
                 <div className="grid gap-3 lg:grid-cols-2">
                   <div className="space-y-2">
-                    <Label htmlFor="llm-provider">Provider</Label>
+                    <Label htmlFor="llm-provider">{t("settings.llm.provider")}</Label>
                     <Select
                       value={llmForm.provider || "__unset__"}
                       onValueChange={(value) =>
@@ -479,10 +479,10 @@ export default function SettingsPage() {
                       }
                     >
                       <SelectTrigger id="llm-provider">
-                        <SelectValue placeholder="Select a provider" />
+                        <SelectValue placeholder={t("settings.llm.providerPlaceholder")} />
                       </SelectTrigger>
                       <SelectContent>
-                        <SelectItem value="__unset__">Not selected</SelectItem>
+                        <SelectItem value="__unset__">{t("settings.llm.notSelected")}</SelectItem>
                         {sortedProviders.map((provider) => (
                           <SelectItem key={provider.id} value={provider.id}>
                             {provider.displayName}
@@ -493,7 +493,7 @@ export default function SettingsPage() {
                   </div>
                   {selectedProvider && availableAuthMethods.length > 1 && (
                     <div className="space-y-2">
-                      <Label>Authentication method</Label>
+                      <Label>{t("settings.llm.authMethod")}</Label>
                       <div className="flex flex-wrap gap-2 rounded-md border border-border bg-muted/30 p-1">
                         {availableAuthMethods.map((method) => (
                           <Button
@@ -510,7 +510,7 @@ export default function SettingsPage() {
                               })
                             }
                           >
-                            {prettyAuthMethod(method)}
+                            {prettyAuthMethod(method, t)}
                           </Button>
                         ))}
                       </div>
@@ -555,24 +555,24 @@ export default function SettingsPage() {
                 {selectedProvider && llmForm.authMethod === "api_key" && (
                   <div className="grid gap-3 lg:grid-cols-2">
                     <div className="space-y-2">
-                      <Label htmlFor="llm-api-key">API key</Label>
+                      <Label htmlFor="llm-api-key">{t("settings.llm.apiKey")}</Label>
                       <Input
                         id="llm-api-key"
                         value={llmForm.apiKey}
                         onChange={(e) =>
                           setLLMForm({ ...llmForm, apiKey: e.target.value })
                         }
-                        placeholder={llmForm.hasApiKey ? "**** (saved)" : "sk-..."}
+                        placeholder={llmForm.hasApiKey ? t("settings.llm.maskedSaved") : "sk-..."}
                         className="font-mono"
                       />
                       <p className="text-xs text-muted-foreground">
-                        Keep the masked value to preserve the saved key.
+                        {t("settings.llm.keepMaskedKey")}
                       </p>
                     </div>
                     {selectedProvider.id === "custom" ? (
                       <>
                         <div className="space-y-2">
-                          <Label htmlFor="llm-api-base">Base URL</Label>
+                          <Label htmlFor="llm-api-base">{t("settings.llm.baseUrl")}</Label>
                           <Input
                             id="llm-api-base"
                             value={llmForm.apiBase}
@@ -595,7 +595,7 @@ export default function SettingsPage() {
                           />
                         </div>
                         <div className="space-y-2">
-                          <Label htmlFor="llm-header-style">Header style</Label>
+                          <Label htmlFor="llm-header-style">{t("settings.llm.headerStyle")}</Label>
                           <Select
                             value={llmForm.apiBase ? "openai" : "openai"}
                             onValueChange={() => {}}
@@ -611,18 +611,18 @@ export default function SettingsPage() {
                             </SelectContent>
                           </Select>
                           <p className="text-xs text-muted-foreground">
-                            Custom providers default to OpenAI-shaped requests. Switch this from the Environment tab if your endpoint speaks Anthropic or Gemini.
+                            {t("settings.llm.headerStyleHint")}
                           </p>
                         </div>
                         <div className="flex items-center justify-between gap-4 rounded-md border border-border bg-muted/30 p-3 lg:col-span-2">
                           <div className="space-y-1">
                             <Label htmlFor="llm-ollama-compatible">
-                              Ollama-compatible endpoint
+                              {t("settings.llm.ollamaCompatible")}
                             </Label>
                             <p className="text-xs text-muted-foreground">
                               {ollamaPortDetected
-                                ? "Detected automatically from port 11434."
-                                : "Enable Ollama reasoning controls when this custom endpoint uses a different port."}
+                                ? t("settings.llm.ollamaDetected")
+                                : t("settings.llm.ollamaHint")}
                             </p>
                           </div>
                           <Switch
@@ -647,7 +647,7 @@ export default function SettingsPage() {
                     ) : (
                       <div className="space-y-2 lg:col-span-2">
                         <Label htmlFor="llm-api-base-override">
-                          API base override (optional)
+                          {t("settings.llm.apiBaseOverride")}
                         </Label>
                         <Input
                           id="llm-api-base-override"
@@ -662,7 +662,7 @@ export default function SettingsPage() {
                           className="font-mono"
                         />
                         <p className="text-xs text-muted-foreground">
-                          Leave blank to use the provider default.
+                          {t("settings.llm.apiBaseBlank")}
                         </p>
                       </div>
                     )}
@@ -672,20 +672,18 @@ export default function SettingsPage() {
                 {selectedProvider && llmForm.authMethod === "oauth" && (
                   <div className="space-y-3 rounded-md border border-border bg-muted/30 p-4">
                     <p className="text-sm">
-                      Sign in with {selectedProvider.displayName} to create a
-                      new OAuth profile. The dashboard polls until the new
-                      credential appears in the saved list below.
+                      {t("settings.llm.oauthDescBefore")}{selectedProvider.displayName}{t("settings.llm.oauthDescAfter")}
                     </p>
                     <Button
                       type="button"
                       onClick={() => setOAuthOpen(true)}
                       disabled={!selectedProvider.flow}
                     >
-                      Sign in with OAuth
+                      {t("settings.llm.signInOAuth")}
                     </Button>
                     {!selectedProvider.flow && (
                       <p className="text-xs text-muted-foreground">
-                        OAuth is not configured for this provider yet.
+                        {t("settings.llm.oauthNotConfigured")}
                       </p>
                     )}
                   </div>
@@ -694,11 +692,10 @@ export default function SettingsPage() {
                 {selectedProvider && llmForm.authMethod === "none" && (
                   <div className="space-y-3 rounded-md border border-border bg-muted/30 p-4">
                     <p className="text-sm">
-                      {selectedProvider.displayName} runs locally — no
-                      credential required. Select or enter the model above.
+                      {selectedProvider.displayName}{t("settings.llm.localDescAfter")}
                     </p>
                     <div className="space-y-2">
-                      <Label htmlFor="llm-local-api-base">Base URL</Label>
+                      <Label htmlFor="llm-local-api-base">{t("settings.llm.baseUrl")}</Label>
                       <Input
                         id="llm-local-api-base"
                         value={llmForm.apiBase}
@@ -721,10 +718,7 @@ export default function SettingsPage() {
                         className="font-mono"
                       />
                       <p className="text-xs text-muted-foreground">
-                        Where this runtime's OpenAI-compatible API listens. Inside
-                        Docker use the host gateway (e.g.
-                        http://172.17.0.1:8080/v1), not localhost — the container
-                        cannot reach its own loopback.
+                        {t("settings.llm.localBaseHint")}
                       </p>
                     </div>
                   </div>
@@ -733,7 +727,7 @@ export default function SettingsPage() {
                 {/* Saved-credentials picker for the active provider. */}
                 {selectedProvider && providerProfiles.length > 0 && (
                   <div className="space-y-2">
-                    <Label>Saved credentials</Label>
+                    <Label>{t("settings.llm.savedCredentials")}</Label>
                     <div className="divide-y divide-border rounded-md border border-border">
                       {providerProfiles.map((profile) => {
                         const key =
@@ -755,18 +749,18 @@ export default function SettingsPage() {
                                 {profile.requiresReauth && (
                                   <Badge variant="warning">
                                     <AlertTriangle className="mr-1 h-3 w-3" />
-                                    re-auth required
+                                    {t("settings.llm.reauthRequired")}
                                   </Badge>
                                 )}
                               </div>
                               <div className="font-mono text-xs text-muted-foreground">
                                 {profile.type === "oauth"
-                                  ? maskedTokenLabel(profile)
-                                  : maskedAPIKeyLabel(profile)}
+                                  ? maskedTokenLabel(profile, t)
+                                  : maskedAPIKeyLabel(profile, t)}
                               </div>
                               {profile.expiresAt && (
                                 <div className="text-xs text-muted-foreground">
-                                  expires {profile.expiresAt}
+                                  {t("settings.llm.expiresBefore")}{profile.expiresAt}
                                 </div>
                               )}
                             </div>
@@ -778,7 +772,7 @@ export default function SettingsPage() {
                                   disabled={updateLLM.isPending}
                                   onClick={() => setActiveProfile(profile)}
                                 >
-                                  Set active
+                                  {t("settings.llm.setActive")}
                                 </Button>
                               )}
                               {profile.type === "oauth" && (
@@ -816,11 +810,9 @@ export default function SettingsPage() {
                     above (the picker there is scoped to that provider). */}
                 {allProfiles.length > 0 && (
                   <div className="space-y-2">
-                    <Label>All provider profiles</Label>
+                    <Label>{t("settings.llm.allProfiles")}</Label>
                     <p className="text-xs text-muted-foreground">
-                      Every stored credential across all providers. These
-                      are the profiles available in the schedule and scan
-                      "Provider profile" pickers.
+                      {t("settings.llm.allProfilesDesc")}
                     </p>
                     <div className="divide-y divide-border rounded-md border border-border">
                       {allProfiles.map(({ profile, key, display, active }) => (
@@ -838,18 +830,18 @@ export default function SettingsPage() {
                               {profile.requiresReauth && (
                                 <Badge variant="warning">
                                   <AlertTriangle className="mr-1 h-3 w-3" />
-                                  re-auth required
+                                  {t("settings.llm.reauthRequired")}
                                 </Badge>
                               )}
                             </div>
                             <div className="font-mono text-xs text-muted-foreground">
                               {profile.type === "oauth"
-                                ? maskedTokenLabel(profile)
-                                : maskedAPIKeyLabel(profile)}
+                                ? maskedTokenLabel(profile, t)
+                                : maskedAPIKeyLabel(profile, t)}
                             </div>
                             {profile.expiresAt && (
                               <div className="text-xs text-muted-foreground">
-                                expires {profile.expiresAt}
+                                {t("settings.llm.expiresBefore")}{profile.expiresAt}
                               </div>
                             )}
                           </div>
@@ -875,7 +867,7 @@ export default function SettingsPage() {
                     of provider / auth method. */}
                 <div className="grid gap-3 lg:grid-cols-4">
                   <div className="space-y-2">
-                    <Label htmlFor="llm-retries">LLM max retries</Label>
+                    <Label htmlFor="llm-retries">{t("settings.llm.retries")}</Label>
                     <Input
                       id="llm-retries"
                       type="number"
@@ -891,7 +883,7 @@ export default function SettingsPage() {
                     />
                   </div>
                   <div className="space-y-2">
-                    <Label htmlFor="llm-memory-timeout">Memory timeout</Label>
+                    <Label htmlFor="llm-memory-timeout">{t("settings.llm.memoryTimeout")}</Label>
                     <Input
                       id="llm-memory-timeout"
                       type="number"
@@ -907,7 +899,7 @@ export default function SettingsPage() {
                     />
                   </div>
                   <div className="space-y-2">
-                    <Label htmlFor="llm-max-iterations">Max iterations</Label>
+                    <Label htmlFor="llm-max-iterations">{t("settings.llm.maxIterations")}</Label>
                     <Input
                       id="llm-max-iterations"
                       type="number"
@@ -923,7 +915,7 @@ export default function SettingsPage() {
                     />
                   </div>
                   <div className="space-y-2">
-                    <Label htmlFor="gemini-api-key">Gemini search key</Label>
+                    <Label htmlFor="gemini-api-key">{t("settings.llm.geminiKey")}</Label>
                     <Input
                       id="gemini-api-key"
                       value={llmForm.geminiApiKey}
@@ -940,7 +932,7 @@ export default function SettingsPage() {
 
                 <div className="grid gap-3 lg:grid-cols-2">
                   <div className="space-y-2">
-                    <Label>Reasoning effort</Label>
+                    <Label>{t("settings.llm.reasoningEffort")}</Label>
                     <Select
                       value={llmForm.reasoningEffort || "high"}
                       onValueChange={(value) =>
@@ -971,7 +963,7 @@ export default function SettingsPage() {
                     onClick={saveLLMSettings}
                     disabled={updateLLM.isPending || !llmForm.provider}
                   >
-                    {updateLLM.isPending ? "Saving..." : "Save LLM settings"}
+                    {updateLLM.isPending ? t("settings.saving") : t("settings.llm.save")}
                   </Button>
                 </div>
               </CardContent>
@@ -999,11 +991,11 @@ export default function SettingsPage() {
             <Skeleton className="h-72" />
           ) : rate.error ? (
             <ErrorState
-              title="Failed to load rate limits"
-              description={rate.error instanceof Error ? rate.error.message : "Unknown error"}
+              title={t("settings.error.rate")}
+              description={rate.error instanceof Error ? rate.error.message : t("common.somethingWrong")}
               action={
                 <Button size="sm" variant="outline" onClick={() => rate.refetch()}>
-                  Retry
+                  {t("common.retry")}
                 </Button>
               }
             />
@@ -1012,13 +1004,13 @@ export default function SettingsPage() {
               <CardHeader>
                 <CardTitle>{t("settings.card.rateLimits")}</CardTitle>
                 <CardDescription>
-                  Applied to outbound requests issued by the agent and persisted to the env file.
+                  {t("settings.rate.desc")}
                 </CardDescription>
               </CardHeader>
               <CardContent className="space-y-5">
                 <div className="grid gap-3 sm:grid-cols-2">
                   <div className="space-y-2">
-                    <Label htmlFor="requests">Requests per window</Label>
+                    <Label htmlFor="requests">{t("settings.rate.requestsPerWindow")}</Label>
                     <Input
                       id="requests"
                       type="number"
@@ -1034,7 +1026,7 @@ export default function SettingsPage() {
                     />
                   </div>
                   <div className="space-y-2">
-                    <Label htmlFor="window">Window (seconds)</Label>
+                    <Label htmlFor="window">{t("settings.rate.windowSeconds")}</Label>
                     <Input
                       id="window"
                       type="number"
@@ -1064,7 +1056,7 @@ export default function SettingsPage() {
                     }}
                     disabled={updateRate.isPending}
                   >
-                    {updateRate.isPending ? "Saving..." : "Save"}
+                    {updateRate.isPending ? t("settings.saving") : t("common.save")}
                   </Button>
                 </div>
               </CardContent>
@@ -1077,11 +1069,11 @@ export default function SettingsPage() {
             <Skeleton className="h-72" />
           ) : environment.error ? (
             <ErrorState
-              title="Failed to load notification settings"
-              description={environment.error instanceof Error ? environment.error.message : "Unknown error"}
+              title={t("settings.error.notifications")}
+              description={environment.error instanceof Error ? environment.error.message : t("common.somethingWrong")}
               action={
                 <Button size="sm" variant="outline" onClick={() => environment.refetch()}>
-                  Retry
+                  {t("common.retry")}
                 </Button>
               }
             />
@@ -1091,13 +1083,13 @@ export default function SettingsPage() {
               <CardHeader>
                 <CardTitle>{t("settings.card.discord")}</CardTitle>
                 <CardDescription>
-                  Global defaults used unless a scan provides its own webhook.
+                  {t("settings.notifications.discordDesc")}
                 </CardDescription>
               </CardHeader>
               <CardContent className="space-y-5">
                 <div className="grid gap-3 lg:grid-cols-[1fr_220px]">
                   <div className="space-y-2">
-                    <Label htmlFor="discord-webhook">Discord webhook</Label>
+                    <Label htmlFor="discord-webhook">{t("settings.notifications.webhookLabel")}</Label>
                     <Input
                       id="discord-webhook"
                       value={notificationForm.webhook}
@@ -1111,11 +1103,11 @@ export default function SettingsPage() {
                       className="font-mono"
                     />
                     <p className="text-xs text-muted-foreground">
-                      Keep the masked value to preserve the saved webhook.
+                      {t("settings.notifications.keepMaskedWebhook")}
                     </p>
                   </div>
                   <div className="space-y-2">
-                    <Label>Minimum severity</Label>
+                    <Label>{t("settings.notifications.minSeverity")}</Label>
                     <Select
                       value={notificationForm.minSeverity || "__unset__"}
                       onValueChange={(value) =>
@@ -1129,7 +1121,7 @@ export default function SettingsPage() {
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
-                        <SelectItem value="__unset__">Default</SelectItem>
+                        <SelectItem value="__unset__">{t("settings.notifications.defaultOption")}</SelectItem>
                         {["info", "low", "medium", "high", "critical"].map((value) => (
                           <SelectItem key={value} value={value}>
                             {value}
@@ -1160,7 +1152,7 @@ export default function SettingsPage() {
                     }}
                     disabled={updateEnvironment.isPending}
                   >
-                    {updateEnvironment.isPending ? "Saving..." : "Save notifications"}
+                    {updateEnvironment.isPending ? t("settings.saving") : t("settings.notifications.save")}
                   </Button>
                 </div>
               </CardContent>
@@ -1169,14 +1161,13 @@ export default function SettingsPage() {
               <CardHeader>
                 <CardTitle>{t("settings.card.telegram")}</CardTitle>
                 <CardDescription>
-                  Send scan events and findings to a Telegram chat or channel.
-                  Configure a bot via @BotFather and add it to the target chat as an admin.
+                  {t("settings.notifications.telegramDesc")}
                 </CardDescription>
               </CardHeader>
               <CardContent className="space-y-5">
                 <div className="grid gap-3 lg:grid-cols-[1fr_1fr_220px]">
                   <div className="space-y-2">
-                    <Label htmlFor="telegram-bot-token">Bot token</Label>
+                    <Label htmlFor="telegram-bot-token">{t("settings.notifications.botToken")}</Label>
                     <Input
                       id="telegram-bot-token"
                       value={notificationForm.telegramBotToken}
@@ -1190,11 +1181,11 @@ export default function SettingsPage() {
                       className="font-mono"
                     />
                     <p className="text-xs text-muted-foreground">
-                      Keep the masked value to preserve the saved token.
+                      {t("settings.notifications.keepMaskedToken")}
                     </p>
                   </div>
                   <div className="space-y-2">
-                    <Label htmlFor="telegram-chat-id">Chat ID</Label>
+                    <Label htmlFor="telegram-chat-id">{t("settings.notifications.chatId")}</Label>
                     <Input
                       id="telegram-chat-id"
                       value={notificationForm.telegramChatId}
@@ -1209,7 +1200,7 @@ export default function SettingsPage() {
                     />
                   </div>
                   <div className="space-y-2">
-                    <Label>Minimum severity</Label>
+                    <Label>{t("settings.notifications.minSeverity")}</Label>
                     <Select
                       value={notificationForm.telegramMinSeverity || "__unset__"}
                       onValueChange={(value) =>
@@ -1223,7 +1214,7 @@ export default function SettingsPage() {
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
-                        <SelectItem value="__unset__">Default</SelectItem>
+                        <SelectItem value="__unset__">{t("settings.notifications.defaultOption")}</SelectItem>
                         {["info", "low", "medium", "high", "critical"].map((value) => (
                           <SelectItem key={value} value={value}>
                             {value}
@@ -1236,10 +1227,9 @@ export default function SettingsPage() {
                 <Separator />
                 <div className="flex items-center justify-between gap-4">
                   <div className="space-y-1">
-                    <Label htmlFor="notify-scan-complete">Notify on scan completion</Label>
+                    <Label htmlFor="notify-scan-complete">{t("settings.notifications.notifyComplete")}</Label>
                     <p className="text-xs text-muted-foreground">
-                      Send the &quot;Scan Finished&quot; summary (report ready / clean scan) after every scan.
-                      Off by default — you only receive per-vulnerability alerts.
+                      {t("settings.notifications.notifyCompleteHint")}
                     </p>
                   </div>
                   <Switch
@@ -1254,8 +1244,7 @@ export default function SettingsPage() {
                   />
                 </div>
                 <p className="text-xs text-muted-foreground">
-                  Telegram is independent of Discord — configure one or both.
-                  The bot token is treated as a secret and never returned in API responses.
+                  {t("settings.notifications.independentHint")}
                 </p>
               </CardContent>
             </Card>
@@ -1268,11 +1257,11 @@ export default function SettingsPage() {
             <Skeleton className="h-72" />
           ) : mail.error ? (
             <ErrorState
-              title="Failed to load AgentMail settings"
-              description={mail.error instanceof Error ? mail.error.message : "Unknown error"}
+              title={t("settings.error.mail")}
+              description={mail.error instanceof Error ? mail.error.message : t("common.somethingWrong")}
               action={
                 <Button size="sm" variant="outline" onClick={() => mail.refetch()}>
-                  Retry
+                  {t("common.retry")}
                 </Button>
               }
             />
@@ -1281,12 +1270,12 @@ export default function SettingsPage() {
               <CardHeader>
                 <CardTitle>{t("settings.card.agentMail")}</CardTitle>
                 <CardDescription>
-                  Inbound triage requires a configured pod and API key.
+                  {t("settings.mail.desc")}
                 </CardDescription>
               </CardHeader>
               <CardContent className="space-y-5">
                 <div className="space-y-2">
-                  <Label htmlFor="pod">Pod</Label>
+                  <Label htmlFor="pod">{t("settings.mail.pod")}</Label>
                   <Input
                     id="pod"
                     value={mailForm.pod}
@@ -1298,7 +1287,7 @@ export default function SettingsPage() {
                   />
                 </div>
                 <div className="space-y-2">
-                  <Label htmlFor="apikey">API key</Label>
+                  <Label htmlFor="apikey">{t("settings.mail.apiKey")}</Label>
                   <Input
                     id="apikey"
                     value={mailForm.apiKey}
@@ -1309,7 +1298,7 @@ export default function SettingsPage() {
                     className="font-mono"
                   />
                   <p className="text-xs text-muted-foreground">
-                    Leave masked value untouched to keep the existing key.
+                    {t("settings.mail.keepMasked")}
                   </p>
                 </div>
                 <Separator />
@@ -1327,7 +1316,7 @@ export default function SettingsPage() {
                     }}
                     disabled={updateMail.isPending}
                   >
-                    {updateMail.isPending ? "Saving..." : "Save"}
+                    {updateMail.isPending ? t("settings.saving") : t("common.save")}
                   </Button>
                 </div>
               </CardContent>
@@ -1340,11 +1329,11 @@ export default function SettingsPage() {
             <Skeleton className="h-96" />
           ) : environment.error ? (
             <ErrorState
-              title="Failed to load environment settings"
-              description={environment.error instanceof Error ? environment.error.message : "Unknown error"}
+              title={t("settings.error.env")}
+              description={environment.error instanceof Error ? environment.error.message : t("common.somethingWrong")}
               action={
                 <Button size="sm" variant="outline" onClick={() => environment.refetch()}>
-                  Retry
+                  {t("common.retry")}
                 </Button>
               }
             />
@@ -1355,18 +1344,18 @@ export default function SettingsPage() {
                 <CardContent className="space-y-4 p-4">
                   <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
                     <div>
-                      <p className="text-sm font-medium">Environment variables</p>
+                      <p className="text-sm font-medium">{t("settings.env.title")}</p>
                       <p className="mt-1 text-xs text-muted-foreground">
-                        Editing {environment.data?.envFile || "~/.xalgorix.env"}. Masked secrets are preserved unless you replace or clear them.
+                        {t("settings.env.editingBefore")}{environment.data?.envFile || "~/.xalgorix.env"}{t("settings.env.editingAfter")}
                       </p>
                     </div>
                     <div className="flex flex-wrap items-center gap-2">
                       {envRestartRequired && (
-                        <Badge variant="warning">Restart required for some changes</Badge>
+                        <Badge variant="warning">{t("settings.env.restartBadge")}</Badge>
                       )}
                       {Object.keys(envChanges).length > 0 && (
                         <Badge variant="outline">
-                          {Object.keys(envChanges).length} unsaved
+                          {Object.keys(envChanges).length} {t("settings.env.unsaved")}
                         </Badge>
                       )}
                       {savedEnvironment && (
@@ -1387,7 +1376,7 @@ export default function SettingsPage() {
                           Object.keys(envChanges).length === 0
                         }
                       >
-                        {updateEnvironment.isPending ? "Saving..." : "Save changes"}
+                        {updateEnvironment.isPending ? t("settings.saving") : t("settings.env.saveChanges")}
                       </Button>
                     </div>
                   </div>
@@ -1441,18 +1430,18 @@ export default function SettingsPage() {
             <CardContent className="space-y-4">
               <div className="grid gap-2 text-sm sm:grid-cols-2">
                 <Field
-                  label="Auth"
+                  label={t("settings.account.auth")}
                   value={
                     auth.data?.auth_enabled
                       ? auth.data.authenticated
-                        ? "Authenticated"
-                        : "Logged out"
-                      : "Disabled"
+                        ? t("settings.account.authenticated")
+                        : t("settings.account.loggedOut")
+                      : t("settings.account.disabled")
                   }
                 />
                 <Field
-                  label="Session"
-                  value={auth.data?.authenticated ? "Active" : "None"}
+                  label={t("settings.account.session")}
+                  value={auth.data?.authenticated ? t("settings.account.active") : t("settings.account.none")}
                 />
               </div>
               {auth.data?.auth_enabled && (
@@ -1466,7 +1455,7 @@ export default function SettingsPage() {
                         navigate("/login", { replace: true });
                       }}
                     >
-                      Sign out
+                      {t("settings.account.signOut")}
                     </Button>
                   </div>
                 </>
@@ -1492,6 +1481,7 @@ function CatalogModelField({
   autoDiscover: boolean;
   onChange: (value: string) => void;
 }) {
+  const { t } = useI18n();
   const discovery = useDiscoverProviderModels();
   const [discoveredModels, setDiscoveredModels] = useState<string[]>([]);
   const [manualEntry, setManualEntry] = useState(false);
@@ -1531,7 +1521,7 @@ function CatalogModelField({
 
   return (
     <div className="space-y-2">
-      <Label htmlFor="llm-model">Model</Label>
+      <Label htmlFor="llm-model">{t("settings.llm.model")}</Label>
       {options.length > 0 && !manualEntry ? (
         <Select
           value={selected}
@@ -1545,7 +1535,7 @@ function CatalogModelField({
           }}
         >
           <SelectTrigger id="llm-model" className="font-mono">
-            <SelectValue placeholder="Select a model" />
+            <SelectValue placeholder={t("settings.llm.modelPlaceholder")} />
           </SelectTrigger>
           <SelectContent>
             {options.map((option) => (
@@ -1553,7 +1543,7 @@ function CatalogModelField({
                 {option.label}
               </SelectItem>
             ))}
-            <SelectItem value="__custom__">Custom model…</SelectItem>
+            <SelectItem value="__custom__">{t("settings.llm.customModel")}</SelectItem>
           </SelectContent>
         </Select>
       ) : null}
@@ -1563,7 +1553,7 @@ function CatalogModelField({
           value={value}
           onChange={(event) => onChange(event.target.value)}
           placeholder="model-name"
-          aria-label={`Custom model for ${provider.displayName}`}
+          aria-label={`${t("settings.llm.customModelFor")} ${provider.displayName}`}
           className="font-mono"
         />
       )}
@@ -1577,12 +1567,11 @@ function CatalogModelField({
             onChange(options[0].value);
           }}
         >
-          Choose a discovered model
+          {t("settings.llm.chooseDiscovered")}
         </Button>
       )}
       <p className="text-xs text-muted-foreground">
-        Models are loaded from the provider when its API supports discovery.
-        Otherwise, enter the exact model ID manually.
+        {t("settings.llm.modelsHint")}
       </p>
       {provider.id !== "custom" && provider.baseURL && (
         <div className="flex flex-wrap items-center gap-2">
@@ -1607,11 +1596,11 @@ function CatalogModelField({
             }}
           >
             <RefreshCw className={`mr-1.5 h-3.5 w-3.5 ${discovery.isPending ? "animate-spin" : ""}`} />
-            {discovery.isPending ? "Scanning models…" : "Scan available models"}
+            {discovery.isPending ? t("settings.llm.scanningModels") : t("settings.llm.scanModels")}
           </Button>
           {discovery.isSuccess && (
             <span className="text-xs text-success">
-              {discoveredModels.length} models loaded
+              {discoveredModels.length} {t("settings.llm.modelsLoaded")}
             </span>
           )}
         </div>
@@ -1620,7 +1609,7 @@ function CatalogModelField({
         <p className="text-xs text-destructive">
           {discovery.error instanceof Error
             ? discovery.error.message
-            : "Model discovery failed"}
+            : t("settings.llm.discoveryFailed")}
         </p>
       )}
     </div>
@@ -1659,15 +1648,16 @@ function EnvironmentRow({
   changed: boolean;
   onChange: (value: string) => void;
 }) {
+  const { t } = useI18n();
   return (
     <div className="grid gap-3 px-4 py-3 lg:grid-cols-[minmax(240px,360px)_1fr] lg:items-center">
       <div className="min-w-0 space-y-1">
         <div className="flex flex-wrap items-center gap-2">
           <p className="font-mono text-xs text-foreground">{variable.key}</p>
-          {changed && <Badge variant="outline">edited</Badge>}
-          {variable.requiresRestart && <Badge variant="warning">restart</Badge>}
+          {changed && <Badge variant="outline">{t("settings.env.edited")}</Badge>}
+          {variable.requiresRestart && <Badge variant="warning">{t("settings.env.restart")}</Badge>}
           {!variable.hasValue && variable.defaultValue && (
-            <Badge variant="muted">default {variable.defaultValue}</Badge>
+            <Badge variant="muted">{t("settings.env.defaultBefore")}{variable.defaultValue}</Badge>
           )}
         </div>
         <p className="text-sm font-medium">{variable.label}</p>
@@ -1687,6 +1677,7 @@ function EnvironmentControl({
   value: string;
   onChange: (value: string) => void;
 }) {
+  const { t } = useI18n();
   if (variable.inputType === "boolean") {
     return (
       <Select
@@ -1697,7 +1688,7 @@ function EnvironmentControl({
           <SelectValue />
         </SelectTrigger>
         <SelectContent>
-          <SelectItem value="__unset__">Default / unset</SelectItem>
+          <SelectItem value="__unset__">{t("settings.env.defaultUnset")}</SelectItem>
           <SelectItem value="true">true</SelectItem>
           <SelectItem value="false">false</SelectItem>
         </SelectContent>
@@ -1715,7 +1706,7 @@ function EnvironmentControl({
           <SelectValue />
         </SelectTrigger>
         <SelectContent>
-          <SelectItem value="__unset__">Default / unset</SelectItem>
+          <SelectItem value="__unset__">{t("settings.env.defaultUnset")}</SelectItem>
           {(variable.options ?? [])
             .filter((option) => option !== "")
             .map((option) => (
@@ -1832,27 +1823,27 @@ function isMaskedSettingValue(value: string): boolean {
   return trimmed.startsWith("****") || trimmed.includes("••••");
 }
 
-function prettyAuthMethod(method: string): string {
+function prettyAuthMethod(method: string, t: (key: string) => string): string {
   switch (method) {
     case "api_key":
-      return "API key";
+      return t("settings.llm.authApiKey");
     case "oauth":
-      return "OAuth";
+      return t("settings.llm.authOAuth");
     case "none":
-      return "No credentials";
+      return t("settings.llm.authNone");
     default:
       return method;
   }
 }
 
-function maskedAPIKeyLabel(profile: AuthProfile): string {
+function maskedAPIKeyLabel(profile: AuthProfile, t: (key: string) => string): string {
   if (profile.apiKey) return profile.apiKey;
-  return "(no key)";
+  return t("settings.llm.noKey");
 }
 
-function maskedTokenLabel(profile: AuthProfile): string {
+function maskedTokenLabel(profile: AuthProfile, t: (key: string) => string): string {
   if (profile.accessToken) return profile.accessToken;
-  return "(no token)";
+  return t("settings.llm.noToken");
 }
 
 // Backup & migration: export the full configuration (environment variables,
@@ -1884,7 +1875,7 @@ function BackupMigrationCard({
       a.remove();
       URL.revokeObjectURL(url);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Export failed");
+      setError(e instanceof Error ? e.message : t("settings.backup.exportFailed"));
     }
   }
 
@@ -1897,28 +1888,28 @@ function BackupMigrationCard({
     try {
       const backup = JSON.parse(await file.text()) as SettingsBackup;
       const counts = [
-        `${Object.keys(backup.env ?? {}).length} env vars`,
-        `${backup.profiles?.length ?? 0} profiles`,
-        `${backup.llm_keys?.length ?? 0} provider keys`,
+        `${Object.keys(backup.env ?? {}).length} ${t("settings.backup.countEnv")}`,
+        `${backup.profiles?.length ?? 0} ${t("settings.backup.countProfiles")}`,
+        `${backup.llm_keys?.length ?? 0} ${t("settings.backup.countKeys")}`,
       ].join(", ");
       if (!window.confirm(`${t("settings.backup.confirm")}\n${counts}`)) return;
       const res: SettingsImportResult = await importSettings.mutateAsync(backup);
       const bits = [
-        `${res.env_applied} env vars`,
-        `${res.profiles_applied} profiles`,
-        `${res.llm_keys_applied} provider keys`,
+        `${res.env_applied} ${t("settings.backup.countEnv")}`,
+        `${res.profiles_applied} ${t("settings.backup.countProfiles")}`,
+        `${res.llm_keys_applied} ${t("settings.backup.countKeys")}`,
       ];
-      if (res.env_skipped?.length) bits.push(`skipped: ${res.env_skipped.join(", ")}`);
-      if (res.profile_warnings?.length) bits.push(`profile issues: ${res.profile_warnings.join("; ")}`);
-      if (res.llm_key_warnings?.length) bits.push(`key issues: ${res.llm_key_warnings.join("; ")}`);
+      if (res.env_skipped?.length) bits.push(`${t("settings.backup.skipped")}${res.env_skipped.join(", ")}`);
+      if (res.profile_warnings?.length) bits.push(`${t("settings.backup.profileIssues")}${res.profile_warnings.join("; ")}`);
+      if (res.llm_key_warnings?.length) bits.push(`${t("settings.backup.keyIssues")}${res.llm_key_warnings.join("; ")}`);
       if (res.general_warnings?.length) bits.push(res.general_warnings.join("; "));
       if (res.restart_required) {
-        bits.push("restart required for some changes");
+        bits.push(t("settings.backup.restartRequired"));
         onRestartRequired(true);
       }
       setSummary(bits.join(" | "));
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Import failed");
+      setError(err instanceof Error ? err.message : t("settings.backup.importFailed"));
     }
   }
 
@@ -1938,7 +1929,7 @@ function BackupMigrationCard({
           onClick={() => fileRef.current?.click()}
           disabled={importSettings.isPending}
         >
-          {importSettings.isPending ? "Importing..." : t("settings.backup.import")}
+          {importSettings.isPending ? t("settings.backup.importing") : t("settings.backup.import")}
         </Button>
         <input
           ref={fileRef}

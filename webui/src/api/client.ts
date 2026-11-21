@@ -35,6 +35,7 @@ import type {
   GuidanceSendResult,
   InfoAssociationParams,
   InfoAssociationResult,
+  ColdPathSyncState,
   InfoContextParams,
   InfoContextResult,
   InfoRegionParams,
@@ -662,12 +663,18 @@ export const api = {
   infoAssociation: (params: InfoAssociationParams) => {
     const sp = new URLSearchParams({
       project_id: params.projectId,
-      scan_id: params.scanId,
       ids: params.ids,
     });
+    // scan_id 缺省即项目级聚合形态（后端按项目白名单归并）。
+    if (params.scanId) sp.set("scan_id", params.scanId);
     if (params.edgeTypes?.length) sp.set("edge_types", params.edgeTypes.join(","));
     if (params.maxDepth) sp.set("max_depth", String(params.maxDepth));
     if (params.limit) sp.set("limit", String(params.limit));
     return http<InfoAssociationResult>(`/api/info/association?${sp.toString()}`);
   },
+
+  // 冷路径同步状态（只读；契约 §3.3「既有端点复用」）。disabled = 无 DSN 的
+  // 正常态，不是 failed。
+  coldPathSync: (scanId: string) =>
+    http<ColdPathSyncState>(`/api/scans/${encodeURIComponent(scanId)}/coldpath`),
 };

@@ -298,7 +298,7 @@ export default function NewScanPage() {
               <Label htmlFor="name">{t("newScan.label.displayName")}</Label>
               <Input
                 id="name"
-                placeholder="Auto-generated from target if blank"
+                placeholder={t("newScan.targetAutoPlaceholder")}
                 value={name}
                 onChange={(e) => setName(e.target.value)}
               />
@@ -366,7 +366,7 @@ export default function NewScanPage() {
                     setContextPath("");
                     setContextInfo("");
                   }}
-                  aria-label="Remove attached context"
+                  aria-label={t("newScan.removeContext")}
                 >
                   <X className="h-3.5 w-3.5" />
                 </Button>
@@ -494,7 +494,7 @@ export default function NewScanPage() {
               <Label htmlFor="companyName">{t("newScan.label.brandName")}</Label>
               <Input
                 id="companyName"
-                placeholder="Shown on the PDF cover"
+                placeholder={t("newScan.logoPlaceholder")}
                 value={companyName}
                 onChange={(e) => setCompanyName(e.target.value)}
               />
@@ -549,7 +549,7 @@ export default function NewScanPage() {
                           setLogoPath("");
                           setLogoFileName("");
                         }}
-                        aria-label="Remove report logo"
+                        aria-label={t("newScan.removeLogo")}
                       >
                         <X className="h-3.5 w-3.5" />
                       </Button>
@@ -695,7 +695,7 @@ export default function NewScanPage() {
               <Label htmlFor="instr">{t("newScan.label.customInstruction")}</Label>
               <Textarea
                 id="instr"
-                placeholder="e.g. Focus on the payment flow at /checkout and skip /static/."
+                placeholder={t("newScan.instructionPlaceholder")}
                 value={instruction}
                 onChange={(e) => setInstruction(e.target.value)}
                 rows={3}
@@ -726,7 +726,7 @@ export default function NewScanPage() {
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="default">Server default</SelectItem>
+                  <SelectItem value="default">{t("newScan.serverDefault")}</SelectItem>
                   {profileOptions.map((opt) => (
                     <SelectItem key={opt.value} value={opt.value}>
                       {opt.label}

@@ -3,24 +3,28 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { useI18n } from "@/i18n";
+import { cn } from "@/lib/utils";
 import type { InfoItem } from "@/types/api";
 
 /**
  * One InfoItem in the information space. Observed items use the sky semantic
  * chip; inferred items use violet. Confidence, coordinates and the source scan
- * stay mono because they are machine data.
+ * stay mono because they are machine data. `focused` renders the deep-link
+ * highlight (ring-ring/40 — the full-color ring is reserved for ?focus=).
  */
 export function InfoItemCard({
   item,
   onAssociate,
+  focused = false,
 }: {
   item: InfoItem;
   onAssociate?: (item: InfoItem) => void;
+  focused?: boolean;
 }) {
   const { t } = useI18n();
   const observed = item.nature === "observed";
   return (
-    <Card className="rounded-md">
+    <Card className={cn("rounded-md", focused && "ring-1 ring-ring/40")}>
       <CardContent className="space-y-3 p-4">
         <div className="flex flex-wrap items-center gap-2">
           <Badge

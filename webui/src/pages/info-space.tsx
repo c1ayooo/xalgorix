@@ -1,4 +1,5 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import { Database, Filter, Network, RefreshCw } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -21,6 +22,7 @@ import { EmptyState, ErrorState } from "@/components/states";
 import { InfoItemCard } from "@/components/info-item-card";
 import { AssociationGraph } from "@/components/association-graph";
 import {
+  useColdPathSync,
   useInfoAssociation,
   useInfoContext,
   useInfoRegion,
@@ -29,9 +31,20 @@ import {
 import { HttpError } from "@/api/client";
 import { useActiveProjectId } from "@/lib/use-active-project";
 import { useI18n } from "@/i18n";
-import type { InfoItem, InfoNature } from "@/types/api";
+import { cn } from "@/lib/utils";
+import type {
+  ColdPathState,
+  ColdPathSyncState,
+  InfoItem,
+  InfoNature,
+} from "@/types/api";
 
 type Tab = "region" | "association" | "context";
+type AssocScope = "project" | "scan";
+
+function isTab(value: string | null): value is Tab {
+  return value === "region" || value === "association" || value === "context";
+}
 
 function isColdPathDisabled(error: unknown): boolean {
   return error instanceof HttpError && error.status === 503;
@@ -51,6 +64,61 @@ function Notice({ truncated, incomplete, gapReason }: { truncated: boolean; inco
         </span>
       )}
     </div>
+  );
+}
+
+/**
+ * Cold-path sync badge. Five states, one meaning each: disabled is the
+ * no-DSN normal state (gray, not red) — only failed carries the destructive
+ * semantic. Counts stay mono/tabular per the machine-data rule.
+ */
+const COLDPATH_BADGE: Record<
+  ColdPathState,
+  { className: string; dot: string }
+> = {
+  applied: {
+    className:
+      "border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400",
+    dot: "bg-emerald-500",
+  },
+  pending: {
+    className:
+      "border-sky-500/30 bg-sky-500/10 text-sky-600 dark:text-sky-400",
+    dot: "bg-sky-500",
+  },
+  gap: {
+    className:
+      "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300",
+    dot: "bg-amber-500",
+  },
+  failed: {
+    className:
+      "border-red-500/30 bg-red-500/10 text-red-600 dark:text-red-400",
+    dot: "bg-red-500",
+  },
+  disabled: {
+    className: "border-border bg-muted text-muted-foreground",
+    dot: "bg-muted-foreground/60",
+  },
+};
+
+function ColdPathBadge({ state }: { state: ColdPathSyncState }) {
+  const { t } = useI18n();
+  const meta = COLDPATH_BADGE[state.state] ?? COLDPATH_BADGE.disabled;
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-[11px]",
+        meta.className,
+      )}
+      aria-label={t(`info.coldpath.${state.state}`)}
+    >
+      <span aria-hidden className={cn("size-1.5 rounded-full", meta.dot)} />
+      {t(`info.coldpath.${state.state}`)}
+      <span className="font-mono text-[10px] tabular-nums opacity-80">
+        {state.applied_seq}/{state.source_seq}
+      </span>
+    </span>
   );
 }
 
@@ -91,10 +159,28 @@ function Loading() {
   );
 }
 
+/**
+ * Information space — project-scoped, read-only InfoItem activation surface.
+ *
+ * Deep link (REDESIGN §7.1): `?tab=` (region|association|context) is synced
+ * to the URL on every tab change (settings-tab pattern, replace); `?focus=`
+ * is consumed once on arrival (approvals pattern): it prefills the matching
+ * input — start item ids on the association tab, the subject filter on the
+ * other two — then the URL is cleaned via replaceState so refresh/back do
+ * not re-trigger it. The Run selector stays session-local: the default
+ * project-wide association scope needs no scan id for a deep link to work.
+ */
 export default function InfoSpacePage() {
   const { t } = useI18n();
+  const [searchParams, setSearchParams] = useSearchParams();
   const projectId = useActiveProjectId();
-  const [tab, setTab] = useState<Tab>("region");
+  const [tab, setTab] = useState<Tab>(() => {
+    const raw = searchParams.get("tab");
+    return isTab(raw) ? raw : "region";
+  });
+  const [focusId, setFocusId] = useState<string | null>(() =>
+    searchParams.get("focus"),
+  );
   const [subject, setSubject] = useState("");
   const [subjectKind, setSubjectKind] = useState("");
   const [purpose, setPurpose] = useState("");
@@ -103,6 +189,7 @@ export default function InfoSpacePage() {
   const [scanId, setScanId] = useState("");
   const [since, setSince] = useState("");
   const [until, setUntil] = useState("");
+  const [assocScope, setAssocScope] = useState<AssocScope>("project");
   const [assocIds, setAssocIds] = useState("");
   const [edgeTypes, setEdgeTypes] = useState("supports,contradicts,references");
   const [depth, setDepth] = useState(2);
@@ -110,6 +197,30 @@ export default function InfoSpacePage() {
   const { data: instancesData } = useInstances(projectId ?? undefined);
   const instances = instancesData?.instances ?? [];
   const activeScanId = scanId || instances[0]?.id || "";
+
+  // Sync the active tab into the URL (settings-tab pattern).
+  useEffect(() => {
+    if (searchParams.get("tab") === tab) return;
+    const sp = new URLSearchParams(searchParams);
+    sp.set("tab", tab);
+    setSearchParams(sp, { replace: true });
+  }, [tab, searchParams, setSearchParams]);
+
+  // Consume ?focus= once (approvals pattern): prefill the matching input,
+  // keep the id for the region-card highlight, then clean the URL.
+  useEffect(() => {
+    const focus = searchParams.get("focus");
+    if (!focus) return;
+    setFocusId(focus);
+    if (tab === "association") {
+      setAssocIds(focus);
+    } else {
+      setSubject(focus);
+    }
+    const sp = new URLSearchParams(searchParams);
+    sp.delete("focus");
+    setSearchParams(sp, { replace: true });
+  }, [searchParams, setSearchParams, tab]);
 
   const regionParams = useMemo(
     () => ({
@@ -138,14 +249,18 @@ export default function InfoSpacePage() {
   const association = useInfoAssociation(
     {
       projectId: projectId ?? "",
-      scanId: activeScanId,
+      scanId: assocScope === "scan" ? activeScanId : undefined,
       ids: assocIds,
       edgeTypes: edgeTypes.split(",").map((v) => v.trim()).filter(Boolean),
       maxDepth: depth,
       limit,
     },
-    tab === "association" && !!activeScanId && !!assocIds,
+    tab === "association" && !!assocIds,
   );
+
+  // Cold-path sync state of the currently selected run. Endpoint failures
+  // degrade silently: the badge simply does not render.
+  const coldpath = useColdPathSync(activeScanId, !!activeScanId);
 
   function associate(item: InfoItem) {
     setAssocIds(item.id);
@@ -171,6 +286,31 @@ export default function InfoSpacePage() {
     </Select>
   );
 
+  const scopeToggle = (
+    <div
+      className="flex items-center gap-1 rounded-md border border-border bg-muted/30 p-1"
+      role="group"
+      aria-label={t("info.association.scope")}
+    >
+      <Button
+        type="button"
+        size="sm"
+        variant={assocScope === "project" ? "default" : "ghost"}
+        onClick={() => setAssocScope("project")}
+      >
+        {t("info.association.scope.project")}
+      </Button>
+      <Button
+        type="button"
+        size="sm"
+        variant={assocScope === "scan" ? "default" : "ghost"}
+        onClick={() => setAssocScope("scan")}
+      >
+        {t("info.association.scope.scan")}
+      </Button>
+    </div>
+  );
+
   return (
     <div className="space-y-6">
       <header className="flex flex-wrap items-end justify-between gap-3">
@@ -178,9 +318,15 @@ export default function InfoSpacePage() {
           <h1 className="text-2xl font-semibold tracking-tight">{t("info.title")}</h1>
           <p className="mt-1 text-sm text-muted-foreground">{t("info.subtitle")}</p>
         </div>
-        <div className="flex items-center gap-2 text-xs text-muted-foreground">
+        <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
           <Database className="size-3.5" />
           {t("info.coldPathHint")}
+          {coldpath.data && !coldpath.error && (
+            <>
+              <span aria-hidden className="h-3 w-px bg-border" />
+              <ColdPathBadge state={coldpath.data} />
+            </>
+          )}
         </div>
       </header>
 
@@ -226,7 +372,12 @@ export default function InfoSpacePage() {
                 {region.data.items.length === 0 ? (
                   <EmptyState title={t("info.region.empty.title")} description={t("info.region.empty.description")} />
                 ) : region.data.items.map((item) => (
-                  <InfoItemCard key={`${item.scan_id}:${item.id}`} item={item} onAssociate={associate} />
+                  <InfoItemCard
+                    key={`${item.scan_id}:${item.id}`}
+                    item={item}
+                    onAssociate={associate}
+                    focused={focusId === item.id}
+                  />
                 ))}
               </div>
             )}
@@ -236,7 +387,8 @@ export default function InfoSpacePage() {
             <Card className="rounded-md">
               <CardContent className="flex flex-wrap items-center gap-2 p-4">
                 <Network className="size-4 text-muted-foreground" />
-                {scanSelect}
+                {scopeToggle}
+                {assocScope === "scan" && scanSelect}
                 <Input className="h-9 min-w-64 flex-1" placeholder={t("info.association.idsPlaceholder")} value={assocIds} onChange={(e) => setAssocIds(e.target.value)} />
                 <Input className="h-9 w-56" value={edgeTypes} onChange={(e) => setEdgeTypes(e.target.value)} aria-label={t("info.association.edgeTypes")} />
                 <Select value={String(depth)} onValueChange={(v) => setDepth(Number(v))}>
@@ -245,7 +397,7 @@ export default function InfoSpacePage() {
                 </Select>
               </CardContent>
             </Card>
-            {!activeScanId || !assocIds ? (
+            {!assocIds || (assocScope === "scan" && !activeScanId) ? (
               <EmptyState title={t("info.association.empty.title")} description={t("info.association.empty.description")} />
             ) : association.isLoading ? <Loading /> : association.error ? (
               <QueryError error={association.error} onRetry={() => association.refetch()} />
@@ -253,7 +405,14 @@ export default function InfoSpacePage() {
               <EmptyState title={t("info.association.empty.title")} description={t("info.association.empty.description")} />
             ) : (
               <div className="space-y-3">
-                <Notice truncated={association.data.truncated} incomplete={association.data.incomplete} gapReason={association.data.gap_reason} />
+                <div className="flex flex-wrap items-center gap-3">
+                  <Notice truncated={association.data.truncated} incomplete={association.data.incomplete} gapReason={association.data.gap_reason} />
+                  {typeof association.data.scans_consulted === "number" && (
+                    <span className="font-mono text-[11px] text-muted-foreground tabular-nums">
+                      {t("info.association.scansConsulted")} {association.data.scans_consulted}
+                    </span>
+                  )}
+                </div>
                 <AssociationGraph hits={association.data.hits} />
               </div>
             )}

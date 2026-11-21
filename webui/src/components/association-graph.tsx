@@ -1,6 +1,7 @@
 import { useMemo } from "react";
 import { useI18n } from "@/i18n";
-import type { InfoAssociationHit } from "@/types/api";
+import { cn } from "@/lib/utils";
+import type { InfoAssociationHit, InfoItem } from "@/types/api";
 
 interface Node {
   id: string;
@@ -10,14 +11,42 @@ interface Node {
   y: number;
 }
 
+type EdgeKind = "supports" | "contradicts" | "references" | "same_session";
+
+interface Edge {
+  from: Node;
+  to: Node;
+  /**
+   * Edge kind, derived only from data that actually exists: the engine's
+   * relation journal currently produces supports edges, so an edge is
+   * "supports" when the reached item lists its predecessor in `supports`.
+   * Everything else stays untyped (neutral stroke) — no invented kinds.
+   */
+  kind: EdgeKind | null;
+}
+
+/**
+ * The charter's four-kind relation vocabulary (CORE v2.1 §4.2). All four stay
+ * listed in the legend even when the data cannot carry them yet; the count
+ * shows what is actually present.
+ */
+const EDGE_LEGEND: { kind: EdgeKind; key: string; dot: string }[] = [
+  { kind: "supports", key: "info.association.edge.supports", dot: "bg-emerald-500" },
+  { kind: "contradicts", key: "info.association.edge.contradicts", dot: "bg-red-500" },
+  { kind: "references", key: "info.association.edge.references", dot: "bg-sky-500" },
+  { kind: "same_session", key: "info.association.edge.sameSession", dot: "bg-amber-500" },
+];
+
 /**
  * Deterministic depth-layered SVG graph. No graph library: nodes are grouped by
  * hop depth, laid out in columns, and connected along the returned paths. The
  * accessible list below the SVG is the primary keyboard/screen-reader surface.
+ * The legend underneath (hairline separator) colors edges by relation kind and
+ * admits honestly when the engine only produces one kind today.
  */
 export function AssociationGraph({ hits }: { hits: InfoAssociationHit[] }) {
   const { t } = useI18n();
-  const { nodes, edges, width, height } = useMemo(() => {
+  const { nodes, edges, width, height, supportsCount } = useMemo(() => {
     const byDepth = new Map<number, InfoAssociationHit[]>();
     for (const hit of hits) {
       const depth = Math.max(1, hit.depth);
@@ -59,12 +88,24 @@ export function AssociationGraph({ hits }: { hits: InfoAssociationHit[] }) {
       startIDs.size,
       ...Array.from(byDepth.values()).map((v) => v.length),
     );
-    const edgeList: { from: Node; to: Node }[] = [];
+    // Reached items keyed by id so edge kinds can consult the target item's
+    // own relation data (start ids have no item payload).
+    const itemByID = new Map<string, InfoItem>();
+    for (const hit of hits) itemByID.set(hit.item.id, hit.item);
+    const edgeList: Edge[] = [];
+    let supports = 0;
     for (const hit of hits) {
       for (let i = 0; i + 1 < hit.path.length; i++) {
         const from = index.get(hit.path[i]);
         const to = index.get(hit.path[i + 1]);
-        if (from && to) edgeList.push({ from, to });
+        if (!from || !to) continue;
+        const kind: EdgeKind | null = itemByID
+          .get(to.id)
+          ?.supports?.includes(from.id)
+          ? "supports"
+          : null;
+        if (kind === "supports") supports += 1;
+        edgeList.push({ from, to, kind });
       }
     }
     return {
@@ -72,6 +113,7 @@ export function AssociationGraph({ hits }: { hits: InfoAssociationHit[] }) {
       edges: edgeList,
       width: 90 + maxDepth * 220 + 180,
       height: Math.max(220, 50 + maxRows * 86 + 40),
+      supportsCount: supports,
     };
   }, [hits]);
 
@@ -92,7 +134,7 @@ export function AssociationGraph({ hits }: { hits: InfoAssociationHit[] }) {
               y1={edge.from.y}
               x2={edge.to.x}
               y2={edge.to.y}
-              className="stroke-border"
+              className={edge.kind === "supports" ? "stroke-emerald-500" : "stroke-border"}
               strokeWidth={1.25}
             />
           ))}
@@ -109,6 +151,43 @@ export function AssociationGraph({ hits }: { hits: InfoAssociationHit[] }) {
           ))}
         </svg>
       </div>
+
+      {/* Legend: charter vocabulary, hairline-separated, quiet chrome. Kinds
+          with no producer yet stay listed with a zero count and a dimmed dot
+          instead of disappearing — the vocabulary is the contract. */}
+      <div className="border-t border-border pt-3">
+        <div
+          className="flex flex-wrap items-center gap-x-4 gap-y-1.5"
+          aria-label={t("info.association.legendLabel")}
+        >
+          {EDGE_LEGEND.map((entry) => {
+            const count = entry.kind === "supports" ? supportsCount : 0;
+            return (
+              <span
+                key={entry.kind}
+                className="inline-flex items-center gap-1.5 text-xs text-muted-foreground"
+              >
+                <span
+                  aria-hidden
+                  className={cn(
+                    "size-1.5 rounded-full",
+                    entry.dot,
+                    count === 0 && "opacity-40",
+                  )}
+                />
+                {t(entry.key)}
+                <span className="font-mono text-[10px] tabular-nums">{count}</span>
+              </span>
+            );
+          })}
+        </div>
+        {edges.length > 0 && supportsCount === 0 && (
+          <p className="mt-2 text-[11px] text-muted-foreground">
+            {t("info.association.legendNote")}
+          </p>
+        )}
+      </div>
+
       <ul className="space-y-1.5" aria-label={t("info.association.listLabel")}>
         {hits.map((hit) => (
           <li

@@ -14,6 +14,7 @@ import {
 } from "lucide-react";
 import { Dialog, DialogContent } from "@/components/ui/dialog";
 import { useInstances, useScansList } from "@/api/queries";
+import { useI18n } from "@/i18n";
 
 type PaletteState = {
   open: boolean;
@@ -28,19 +29,20 @@ export const useCommandPalette = create<PaletteState>((set) => ({
 }));
 
 const NAV_ITEMS = [
-  { label: "Overview", to: "/", icon: LayoutGrid },
-  { label: "New Scan", to: "/scans/new", icon: Plus },
-  { label: "Scans", to: "/scans", icon: Target },
-  { label: "Findings", to: "/findings", icon: ShieldAlert },
-  { label: "Live Feed", to: "/live", icon: Radio },
-  { label: "Reports", to: "/reports", icon: FileText },
-  { label: "Integrations", to: "/integrations", icon: Plug },
-  { label: "Settings", to: "/settings", icon: Settings },
+  { labelKey: "nav.overview", to: "/", icon: LayoutGrid },
+  { labelKey: "nav.newScan", to: "/scans/new", icon: Plus },
+  { labelKey: "nav.scans", to: "/scans", icon: Target },
+  { labelKey: "nav.findings", to: "/findings", icon: ShieldAlert },
+  { labelKey: "nav.live", to: "/live", icon: Radio },
+  { labelKey: "nav.reports", to: "/reports", icon: FileText },
+  { labelKey: "nav.integrations", to: "/integrations", icon: Plug },
+  { labelKey: "nav.settings", to: "/settings", icon: Settings },
 ];
 
 export function CommandPalette() {
   const open = useCommandPalette((s) => s.open);
   const setOpen = useCommandPalette((s) => s.setOpen);
+  const { t } = useI18n();
   const navigate = useNavigate();
   const { data: instances } = useInstances();
   const { data: scans } = useScansList();
@@ -82,7 +84,7 @@ export function CommandPalette() {
       <DialogContent className="p-0 max-w-xl overflow-hidden">
         <Command label="Command palette" className="flex flex-col">
           <Command.Input
-            placeholder="Type a command or search…"
+            placeholder={t("palette.placeholder")}
             className="h-11 w-full border-b border-border bg-transparent px-4 text-sm outline-none placeholder:text-muted-foreground"
           />
           <Command.List className="max-h-96 overflow-y-auto p-2">
@@ -98,7 +100,7 @@ export function CommandPalette() {
                     onSelect={() => go(n.to)}
                     className="flex items-center gap-2 rounded-sm px-2 py-1.5 text-sm text-foreground aria-selected:bg-accent aria-selected:text-accent-foreground cursor-pointer"
                   >
-                    <Icon className="h-3.5 w-3.5 text-muted-foreground" /> {n.label}
+                    <Icon className="h-3.5 w-3.5 text-muted-foreground" /> {t(n.labelKey)}
                   </Command.Item>
                 );
               })}

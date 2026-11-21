@@ -56,16 +56,9 @@ import { api } from "@/api/client";
 const SEVERITIES = ["info", "low", "medium", "high", "critical"];
 type ActivityMode = "active" | "passive";
 
-// Mirrors Go's time.Weekday: index 0 is Sunday.
-const WEEKDAYS = [
-  "Sunday",
-  "Monday",
-  "Tuesday",
-  "Wednesday",
-  "Thursday",
-  "Friday",
-  "Saturday",
-];
+// Weekday vocabulary lives in the dictionary (schedules.weekday.0-6), keyed by
+// Go's time.Weekday ordering: index 0 is Sunday.
+const WEEKDAY_KEYS = Array.from({ length: 7 }, (_, i) => `schedules.weekday.${i}`);
 const MONTH_DAYS = Array.from({ length: 31 }, (_, i) => i + 1);
 
 // Intervals that carry a day component; the others only take a time of day.
@@ -101,16 +94,16 @@ function listTimeZones(detected: string): string[] {
 }
 
 // One-line summary of when a schedule fires, for the list view.
-function formatScheduleWindow(s: ScanSchedule): string {
+function formatScheduleWindow(s: ScanSchedule, t: (key: string) => string): string {
   if (!s.run_at) return "";
   const tz = s.timezone ? ` · ${s.timezone}` : "";
   switch (s.interval) {
     case "hourly":
-      return `:${s.run_at.slice(3)} every hour${tz}`;
+      return `${t("schedules.windowHourlyBefore")}${s.run_at.slice(3)}${t("schedules.windowHourlyAfter")}${tz}`;
     case "weekly":
-      return `${WEEKDAYS[s.run_day ?? 0] ?? WEEKDAYS[0]} ${s.run_at}${tz}`;
+      return `${t(WEEKDAY_KEYS[s.run_day ?? 0] ?? WEEKDAY_KEYS[0])} ${s.run_at}${tz}`;
     case "monthly":
-      return `Day ${s.run_day ?? 1} · ${s.run_at}${tz}`;
+      return `${t("schedules.windowMonthlyBefore")}${s.run_day ?? 1}${t("schedules.windowMonthlyAfter")}${s.run_at}${tz}`;
     default:
       return `${s.run_at}${tz}`;
   }
@@ -264,7 +257,12 @@ export default function SchedulesPage() {
 
   // Trigger ad-hoc scan execution
   async function handleTrigger(sch: ScanSchedule) {
-    if (!window.confirm(`Trigger ad-hoc scan for "${sch.name}" now?`)) return;
+    if (
+      !window.confirm(
+        `${t("schedules.triggerConfirmBefore")}${sch.name}${t("schedules.triggerConfirmAfter")}`,
+      )
+    )
+      return;
     try {
       await triggerMutation.mutateAsync(sch.id);
       toast.success(t("toast.scheduleTriggered"));
@@ -277,7 +275,7 @@ export default function SchedulesPage() {
   async function handleDelete(sch: ScanSchedule) {
     if (
       !window.confirm(
-        `Are you sure you want to delete the schedule "${sch.name}"?`,
+        `${t("schedules.deleteConfirmBefore")}${sch.name}${t("schedules.deleteConfirmAfter")}`,
       )
     )
       return;
@@ -294,7 +292,7 @@ export default function SchedulesPage() {
     if (!file) return;
     setFormError(null);
     if (!/\.(png|jpe?g)$/i.test(file.name)) {
-      setFormError("Report logos must be PNG or JPEG.");
+      setFormError(t("schedules.logoTypeError"));
       return;
     }
     setLogoUploading(true);
@@ -304,7 +302,7 @@ export default function SchedulesPage() {
       setLogoFileName(res.filename || file.name);
     } catch (err) {
       setFormError(
-        err instanceof Error ? err.message : "Failed to upload logo",
+        err instanceof Error ? err.message : t("schedules.logoUploadError"),
       );
     } finally {
       setLogoUploading(false);
@@ -322,7 +320,7 @@ export default function SchedulesPage() {
       .filter(Boolean);
 
     if (targets.length === 0) {
-      setFormError("Provide at least one target.");
+      setFormError(t("schedules.targetsError"));
       return;
     }
 
@@ -361,7 +359,7 @@ export default function SchedulesPage() {
       toast.success(t("toast.saved"));
     } catch (err) {
       setFormError(
-        err instanceof Error ? err.message : "Failed to save schedule",
+        err instanceof Error ? err.message : t("schedules.saveError"),
       );
     }
   }
@@ -396,7 +394,7 @@ export default function SchedulesPage() {
             <Input
               value={q}
               onChange={(e) => setQ(e.target.value)}
-              placeholder="Search schedule name or target…"
+              placeholder={t("schedules.searchPlaceholder")}
               className="pl-9"
             />
           </div>
@@ -405,11 +403,11 @@ export default function SchedulesPage() {
 
       {error ? (
         <ErrorState
-          title="Could not load schedules"
-          description={error instanceof Error ? error.message : "Unknown error"}
+          title={t("schedules.error.title")}
+          description={error instanceof Error ? error.message : t("common.somethingWrong")}
           action={
             <Button size="sm" variant="outline" onClick={() => refetch()}>
-              Retry
+              {t("common.retry")}
             </Button>
           }
         />
@@ -433,20 +431,20 @@ export default function SchedulesPage() {
               <table className="w-full text-sm">
                 <thead className="border-b border-border bg-muted/30 text-xs uppercase tracking-wider text-muted-foreground">
                   <tr>
-                    <th className="px-4 py-3 text-left font-medium">Name</th>
+                    <th className="px-4 py-3 text-left font-medium">{t("schedules.col.name")}</th>
                     <th className="px-4 py-3 text-left font-medium">
-                      Interval
+                      {t("schedules.col.interval")}
                     </th>
-                    <th className="px-4 py-3 text-left font-medium">Targets</th>
+                    <th className="px-4 py-3 text-left font-medium">{t("schedules.col.targets")}</th>
                     <th className="px-4 py-3 text-left font-medium">
-                      Last Run
+                      {t("schedules.col.lastRun")}
                     </th>
                     <th className="px-4 py-3 text-left font-medium">
-                      Next Run
+                      {t("schedules.col.nextRun")}
                     </th>
-                    <th className="px-4 py-3 text-left font-medium">Status</th>
+                    <th className="px-4 py-3 text-left font-medium">{t("schedules.col.status")}</th>
                     <th className="px-4 py-3 text-right font-medium">
-                      Actions
+                      {t("schedules.col.actions")}
                     </th>
                   </tr>
                 </thead>
@@ -465,7 +463,7 @@ export default function SchedulesPage() {
                         </Badge>
                         {s.run_at && (
                           <div className="mt-1 text-[11px] text-muted-foreground">
-                            {formatScheduleWindow(s)}
+                            {formatScheduleWindow(s, t)}
                           </div>
                         )}
                       </td>
@@ -512,11 +510,10 @@ export default function SchedulesPage() {
         <DialogContent className="max-w-2xl max-h-[85vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle>
-              {editingSchedule ? "Edit Schedule" : "New Scan Schedule"}
+              {editingSchedule ? t("schedules.editTitle") : t("schedules.newTitle")}
             </DialogTitle>
             <DialogDescription>
-              Configure the schedule frequency, target list, and scanning
-              preferences.
+              {t("schedules.desc")}
             </DialogDescription>
           </DialogHeader>
 
@@ -527,7 +524,7 @@ export default function SchedulesPage() {
                 <Input
                   id="sched-name"
                   required
-                  placeholder="e.g. Weekly Perimeter Audit"
+                  placeholder={t("schedules.namePlaceholder")}
                   value={name}
                   onChange={(e) => setName(e.target.value)}
                 />
@@ -547,10 +544,10 @@ export default function SchedulesPage() {
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="hourly">Hourly</SelectItem>
-                    <SelectItem value="daily">Daily</SelectItem>
-                    <SelectItem value="weekly">Weekly</SelectItem>
-                    <SelectItem value="monthly">Monthly</SelectItem>
+                    <SelectItem value="hourly">{t("schedules.interval.hourly")}</SelectItem>
+                    <SelectItem value="daily">{t("schedules.interval.daily")}</SelectItem>
+                    <SelectItem value="weekly">{t("schedules.interval.weekly")}</SelectItem>
+                    <SelectItem value="monthly">{t("schedules.interval.monthly")}</SelectItem>
                   </SelectContent>
                 </Select>
               </div>
@@ -566,7 +563,7 @@ export default function SchedulesPage() {
                 {hasDayPicker(interval) && (
                   <div className="space-y-2">
                     <Label htmlFor="sched-run-day">
-                      {interval === "weekly" ? "Day of week" : "Day of month"}
+                      {interval === "weekly" ? t("schedules.dayOfWeek") : t("schedules.dayOfMonth")}
                     </Label>
                     <Select
                       value={String(runDay)}
@@ -577,9 +574,9 @@ export default function SchedulesPage() {
                       </SelectTrigger>
                       <SelectContent>
                         {interval === "weekly"
-                          ? WEEKDAYS.map((day, i) => (
-                              <SelectItem key={day} value={String(i)}>
-                                {day}
+                          ? WEEKDAY_KEYS.map((key, i) => (
+                              <SelectItem key={key} value={String(i)}>
+                                {t(key)}
                               </SelectItem>
                             ))
                           : MONTH_DAYS.map((day) => (
@@ -622,16 +619,15 @@ export default function SchedulesPage() {
               </div>
               <p className="text-[11px] text-muted-foreground">
                 {interval === "hourly"
-                  ? "Only the minutes are used: the scan runs at that minute of every hour."
-                  : `Wall-clock time the scan is launched${
+                  ? t("schedules.hint.hourly")
+                  : `${t("schedules.hint.wallClock")}${
                       hasDayPicker(interval)
                         ? interval === "weekly"
-                          ? ", on the selected weekday"
-                          : ", on the selected day of the month (clamped to the last day of shorter months)"
+                          ? t("schedules.hint.wallClockWeekly")
+                          : t("schedules.hint.wallClockMonthly")
                         : ""
                     }.`}{" "}
-                Leave blank to keep running one interval after the schedule was
-                created or last ran.
+                {t("schedules.hint.blank")}
               </p>
             </div>
 
@@ -647,8 +643,7 @@ export default function SchedulesPage() {
                 className="mono text-xs"
               />
               <p className="text-[11px] text-muted-foreground">
-                One target per line, or comma-separated. Only targets you are
-                authorized to audit.
+                {t("schedules.targetsHint")}
               </p>
             </div>
 
@@ -660,9 +655,9 @@ export default function SchedulesPage() {
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="single">Single target</SelectItem>
-                    <SelectItem value="wildcard">Wildcard / multi</SelectItem>
-                    <SelectItem value="dast">DAST</SelectItem>
+                    <SelectItem value="single">{t("schedules.mode.single")}</SelectItem>
+                    <SelectItem value="wildcard">{t("schedules.mode.wildcard")}</SelectItem>
+                    <SelectItem value="dast">{t("schedules.mode.dast")}</SelectItem>
                   </SelectContent>
                 </Select>
               </div>
@@ -678,7 +673,7 @@ export default function SchedulesPage() {
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="default">Server default</SelectItem>
+                    <SelectItem value="default">{t("schedules.serverDefault")}</SelectItem>
                     {profileOptions.map((opt) => (
                       <SelectItem key={opt.value} value={opt.value}>
                         {opt.label}
@@ -687,8 +682,7 @@ export default function SchedulesPage() {
                   </SelectContent>
                 </Select>
                 <p className="text-[11px] text-muted-foreground">
-                  Pick a stored credential profile to run this schedule
-                  under. Manage profiles under Settings → Providers.
+                  {t("schedules.providerHint")}
                 </p>
               </div>
             </div>
@@ -705,8 +699,8 @@ export default function SchedulesPage() {
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="active">Active allowed</SelectItem>
-                    <SelectItem value="passive">Passive only</SelectItem>
+                    <SelectItem value="active">{t("schedules.access.active")}</SelectItem>
+                    <SelectItem value="passive">{t("schedules.access.passive")}</SelectItem>
                   </SelectContent>
                 </Select>
               </div>
@@ -724,8 +718,8 @@ export default function SchedulesPage() {
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="active">Active allowed</SelectItem>
-                    <SelectItem value="passive">Passive only</SelectItem>
+                    <SelectItem value="active">{t("schedules.access.active")}</SelectItem>
+                    <SelectItem value="passive">{t("schedules.access.passive")}</SelectItem>
                   </SelectContent>
                 </Select>
               </div>
@@ -733,12 +727,12 @@ export default function SchedulesPage() {
 
             <div className="space-y-2">
               <Label htmlFor="sched-instruction">
-                Custom instruction (optional)
+                {t("schedules.instructionLabel")}
               </Label>
               <Textarea
                 id="sched-instruction"
                 rows={4}
-                placeholder="e.g. Skip noisy subdomain enumeration, focus on api testing"
+                placeholder={t("schedules.instructionPlaceholder")}
                 value={instruction}
                 onChange={(e) => setInstruction(e.target.value)}
               />
@@ -753,8 +747,10 @@ export default function SchedulesPage() {
                 onChange={(e) => setModel(e.target.value)}
               />
               <p className="text-[11px] text-muted-foreground">
-                Override the model for this schedule. Leave blank to use the
-                server default{llmQuery.data?.model ? ` (${llmQuery.data.model})` : ""}.
+                {t("schedules.modelHint")}
+                {llmQuery.data?.model
+                  ? `${t("schedules.modelCurrentBefore")}${llmQuery.data.model}${t("schedules.modelCurrentAfter")}`
+                  : ""}
               </p>
             </div>
 
@@ -783,8 +779,7 @@ export default function SchedulesPage() {
                 })}
               </div>
               <p className="text-[11px] text-muted-foreground">
-                Report only findings at or above selected severities. Leave
-                blank for all.
+                {t("schedules.severityHint")}
               </p>
             </div>
 
@@ -795,14 +790,14 @@ export default function SchedulesPage() {
                 <Label htmlFor="sched-company">{t("schedules.label.companyName")}</Label>
                 <Input
                   id="sched-company"
-                  placeholder="Shown on the PDF cover page"
+                  placeholder={t("schedules.companyPlaceholder")}
                   value={companyName}
                   onChange={(e) => setCompanyName(e.target.value)}
                 />
               </div>
               <div className="space-y-2">
                 <Label htmlFor="sched-webhook">
-                  Discord Webhook Notification
+                  {t("schedules.discordLabel")}
                 </Label>
                 <Input
                   id="sched-webhook"
@@ -841,7 +836,7 @@ export default function SchedulesPage() {
                       ) : (
                         <Upload className="h-3.5 w-3.5" />
                       )}
-                      Upload
+                      {t("schedules.upload")}
                     </label>
                     <Input
                       id="scheduleLogo"
@@ -863,7 +858,7 @@ export default function SchedulesPage() {
                           setLogoPath("");
                           setLogoFileName("");
                         }}
-                        aria-label="Remove logo"
+                        aria-label={t("schedules.removeLogoAria")}
                       >
                         <X className="h-3.5 w-3.5" />
                       </Button>
@@ -964,7 +959,7 @@ function ScheduleActionMenu({
         <Button
           size="icon"
           variant="ghost"
-          aria-label={`Actions for schedule ${schedule.name}`}
+          aria-label={`${t("schedules.actionsForAria")} ${schedule.name}`}
         >
           <MoreHorizontal className="h-4 w-4" />
         </Button>

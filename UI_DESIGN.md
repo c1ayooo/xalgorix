@@ -89,6 +89,7 @@
 - `guidance-tab.tsx` [已确认，2026-11-21；同日被 `run-console.tsx` 会话控制台吸收]：插入意图 composer 的独立 Tab 版本（右栏），功能并入左栏控制台后保留文件作为历史。
 - `run-console.tsx` [已确认，2026-11-21]：**任务详情左栏会话控制台**（4zreco sessions-tab 功能等价物）。头部 = Run 切换器（Select，默认最新活跃）+ 运行控制（暂停/恢复/停止，instance API）；主体 = transcript（`LiveFeed fillHeight`：agent 步骤行 + 行内审批卡 + **guidance 事件渲染为右对齐品牌色人工气泡**（`GUIDANCE_INJECTED` 色标 violet、气泡 `rounded-lg rounded-tr-sm bg-primary`，混排进步骤流——4zreco UserRow 模式）；底部 = **双模式 composer 常驻**：「注入意图」（guidance API，进 loop；无 Run 自动排队）/「提问（旁路）」（`/api/chat`，永不进 loop，问答对以 violet 卡显示在 composer 上方、本地保留最近 3 对）+ paused 时「不带消息直接恢复」ghost 按钮 + 状态提示行（运行中注入绿 / 已暂停 / 无运行排队灰）+ 码点计数。**无乐观回显**：注入经 mock WS 广播 `guidance_injected` 后从流渲染（服务端先持久化再广播，契约 §3.1）。
 - `approval-inline-bar.tsx` [已确认，2026-11-21]：事件流内嵌紧凑审批条——`approval_requested` 事件行下**默认展开**（HITL 不藏折叠里）：mono 摘要 + 倒计时 + 行内批准/拒绝 + `/approvals?focus=` 深链；409（他处已决）翻转为"已被裁决"章。`TYPE_COLOR` 补 approval_requested(amber)/approval_decided(emerald)/guidance_*(violet/emerald)。
+- `association-graph.tsx` [已确认，2026-11-21]：**信息全景关联图画布规范**（替代 G6 的自绘方案，无新图库）：SVG 分层布局（源/目标两层列 + 边），节点 = mono 短 id + nature 胶囊色，边按关系 kind 着色——supports=emerald / contradicts=red / references=sky / same_session=amber（`/10` 底 `/30` 边惯例）；图例置于图下方 hairline 分隔处，**四类词表全列但只渲染真实存在的边**（当前引擎仅产 supports，其余 kind 给说明性空态，禁止编造假边）；无障碍平行列表随图提供；节点点击经 `relation_ids` 进关联 Tab。画布色值随主题令牌，不引入 canvas 中值色例外。
 
 ## 7. 表单、表格、弹窗与危险操作规则
 

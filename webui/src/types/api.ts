@@ -852,6 +852,8 @@ export interface InfoAssociationResult {
   truncated: boolean;
   incomplete: boolean;
   gap_reason?: string;
+  /** 项目级聚合形态：实际查询的白名单 scan 数（诚实披露聚合面）。 */
+  scans_consulted?: number;
 }
 
 export interface InfoRegionParams {
@@ -877,9 +879,23 @@ export interface InfoContextParams {
 
 export interface InfoAssociationParams {
   projectId: string;
-  scanId: string;
+  /** 单扫描形态必填；省略时走项目级聚合（无 scan_id 参数）。 */
+  scanId?: string;
   ids: string;
   edgeTypes?: string[];
   maxDepth?: number;
   limit?: number;
+}
+
+/** GET /api/scans/{id}/coldpath — 冷路径同步状态（契约 §3.3 复用）。 */
+export type ColdPathState = "pending" | "applied" | "gap" | "failed" | "disabled";
+
+export interface ColdPathSyncState {
+  scan_id: string;
+  cold_path: "enabled" | "disabled";
+  source_seq: number;
+  applied_seq: number;
+  state: ColdPathState;
+  last_error?: string;
+  updated_at?: string;
 }

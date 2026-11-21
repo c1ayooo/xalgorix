@@ -104,8 +104,8 @@ export default function InstancesPage() {
           {data?.resources && <ResourcesBar resources={data.resources} />}
           {!showFilterBar ? (
             <EmptyState
-              title="No instances"
-              description="Start a scan to see it appear here as a running instance."
+              title={t("instances.emptyTitle")}
+              description={t("instances.emptyDescription")}
             />
           ) : (
             <>
@@ -116,7 +116,7 @@ export default function InstancesPage() {
                     <Input
                       value={q}
                       onChange={(e) => setQ(e.target.value)}
-                      placeholder="Search name, target or instance id…"
+                      placeholder={t("instances.searchPlaceholder")}
                       className="pl-9"
                     />
                   </div>

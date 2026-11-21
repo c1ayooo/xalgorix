@@ -39,6 +39,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { Input } from "@/components/ui/input";
 import { ExternalLink } from "lucide-react";
 import { HttpError } from "@/api/client";
+import { useI18n } from "@/i18n";
 import {
   useAuthProfiles,
   useOAuthComplete,
@@ -57,14 +58,14 @@ interface OAuthModalProps {
   onClose: () => void;
 }
 
-function errorMessage(err: unknown): string {
+function errorMessage(err: unknown, fallback: string): string {
   if (err instanceof HttpError) {
     const data = err.data as { error?: string } | null | undefined;
     if (data?.error) return data.error;
     return err.message;
   }
   if (err instanceof Error) return err.message;
-  return "Unknown error";
+  return fallback;
 }
 
 export default function OAuthModal({
@@ -74,6 +75,7 @@ export default function OAuthModal({
   existingKeys,
   onClose,
 }: OAuthModalProps) {
+  const { t } = useI18n();
   const start = useOAuthStart();
   const complete = useOAuthComplete();
   const profiles = useAuthProfiles();
@@ -116,7 +118,7 @@ export default function OAuthModal({
     start
       .mutateAsync({ provider, profileId, preferPaste: false })
       .then((res) => setStartResult(res))
-      .catch((err) => setError(errorMessage(err)));
+      .catch((err) => setError(errorMessage(err, t("common.somethingWrong"))));
     // We deliberately omit `start` and `profileId` from the deps —
     // the start call is keyed off `open` + `provider` only. The
     // operator-tweakable profileId is sent with the initial start
@@ -179,7 +181,7 @@ export default function OAuthModal({
     start
       .mutateAsync({ provider, profileId, preferPaste: false })
       .then((res) => setStartResult(res))
-      .catch((err) => setError(errorMessage(err)));
+      .catch((err) => setError(errorMessage(err, t("common.somethingWrong"))));
   }
 
   // Detect the newly persisted profile. Once we see a key for this
@@ -200,10 +202,8 @@ export default function OAuthModal({
     }
   }, [open, startResult, profiles.data, provider, onClose]);
 
-  const heading = useMemo(
-    () => `Sign in with ${displayName}`,
-    [displayName],
-  );
+  // Title translated at render time; displayName is data, the frame is chrome.
+  const heading = `${t("oauth.titleBefore")}${displayName}${t("oauth.titleAfter")}`;
 
   async function onSubmitPaste(e: FormEvent) {
     e.preventDefault();
@@ -218,7 +218,7 @@ export default function OAuthModal({
       });
       onClose();
     } catch (err) {
-      setError(errorMessage(err));
+      setError(errorMessage(err, t("common.somethingWrong")));
     }
   }
 
@@ -234,7 +234,7 @@ export default function OAuthModal({
       });
       onClose();
     } catch (err) {
-      setError(errorMessage(err));
+      setError(errorMessage(err, t("common.somethingWrong")));
     }
   }
 
@@ -252,7 +252,7 @@ export default function OAuthModal({
       });
       onClose();
     } catch (err) {
-      setError(errorMessage(err));
+      setError(errorMessage(err, t("common.somethingWrong")));
     }
   }
 
@@ -267,17 +267,17 @@ export default function OAuthModal({
         <DialogHeader>
           <DialogTitle>{heading}</DialogTitle>
           <DialogDescription>
-            xalgorix will store the resulting credential under
+            {t("oauth.descBefore")}
             <span className="ml-1 font-mono">
               {provider}:{profileId || "default"}
             </span>
-            . The token never leaves this host once persisted.
+            {t("oauth.descAfter")}
           </DialogDescription>
         </DialogHeader>
 
         {!startResult && !error && (
           <div className="rounded-md border border-border bg-muted/40 p-4 text-sm text-muted-foreground">
-            Starting authentication flow…
+            {t("oauth.starting")}
           </div>
         )}
 
@@ -302,11 +302,9 @@ export default function OAuthModal({
 
         {expired && (
           <div className="space-y-3 rounded-md border border-amber-500/30 bg-amber-500/10 p-4 text-sm text-amber-900 dark:text-amber-200">
-            <p className="font-medium">Flow expired</p>
+            <p className="font-medium">{t("oauth.expired.title")}</p>
             <p className="text-xs">
-              The authorization deadline passed before the flow completed.
-              Start a fresh flow to try again — the previous code is no
-              longer valid.
+              {t("oauth.expired.desc")}
             </p>
             <div className="flex justify-end">
               <Button
@@ -314,7 +312,7 @@ export default function OAuthModal({
                 onClick={onRetryStart}
                 disabled={start.isPending}
               >
-                {start.isPending ? "Starting…" : "Try again"}
+                {start.isPending ? t("oauth.startingShort") : t("common.retry")}
               </Button>
             </div>
           </div>
@@ -390,23 +388,21 @@ export default function OAuthModal({
           !startResult.authURL && (
             <div className="space-y-3 rounded-md border border-border bg-muted/30 p-4 text-sm">
               <p>
-                xalgorix will read the credential file already present on
-                this host (created by the official CLI sign-in) and persist a
-                profile under{" "}
+                {t("oauth.import.descBefore")}
                 <code className="font-mono">
                   {provider}:{profileId || "default"}
                 </code>
-                . The token never leaves this host.
+                {t("oauth.import.descAfter")}
               </p>
               {provider === "codex" && (
                 <p className="text-xs text-muted-foreground">
-                  Expected file:
+                  {t("oauth.import.expectedFile")}
                   <code className="mx-1 font-mono">~/.codex/auth.json</code>.
-                  In Docker, mount it read-only at
+                  {t("oauth.import.dockerBefore")}
                   <code className="ml-1 font-mono">
                     /root/.codex/auth.json
                   </code>
-                  .
+                  {t("oauth.import.dockerAfter")}
                 </p>
               )}
               <div className="flex justify-end">
@@ -415,7 +411,7 @@ export default function OAuthModal({
                   onClick={onSubmitImport}
                   disabled={complete.isPending}
                 >
-                  {complete.isPending ? "Importing…" : "Import credential"}
+                  {complete.isPending ? t("oauth.importing") : t("oauth.import.button")}
                 </Button>
               </div>
             </div>
@@ -424,11 +420,11 @@ export default function OAuthModal({
         <DialogFooter className="border-t border-border pt-3">
           <div className="flex w-full items-center justify-between text-xs text-muted-foreground">
             <span>
-              Profile id:&nbsp;
+              {t("oauth.profileId")}&nbsp;
               <code className="font-mono">{profileId || "default"}</code>
             </span>
             <Button variant="ghost" size="sm" onClick={onClose}>
-              {startResult?.mode === "paste" ? "Cancel" : "Close"}
+              {startResult?.mode === "paste" ? t("common.cancel") : t("oauth.close")}
             </Button>
           </div>
         </DialogFooter>
@@ -438,6 +434,7 @@ export default function OAuthModal({
 }
 
 function LoopbackBody({ startResult }: { startResult: OAuthStartResponse }) {
+  const { t } = useI18n();
   // Open the authorization URL in a new tab on first render. Doing
   // it lazily inside a useEffect avoids triggering the popup blocker
   // on the very first render before React commits.
@@ -449,9 +446,7 @@ function LoopbackBody({ startResult }: { startResult: OAuthStartResponse }) {
   return (
     <div className="space-y-3 rounded-md border border-border bg-muted/30 p-4 text-sm">
       <p>
-        We opened the authorization page in a new tab. Complete the sign-in
-        there; the browser will redirect back to a one-shot loopback listener
-        on this host and xalgorix will persist the credential automatically.
+        {t("oauth.loopback.desc")}
       </p>
       {startResult.authURL && (
         <a
@@ -460,33 +455,32 @@ function LoopbackBody({ startResult }: { startResult: OAuthStartResponse }) {
           rel="noopener noreferrer"
           className="inline-flex items-center gap-1 text-primary underline-offset-2 hover:underline"
         >
-          Open authorization page <ExternalLink className="h-3.5 w-3.5" />
+          {t("oauth.openAuthPage")} <ExternalLink className="h-3.5 w-3.5" />
         </a>
       )}
       <p className="text-xs text-muted-foreground">
-        Waiting for the loopback callback. This dialog will close as soon as
-        the credential is stored.
+        {t("oauth.loopback.waiting")}
       </p>
     </div>
   );
 }
 
 function DeviceBody({ startResult }: { startResult: OAuthStartResponse }) {
+  const { t } = useI18n();
   return (
     <div className="space-y-3 rounded-md border border-border bg-muted/30 p-4 text-sm">
       <p>
-        Open the verification page on any device and enter the user code
-        below. xalgorix is polling the provider for completion.
+        {t("oauth.device.desc")}
       </p>
       <div className="grid gap-3 sm:grid-cols-[auto_1fr]">
         <div className="space-y-1">
-          <Label className="text-[10px]">User code</Label>
+          <Label className="text-[10px]">{t("oauth.device.userCode")}</Label>
           <code className="block rounded-md border border-border bg-background px-3 py-2 font-mono text-base tracking-widest">
             {startResult.userCode || "—"}
           </code>
         </div>
         <div className="space-y-1">
-          <Label className="text-[10px]">Verification URI</Label>
+          <Label className="text-[10px]">{t("oauth.device.verificationUri")}</Label>
           {startResult.verificationURI ? (
             <a
               href={startResult.verificationURI}
@@ -504,7 +498,7 @@ function DeviceBody({ startResult }: { startResult: OAuthStartResponse }) {
       </div>
       {startResult.expiresAt && (
         <p className="text-xs text-muted-foreground">
-          Code expires {new Date(startResult.expiresAt).toLocaleString()}.
+          {t("oauth.device.expiresBefore")}{new Date(startResult.expiresAt).toLocaleString()}
         </p>
       )}
     </div>
@@ -528,13 +522,13 @@ function PasteBody({
   onSubmit: (e: FormEvent) => void;
   submitting: boolean;
 }) {
+  const { t } = useI18n();
   return (
     <form onSubmit={onSubmit} className="space-y-3">
       {startResult.authURL && (
         <div className="rounded-md border border-border bg-muted/30 p-3 text-sm">
           <p className="mb-2 text-xs text-muted-foreground">
-            Open the authorization page, complete sign-in, then copy the URL
-            your browser lands on and paste it below.
+            {t("oauth.paste.desc")}
           </p>
           <a
             href={startResult.authURL}
@@ -542,44 +536,41 @@ function PasteBody({
             rel="noopener noreferrer"
             className="inline-flex items-center gap-1 text-primary underline-offset-2 hover:underline"
           >
-            Open authorization page <ExternalLink className="h-3.5 w-3.5" />
+            {t("oauth.openAuthPage")} <ExternalLink className="h-3.5 w-3.5" />
           </a>
           <p className="mt-2 text-xs text-muted-foreground">
-            After sign-in your browser will try to open{" "}
-            <code className="font-mono">localhost:1455</code> and may show a
-            “this site can’t be reached” error. That is expected on a remote or
-            headless host — just copy the full address-bar URL (it contains{" "}
-            <code className="font-mono">?code=…</code>) and paste it here.
+            {t("oauth.paste.expectedBefore")}
+            <code className="font-mono">localhost:1455</code>
+            {t("oauth.paste.expectedAfter")}
           </p>
         </div>
       )}
       <div className="space-y-2">
-        <Label htmlFor="oauth-paste-code">Redirect URL or code</Label>
+        <Label htmlFor="oauth-paste-code">{t("oauth.paste.urlLabel")}</Label>
         <Textarea
           id="oauth-paste-code"
           value={code}
           onChange={(e) => setCode(e.target.value)}
           rows={3}
           required
-          placeholder="Paste the full http://localhost:1455/auth/callback?code=… URL (or just the code)"
+          placeholder={t("oauth.paste.urlPlaceholder")}
           className="font-mono text-xs"
         />
         <p className="text-xs text-muted-foreground">
-          Pasting the whole redirect URL is easiest — the state value is
-          extracted automatically.
+          {t("oauth.paste.urlHint")}
         </p>
       </div>
       <details className="text-xs">
         <summary className="cursor-pointer text-muted-foreground">
-          Advanced: enter state manually
+          {t("oauth.paste.advanced")}
         </summary>
         <div className="mt-2 space-y-2">
-          <Label htmlFor="oauth-paste-state">State (optional)</Label>
+          <Label htmlFor="oauth-paste-state">{t("oauth.paste.stateLabel")}</Label>
           <Input
             id="oauth-paste-state"
             value={stateValue}
             onChange={(e) => setStateValue(e.target.value)}
-            placeholder="Returned `state` parameter, when not pasting the full URL"
+            placeholder={t("oauth.paste.statePlaceholder")}
             className="font-mono text-xs"
           />
         </div>
@@ -590,7 +581,7 @@ function PasteBody({
           disabled={submitting || code.trim() === ""}
           size="sm"
         >
-          {submitting ? "Completing…" : "Complete sign-in"}
+          {submitting ? t("oauth.paste.completing") : t("oauth.paste.complete")}
         </Button>
       </div>
     </form>
@@ -608,21 +599,22 @@ function SetupTokenBody({
   onSubmit: (e: FormEvent) => void;
   submitting: boolean;
 }) {
+  const { t } = useI18n();
   return (
     <form onSubmit={onSubmit} className="space-y-3">
       <div className="space-y-2">
-        <Label htmlFor="oauth-setup-token">Setup token</Label>
+        <Label htmlFor="oauth-setup-token">{t("oauth.setupToken.label")}</Label>
         <Textarea
           id="oauth-setup-token"
           value={code}
           onChange={(e) => setCode(e.target.value)}
           rows={3}
           required
-          placeholder="Paste the one-time setup token"
+          placeholder={t("oauth.setupToken.placeholder")}
           className="font-mono text-xs"
         />
         <p className="text-xs text-muted-foreground">
-          The token is exchanged with the provider once and never logged.
+          {t("oauth.setupToken.hint")}
         </p>
       </div>
       <div className="flex justify-end">
@@ -631,7 +623,7 @@ function SetupTokenBody({
           disabled={submitting || code.trim() === ""}
           size="sm"
         >
-          {submitting ? "Exchanging…" : "Exchange setup token"}
+          {submitting ? t("oauth.setupToken.exchanging") : t("oauth.setupToken.exchange")}
         </Button>
       </div>
     </form>
