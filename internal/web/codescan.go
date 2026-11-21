@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/xalgord/xalgorix/v4/internal/agent"
+	"github.com/xalgord/xalgorix/v4/internal/config"
 	"github.com/xalgord/xalgorix/v4/internal/scopeguard"
 )
 
@@ -62,11 +63,15 @@ func (s *Server) resolveCodeScan(req *ScanRequest) (isCodeScan bool, errMsg stri
 // with a port set, a loopback target on that exact port is permitted (used by
 // provision code scans). The dashboard's own listener port is never allowed.
 func (s *Server) isBlockedTargetForScan(target string, allowLoopbackPorts []int) bool {
+	cfg := s.configSnapshot()
+	if cfg == nil {
+		cfg = &config.Config{}
+	}
 	return scopeguard.IsLocalOrListener(scopeguard.Config{
-		BindAddr:           s.cfg.BindAddr,
+		BindAddr:           cfg.BindAddr,
 		Port:               s.port,
 		AllowLoopbackPorts: allowLoopbackPorts,
-		AllowLocalTargets:  s.cfg.AllowLocalTargets,
+		AllowLocalTargets:  cfg.AllowLocalTargets,
 	}, target)
 }
 

@@ -17,6 +17,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/xalgord/xalgorix/v4/internal/config"
+
 	"github.com/xalgord/xalgorix/v4/internal/safe"
 	"github.com/xalgord/xalgorix/v4/internal/scopeguard"
 )
@@ -344,10 +346,14 @@ func (s *Server) sendSimpleEmbedTo(webhook string, color int, title, description
 // shared package preserves the single-DNS-lookup-per-call contract
 // (Requirement 3.8 / design.md → "DNS Lookup Semantics").
 func (s *Server) isBlockedTarget(target string) bool {
+	cfg := s.configSnapshot()
+	if cfg == nil {
+		cfg = &config.Config{}
+	}
 	return scopeguard.IsLocalOrListener(scopeguard.Config{
-		BindAddr:          s.cfg.BindAddr,
+		BindAddr:          cfg.BindAddr,
 		Port:              s.port,
-		AllowLocalTargets: s.cfg.AllowLocalTargets,
+		AllowLocalTargets: cfg.AllowLocalTargets,
 	}, target)
 }
 

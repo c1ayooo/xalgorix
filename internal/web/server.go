@@ -1896,7 +1896,7 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 		}
 		if allBlocked {
 			msg := "All targets are local/internal addresses or the dashboard's own listener, so the scan was refused (self-scan protection)."
-			if s.cfg.AllowLocalTargets {
+			if cfg := s.configSnapshot(); cfg != nil && cfg.AllowLocalTargets {
 				// Local scanning is already on, so the only things still blocked
 				// are the dashboard itself and the unspecified address.
 				msg += " The dashboard's own listener and the unspecified address (0.0.0.0 / ::) are never scannable, even with local targets enabled — point the scan at the app's actual host:port instead."
@@ -2332,7 +2332,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"watchdog_kills":     counters.WatchdogKills,
 		"admission_refusals": counters.AdmissionRefusals,
 		"llm_inflight_cap":   resources.LLMInFlightCap(),
-		"data_dir":           s.cfg.DataDir,
+		"data_dir":           s.dataDir,
 		"allow_list":         allowList,
 		// read_deny is the deny-list applied to Filesystem_Tool reads.
 		// Reads outside allow_list succeed by default; only paths under
@@ -3629,13 +3629,18 @@ func (s *Server) handleDownloadReport(w http.ResponseWriter, r *http.Request) {
 // handleRateLimit handles GET and POST for rate limit settings.
 func (s *Server) handleRateLimit(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+	cfg := s.configSnapshot()
 
 	switch r.Method {
 	case "GET":
 		// Return current rate limit settings
+		requests, window := 0, 0
+		if cfg != nil {
+			requests, window = cfg.RateLimitRequests, cfg.RateLimitWindow
+		}
 		_ = json.NewEncoder(w).Encode(map[string]int{
-			"requests": s.cfg.RateLimitRequests,
-			"window":   s.cfg.RateLimitWindow,
+			"requests": requests,
+			"window":   window,
 		})
 
 	case "POST":
@@ -3672,9 +3677,13 @@ func (s *Server) handleRateLimit(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		requests, window := 0, 0
+		if cfg := s.configSnapshot(); cfg != nil {
+			requests, window = cfg.RateLimitRequests, cfg.RateLimitWindow
+		}
 		_ = json.NewEncoder(w).Encode(map[string]int{
-			"requests": s.cfg.RateLimitRequests,
-			"window":   s.cfg.RateLimitWindow,
+			"requests": requests,
+			"window":   window,
 		})
 
 	default:
@@ -3700,14 +3709,19 @@ func isMaskedAgentMailKey(apiKey string) bool {
 // handleAgentMailSettings handles GET and POST for AgentMail settings.
 func (s *Server) handleAgentMailSettings(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+	cfg := s.configSnapshot()
 
 	switch r.Method {
 	case "GET":
 		// Return current AgentMail settings (without exposing the full API key)
+		pod, apiKey := "", ""
+		if cfg != nil {
+			pod, apiKey = cfg.AgentMailPod, cfg.AgentMailAPIKey
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"pod":       s.cfg.AgentMailPod,
-			"apiKey":    maskAgentMailKey(s.cfg.AgentMailAPIKey),
-			"hasApiKey": s.cfg.AgentMailAPIKey != "",
+			"pod":       pod,
+			"apiKey":    maskAgentMailKey(apiKey),
+			"hasApiKey": apiKey != "",
 		})
 
 	case "POST":
@@ -3724,7 +3738,9 @@ func (s *Server) handleAgentMailSettings(w http.ResponseWriter, r *http.Request)
 		preserveKey := strings.TrimSpace(req.APIKey) == "" || isMaskedAgentMailKey(req.APIKey)
 		effectiveAPIKey := req.APIKey
 		if preserveKey {
-			effectiveAPIKey = s.cfg.AgentMailAPIKey
+			if current := s.configSnapshot(); current != nil {
+				effectiveAPIKey = current.AgentMailAPIKey
+			}
 		}
 
 		updates := map[string]string{"AGENTMAIL_POD": req.Pod}
@@ -3753,13 +3769,18 @@ func (s *Server) handleAgentMailSettings(w http.ResponseWriter, r *http.Request)
 // handleVersion returns the current Xalgorix version
 func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+	cfg := s.configSnapshot()
+	apiKey, model, apiBase := "", "", ""
+	if cfg != nil {
+		apiKey, model, apiBase = cfg.APIKey, cfg.LLM, cfg.APIBase
+	}
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"version": Version,
 		"ai": map[string]any{
-			"configured": s.cfg.APIKey != "" && s.cfg.LLM != "",
-			"provider":   llmProviderLabel(s.cfg.LLM, s.cfg.APIBase),
-			"model":      s.cfg.LLM,
-			"gateway":    llmGatewayName(s.cfg.LLM, s.cfg.APIBase),
+			"configured": apiKey != "" && model != "",
+			"provider":   llmProviderLabel(model, apiBase),
+			"model":      model,
+			"gateway":    llmGatewayName(model, apiBase),
 		},
 	})
 }

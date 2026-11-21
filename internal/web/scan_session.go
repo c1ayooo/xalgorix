@@ -13,6 +13,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/xalgord/xalgorix/v4/internal/agent"
+	"github.com/xalgord/xalgorix/v4/internal/egress"
 	"github.com/xalgord/xalgorix/v4/internal/engine"
 	"github.com/xalgord/xalgorix/v4/internal/llm"
 	"github.com/xalgord/xalgorix/v4/internal/platform"
@@ -202,8 +203,23 @@ func (s *Server) executeScanSession(sess *scanSession) {
 	// 0. Create and activate a per-session ScanContext for isolation.
 	//    This must happen BEFORE any tool state is touched.
 	sctx := scanctx.New(sess.id, sess.scanDir)
-	if s.cfg != nil {
-		sctx.Ledger.SetVOIWeight(s.cfg.VOIWeight)
+	cfg := s.configSnapshot()
+	if cfg != nil {
+		sctx.Ledger.SetVOIWeight(cfg.VOIWeight)
+	}
+	egressID := sess.instanceID
+	if strings.TrimSpace(egressID) == "" {
+		egressID = sess.id
+	}
+	egressStatus, err := egress.PrepareScan(sctx.Ctx, egressID)
+	if err != nil {
+		log.Printf("[egress] refusing scan %s: %v", egressID, err)
+		sess.abortReason = "egress_isolation_unavailable"
+		return
+	}
+	defer egress.Forget(egressID)
+	if !egressStatus.Enforced {
+		log.Printf("[egress] scan %s: %s (OS-level isolation unmanaged)", egressID, egressStatus.Reason)
 	}
 	// Resume continuity: reload compact per-request token records persisted
 	// before a restart so attribution aggregates continue across restarts.
@@ -221,10 +237,10 @@ func (s *Server) executeScanSession(sess *scanSession) {
 	if s.cfg != nil {
 		sess.runToken = randomSlug()
 		trafficproxy.RegisterRun(sess.runToken, sess.instanceID, sctx.ID, scopeguard.Config{
-			BindAddr:           s.cfg.BindAddr,
+			BindAddr:           cfg.BindAddr,
 			Port:               s.port,
 			AllowLoopbackPorts: sess.allowLoopbackPorts,
-			AllowLocalTargets:  s.cfg.AllowLocalTargets,
+			AllowLocalTargets:  cfg.AllowLocalTargets,
 		})
 	}
 
@@ -305,7 +321,11 @@ func (s *Server) executeScanSession(sess *scanSession) {
 	var legacyGate *registryGate
 	var einoBroker *einoApprovalBroker
 	if einoMode {
-		store, err := engine.OpenCheckpointStore(context.Background(), s.dataDir, s.cfg.DatabaseURL)
+		databaseURL := ""
+		if cfg != nil {
+			databaseURL = cfg.DatabaseURL
+		}
+		store, err := engine.OpenCheckpointStore(context.Background(), s.dataDir, databaseURL)
 		if err != nil {
 			// PG is a cold-path capability: a database outage must not disable
 			// scanning. Fall back to the atomic file checkpoint, loudly.
@@ -325,10 +345,10 @@ func (s *Server) executeScanSession(sess *scanSession) {
 		agentOpts = append(agentOpts, agent.WithApprovalGate(gate))
 	}
 	agnt := agent.NewAgent(sess.cfg, "XalgorixAgent", events, scopeguard.Config{
-		BindAddr:           s.cfg.BindAddr,
+		BindAddr:           cfg.BindAddr,
 		Port:               s.port,
 		AllowLoopbackPorts: sess.allowLoopbackPorts,
-		AllowLocalTargets:  s.cfg.AllowLocalTargets,
+		AllowLocalTargets:  cfg.AllowLocalTargets,
 	}, agentOpts...)
 	// Bind the operator-secret registry into whichever approval adapter was
 	// installed (HIGH-1): approval payloads are by-value redacted with the

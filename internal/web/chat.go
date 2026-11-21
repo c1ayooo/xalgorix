@@ -144,8 +144,8 @@ func (s *Server) postScanChat(inst *ScanInstance, message string) (string, error
 	chatCfg := *inst.chatCfg
 	if len(inst.chatMessages) == 0 {
 		lang := ""
-		if s.cfg != nil {
-			lang = s.cfg.Language
+		if cfg := s.configSnapshot(); cfg != nil {
+			lang = cfg.Language
 		}
 		inst.chatMessages = []llm.Message{{
 			Role:    "system",

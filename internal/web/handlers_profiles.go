@@ -501,11 +501,15 @@ func (s *Server) handleOAuthStart(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	bindAddr := ""
+	if cfg := s.configSnapshot(); cfg != nil {
+		bindAddr = cfg.BindAddr
+	}
 	opts := auth.StartOptions{
 		// cfg.BindAddr is the resolved XALGORIX_BIND value (default
 		// "127.0.0.1"). The PKCE driver inspects this and refuses
 		// non-loopback binds per R13.2 by returning Mode "paste".
-		BindAddr:    s.cfg.BindAddr,
+		BindAddr:    bindAddr,
 		PreferPaste: req.PreferPaste,
 	}
 	res, err := driver.Start(r.Context(), entry, opts)

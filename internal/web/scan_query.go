@@ -196,8 +196,8 @@ func (s *Server) generateReportAt(scan *ScanRecord, scanDir string) (string, err
 	// fonts. Preserve the localized/CJK renderer added on main for non-English
 	// reports until that support is moved into internal/reporting.
 	language := config.DefaultLanguage
-	if s.cfg != nil {
-		language = config.NormalizeLanguage(s.cfg.Language)
+	if cfg := s.configSnapshot(); cfg != nil {
+		language = config.NormalizeLanguage(cfg.Language)
 	}
 	if language != config.DefaultLanguage {
 		return s.generateReport(scan, scanDir)

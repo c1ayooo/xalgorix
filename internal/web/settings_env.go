@@ -330,6 +330,10 @@ func (s *Server) handleLLMSettings(w http.ResponseWriter, r *http.Request) {
 //     legacy path still has something usable; OAuth profile work
 //     happens through /api/auth/profiles/oauth/{start,complete}.
 func (s *Server) applyCatalogLLMSettings(ctx context.Context, req llmSettingsRequest) error {
+	cfg := s.configSnapshot()
+	if cfg == nil {
+		cfg = &config.Config{}
+	}
 	provider := strings.TrimSpace(req.Provider)
 	authMethod := strings.ToLower(strings.TrimSpace(req.AuthMethod))
 	activeProfileKey := strings.TrimSpace(req.ActiveProfileKey)
@@ -406,9 +410,9 @@ func (s *Server) applyCatalogLLMSettings(ctx context.Context, req llmSettingsReq
 			} else if ok {
 				activeProfileKey = existing.Key()
 			} else {
-				carry := strings.TrimSpace(s.cfg.APIKey)
-				if carry == "" && strings.TrimSpace(s.cfg.LLMProfile) != "" {
-					if prof, ok, err := s.profiles.Get(ctx, strings.TrimSpace(s.cfg.LLMProfile)); err == nil && ok {
+				carry := strings.TrimSpace(cfg.APIKey)
+				if carry == "" && strings.TrimSpace(cfg.LLMProfile) != "" {
+					if prof, ok, err := s.profiles.Get(ctx, strings.TrimSpace(cfg.LLMProfile)); err == nil && ok {
 						carry = strings.TrimSpace(prof.APIKey)
 					}
 				}
@@ -485,9 +489,9 @@ func (s *Server) applyCatalogLLMSettings(ctx context.Context, req llmSettingsReq
 			// container cannot reach. Prefer the persisted base when the
 			// provider is unchanged; fall back to the catalog only on a
 			// real provider switch (or when nothing is configured yet).
-			sameProvider := provider != "" && strings.TrimSpace(s.cfg.LLMProvider) == provider
-			if sameProvider && strings.TrimSpace(s.cfg.APIBase) != "" {
-				base = strings.TrimSpace(s.cfg.APIBase)
+			sameProvider := provider != "" && strings.TrimSpace(cfg.LLMProvider) == provider
+			if sameProvider && strings.TrimSpace(cfg.APIBase) != "" {
+				base = strings.TrimSpace(cfg.APIBase)
 			} else if provider != "" && s.catalog != nil {
 				if entry, ok, err := s.catalog.Get(ctx, provider); err == nil && ok {
 					base = strings.TrimSpace(entry.BaseURL)
@@ -583,48 +587,52 @@ func (s *Server) handleEnvironmentSettings(w http.ResponseWriter, r *http.Reques
 }
 
 func (s *Server) llmSettings(ctx context.Context) llmSettingsResponse {
+	cfg := s.configSnapshot()
+	if cfg == nil {
+		cfg = &config.Config{}
+	}
 	resp := llmSettingsResponse{
-		Model:                   s.cfg.LLM,
-		APIBase:                 s.cfg.APIBase,
-		APIKey:                  maskSecretValue(s.cfg.APIKey),
-		HasAPIKey:               s.cfg.APIKey != "",
-		ReasoningEffort:         s.cfg.ReasoningEffort,
-		OllamaCompatible:        s.cfg.OllamaCompatible,
-		LLMMaxRetries:           s.cfg.LLMMaxRetries,
-		MemoryCompressorTimeout: s.cfg.MemCompTimeout,
-		MaxIterations:           s.cfg.MaxIterations,
-		GeminiAPIKey:            maskSecretValue(s.cfg.GeminiAPIKey),
-		APIKeyPool:              maskedKeyPoolList(s.cfg.APIKeys),
-		HasAPIKeyPool:           len(s.cfg.APIKeys) > 0,
-		HasGeminiAPIKey:         s.cfg.GeminiAPIKey != "",
+		Model:                   cfg.LLM,
+		APIBase:                 cfg.APIBase,
+		APIKey:                  maskSecretValue(cfg.APIKey),
+		HasAPIKey:               cfg.APIKey != "",
+		ReasoningEffort:         cfg.ReasoningEffort,
+		OllamaCompatible:        cfg.OllamaCompatible,
+		LLMMaxRetries:           cfg.LLMMaxRetries,
+		MemoryCompressorTimeout: cfg.MemCompTimeout,
+		MaxIterations:           cfg.MaxIterations,
+		GeminiAPIKey:            maskSecretValue(cfg.GeminiAPIKey),
+		APIKeyPool:              maskedKeyPoolList(cfg.APIKeys),
+		HasAPIKeyPool:           len(cfg.APIKeys) > 0,
+		HasGeminiAPIKey:         cfg.GeminiAPIKey != "",
 		EnvFile:                 xalgorixEnvFilePath(),
-		ActiveProfileKey:        s.cfg.LLMProfile,
+		ActiveProfileKey:        cfg.LLMProfile,
 		Profiles:                []llmProfileSummary{},
 	}
 
 	// Provider derivation: prefer the explicit provider, then the active
 	// profile, and finally a legacy "<provider>/<model>" model value.
-	provider := strings.TrimSpace(s.cfg.LLMProvider)
-	if key := strings.TrimSpace(s.cfg.LLMProfile); key != "" {
+	provider := strings.TrimSpace(cfg.LLMProvider)
+	if key := strings.TrimSpace(cfg.LLMProfile); key != "" {
 		if i := strings.Index(key, ":"); i > 0 {
 			provider = key[:i]
 		}
 	}
 	if provider == "" {
-		if i := strings.Index(s.cfg.LLM, "/"); i > 0 {
-			provider = strings.ToLower(s.cfg.LLM[:i])
+		if i := strings.Index(cfg.LLM, "/"); i > 0 {
+			provider = strings.ToLower(cfg.LLM[:i])
 		}
 	}
 	resp.Provider = provider
-	resp.Model = modelForConfiguredProvider(s.cfg.LLM, provider)
+	resp.Model = modelForConfiguredProvider(cfg.LLM, provider)
 
 	// AuthMethod derivation: dispatch precedence mirrors the
 	// resolver. cfg.LLMProfile present + Profile.Type drives the
 	// answer; otherwise cfg.APIKey indicates api_key; otherwise
 	// "" (operator hasn't picked anything yet).
 	authMethod := ""
-	if s.profiles != nil && strings.TrimSpace(s.cfg.LLMProfile) != "" {
-		if prof, ok, err := s.profiles.Get(ctx, strings.TrimSpace(s.cfg.LLMProfile)); err == nil && ok {
+	if s.profiles != nil && strings.TrimSpace(cfg.LLMProfile) != "" {
+		if prof, ok, err := s.profiles.Get(ctx, strings.TrimSpace(cfg.LLMProfile)); err == nil && ok {
 			switch prof.Type {
 			case auth.OAuth:
 				authMethod = "oauth"
@@ -633,7 +641,7 @@ func (s *Server) llmSettings(ctx context.Context) llmSettingsResponse {
 			}
 		}
 	}
-	if authMethod == "" && s.cfg.APIKey != "" {
+	if authMethod == "" && cfg.APIKey != "" {
 		authMethod = "api_key"
 	}
 	if authMethod == "" && provider != "" && s.catalog != nil {
@@ -941,131 +949,135 @@ func (s *Server) applyEnvironmentToRuntimeConfig(values map[string]string) {
 }
 
 func (s *Server) envSettingValue(key string) string {
+	cfg := s.configSnapshot()
+	if cfg == nil {
+		return ""
+	}
 	switch key {
 	case "XALGORIX_LLM":
-		return s.cfg.LLM
+		return cfg.LLM
 	case "XALGORIX_API_BASE":
-		return s.cfg.APIBase
+		return cfg.APIBase
 	case "XALGORIX_API_KEY":
-		return s.cfg.APIKey
+		return cfg.APIKey
 	case "XALGORIX_API_KEYS":
-		return strings.Join(s.cfg.APIKeys, ", ")
+		return strings.Join(cfg.APIKeys, ", ")
 	case "XALGORIX_LLM_PROFILE":
-		return s.cfg.LLMProfile
+		return cfg.LLMProfile
 	case "XALGORIX_REASONING_EFFORT":
-		return valueOrDefault(s.cfg.ReasoningEffort, "high")
+		return valueOrDefault(cfg.ReasoningEffort, "high")
 	case "XALGORIX_LANGUAGE":
-		return config.NormalizeLanguage(s.cfg.Language)
+		return config.NormalizeLanguage(cfg.Language)
 	case "XALGORIX_OLLAMA_COMPATIBLE":
-		return strconv.FormatBool(s.cfg.OllamaCompatible)
+		return strconv.FormatBool(cfg.OllamaCompatible)
 	case "XALGORIX_LLM_MAX_RETRIES":
-		return strconv.Itoa(s.cfg.LLMMaxRetries)
+		return strconv.Itoa(cfg.LLMMaxRetries)
 	case "XALGORIX_MAX_RATE_LIMIT_WAIT":
-		return strconv.Itoa(s.cfg.MaxRateLimitWaitSec)
+		return strconv.Itoa(cfg.MaxRateLimitWaitSec)
 	case "XALGORIX_MAX_OUTPUT_TOKENS":
-		return strconv.Itoa(s.cfg.MaxOutputTokens)
+		return strconv.Itoa(cfg.MaxOutputTokens)
 	case "XALGORIX_CONTEXT_COMPACT_TOKENS":
-		return strconv.Itoa(s.cfg.ContextCompactTokens)
+		return strconv.Itoa(cfg.ContextCompactTokens)
 	case "XALGORIX_LLM_CONTEXT_WINDOW":
-		return strconv.Itoa(s.cfg.LLMContextWindow)
+		return strconv.Itoa(cfg.LLMContextWindow)
 	case "XALGORIX_CONTEXT_COMPACT_RATIO":
-		return strconv.FormatFloat(s.cfg.ContextCompactRatio, 'g', -1, 64)
+		return strconv.FormatFloat(cfg.ContextCompactRatio, 'g', -1, 64)
 	case "XALGORIX_BOUNDED_CONTEXT":
-		return strconv.FormatBool(s.cfg.BoundedContext)
+		return strconv.FormatBool(cfg.BoundedContext)
 	case "XALGORIX_EPOCH_COVERAGE":
-		return strconv.FormatBool(s.cfg.EpochCoverage)
+		return strconv.FormatBool(cfg.EpochCoverage)
 	case "XALGORIX_NATIVE_TOOL_CALLS":
-		return strconv.FormatBool(s.cfg.NativeToolCalls)
+		return strconv.FormatBool(cfg.NativeToolCalls)
 	case "XALGORIX_TOOL_ARCHIVE_MIN_BYTES":
-		return strconv.Itoa(s.cfg.ToolArchiveMinBytes)
+		return strconv.Itoa(cfg.ToolArchiveMinBytes)
 	case "XALGORIX_TOOL_ARCHIVE_ACTIVE_WINDOW":
-		return strconv.Itoa(s.cfg.ToolArchiveActiveWindow)
+		return strconv.Itoa(cfg.ToolArchiveActiveWindow)
 	case "XALGORIX_ROLE_SCOPED_TOOLS":
-		return strconv.FormatBool(s.cfg.RoleScopedTools)
+		return strconv.FormatBool(cfg.RoleScopedTools)
 	case "XALGORIX_MEMORY_COMPRESSOR_TIMEOUT":
-		return strconv.Itoa(s.cfg.MemCompTimeout)
+		return strconv.Itoa(cfg.MemCompTimeout)
 	case "XALGORIX_MAX_ITERATIONS":
-		return strconv.Itoa(s.cfg.MaxIterations)
+		return strconv.Itoa(cfg.MaxIterations)
 	case "XALGORIX_MIN_ITERATIONS":
-		return strconv.Itoa(s.cfg.MinIterations)
+		return strconv.Itoa(cfg.MinIterations)
 	case "XALGORIX_ITERATION_DELAY":
-		return strconv.FormatFloat(s.cfg.IterationDelaySec, 'g', -1, 64)
+		return strconv.FormatFloat(cfg.IterationDelaySec, 'g', -1, 64)
 	case "XALGORIX_MAX_WILDCARD_SUBDOMAINS":
-		return strconv.Itoa(s.cfg.MaxWildcardSubdomains)
+		return strconv.Itoa(cfg.MaxWildcardSubdomains)
 	case "XALGORIX_NO_TOOL_ABORT_AT":
-		return strconv.Itoa(s.cfg.NoToolAbortAt)
+		return strconv.Itoa(cfg.NoToolAbortAt)
 	case "XALGORIX_MAX_FINISH_REJECTIONS":
-		return strconv.Itoa(s.cfg.MaxFinishRejections)
+		return strconv.Itoa(cfg.MaxFinishRejections)
 	case "XALGORIX_CONVERGE_FINISH_IDLE":
-		return strconv.Itoa(s.cfg.ConvergeFinishIdle)
+		return strconv.Itoa(cfg.ConvergeFinishIdle)
 	case "XALGORIX_CONVERGE_FINISH_LEAD_WINDOW":
-		return strconv.Itoa(s.cfg.ConvergeFinishLeadWindow)
+		return strconv.Itoa(cfg.ConvergeFinishLeadWindow)
 	case "XALGORIX_WORKSPACE":
-		return s.cfg.Workspace
+		return cfg.Workspace
 	case "XALGORIX_DISABLE_BROWSER":
-		return strconv.FormatBool(s.cfg.DisableBrowser)
+		return strconv.FormatBool(cfg.DisableBrowser)
 	case "XALGORIX_RATE_LIMIT_REQUESTS":
-		return strconv.Itoa(s.cfg.RateLimitRequests)
+		return strconv.Itoa(cfg.RateLimitRequests)
 	case "XALGORIX_RATE_LIMIT_WINDOW":
-		return strconv.Itoa(s.cfg.RateLimitWindow)
+		return strconv.Itoa(cfg.RateLimitWindow)
 	case "XALGORIX_RATE_RPS":
-		return strconv.FormatFloat(s.cfg.RateLimitRPS, 'f', -1, 64)
+		return strconv.FormatFloat(cfg.RateLimitRPS, 'f', -1, 64)
 	case "XALGORIX_RATE_BURST":
-		return strconv.Itoa(s.cfg.RateLimitBurst)
+		return strconv.Itoa(cfg.RateLimitBurst)
 	case "XALGORIX_TLS_SKIP_VERIFY":
-		return strconv.FormatBool(s.cfg.TLSSkipVerify)
+		return strconv.FormatBool(cfg.TLSSkipVerify)
 	case "XALGORIX_ALLOW_LOCAL_TARGETS":
-		return strconv.FormatBool(s.cfg.AllowLocalTargets)
+		return strconv.FormatBool(cfg.AllowLocalTargets)
 	case "CAIDO_PORT":
-		return strconv.Itoa(s.cfg.CaidoPort)
+		return strconv.Itoa(cfg.CaidoPort)
 	case "CAIDO_API_TOKEN":
-		return s.cfg.CaidoAPIToken
+		return cfg.CaidoAPIToken
 	case "XALGORIX_TELEMETRY":
-		return strconv.FormatBool(s.cfg.Telemetry)
+		return strconv.FormatBool(cfg.Telemetry)
 	case "XALGORIX_OTEL_ENDPOINT":
-		return s.cfg.OTelEndpoint
+		return cfg.OTelEndpoint
 	case "GEMINI_API_KEY":
-		return s.cfg.GeminiAPIKey
+		return cfg.GeminiAPIKey
 	case "AGENTMAIL_API_KEY":
-		return s.cfg.AgentMailAPIKey
+		return cfg.AgentMailAPIKey
 	case "AGENTMAIL_POD":
-		return s.cfg.AgentMailPod
+		return cfg.AgentMailPod
 	case "XALGORIX_DISCORD_WEBHOOK":
-		return s.cfg.DiscordWebhook
+		return cfg.DiscordWebhook
 	case "XALGORIX_DISCORD_MIN_SEVERITY":
-		return s.cfg.DiscordMinSeverity
+		return cfg.DiscordMinSeverity
 	case "XALGORIX_TELEGRAM_BOT_TOKEN":
-		return s.cfg.TelegramBotToken
+		return cfg.TelegramBotToken
 	case "XALGORIX_TELEGRAM_CHAT_ID":
-		return s.cfg.TelegramChatID
+		return cfg.TelegramChatID
 	case "XALGORIX_TELEGRAM_MIN_SEVERITY":
-		return s.cfg.TelegramMinSeverity
+		return cfg.TelegramMinSeverity
 	case "XALGORIX_NOTIFY_SCAN_COMPLETE":
 		return strconv.FormatBool(s.notifyScanComplete.Load())
 	case "XALGORIX_USERNAME":
-		return s.cfg.Username
+		return cfg.Username
 	case "XALGORIX_PASSWORD":
-		return s.cfg.Password
+		return cfg.Password
 	case "XALGORIX_PASSWORD_HASH":
-		return s.cfg.PasswordHash
+		return cfg.PasswordHash
 	case "XALGORIX_BIND":
-		return valueOrDefault(s.cfg.BindAddr, "127.0.0.1")
+		return valueOrDefault(cfg.BindAddr, "127.0.0.1")
 	case "XALGORIX_ALLOW_AUTO_INSTALL":
-		return strconv.FormatBool(s.cfg.AllowAutoInstall)
+		return strconv.FormatBool(cfg.AllowAutoInstall)
 	case "XALGORIX_AUTO_INSTALL_SUDO":
-		return strconv.FormatBool(s.cfg.AllowAutoInstallSudo)
+		return strconv.FormatBool(cfg.AllowAutoInstallSudo)
 	case "XALGORIX_USE_PROXY":
-		return strconv.FormatBool(s.cfg.UseProxy)
+		return strconv.FormatBool(cfg.UseProxy)
 	case "XALGORIX_PROXY_REQUIRED":
-		return strconv.FormatBool(s.cfg.ProxyRequired)
+		return strconv.FormatBool(cfg.ProxyRequired)
 	case "XALGORIX_PROXY_FILE":
-		return s.cfg.ProxyFile
+		return cfg.ProxyFile
 	case "XALGORIX_PROXY_ROTATION":
-		return valueOrDefault(s.cfg.ProxyRotation, "roundrobin")
+		return valueOrDefault(cfg.ProxyRotation, "roundrobin")
 	case "XALGORIX_PROXY_URL":
-		return s.cfg.ProxyURL
+		return cfg.ProxyURL
 	case "XALGORIX_BROWSER_PATH":
-		return s.cfg.BrowserPath
+		return cfg.BrowserPath
 	default:
 		return os.Getenv(key)
 	}

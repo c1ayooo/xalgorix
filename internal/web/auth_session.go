@@ -425,19 +425,23 @@ func authMiddleware(cfg *config.Config) func(http.Handler) http.Handler {
 var plaintextPasswordWarnOnce sync.Once
 
 func (s *Server) verifyPassword(presented string) bool {
-	if s.cfg.PasswordHash != "" {
+	cfg := s.configSnapshot()
+	if cfg == nil {
+		return false
+	}
+	if cfg.PasswordHash != "" {
 		// bcrypt.CompareHashAndPassword is constant-time wrt password length
 		// for matching hashes and is the recommended verification path.
-		err := bcrypt.CompareHashAndPassword([]byte(s.cfg.PasswordHash), []byte(presented))
+		err := bcrypt.CompareHashAndPassword([]byte(cfg.PasswordHash), []byte(presented))
 		return err == nil
 	}
-	if s.cfg.Password == "" {
+	if cfg.Password == "" {
 		return false
 	}
 	plaintextPasswordWarnOnce.Do(func() {
 		log.Printf("[auth] WARNING: XALGORIX_PASSWORD is set in plaintext. Migrate to XALGORIX_PASSWORD_HASH (bcrypt) — see README.")
 	})
-	return subtle.ConstantTimeCompare([]byte(presented), []byte(s.cfg.Password)) == 1
+	return subtle.ConstantTimeCompare([]byte(presented), []byte(cfg.Password)) == 1
 }
 
 // handleLogin handles POST /api/auth/login
@@ -474,7 +478,11 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	// Constant-time username comparison; bcrypt for password. We always
 	// run the password compare even on a username miss so the work
 	// performed is independent of which side is wrong (timing-equalized).
-	userMatch := subtle.ConstantTimeCompare([]byte(creds.Username), []byte(s.cfg.Username)) == 1
+	username := ""
+	if cfg := s.configSnapshot(); cfg != nil {
+		username = cfg.Username
+	}
+	userMatch := subtle.ConstantTimeCompare([]byte(creds.Username), []byte(username)) == 1
 	passMatch := s.verifyPassword(creds.Password)
 	if !userMatch || !passMatch {
 		loginRecordFailure(ip)

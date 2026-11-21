@@ -2076,8 +2076,8 @@ func (s *Server) collectSubdomains(scanDir, root, contextID string) []string {
 		if wd := terminal.GetWorkDir(); wd != "" && wd != scanDir {
 			checkDirs = append(checkDirs, wd)
 		}
-		if s.cfg.Workspace != "" && s.cfg.Workspace != scanDir {
-			checkDirs = append(checkDirs, s.cfg.Workspace)
+		if cfg := s.configSnapshot(); cfg != nil && cfg.Workspace != "" && cfg.Workspace != scanDir {
+			checkDirs = append(checkDirs, cfg.Workspace)
 		}
 		for _, dir := range checkDirs {
 			for _, name := range subdomainFileNames {

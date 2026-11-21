@@ -188,8 +188,8 @@ func (s *Server) handleBatchDecision(w http.ResponseWriter, r *http.Request, sto
 // the contract's "operator:<user>" vocabulary.
 func (s *Server) decideApproval(ctx context.Context, store platform.Repository, id, decision, reason string) (*platform.Approval, error) {
 	decidedBy := "operator"
-	if s.cfg != nil && strings.TrimSpace(s.cfg.Username) != "" {
-		decidedBy = "operator:" + s.cfg.Username
+	if cfg := s.configSnapshot(); cfg != nil && strings.TrimSpace(cfg.Username) != "" {
+		decidedBy = "operator:" + cfg.Username
 	}
 	if svc := s.approvalService(); svc != nil {
 		return svc.Decide(ctx, id, decision, decidedBy, reason)

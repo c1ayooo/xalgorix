@@ -68,10 +68,11 @@ const retentionCheckInterval = time.Hour
 // The loop honors s.shutdownChan like startScheduler so it tears down
 // cleanly when the server stops.
 func (s *Server) startRetentionSweeper() {
-	if s.cfg == nil || s.cfg.ScanRetentionDays <= 0 {
+	cfg := s.configSnapshot()
+	if cfg == nil || cfg.ScanRetentionDays <= 0 {
 		return // retention disabled — keep scans forever
 	}
-	days := s.cfg.ScanRetentionDays
+	days := cfg.ScanRetentionDays
 	log.Printf("[RETENTION] Started: pruning scan data older than %d day(s) under %s", days, s.dataDir)
 
 	// Run one sweep immediately so a newly-set retention window applies

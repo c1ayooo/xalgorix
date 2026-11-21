@@ -141,9 +141,9 @@ func (s *Server) storedEndpointURL(ctx context.Context, req ScanRequest, cfg *co
 		opCfg = *cfg
 	}
 	operatorBase := ""
-	if s.cfg != nil {
-		operatorBase = s.cfg.APIBase
-		opCfg.LLM = s.cfg.LLM
+	if operatorCfg := s.configSnapshot(); operatorCfg != nil {
+		operatorBase = operatorCfg.APIBase
+		opCfg.LLM = operatorCfg.LLM
 	}
 	opCfg.APIBase = operatorBase
 	stored := req

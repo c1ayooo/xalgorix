@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/xalgord/xalgorix/v4/internal/auth"
+	"github.com/xalgord/xalgorix/v4/internal/config"
 	"github.com/xalgord/xalgorix/v4/internal/providers"
 )
 
@@ -65,20 +66,25 @@ func (s *Server) handleDiscoverProviderModels(w http.ResponseWriter, r *http.Req
 // branch, discovery for such providers falls through to "save or select
 // credentials" even though the active credentials are already persisted.
 func (s *Server) activeConfigTargetsProvider(providerID string) bool {
-	if s.cfg == nil {
+	cfg := s.configSnapshot()
+	if cfg == nil {
 		return false
 	}
-	if strings.HasPrefix(s.cfg.LLM, providerID+"/") {
+	if strings.HasPrefix(cfg.LLM, providerID+"/") {
 		return true
 	}
-	return strings.TrimSpace(s.cfg.LLMProvider) == providerID
+	return strings.TrimSpace(cfg.LLMProvider) == providerID
 }
 
 func (s *Server) modelDiscoveryConfig(r *http.Request, entry providers.Entry) (providers.Entry, string, string, error) {
+	cfg := s.configSnapshot()
+	if cfg == nil {
+		cfg = &config.Config{}
+	}
 	for _, method := range entry.AuthMethods {
 		if method == "none" {
-			if s.activeConfigTargetsProvider(entry.ID) && strings.TrimSpace(s.cfg.APIBase) != "" {
-				entry.BaseURL = strings.TrimSpace(s.cfg.APIBase)
+			if s.activeConfigTargetsProvider(entry.ID) && strings.TrimSpace(cfg.APIBase) != "" {
+				entry.BaseURL = strings.TrimSpace(cfg.APIBase)
 			}
 			return entry, "", "", nil
 		}
@@ -104,10 +110,10 @@ func (s *Server) modelDiscoveryConfig(r *http.Request, entry providers.Entry) (p
 		return entry, strings.TrimSpace(profile.APIKey), "", nil
 	}
 	if s.activeConfigTargetsProvider(entry.ID) {
-		if strings.TrimSpace(s.cfg.APIBase) != "" {
-			entry.BaseURL = strings.TrimSpace(s.cfg.APIBase)
+		if strings.TrimSpace(cfg.APIBase) != "" {
+			entry.BaseURL = strings.TrimSpace(cfg.APIBase)
 		}
-		return entry, strings.TrimSpace(s.cfg.APIKey), "", nil
+		return entry, strings.TrimSpace(cfg.APIKey), "", nil
 	}
 	return entry, "", "", fmt.Errorf("save or select credentials before scanning models")
 }

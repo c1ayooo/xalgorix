@@ -520,8 +520,8 @@ var methodologyPhaseNames = func() map[int]string {
 // server-global output directory.
 func (s *Server) generateReport(scan *ScanRecord, scanDir string) (string, error) {
 	language := ""
-	if s.cfg != nil {
-		language = s.cfg.Language
+	if cfg := s.configSnapshot(); cfg != nil {
+		language = cfg.Language
 	}
 	pdf := newReportPDF(language)
 	pdf.SetAutoPageBreak(true, 20)
