@@ -9,6 +9,10 @@ package web
 //	POST /api/approvals/batch-decision  {ids, decision, reason?} → counts
 //	GET/POST /api/tasks/{id}/guidance   (contract §3.1; routed via handleTaskDetail)
 //
+// The running-agent injection path embeds a stable `[OPERATOR GUIDANCE
+// gi:<id>]: ` marker and arms the journal observer (guidance_observer.go) that
+// flips the row to consumed once engine output cites the marker.
+//
 // pending_total is ALWAYS the cross-project count (D7 exception: the
 // OpsPulse pending counter is the one cross-project data surface). Response
 // shapes follow mock-backend.mjs:887-958 field-for-field — the frontend
@@ -79,6 +83,21 @@ func (s *Server) handleApprovals(w http.ResponseWriter, r *http.Request) {
 		"approvals":     approvals,
 		"pending_total": summary.Total,
 	})
+}
+
+// handleApprovalsSummaryRoute is the mux-level entry for the exact
+// "/api/approvals/summary" pattern. It validates method and store before
+// delegating, so the summary can never be swallowed by the detail subtree.
+func (s *Server) handleApprovalsSummaryRoute(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSONStatus(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	store, ok := s.requirePlatformStore(w)
+	if !ok {
+		return
+	}
+	s.handleApprovalsSummary(w, r, store)
 }
 
 // handleApprovalsSummary serves GET /api/approvals/summary: the cross-project
@@ -327,7 +346,10 @@ func (s *Server) handleTaskGuidance(w http.ResponseWriter, r *http.Request, stor
 
 		status := platform.GuidanceQueued
 		if canInject {
-			if _, serr := s.instanceAgent(instanceID).SendMessage("[OPERATOR GUIDANCE]: " + g.Message); serr == nil {
+			// Path A: the stable gi:<id> marker (guidance_observer.go) makes
+			// the turn attributable from engine output, which is what lets the
+			// journal observer flip the row to consumed later.
+			if _, serr := s.instanceAgent(instanceID).SendMessage(operatorGuidanceMessage(g.ID, g.Message)); serr == nil {
 				status = platform.GuidanceInjected
 				if _, uerr := store.UpdateGuidanceStatus(r.Context(), g.ID, platform.GuidanceInjected); uerr != nil {
 					log.Printf("[platform] guidance %s flip to injected failed: %v", g.ID, uerr)
@@ -335,6 +357,7 @@ func (s *Server) handleTaskGuidance(w http.ResponseWriter, r *http.Request, stor
 				} else {
 					s.broadcastToInstance(instanceID, WSEvent{Type: "guidance_injected", Guidance: g, Content: "Operator guidance delivered to the running scan"})
 					g.Status = platform.GuidanceInjected
+					s.watchGuidanceConsumption(instanceID, g.ID)
 				}
 			} else {
 				log.Printf("[platform] guidance %s injection into run %s failed: %v — queued", g.ID, runID, serr)

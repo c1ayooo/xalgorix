@@ -157,9 +157,12 @@ interface Guidance {
   instance_id?: string;
   message: string;        // ≤4000 码点
   status: "injected" | "queued" | "consumed";
-  // injected = 已注入运行中 agent 的下一轮对话；queued = 无活跃 Run，挂到任务，
-  // 下次 Run 启动时作为 briefing 的一部分（source=human）进入点亮视野；
-  // consumed = 引擎已消费（对应 hypothesis/evidence 产出后由后端翻转）。
+  // injected = 已注入运行中 agent 的下一轮对话（注入消息带稳定标记
+  //   `[OPERATOR GUIDANCE gi:<id>]: `，id 即本行 id）；queued = 无活跃 Run，挂到任务，
+  // 下次 Run 启动时作为 briefing 的一部分（source=human）进入点亮视野——
+  //   briefing 并入无逐行标记载体，如实保持 injected，不自动翻转；
+  // consumed = 引擎已消费：domain journal 观察者在 hypothesis/evidence 产出
+  //   （记录 summary / InfoItem 文本）命中 `gi:<id>` 标记后由后端翻转。
   created_at: string;
   consumed_at?: string;
 }
@@ -175,7 +178,8 @@ interface Guidance {
 **注入语义**（后端实现要点）：
 - 目标 Run **running** → 走 in-scan chat 通道（`internal/web/chat.go`）注入下一轮 user turn，`status=injected`；
 - 目标 Run 暂停/停止/无 Run → `status=queued`，Run 启动时并入 briefing（等价 4zreco"暂停后发消息继续"的 xalgorix 变体：不必先暂停，排队即可）；
-- `message` 超过 4000 码点 → 400；`request_id` 缺失 → 400。
+- `message` 超过 4000 码点 → 400；`request_id` 缺失 → 400；
+- **consumed 翻转闭环**：injected 行由 domain journal 观察者（`internal/web/guidance_observer.go`）闭环——引擎产出（hypothesis/evidence 记录的 summary、InfoItem 文本）引用 `gi:<id>` → `UpdateGuidanceStatus(consumed)` + `guidance_consumed` WS 事件；briefing 并入路径无逐行标记载体，如实保持 injected（操作者从 injected 即可理解该 turn 已带入上下文）；store 失败只留日志，观察者永远 fail-open。
 
 ## 3.2 项目维度过滤（overview 项目化，2026-11-20 增补）
 

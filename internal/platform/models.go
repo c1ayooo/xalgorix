@@ -292,10 +292,13 @@ type ApprovalSummary struct {
 // ── guidance (R2a HITL-intent, API_CONTRACT §3.1) ───────────────────────────
 
 // Guidance lifecycle statuses: injected = handed to a running agent's next
-// conversation round; queued = no active run, merged into the next session's
-// briefing; consumed = the engine consumed it (flipped by a later cold-path
-// observer; R2a keeps the status writable via UpdateGuidanceStatus but does
-// not auto-derive it).
+// conversation round (the injected turn carries a stable `gi:<id>` marker);
+// queued = no active run, merged into the next session's briefing (stays
+// injected — the merged briefing has no per-row marker carrier, so those rows
+// are never auto-flipped); consumed = the engine consumed it: the web-layer
+// domain-journal observer flips the row when a hypothesis/evidence record's
+// text cites the marker. UpdateGuidanceStatus remains the only status write
+// path (guidance_observer.go is its sole consumed caller).
 const (
 	GuidanceInjected = "injected"
 	GuidanceQueued   = "queued"
