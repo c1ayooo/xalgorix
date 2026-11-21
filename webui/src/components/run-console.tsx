@@ -31,7 +31,10 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { LiveFeed, type FeedFilter } from "@/components/live-feed";
+import { ExecutionTrace, TraceViewToggle } from "@/components/execution-trace";
+import { PlanRail } from "@/components/plan-rail";
 import { EmptyState } from "@/components/states";
+import { extractPlan, planProgress } from "@/lib/execution-trace";
 import { useI18n } from "@/i18n";
 import {
   useInstanceEvents,
@@ -101,6 +104,8 @@ export function RunConsole({
   const [stopReason, setStopReason] = useState("");
   // 会话视角：All agents / 单个 agent（coordinator 或 specialist）。
   const [agentScope, setAgentScope] = useState<string>("all");
+  // 轨迹视图（默认）= 分组后的执行步骤 + 规划；原始事件 = 既有 LiveFeed。
+  const [view, setView] = useState<"trace" | "raw">("trace");
 
   // 历史自管：一次性拉全量分页历史（静态），实时增量靠 WS；"加载更早"
   // 按 offset 继续向前翻（events_truncated 的真实后端同样适用）。
@@ -134,13 +139,14 @@ export function RunConsole({
     api
       .runEventsPage(selectedInstanceId, history.length, 100)
       .then((page) => {
-        setHistory((prev) => [
-          ...page.map((e, i) =>
-            toFeedEvent(e, `task-run:${selectedInstanceId}`, prev.length + i),
-          ),
-          ...prev,
-        ]);
-        setHasMore(page.length >= 100);
+        const mapped = page.map((e, i) =>
+          toFeedEvent(e, `task-run:${selectedInstanceId}`, history.length + i),
+        );
+        const merged = mergeFeedEvents(history, mapped);
+        // /api/instances/{id}/events ignores offset and returns the whole
+        // buffer; when a page adds nothing new, stop offering "load earlier".
+        if (merged.length === history.length) setHasMore(false);
+        setHistory(merged);
       })
       .catch(() => setHasMore(false))
       .finally(() => setHistoryLoading(false));
@@ -191,6 +197,11 @@ export function RunConsole({
     [streamingAll, selectedInstanceId, agentScope],
   );
 
+  // 规划轨迹：从 build_plan / update_plan 工具调用重建；引擎自动规划时
+  // 退回实例上的 plan_tasks_* 计数（不编造任务行）。
+  const plan = useMemo(() => extractPlan(rawEvents, hasMore), [rawEvents, hasMore]);
+  const progress = useMemo(() => planProgress(plan, instance), [plan, instance]);
+
   const status = instance?.status ?? "";
   const paused = status === "paused";
   const running = status === "running";
@@ -237,7 +248,7 @@ export function RunConsole({
   }
 
   return (
-    <Card className="flex h-full min-h-0 flex-col overflow-hidden">
+    <Card className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden">
       {/* Console head: run picker + controls */}
       <div className="flex flex-wrap items-center gap-2 border-b border-border px-2 py-1.5">
         <Select
@@ -285,57 +296,71 @@ export function RunConsole({
           </div>
         )}
 
-        {instance && (
-          <div className="ml-auto flex items-center gap-1">
-            {paused && (
-              <Button
-                size="sm"
-                variant="outline"
-                className="h-7 px-2 text-xs"
-                disabled={resume.isPending}
-                onClick={() =>
-                  resume.mutate(instance.id, {
-                    onSuccess: () => toast.success(t("toast.runResumed")),
-                  })
-                }
-              >
-                <Play className="h-3 w-3" />
-                {t("console.resume")}
-              </Button>
-            )}
-            {running && (
-              <Button
-                size="sm"
-                variant="ghost"
-                className="h-7 px-2 text-xs"
-                disabled={pause.isPending}
-                onClick={() =>
-                  pause.mutate(instance.id, {
-                    onSuccess: () => toast.success(t("toast.runPaused")),
-                  })
-                }
-              >
-                <Pause className="h-3 w-3" />
-                {t("console.pause")}
-              </Button>
-            )}
-            {(running || paused) && (
-              <Button
-                size="sm"
-                variant="ghost"
-                className="h-7 px-2 text-red-600 hover:text-red-700 dark:text-red-400"
-                onClick={() => {
-                  setStopReason("");
-                  setStopOpen(true);
-                }}
-              >
-                <Square className="h-3 w-3" />
-                {t("console.stop")}
-              </Button>
-            )}
-          </div>
-        )}
+        <div className="ml-auto flex shrink-0 items-center gap-1.5">
+          {selectedInstanceId && (
+            <TraceViewToggle view={view} onChange={setView} />
+          )}
+          {instance && (
+            <>
+              {paused && (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-7 px-2 text-xs"
+                  disabled={resume.isPending}
+                  onClick={() =>
+                    resume.mutate(instance.id, {
+                      onSuccess: () => toast.success(t("toast.runResumed")),
+                    })
+                  }
+                >
+                  <Play className="h-3 w-3" />
+                  {t("console.resume")}
+                </Button>
+              )}
+              {running && (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="h-7 px-2 text-xs"
+                  disabled={pause.isPending}
+                  onClick={() =>
+                    pause.mutate(instance.id, {
+                      onSuccess: () => toast.success(t("toast.runPaused")),
+                    })
+                  }
+                >
+                  <Pause className="h-3 w-3" />
+                  {t("console.pause")}
+                </Button>
+              )}
+              {(running || paused) && (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="h-7 px-2 text-red-600 hover:text-red-700 dark:text-red-400"
+                  onClick={() => {
+                    setStopReason("");
+                    setStopOpen(true);
+                  }}
+                >
+                  <Square className="h-3 w-3" />
+                  {t("console.stop")}
+                </Button>
+              )}
+            </>
+          )}
+        </div>
       </div>
+
+      {/* Plan rail: planning steps + progress, always visible while a run is selected. */}
+      {selectedInstanceId && (
+        <PlanRail
+          plan={plan}
+          progress={progress}
+          currentPhase={instance?.current_phase}
+        />
+      )}
 
       {/* Transcript */}
       <CardContent className="min-h-0 flex-1 p-0">
@@ -353,16 +378,27 @@ export function RunConsole({
                 </button>
               </div>
             )}
-            <LiveFeed
-              events={events}
-              filter={filter}
-              onFilterChange={setFilter}
-              showControls
-              fillHeight
-              streaming={streaming}
-              emptyTitle={t("taskDetail.noEventsTitle")}
-              emptyDescription={t("taskDetail.noEventsDescription")}
-            />
+            {view === "trace" ? (
+              <ExecutionTrace
+                events={events}
+                streaming={streaming}
+                instanceId={selectedInstanceId}
+                active={running}
+                emptyTitle={t("taskDetail.noEventsTitle")}
+                emptyDescription={t("taskDetail.noEventsDescription")}
+              />
+            ) : (
+              <LiveFeed
+                events={events}
+                filter={filter}
+                onFilterChange={setFilter}
+                showControls
+                fillHeight
+                streaming={streaming}
+                emptyTitle={t("taskDetail.noEventsTitle")}
+                emptyDescription={t("taskDetail.noEventsDescription")}
+              />
+            )}
           </div>
         ) : (
           <div className="grid h-full place-items-center p-6">

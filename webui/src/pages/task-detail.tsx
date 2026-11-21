@@ -120,9 +120,9 @@ export default function TaskDetailPage() {
 
       {/* 4zreco sessions-tab 模式：大屏整页视口定高、面板内部滚动，
           页面本身不滚。 */}
-      <div className="grid items-start gap-4 lg:h-[calc(100vh-16.5rem)] lg:grid-cols-[minmax(0,1fr)_400px] lg:grid-rows-[minmax(0,1fr)]">
+      <div className="grid grid-cols-1 items-start gap-4 lg:h-[calc(100vh-16.5rem)] lg:grid-cols-[minmax(0,1fr)_400px] lg:grid-rows-[minmax(0,1fr)]">
         {/* 左栏：会话控制台（Run 切换 + 控制 + transcript + 双模式 composer）。 */}
-        <div className="h-[560px] lg:h-full lg:min-h-0">
+        <div className="h-[560px] min-w-0 lg:h-full lg:min-h-0">
           <RunConsole
             taskId={task.id}
             runs={runs}

@@ -707,6 +707,33 @@ const server = http.createServer(async (req, res) => {
     const kinds = [
       { type: "phase", content: "Entering phase: reconnaissance", agent_id: inst.id },
       { type: "thought", content: "Surface is wide; prioritize the api host first", agent_id: inst.id },
+      {
+        type: "tool_call",
+        tool_name: "build_plan",
+        content: "build_plan",
+        tool_args: {
+          tasks: JSON.stringify([
+            { id: "recon", title: "Recon + endpoint inventory", phase: 1, depends_on: [] },
+            { id: "test-idor", title: "Test /api/v1/orders for IDOR", phase: 8, vuln_class: "idor", depends_on: ["recon"] },
+            { id: "test-sqli", title: "Test /search for SQL injection", phase: 6, vuln_class: "sqli", depends_on: ["recon"] },
+          ]),
+        },
+        agent_id: inst.id,
+      },
+      {
+        type: "tool_call",
+        tool_name: "update_plan",
+        content: "update_plan recon",
+        tool_args: { task_id: "recon", status: "completed", notes: "endpoint inventory complete" },
+        agent_id: inst.id,
+      },
+      {
+        type: "tool_call",
+        tool_name: "update_plan",
+        content: "update_plan test-idor",
+        tool_args: { task_id: "test-idor", status: "active" },
+        agent_id: inst.id,
+      },
       { type: "tool_call", tool_name: "nuclei", content: `nuclei -rl 60 -severity low,medium ${inst.targets}`, agent_id: inst.id },
       { type: "tool_result", content: "42 templates ran; 0 matches in passive set", agent_id: inst.id },
       { type: "tool_call", tool_name: "httpx", content: `httpx -silent -status-code ${inst.targets}`, agent_id: `${inst.id}/spec-injection` },
