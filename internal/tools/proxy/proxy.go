@@ -3,6 +3,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -55,6 +56,9 @@ func Register(r *tools.Registry) {
 		},
 		Execute: func(args map[string]string) (tools.Result, error) {
 			return sendRequestGuarded(r.GetScanContextID(), r.RequestGuard(), r.DialGuard(), args)
+		},
+		ExecuteContext: func(ctx context.Context, args map[string]string) (tools.Result, error) {
+			return sendRequestGuardedCtx(ctx, r.GetScanContextID(), r.RequestGuard(), r.DialGuard(), args)
 		},
 	})
 
@@ -190,6 +194,10 @@ func sendRequest(args map[string]string) (tools.Result, error) {
 // applied to every redirect hop before it is followed; dialGuard, when
 // non-nil, to every direct connection.
 func sendRequestGuarded(scanCtxID string, guard tools.RequestGuard, dialGuard tools.DialGuard, args map[string]string) (tools.Result, error) {
+	return sendRequestGuardedCtx(context.Background(), scanCtxID, guard, dialGuard, args)
+}
+
+func sendRequestGuardedCtx(parent context.Context, scanCtxID string, guard tools.RequestGuard, dialGuard tools.DialGuard, args map[string]string) (tools.Result, error) {
 	targetURL := args["url"]
 	method := strings.ToUpper(args["method"])
 
@@ -202,7 +210,11 @@ func sendRequestGuarded(scanCtxID string, guard tools.RequestGuard, dialGuard to
 		bodyReader = strings.NewReader(body)
 	}
 
-	req, err := http.NewRequest(method, targetURL, bodyReader)
+	reqCtx := parent
+	if reqCtx == nil {
+		reqCtx = context.Background()
+	}
+	req, err := http.NewRequestWithContext(reqCtx, method, targetURL, bodyReader)
 	if err != nil {
 		return tools.Result{}, fmt.Errorf("invalid request: %w", err)
 	}

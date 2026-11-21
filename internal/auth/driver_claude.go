@@ -29,9 +29,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
+	"github.com/xalgord/xalgorix/v4/internal/platformutil"
 	"github.com/xalgord/xalgorix/v4/internal/providers"
 )
 
@@ -206,7 +206,7 @@ func (d *claudeReuseDriver) Complete(ctx context.Context, e providers.Entry, in 
 	// renders 404; the wrapped errno is logged separately so a
 	// symlink-rejection (ELOOP) can be triaged without leaking
 	// the path through the HTTP response.
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	f, err := platformutil.OpenReadNoFollow(path)
 	if err != nil {
 		// Treat ENOENT, ELOOP (symlink at final component), and
 		// any other open failure as ErrNotFound. Distinguishing

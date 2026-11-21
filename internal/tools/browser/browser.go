@@ -24,6 +24,7 @@ import (
 	"github.com/go-rod/rod/lib/proto"
 
 	"github.com/xalgord/xalgorix/v4/internal/config"
+	"github.com/xalgord/xalgorix/v4/internal/egress"
 	egressproxy "github.com/xalgord/xalgorix/v4/internal/proxy"
 	"github.com/xalgord/xalgorix/v4/internal/resources"
 	"github.com/xalgord/xalgorix/v4/internal/sandbox"
@@ -75,6 +76,7 @@ type browserStore struct {
 	requiredProxy   bool
 	lease           *resources.ToolLease
 	page            *rod.Page
+	callCtx         context.Context // per-action context, guarded by actionMu
 	pages           map[string]*rod.Page
 	nextTab         int
 	currentTab      string
@@ -272,6 +274,9 @@ ACTIONS:
 		Execute: func(args map[string]string) (tools.Result, error) {
 			return browserActionForRegistry(r, args)
 		},
+		ExecuteContext: func(ctx context.Context, args map[string]string) (tools.Result, error) {
+			return browserActionWithContextCtx(ctx, r.GetScanContextID(), args)
+		},
 	})
 
 	// Keep route discovery as a first-class tool as well as a browser_action
@@ -444,6 +449,9 @@ func ensureBrowser(ctxID, proxy string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	requiredProxy := config.Get().ProxyRequired || egressproxy.Required()
+	if egress.StatusFor(ctxID).Mode == "enforce" {
+		return fmt.Errorf("browser cannot be launched under egress enforce mode: Chromium launcher does not support the dedicated egress UID")
+	}
 
 	if s.browser != nil {
 		if requiredProxy && !s.requiredProxy {
@@ -696,6 +704,34 @@ func browserActionWithContext(ctxID string, args map[string]string) (tools.Resul
 	})
 }
 
+// browserActionWithContextCtx binds the per-call context to every rod Page
+// operation for this action only. actionMu (acquired by
+// withBrowserTransportRecoveryCtx) serializes the binding, so no other action
+// can observe or overwrite it.
+func browserActionWithContextCtx(ctx context.Context, ctxID string, args map[string]string) (tools.Result, error) {
+	return withBrowserTransportRecoveryCtx(ctxID, ctx, func() (tools.Result, error) {
+		return dispatchBrowserAction(ctxID, args)
+	})
+}
+
+// bindPageContext is replaceable in tests so the binding can be verified
+// without a live Chromium instance.
+var bindPageContext = func(page *rod.Page, ctx context.Context) *rod.Page {
+	return page.Context(ctx)
+}
+
+// contextPage returns the current page bound to the in-flight action context.
+// Startup/teardown paths run with callCtx nil and therefore use the raw page.
+func (s *browserStore) contextPage() *rod.Page {
+	if s == nil || s.page == nil {
+		return nil
+	}
+	if s.callCtx == nil {
+		return s.page
+	}
+	return bindPageContext(s.page, s.callCtx)
+}
+
 func dispatchBrowserAction(ctxID string, args map[string]string) (tools.Result, error) {
 	command := strings.TrimSpace(args["command"])
 	if command == "" {
@@ -806,7 +842,7 @@ func launchBrowser(ctxID, rawURL, proxy string) (tools.Result, error) {
 	setupConsoleHandler(ctxID, p)
 
 	// Set a realistic user agent for login flows
-	s.page.MustSetUserAgent(&proto.NetworkSetUserAgentOverride{
+	s.contextPage().MustSetUserAgent(&proto.NetworkSetUserAgentOverride{
 		UserAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
 	})
 
@@ -826,10 +862,10 @@ func navigateTo(ctxID, rawURL string) (tools.Result, error) {
 		return tools.Result{}, fmt.Errorf("browser not launched — use launch first")
 	}
 
-	err := s.page.Timeout(20 * time.Second).Navigate(rawURL)
+	err := s.contextPage().Timeout(20 * time.Second).Navigate(rawURL)
 	if err == nil {
 		// Wait for both DOM and network to become stable natively
-		_ = s.page.Timeout(10 * time.Second).WaitStable(1 * time.Second)
+		_ = s.contextPage().Timeout(10 * time.Second).WaitStable(1 * time.Second)
 	}
 	return pageState(ctxID, "Navigated", s.currentTab)
 }
@@ -848,7 +884,7 @@ func clickElement(ctxID, selector string) (tools.Result, error) {
 	}
 
 	selector = parseSelector(selector)
-	el, err := s.page.Timeout(10 * time.Second).Element(selector)
+	el, err := s.contextPage().Timeout(10 * time.Second).Element(selector)
 	if err != nil {
 		return tools.Result{}, fmt.Errorf("element not found: %s", selector)
 	}
@@ -858,7 +894,7 @@ func clickElement(ctxID, selector string) (tools.Result, error) {
 	el.MustClick()
 	// Wait for any navigation or AJAX that results from the click
 	time.Sleep(500 * time.Millisecond)
-	_ = s.page.Timeout(10 * time.Second).WaitStable(1 * time.Second)
+	_ = s.contextPage().Timeout(10 * time.Second).WaitStable(1 * time.Second)
 	return pageState(ctxID, fmt.Sprintf("Clicked: %s", selector), s.currentTab)
 }
 
@@ -869,7 +905,7 @@ func typeText(ctxID, selector, text string) (tools.Result, error) {
 	}
 
 	selector = parseSelector(selector)
-	el, err := s.page.Timeout(10 * time.Second).Element(selector)
+	el, err := s.contextPage().Timeout(10 * time.Second).Element(selector)
 	if err != nil {
 		return tools.Result{}, fmt.Errorf("element not found: %s", selector)
 	}
@@ -890,7 +926,7 @@ func submitForm(ctxID, selector string) (tools.Result, error) {
 	if selector != "" {
 		// Click the specified submit button/element
 		selector = parseSelector(selector)
-		el, err := s.page.Timeout(10 * time.Second).Element(selector)
+		el, err := s.contextPage().Timeout(10 * time.Second).Element(selector)
 		if err != nil {
 			return tools.Result{}, fmt.Errorf("submit element not found: %s", selector)
 		}
@@ -906,7 +942,7 @@ func submitForm(ctxID, selector string) (tools.Result, error) {
 		}
 		clicked := false
 		for _, sel := range submitSelectors {
-			el, err := s.page.Timeout(2 * time.Second).Element(sel)
+			el, err := s.contextPage().Timeout(2 * time.Second).Element(sel)
 			if err == nil {
 				el.MustScrollIntoView()
 				el.MustClick()
@@ -916,13 +952,13 @@ func submitForm(ctxID, selector string) (tools.Result, error) {
 		}
 		if !clicked {
 			// Fallback: press Enter on the active element
-			_ = s.page.Keyboard.Press(input.Enter)
+			_ = s.contextPage().Keyboard.Press(input.Enter)
 		}
 	}
 
 	// Wait for navigation/AJAX after form submission
 	time.Sleep(1 * time.Second)
-	_ = s.page.Timeout(10 * time.Second).WaitStable(1 * time.Second)
+	_ = s.contextPage().Timeout(10 * time.Second).WaitStable(1 * time.Second)
 	return pageState(ctxID, "Form submitted", s.currentTab)
 }
 
@@ -933,7 +969,7 @@ func getCookies(ctxID string) (tools.Result, error) {
 		return tools.Result{}, fmt.Errorf("browser not launched")
 	}
 
-	cookies, err := s.page.Cookies([]string{})
+	cookies, err := s.contextPage().Cookies([]string{})
 	if err != nil {
 		return tools.Result{}, fmt.Errorf("failed to get cookies: %w", err)
 	}
@@ -980,7 +1016,7 @@ func setCookie(ctxID, name, value, domain string) (tools.Result, error) {
 
 	// Auto-detect domain from current URL if not provided
 	if domain == "" {
-		info, _ := s.page.Info()
+		info, _ := s.contextPage().Info()
 		if info != nil {
 			u, err := url.Parse(info.URL)
 			if err == nil {
@@ -989,7 +1025,7 @@ func setCookie(ctxID, name, value, domain string) (tools.Result, error) {
 		}
 	}
 
-	err := s.page.SetCookies([]*proto.NetworkCookieParam{
+	err := s.contextPage().SetCookies([]*proto.NetworkCookieParam{
 		{
 			Name:   name,
 			Value:  value,
@@ -1020,7 +1056,7 @@ func saveSession(ctxID, sessionName string) (tools.Result, error) {
 		sessionName = "default"
 	}
 
-	cookies, err := s.page.Cookies([]string{})
+	cookies, err := s.contextPage().Cookies([]string{})
 	if err != nil {
 		return tools.Result{}, fmt.Errorf("failed to get cookies: %w", err)
 	}
@@ -1102,13 +1138,13 @@ func loadSession(ctxID, sessionName string) (tools.Result, error) {
 					}
 					// Clear existing cookies before restoring to avoid mixed auth state
 					_ = proto.NetworkClearBrowserCookies{}.Call(s.page)
-					if err := s.page.SetCookies(params); err != nil {
+					if err := s.contextPage().SetCookies(params); err != nil {
 						return tools.Result{}, fmt.Errorf("failed to restore session '%s' from disk: %w", sessionName, err)
 					}
-					if err := s.page.Timeout(10 * time.Second).Reload(); err != nil {
+					if err := s.contextPage().Timeout(10 * time.Second).Reload(); err != nil {
 						log.Printf("[browser] Warning: page reload after session '%s' restore failed: %v", sessionName, err)
 					}
-					if err := s.page.Timeout(10 * time.Second).WaitStable(1 * time.Second); err != nil {
+					if err := s.contextPage().Timeout(10 * time.Second).WaitStable(1 * time.Second); err != nil {
 						log.Printf("[browser] Warning: page wait-stable after session '%s' restore failed: %v", sessionName, err)
 					}
 					return tools.Result{
@@ -1142,15 +1178,15 @@ func loadSession(ctxID, sessionName string) (tools.Result, error) {
 
 	// Clear existing cookies before restoring to avoid mixed auth state
 	_ = proto.NetworkClearBrowserCookies{}.Call(s.page)
-	if err := s.page.SetCookies(params); err != nil {
+	if err := s.contextPage().SetCookies(params); err != nil {
 		return tools.Result{}, fmt.Errorf("failed to restore session '%s': %w", sessionName, err)
 	}
 
 	// Reload page to apply cookies
-	if err := s.page.Timeout(10 * time.Second).Reload(); err != nil {
+	if err := s.contextPage().Timeout(10 * time.Second).Reload(); err != nil {
 		log.Printf("[browser] Warning: page reload after session '%s' restore failed: %v", sessionName, err)
 	}
-	if err := s.page.Timeout(10 * time.Second).WaitStable(1 * time.Second); err != nil {
+	if err := s.contextPage().Timeout(10 * time.Second).WaitStable(1 * time.Second); err != nil {
 		log.Printf("[browser] Warning: page wait-stable after session '%s' restore failed: %v", sessionName, err)
 	}
 
@@ -1243,7 +1279,7 @@ func waitFor(ctxID, selector, waitType, timeoutStr string) (tools.Result, error)
 
 	if waitType == "navigation" || waitType == "nav" {
 		// Wait for navigation to complete (URL change)
-		info, _ := s.page.Info()
+		info, _ := s.contextPage().Info()
 		oldURL := ""
 		if info != nil {
 			oldURL = info.URL
@@ -1252,9 +1288,9 @@ func waitFor(ctxID, selector, waitType, timeoutStr string) (tools.Result, error)
 		deadline := time.Now().Add(timeout)
 		for time.Now().Before(deadline) {
 			time.Sleep(500 * time.Millisecond)
-			info, _ = s.page.Info()
+			info, _ = s.contextPage().Info()
 			if info != nil && info.URL != oldURL {
-				_ = s.page.Timeout(10 * time.Second).WaitStable(1 * time.Second)
+				_ = s.contextPage().Timeout(10 * time.Second).WaitStable(1 * time.Second)
 				return pageState(ctxID, "Navigation detected", s.currentTab)
 			}
 		}
@@ -1263,7 +1299,7 @@ func waitFor(ctxID, selector, waitType, timeoutStr string) (tools.Result, error)
 
 	if selector != "" {
 		selector = parseSelector(selector)
-		_, err := s.page.Timeout(timeout).Element(selector)
+		_, err := s.contextPage().Timeout(timeout).Element(selector)
 		if err != nil {
 			return tools.Result{Output: fmt.Sprintf("Element '%s' did not appear within %v", selector, timeout)}, nil
 		}
@@ -1271,7 +1307,7 @@ func waitFor(ctxID, selector, waitType, timeoutStr string) (tools.Result, error)
 	}
 
 	// Default: just wait for page to stabilize
-	_ = s.page.Timeout(10 * time.Second).WaitStable(1 * time.Second)
+	_ = s.contextPage().Timeout(10 * time.Second).WaitStable(1 * time.Second)
 	return pageState(ctxID, "Page stabilized", s.currentTab)
 }
 
@@ -1283,7 +1319,7 @@ func selectOption(ctxID, selector, value string) (tools.Result, error) {
 	}
 
 	selector = parseSelector(selector)
-	el, err := s.page.Timeout(10 * time.Second).Element(selector)
+	el, err := s.contextPage().Timeout(10 * time.Second).Element(selector)
 	if err != nil {
 		return tools.Result{}, fmt.Errorf("select element not found: %s", selector)
 	}
@@ -1294,7 +1330,7 @@ func selectOption(ctxID, selector, value string) (tools.Result, error) {
 	err = el.Select([]string{value}, true, rod.SelectorTypeText)
 	if err != nil {
 		// Fallback: try by value attribute
-		result, evalErr := s.page.Eval(fmt.Sprintf(`() => {
+		result, evalErr := s.contextPage().Eval(fmt.Sprintf(`() => {
 			const el = document.querySelector(%s);
 			if (el) {
 				for (const opt of el.options) {
@@ -1351,7 +1387,7 @@ func fillForm(ctxID, fields string) (tools.Result, error) {
 
 		found := false
 		for _, sel := range selectors {
-			el, err := s.page.Timeout(2 * time.Second).Element(sel)
+			el, err := s.contextPage().Timeout(2 * time.Second).Element(sel)
 			if err == nil {
 				tag, _ := el.Eval(`() => this.tagName.toLowerCase()`)
 				if tag != nil && tag.Value.String() == "select" {
@@ -1382,7 +1418,7 @@ func getURL(ctxID string) (tools.Result, error) {
 		return tools.Result{}, fmt.Errorf("browser not launched")
 	}
 
-	info, _ := s.page.Info()
+	info, _ := s.contextPage().Info()
 	if info == nil {
 		return tools.Result{Output: "Unable to get page info"}, nil
 	}
@@ -1405,7 +1441,7 @@ func switchToIframe(ctxID, selector string) (tools.Result, error) {
 	}
 	selector = parseSelector(selector)
 
-	el, err := s.page.Timeout(10 * time.Second).Element(selector)
+	el, err := s.contextPage().Timeout(10 * time.Second).Element(selector)
 	if err != nil {
 		return tools.Result{}, fmt.Errorf("iframe not found: %s", selector)
 	}
@@ -1467,7 +1503,7 @@ func extractLinks(ctxID string) (tools.Result, error) {
 		return links.join('\n');
 	}`
 
-	result, err := s.page.Eval(script)
+	result, err := s.contextPage().Eval(script)
 	if err != nil {
 		return tools.Result{}, fmt.Errorf("failed to extract links: %w", err)
 	}
@@ -1494,11 +1530,11 @@ func scrollPage(ctxID, direction string) (tools.Result, error) {
 
 	switch strings.ToLower(direction) {
 	case "down":
-		s.page.Mouse.MustScroll(0, 500)
+		s.contextPage().Mouse.MustScroll(0, 500)
 	case "up":
-		s.page.Mouse.MustScroll(0, -500)
+		s.contextPage().Mouse.MustScroll(0, -500)
 	default:
-		s.page.Mouse.MustScroll(0, 500)
+		s.contextPage().Mouse.MustScroll(0, 500)
 	}
 
 	time.Sleep(500 * time.Millisecond)
@@ -1511,7 +1547,7 @@ func takeScreenshot(ctxID string) (tools.Result, error) {
 		return tools.Result{}, fmt.Errorf("browser not launched")
 	}
 
-	img, err := s.page.Screenshot(true, &proto.PageCaptureScreenshot{
+	img, err := s.contextPage().Screenshot(true, &proto.PageCaptureScreenshot{
 		Format:  proto.PageCaptureScreenshotFormatPng,
 		Quality: nil,
 	})
@@ -1607,12 +1643,12 @@ func takeSnapshot(ctxID string) (tools.Result, error) {
 		return output.join('\n');
 	}`
 
-	result, err := s.page.Eval(script)
+	result, err := s.contextPage().Eval(script)
 	if err != nil {
 		return tools.Result{}, fmt.Errorf("snapshot failed: %w", err)
 	}
 
-	info, _ := s.page.Info()
+	info, _ := s.contextPage().Info()
 	urlStr := ""
 	if info != nil {
 		urlStr = "\nURL: " + info.URL + "\n"
@@ -1632,13 +1668,13 @@ func getHTML(ctxID, selector string) (tools.Result, error) {
 	var html string
 	if selector != "" {
 		selector = parseSelector(selector)
-		el, err := s.page.Timeout(10 * time.Second).Element(selector)
+		el, err := s.contextPage().Timeout(10 * time.Second).Element(selector)
 		if err != nil {
 			return tools.Result{}, fmt.Errorf("element not found: %s", selector)
 		}
 		html, _ = el.HTML()
 	} else {
-		html = s.page.MustHTML()
+		html = s.contextPage().MustHTML()
 	}
 
 	if len(html) > 20000 {
@@ -1659,7 +1695,7 @@ func executeJS(ctxID, code string) (tools.Result, error) {
 
 	// Use a timeout to prevent blocking forever (e.g., alert() in headless Chrome).
 	// The dialog handler auto-dismisses alerts, but we add a timeout as a safety net.
-	result, err := s.page.Timeout(10 * time.Second).Eval(code)
+	result, err := s.contextPage().Timeout(10 * time.Second).Eval(code)
 	if err != nil {
 		// Providers commonly emit DevTools-console snippets such as
 		// `return document.title;` or `const x = ...; return x;`. Rod's Eval
@@ -1667,7 +1703,7 @@ func executeJS(ctxID, code string) (tools.Result, error) {
 		// with a syntax error at top level. Retry only syntax failures, wrapped
 		// as a zero-argument function; runtime errors still pass through unchanged.
 		if repaired, ok := repairExecuteJSCode(code, err); ok {
-			result, err = s.page.Timeout(10 * time.Second).Eval(repaired)
+			result, err = s.contextPage().Timeout(10 * time.Second).Eval(repaired)
 		}
 	}
 	if err != nil {
@@ -1827,7 +1863,7 @@ func pageState(ctxID, action, tabID string) (tools.Result, error) {
 		return tools.Result{Output: action}, nil
 	}
 
-	info, _ := s.page.Info()
+	info, _ := s.contextPage().Info()
 	rawURL := ""
 	title := ""
 	if info != nil {

@@ -34,6 +34,7 @@ package agent
 // Each test below documents which production lines it mirrors.
 
 import (
+	"context"
 	"testing"
 
 	"github.com/xalgord/xalgorix/v4/internal/config"
@@ -152,13 +153,17 @@ func captureTool(t *testing.T, a *Agent, toolName string) *map[string]string {
 		t.Fatalf("tool %q not registered on agent — newIntegrationAgent must call NewAgent", toolName)
 	}
 	wrapped := *tool
-	wrapped.Execute = func(args map[string]string) (tools.Result, error) {
+	capture := func(args map[string]string) (tools.Result, error) {
 		// Copy on capture so a later mutation of the caller's map
 		// can't retroactively change what the test observes.
 		for k, v := range args {
 			captured[k] = v
 		}
 		return tools.Result{Output: "captured-by-test"}, nil
+	}
+	wrapped.Execute = capture
+	wrapped.ExecuteContext = func(_ context.Context, args map[string]string) (tools.Result, error) {
+		return capture(args)
 	}
 	a.registry.Register(&wrapped)
 	return &captured

@@ -714,6 +714,9 @@ Some settings require a restart because they affect process startup or server bi
 | `XALGORIX_MEMORY_COMPRESSOR_TIMEOUT` | `30`             | Timeout in seconds for context compression.            |
 | `XALGORIX_MAX_ITERATIONS`            | `0`              | Agent iteration cap. `0` means unlimited.              |
 | `XALGORIX_ENGINE`                    | `eino`           | Scan loop engine: `eino` (ADK, default) or `legacy` (immediate rollback). |
+| `XALGORIX_EGRESS_MODE`               | `proxy`          | `proxy` (loopback traffic proxy) or `enforce` (Linux nftables + dedicated UID; fails closed if unavailable). |
+| `XALGORIX_EGRESS_UID`                | `65534`          | Dedicated UID for terminal/Python child processes in enforce mode. |
+| `XALGORIX_EGRESS_GID`                | `65534`          | Dedicated GID for terminal/Python child processes in enforce mode. |
 | `XALGORIX_PPROF_ADDR`                | none             | Opt-in Go profiler. When set (e.g. `127.0.0.1:6060`), starts a standalone pprof server at `/debug/pprof/` on that address for CPU/heap diagnosis. Disabled by default. Exposes process internals — bind loopback and reach it via an SSH tunnel; never expose publicly. |
 | `GEMINI_API_KEY`                     | none             | Optional Gemini key for web-search enrichment.         |
 

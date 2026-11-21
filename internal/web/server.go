@@ -28,7 +28,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/xalgord/xalgorix/v4/internal/agent"
@@ -37,6 +36,7 @@ import (
 	"github.com/xalgord/xalgorix/v4/internal/infoitem"
 	"github.com/xalgord/xalgorix/v4/internal/llm"
 	"github.com/xalgord/xalgorix/v4/internal/platform"
+	"github.com/xalgord/xalgorix/v4/internal/platformutil"
 	"github.com/xalgord/xalgorix/v4/internal/providers"
 	"github.com/xalgord/xalgorix/v4/internal/proxy"
 	"github.com/xalgord/xalgorix/v4/internal/resources"
@@ -1581,7 +1581,7 @@ func (s *Server) Start() error {
 
 	go func() {
 		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+		signal.Notify(sigCh, platformutil.ShutdownSignals()...)
 		sig := <-sigCh
 		log.Printf("[SHUTDOWN] Received signal %s — saving state and shutting down gracefully", sig)
 
@@ -1659,15 +1659,17 @@ func (s *Server) Start() error {
 	// restart immediately: a watcher waits until no scan instance is active
 	// and no tool process is leased, then restarts cleanly (so in-flight
 	// engagements are never interrupted).
-	go func() {
-		usrCh := make(chan os.Signal, 1)
-		signal.Notify(usrCh, syscall.SIGUSR1)
-		for range usrCh {
-			if !s.scheduleGracefulRestart() {
-				log.Printf("[RESTART] Graceful restart already pending — ignoring duplicate SIGUSR1")
+	if restartSignal := platformutil.RestartSignal(); restartSignal != nil {
+		go func() {
+			usrCh := make(chan os.Signal, 1)
+			signal.Notify(usrCh, restartSignal)
+			for range usrCh {
+				if !s.scheduleGracefulRestart() {
+					log.Printf("[RESTART] Graceful restart already pending — ignoring duplicate restart signal")
+				}
 			}
-		}
-	}()
+		}()
+	}
 
 	err = httpServer.ListenAndServe()
 	if errors.Is(err, http.ErrServerClosed) {
@@ -1791,7 +1793,7 @@ func (s *Server) restartNow(httpServer *http.Server) {
 		exe = os.Args[0]
 	}
 	log.Printf("[RESTART] Re-executing %s", exe)
-	if err := syscall.Exec(exe, os.Args, os.Environ()); err != nil {
+	if err := platformutil.ExecReplace(); err != nil {
 		log.Printf("[RESTART] re-exec failed: %v — exiting for supervisor restart", err)
 		os.Exit(0)
 	}
@@ -3560,11 +3562,7 @@ func (s *Server) saveScanRecordTo(rec *ScanRecord, scanDir string) {
 
 // diskAvailable returns available bytes on the filesystem containing path, or 0 on error.
 func diskAvailable(path string) uint64 {
-	var stat syscall.Statfs_t
-	if err := syscall.Statfs(path, &stat); err != nil {
-		return 0
-	}
-	return stat.Bavail * uint64(stat.Bsize) //nolint:gosec // G115: filesystem block size is small and non-negative
+	return platformutil.DiskAvailable(path)
 }
 
 func (s *Server) handleDownloadReport(w http.ResponseWriter, r *http.Request) {

@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/xalgord/xalgorix/v4/internal/config"
+	"github.com/xalgord/xalgorix/v4/internal/safefile"
 	"github.com/xalgord/xalgorix/v4/internal/sandbox"
 	"github.com/xalgord/xalgorix/v4/internal/scanctx"
 	"github.com/xalgord/xalgorix/v4/internal/tools"
@@ -191,7 +192,7 @@ func runEditorWithPolicy(sc *scanctx.ScanContext, args map[string]string) (tools
 // sandbox.Default().CheckRead (the view read).
 
 func viewFile(path, viewRange string) (tools.Result, error) {
-	data, err := os.ReadFile(path)
+	data, err := safefile.ReadFile(path)
 	if err != nil {
 		return tools.Result{}, fmt.Errorf("cannot read file: %w", err)
 	}
@@ -231,11 +232,11 @@ func viewFile(path, viewRange string) (tools.Result, error) {
 
 func createFile(path, content string) (tools.Result, error) {
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := safefile.MkdirAll(dir, 0o700); err != nil {
 		return tools.Result{}, fmt.Errorf("cannot create directory: %w", err)
 	}
 
-	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+	if err := safefile.WriteFile(path, []byte(content), 0o600); err != nil {
 		return tools.Result{}, fmt.Errorf("cannot write file: %w", err)
 	}
 
@@ -243,7 +244,7 @@ func createFile(path, content string) (tools.Result, error) {
 }
 
 func replaceInFile(path, oldStr, newStr string) (tools.Result, error) {
-	data, err := os.ReadFile(path)
+	data, err := safefile.ReadFile(path)
 	if err != nil {
 		return tools.Result{}, fmt.Errorf("cannot read file: %w", err)
 	}
@@ -260,7 +261,7 @@ func replaceInFile(path, oldStr, newStr string) (tools.Result, error) {
 
 	newContent := strings.Replace(content, oldStr, newStr, 1)
 
-	if err := os.WriteFile(path, []byte(newContent), 0o600); err != nil {
+	if err := safefile.WriteFile(path, []byte(newContent), 0o600); err != nil {
 		return tools.Result{}, fmt.Errorf("cannot write file: %w", err)
 	}
 
@@ -268,7 +269,7 @@ func replaceInFile(path, oldStr, newStr string) (tools.Result, error) {
 }
 
 func insertInFile(path, newStr, insertLineStr string) (tools.Result, error) {
-	data, err := os.ReadFile(path)
+	data, err := safefile.ReadFile(path)
 	if err != nil {
 		return tools.Result{}, fmt.Errorf("cannot read file: %w", err)
 	}
@@ -289,7 +290,7 @@ func insertInFile(path, newStr, insertLineStr string) (tools.Result, error) {
 	result = append(result, newLines...)
 	result = append(result, lines[insertLine:]...)
 
-	if err := os.WriteFile(path, []byte(strings.Join(result, "\n")), 0o600); err != nil {
+	if err := safefile.WriteFile(path, []byte(strings.Join(result, "\n")), 0o600); err != nil {
 		return tools.Result{}, fmt.Errorf("cannot write file: %w", err)
 	}
 

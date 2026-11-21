@@ -4,6 +4,7 @@ package python
 // carries the traffic-proxy trust bundle via parent-process injection.
 
 import (
+	"os"
 	"strings"
 	"testing"
 
@@ -19,16 +20,21 @@ func TestTrafficProxyTLSBundleEnv(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = trafficproxy.Close() })
 
-	env := trafficProxyTLSBundleEnv([]string{"PATH=/usr/bin"})
+	workDir := t.TempDir()
+	env, err := trafficProxyTLSBundleEnv([]string{"PATH=/usr/bin"}, workDir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	joined := strings.Join(env, "\n")
-	if !strings.Contains(joined, "REQUESTS_CA_BUNDLE="+trafficproxy.BundlePath()) {
+	localBundle := workDir + "/.xalgorix-ca-bundle.pem"
+	if !strings.Contains(joined, "REQUESTS_CA_BUNDLE="+localBundle) {
 		t.Fatalf("REQUESTS_CA_BUNDLE missing from %q", joined)
 	}
-	if !strings.Contains(joined, "SSL_CERT_FILE="+trafficproxy.BundlePath()) {
+	if !strings.Contains(joined, "SSL_CERT_FILE="+localBundle) {
 		t.Fatalf("SSL_CERT_FILE missing from %q", joined)
 	}
-	if trafficproxy.BundlePath() == "" {
-		t.Fatal("bundle path empty")
+	if _, err := os.Stat(localBundle); err != nil {
+		t.Fatalf("workspace bundle: %v", err)
 	}
 }
 
@@ -39,7 +45,10 @@ func TestTrafficProxyTLSBundleEnvOffIsNoop(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = trafficproxy.Close() })
 	base := []string{"PATH=/usr/bin"}
-	env := trafficProxyTLSBundleEnv(base)
+	env, err := trafficProxyTLSBundleEnv(base, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(env) != len(base) {
 		t.Fatalf("off mode injected env: %v", env)
 	}

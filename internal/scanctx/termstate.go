@@ -2,13 +2,12 @@ package scanctx
 
 import (
 	"context"
-	"errors"
 	"log"
-	"os"
 	"os/exec"
 	"sync"
-	"syscall"
 	"time"
+
+	"github.com/xalgord/xalgorix/v4/internal/platformutil"
 )
 
 // TerminalState provides per-session terminal process tracking,
@@ -122,21 +121,8 @@ func killTrackedProcess(cmd *exec.Cmd) {
 	if cmd == nil || cmd.Process == nil {
 		return
 	}
-
-	pid := cmd.Process.Pid
-	if pgid, err := syscall.Getpgid(pid); err == nil && pgid > 0 {
-		selfPGID, selfErr := syscall.Getpgid(os.Getpid())
-		if selfErr != nil || pgid != selfPGID {
-			if err := syscall.Kill(-pgid, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
-				log.Printf("[termstate] Failed to kill process group %d for pid %d: %v", pgid, pid, err)
-			}
-		} else {
-			log.Printf("[termstate] Refusing to kill process group %d for pid %d because it matches xalgorix", pgid, pid)
-		}
-	}
-
-	if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
-		log.Printf("[termstate] Failed to kill process pid %d: %v", pid, err)
+	if err := platformutil.KillProcessTree(cmd); err != nil {
+		log.Printf("[termstate] Failed to kill process pid %d: %v", cmd.Process.Pid, err)
 	}
 }
 

@@ -17,12 +17,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/shirou/gopsutil/v3/load"
 	"github.com/shirou/gopsutil/v3/mem"
+
 	"github.com/shirou/gopsutil/v3/process"
+	"github.com/xalgord/xalgorix/v4/internal/platformutil"
 )
 
 // ── Resource Levels ──
@@ -1113,18 +1114,14 @@ func readProcessRSSMB() int64 {
 	return int64(stats.RSS / (1024 * 1024)) //nolint:gosec // G115: MB-scaled RSS fits int64
 }
 
-// readDiskFree returns free disk space (in MB) for the root filesystem.
+// readDiskFree returns free disk space (in MB) for the current filesystem.
 func readDiskFree() int64 {
-	var stat syscall.Statfs_t
-	if err := syscall.Statfs("/", &stat); err != nil {
-		log.Printf("[RESOURCES] Cannot statfs /: %v", err)
+	free := platformutil.DiskAvailable(".")
+	if free == 0 {
+		log.Printf("[RESOURCES] Cannot query disk free space")
 		return 0
 	}
-	// Available blocks * block size → bytes → MB. Compute in uint64 to
-	// match the statfs field types, then convert the MB-scaled result
-	// (which always fits int64) once.
-	freeMB := stat.Bavail * uint64(stat.Bsize) / (1024 * 1024) //nolint:gosec // G115: filesystem block size is small and non-negative
-	return int64(freeMB)                                       //nolint:gosec // G115: MB-scaled free space fits int64
+	return int64(free / (1024 * 1024)) //nolint:gosec // G115: MB-scaled free space fits int64
 }
 
 // ── Env var helpers ──

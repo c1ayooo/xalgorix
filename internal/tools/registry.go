@@ -3,6 +3,7 @@ package tools
 
 import (
 	"bytes"
+	"context"
 	"encoding/xml"
 	"fmt"
 	"regexp"
@@ -94,6 +95,10 @@ type Tool struct {
 	Description string
 	Parameters  []Parameter
 	Execute     func(args map[string]string) (Result, error)
+	// ExecuteContext is the cancellation-aware entry point. When set it takes
+	// precedence over Execute; tools that do not implement it keep the legacy
+	// hard-timeout fallback.
+	ExecuteContext func(ctx context.Context, args map[string]string) (Result, error)
 }
 
 // Parameter describes a tool parameter.
@@ -297,6 +302,20 @@ func (r *Registry) MatchByParams(paramNames []string) (string, bool) {
 // Execute runs a tool by name with the given arguments.
 // Note: the caller's args map is never mutated — Execute works on a copy.
 func (r *Registry) Execute(name string, args map[string]string) (Result, error) {
+	return r.ExecuteContext(context.Background(), name, args)
+}
+
+// SupportsContext reports whether the named tool can observe cancellation.
+func (r *Registry) SupportsContext(name string) bool {
+	tool, ok := r.Get(name)
+	return ok && tool.ExecuteContext != nil
+}
+
+// ExecuteContext runs a tool by name with a cancellation context. The six-ring
+// safety chain, approval gate, circuit breaker and argument validation stay in
+// this single path for both Execute and ExecuteContext.
+// Note: the caller's args map is never mutated — ExecuteContext works on a copy.
+func (r *Registry) ExecuteContext(ctx context.Context, name string, args map[string]string) (Result, error) {
 	// Check circuit breaker
 	if r.circuitBreaker.IsOpen(name) {
 		recoveryTime := r.circuitBreaker.GetRecoveryTime(name)
@@ -382,7 +401,13 @@ func (r *Registry) Execute(name string, args map[string]string) (Result, error) 
 		}
 	}
 
-	result, err := tool.Execute(localArgs)
+	var result Result
+	var err error
+	if tool.ExecuteContext != nil {
+		result, err = tool.ExecuteContext(ctx, localArgs)
+	} else {
+		result, err = tool.Execute(localArgs)
+	}
 	if err != nil {
 		// Record failure in circuit breaker
 		r.circuitBreaker.RecordFailure(name)

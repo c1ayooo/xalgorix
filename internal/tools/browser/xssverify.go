@@ -110,10 +110,10 @@ func verifyXSS(ctxID, rawURL, nonce, parameter, data, method string) (tools.Resu
 	if method == "GET" {
 		// Navigate directly to the payload URL (original behavior).
 		if strings.TrimSpace(rawURL) != "" {
-			if err := s.page.Timeout(20 * time.Second).Navigate(rawURL); err != nil {
+			if err := s.contextPage().Timeout(20 * time.Second).Navigate(rawURL); err != nil {
 				return tools.Result{Error: fmt.Sprintf("navigation to %q failed: %v", rawURL, err)}, nil
 			}
-			_ = s.page.Timeout(10 * time.Second).WaitStable(time.Second)
+			_ = s.contextPage().Timeout(10 * time.Second).WaitStable(time.Second)
 		}
 	} else {
 		// Perform a real top-level POST navigation via a self-submitting,
@@ -123,15 +123,15 @@ func verifyXSS(ctxID, rawURL, nonce, parameter, data, method string) (tools.Resu
 		if strings.TrimSpace(rawURL) == "" {
 			return tools.Result{Error: "url is required for a POST verify_xss — pass the form's action URL and the body via data (e.g. data=\"search=<payload>\")."}, nil
 		}
-		if err := s.page.Timeout(20 * time.Second).SetDocumentContent(buildXSSFormHTML(rawURL, data)); err != nil {
+		if err := s.contextPage().Timeout(20 * time.Second).SetDocumentContent(buildXSSFormHTML(rawURL, data)); err != nil {
 			return tools.Result{Error: fmt.Sprintf("could not stage the POST form for %q: %v", rawURL, err)}, nil
 		}
 		// Submit on a 0ms timer so this Eval returns before navigation tears down
 		// the JS context (avoids a spurious "context destroyed" error).
-		if _, err := s.page.Timeout(10 * time.Second).Eval(`() => { const f = document.forms['xssverify']; if (!f) { return false; } setTimeout(() => f.submit(), 0); return true; }`); err != nil {
+		if _, err := s.contextPage().Timeout(10 * time.Second).Eval(`() => { const f = document.forms['xssverify']; if (!f) { return false; } setTimeout(() => f.submit(), 0); return true; }`); err != nil {
 			return tools.Result{Error: fmt.Sprintf("could not submit the POST form to %q: %v", rawURL, err)}, nil
 		}
-		_ = s.page.Timeout(15 * time.Second).WaitStable(time.Second)
+		_ = s.contextPage().Timeout(15 * time.Second).WaitStable(time.Second)
 	}
 
 	// Dialogs and console messages fire asynchronously during/after load; poll a
@@ -150,7 +150,7 @@ func verifyXSS(ctxID, rawURL, nonce, parameter, data, method string) (tools.Resu
 	// dialog or logging to the console. If nothing matched yet, read those
 	// markers once and record a signal when the nonce is present.
 	if _, ok := matchExecNonce(execSignalsFor(ctxID), nonce); !ok && s.page != nil {
-		if res, err := s.page.Timeout(5 * time.Second).Eval(`() => [document.title, window.name, (window.__xss || "")].join("\u0001")`); err == nil {
+		if res, err := s.contextPage().Timeout(5 * time.Second).Eval(`() => [document.title, window.name, (window.__xss || "")].join("\u0001")`); err == nil {
 			if v := res.Value.String(); strings.Contains(strings.ToLower(v), strings.ToLower(nonce)) {
 				recordExecSignal(ctxID, ExecSignal{Kind: "dom:marker", Message: v, At: time.Now()})
 			}

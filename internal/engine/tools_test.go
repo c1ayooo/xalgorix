@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/xalgord/xalgorix/v4/internal/tools"
 )
@@ -52,6 +53,41 @@ func TestRegistryToolInfoAndInvokableRun(t *testing.T) {
 	if err := json.Unmarshal([]byte(captured["obj"]), &nested); err != nil || nested["a"] != float64(1) {
 		t.Fatalf("structured argument = %q (%v)", captured["obj"], err)
 	}
+}
+
+func TestRegistryToolHardTimeoutForceReturnsForUncooperativeTool(t *testing.T) {
+	oldGrace := toolTimeoutGrace
+	toolTimeoutGrace = 20 * time.Millisecond
+	t.Cleanup(func() { toolTimeoutGrace = oldGrace })
+	reg := tools.NewRegistry()
+	release := make(chan struct{})
+	reg.Register(&tools.Tool{
+		Name: "blocked", Description: "ignores ctx",
+		Execute: func(map[string]string) (tools.Result, error) {
+			<-release
+			return tools.Result{Output: "late"}, nil
+		},
+	})
+	timedOut := 0
+	adapters, err := registryTools(reg, func(string) time.Duration { return 10 * time.Millisecond }, func(string) { timedOut++ })
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	_, err = adapters[0].InvokableRun(context.Background(), `{}`)
+	if err == nil || !strings.Contains(err.Error(), "hard timeout") {
+		close(release)
+		t.Fatalf("hard timeout = %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		close(release)
+		t.Fatalf("hard timeout took %s", elapsed)
+	}
+	if timedOut != 1 {
+		close(release)
+		t.Fatalf("timeout callback calls = %d", timedOut)
+	}
+	close(release)
 }
 
 func TestRegistryToolFailureSemantics(t *testing.T) {

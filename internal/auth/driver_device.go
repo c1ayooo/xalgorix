@@ -750,16 +750,17 @@ func (d *deviceCodeDriver) persistProfile(ctx context.Context, e providers.Entry
 // given the tiny per-flow footprint.
 func (d *deviceCodeDriver) finishFlow(flow *deviceFlow, err error) {
 	flow.cleanup.Do(func() {
+		// The persisted Profile is the credential source of truth; the
+		// in-memory copy must not keep access/refresh tokens for the process
+		// lifetime once the flow has finalized. Clear before closing done so
+		// the channel close publishes these writes to the waiter.
+		flow.profile = Profile{}
+		flow.deviceCode = ""
 		select {
 		case flow.done <- err:
 		default:
 		}
 		close(flow.done)
-		// The persisted Profile is the credential source of truth; the
-		// in-memory copy must not keep access/refresh tokens for the process
-		// lifetime once the flow has finalized.
-		flow.profile = Profile{}
-		flow.deviceCode = ""
 	})
 }
 

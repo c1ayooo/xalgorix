@@ -231,6 +231,7 @@ type Agent struct {
 	stopped                    atomic.Bool
 	iterationDelayMs           atomic.Int64
 	droppedTelemetry           atomic.Int64
+	uncooperativeTimeouts      atomic.Int64
 	childrenMu                 sync.Mutex
 	children                   map[*Agent]struct{}
 	ctx                        context.Context
@@ -1644,6 +1645,23 @@ func (a *Agent) executeToolAsync(toolName string, toolArgs map[string]string) (r
 	})
 	defer a.scanCtx.Terminal.ClearStreamCallback()
 
+	// Hard timeout safety net (P2.1): bound the tool invocation by the
+	// per-tool ceiling plus a 30-second grace so even tools that ignore
+	// their own ctx still terminate. We derive from a.ctx so parent
+	// cancellation propagates as well.
+	//
+	// Exec-channel breaker: once consecutive exec tools have hit the hard
+	// cap (only possible when the exec backend is wedged), shrink the
+	// ceiling so a dead channel cannot burn the full 65 minutes per call.
+	hardTimeoutDuration := a.hardTimeoutFor(toolName)
+	degradedExecChannel := false
+	if isExecChannelTool(toolName) && int(a.execTimeoutStreak.Load()) >= execChannelBreakerThreshold {
+		hardTimeoutDuration = execChannelDegradedTimeout
+		degradedExecChannel = true
+	}
+	tcCtx, tcCancel := a.toolWaitContext(hardTimeoutDuration + 30*time.Second)
+	defer tcCancel()
+
 	// Execute in goroutine with panic recovery.
 	//
 	// NOTE (Task 6.3): this goroutine is intentionally NOT wrapped with
@@ -1668,30 +1686,13 @@ func (a *Agent) executeToolAsync(toolName string, toolArgs map[string]string) (r
 				}
 			}
 		}()
-		res, err := a.registry.Execute(toolName, toolArgs)
+		res, err := a.registry.ExecuteContext(tcCtx, toolName, toolArgs)
 		resultCh <- toolExecResult{Result: res, Err: err}
 	}()
 
 	// Heartbeat loop while waiting for tool to complete
 	heartbeat := time.NewTicker(15 * time.Second)
 	defer heartbeat.Stop()
-
-	// Hard timeout safety net (P2.1): bound the tool invocation by the
-	// per-tool ceiling plus a 30-second grace so even tools that ignore
-	// their own ctx still terminate. We derive from a.ctx so parent
-	// cancellation propagates as well.
-	//
-	// Exec-channel breaker: once consecutive exec tools have hit the hard
-	// cap (only possible when the exec backend is wedged), shrink the
-	// ceiling so a dead channel cannot burn the full 65 minutes per call.
-	hardTimeoutDuration := a.hardTimeoutFor(toolName)
-	degradedExecChannel := false
-	if isExecChannelTool(toolName) && int(a.execTimeoutStreak.Load()) >= execChannelBreakerThreshold {
-		hardTimeoutDuration = execChannelDegradedTimeout
-		degradedExecChannel = true
-	}
-	tcCtx, tcCancel := a.toolWaitContext(hardTimeoutDuration + 30*time.Second)
-	defer tcCancel()
 
 	for {
 		select {
@@ -1720,6 +1721,13 @@ func (a *Agent) executeToolAsync(toolName string, toolArgs map[string]string) (r
 			// parent (a.ctx) is canceled, tcCtx.Err() is context.Canceled;
 			// when our own deadline elapses it is context.DeadlineExceeded.
 			if tcCtx.Err() == context.DeadlineExceeded {
+				// Signal cooperative tools before the hard fallback. Tools that
+				// do not implement ExecuteContext are counted so the terminal
+				// telemetry can distinguish a real leak from a normal timeout.
+				if !a.registry.SupportsContext(toolName) {
+					a.uncooperativeTimeouts.Add(1)
+				}
+				tcCancel()
 				a.emit(Event{Type: "error", Content: fmt.Sprintf("⛔ Tool '%s' timed out after %s. Force-returning to prevent infinite hang.", toolName, hardTimeoutDuration)})
 				if isExecChannelTool(toolName) {
 					streak := int(a.execTimeoutStreak.Add(1))
@@ -2819,6 +2827,24 @@ func (a *Agent) Run(targets []string, instruction string) {
 	a.emit(Event{Type: "finished", Content: finishReason, TotalTokens: tokenCount(), Aborted: abortReason != "", AbortReason: abortReason, Resumable: abortReason == ""})
 }
 
+// DroppedNarration reports narration events dropped because the event channel
+// was full or closed. Tool/claim events never use this best-effort path.
+func (a *Agent) DroppedNarration() int64 { return a.droppedTelemetry.Load() }
+
+// UncooperativeTimeouts reports hard timeouts on tools without ExecuteContext.
+func (a *Agent) UncooperativeTimeouts() int64 { return a.uncooperativeTimeouts.Load() }
+
+// TelemetryStats renders the loss/fallback counters appended to the terminal
+// telemetry block. An empty string means nothing was lost.
+func (a *Agent) TelemetryStats() string {
+	dropped := a.DroppedNarration()
+	uncooperative := a.UncooperativeTimeouts()
+	if dropped == 0 && uncooperative == 0 {
+		return ""
+	}
+	return fmt.Sprintf("telemetry: dropped_narration=%d uncooperative_timeouts=%d\n", dropped, uncooperative)
+}
+
 // completeWithFinish emits the terminal finish event with the same honest
 // completion assessment and telemetry used by the legacy loop. The Eino
 // observer calls it after an allowed finish tool; keeping one implementation
@@ -2840,6 +2866,9 @@ func (a *Agent) completeWithFinish(output string, tokenCount func() int) {
 			content += "\n\n" + formatIncompleteSummary(status, reasons)
 		}
 		if summary := scanTelemetrySummary(a.state, status, reasons); summary != "" {
+			if stats := a.TelemetryStats(); stats != "" {
+				summary += stats
+			}
 			a.emit(Event{Type: "message", Content: summary, TotalTokens: tokenCount()})
 		}
 	}

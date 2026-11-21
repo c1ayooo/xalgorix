@@ -15,10 +15,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/xalgord/xalgorix/v4/internal/config"
+	"github.com/xalgord/xalgorix/v4/internal/egress"
+	"github.com/xalgord/xalgorix/v4/internal/platformutil"
 	egressproxy "github.com/xalgord/xalgorix/v4/internal/proxy"
 	"github.com/xalgord/xalgorix/v4/internal/resources"
 	"github.com/xalgord/xalgorix/v4/internal/scanctx"
@@ -692,11 +693,23 @@ func prepareTrafficProxyClientConfig(workDir string) error {
 	if caFile == "" {
 		return nil
 	}
+	// Copy the public CA certificate into the command workspace. Enforce mode
+	// drops children to a dedicated UID, which cannot traverse the 0700
+	// ~/.xalgorix/ca directory; a workspace-local copy keeps the trust path
+	// readable without exposing the CA private key.
+	caPEM, err := os.ReadFile(caFile)
+	if err != nil {
+		return fmt.Errorf("read traffic proxy CA: %w", err)
+	}
+	localCA := filepath.Join(workDir, ".xalgorix-traffic-ca.pem")
+	if err := storage.WriteAtomic(localCA, caPEM); err != nil {
+		return fmt.Errorf("write workspace CA: %w", err)
+	}
 	// curl reads $CURL_HOME|$HOME/.curlrc, wget reads $HOME/.wgetrc; the
 	// command environment roots HOME at the scan workspace (commandEnv).
 	configs := [][2]string{
-		{".curlrc", fmt.Sprintf("cacert = %s\n", caFile)},
-		{".wgetrc", fmt.Sprintf("ca_certificate = %s\n", caFile)},
+		{".curlrc", fmt.Sprintf("cacert = %s\n", localCA)},
+		{".wgetrc", fmt.Sprintf("ca_certificate = %s\n", localCA)},
 	}
 	for _, cfg := range configs {
 		path := filepath.Join(workDir, cfg[0])
@@ -1007,21 +1020,8 @@ func killTrackedProcess(cmd *exec.Cmd) {
 	if cmd == nil || cmd.Process == nil {
 		return
 	}
-
-	pid := cmd.Process.Pid
-	if pgid, err := syscall.Getpgid(pid); err == nil && pgid > 0 {
-		selfPGID, selfErr := syscall.Getpgid(os.Getpid())
-		if selfErr != nil || pgid != selfPGID {
-			if err := syscall.Kill(-pgid, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
-				log.Printf("[terminal] Failed to kill process group %d for pid %d: %v", pgid, pid, err)
-			}
-		} else {
-			log.Printf("[terminal] Refusing to kill process group %d for pid %d because it matches xalgorix", pgid, pid)
-		}
-	}
-
-	if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
-		log.Printf("[terminal] Failed to kill process pid %d: %v", pid, err)
+	if err := platformutil.KillProcessTree(cmd); err != nil {
+		log.Printf("[terminal] Failed to kill process pid %d: %v", cmd.Process.Pid, err)
 	}
 }
 
@@ -1210,6 +1210,9 @@ func Register(r *tools.Registry) {
 		Execute: func(args map[string]string) (tools.Result, error) {
 			return executeCommandForRegistry(r, args)
 		},
+		ExecuteContext: func(ctx context.Context, args map[string]string) (tools.Result, error) {
+			return executeCommandForRegistryContext(ctx, r, args)
+		},
 	})
 }
 
@@ -1251,7 +1254,11 @@ func toolExists(name string) bool {
 
 // executeCommandForRegistry resolves the correct terminal store via the registry's ScanContextID.
 func executeCommandForRegistry(reg *tools.Registry, args map[string]string) (tools.Result, error) {
-	return executeCommandWithContextID(reg.GetScanContextID(), args)
+	return executeCommandForRegistryContext(context.Background(), reg, args)
+}
+
+func executeCommandForRegistryContext(ctx context.Context, reg *tools.Registry, args map[string]string) (tools.Result, error) {
+	return executeCommandWithContextIDContext(ctx, reg.GetScanContextID(), args)
 }
 
 // executeCommand is the backward-compatible version using scanctx.Default().
@@ -1262,6 +1269,10 @@ func executeCommand(args map[string]string) (tools.Result, error) {
 }
 
 func executeCommandWithContextID(contextID string, args map[string]string) (tools.Result, error) {
+	return executeCommandWithContextIDContext(context.Background(), contextID, args)
+}
+
+func executeCommandWithContextIDContext(ctx context.Context, contextID string, args map[string]string) (tools.Result, error) {
 	command := args["command"]
 	if command == "" {
 		return tools.Result{}, fmt.Errorf("command is required")
@@ -1280,14 +1291,20 @@ func executeCommandWithContextID(contextID string, args map[string]string) (tool
 		if !toolExists(tool) {
 			pkg := resolvePackage(tool)
 			if pkg != "" {
-				installPackage(pkg)
+				installPackage(ctx, pkg)
 				preInstalled = append(preInstalled, tool)
 			}
 		}
 	}
 
 	// Run the command using the correct context's store
-	output, exitCode := runShellWithContext(contextID, command)
+	output, exitCode := runShellWithContextCtx(ctx, contextID, command)
+	if ctx.Err() != nil && exitCode != 0 {
+		return tools.Result{
+			Output: output,
+			Error:  fmt.Sprintf("terminal_execute canceled: %v", ctx.Err()),
+		}, nil
+	}
 
 	// If it still fails with "command not found", try one more install+retry.
 	// This catches tools not in extractCommands' list (e.g. piped commands).
@@ -1296,8 +1313,8 @@ func executeCommandWithContextID(contextID string, args map[string]string) (tool
 		if missingCmd != "" {
 			pkg := resolvePackage(missingCmd)
 			if pkg != "" {
-				installOutput := installPackage(pkg)
-				retryOutput, retryExit := runShellWithContext(contextID, command)
+				installOutput := installPackage(ctx, pkg)
+				retryOutput, retryExit := runShellWithContextCtx(ctx, contextID, command)
 				combined := fmt.Sprintf("[auto-installed %s (%s)]\n%s\n%s",
 					missingCmd, pkg, installOutput, retryOutput)
 				if retryExit != 0 {
@@ -1316,7 +1333,7 @@ func executeCommandWithContextID(contextID string, args map[string]string) (tool
 	return tools.Result{Output: output}, nil
 }
 
-func ensureVenv() {
+func ensureVenv(parent context.Context) {
 	homeDir := os.Getenv("HOME")
 	if homeDir == "" {
 		homeDir = "/root"
@@ -1328,9 +1345,13 @@ func ensureVenv() {
 		// Create venv. Bounded: this runs on EVERY terminal_execute
 		// pre-launch (before any per-command timeout applies), so an
 		// unbounded cmd.Run() here would wedge every command if
-		// `python3 -m venv` hangs.
+		// `python3 -m venv` hangs. Derive from the tool call so Stop also
+		// cancels this pre-launch phase.
+		if parent == nil {
+			parent = context.Background()
+		}
 		fmt.Println("Creating Python virtual environment at ~/venv...")
-		venvCtx, venvCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		venvCtx, venvCancel := context.WithTimeout(parent, 2*time.Minute)
 		defer venvCancel()
 		cmd := exec.CommandContext(venvCtx, "python3", "-m", "venv", venvPath)
 		if err := cmd.Run(); err != nil {
@@ -1344,6 +1365,10 @@ func ensureVenv() {
 // routed through the correct per-session store instead of the global default.
 func runShellWithContext(contextID string, command string) (string, int) {
 	return runShellInternal(contextID, command)
+}
+
+func runShellWithContextCtx(parent context.Context, contextID string, command string) (string, int) {
+	return runShellInternalContext(parent, contextID, command)
 }
 
 //lint:ignore U1000 kept as a package-level compatibility wrapper for callers in this package.
@@ -1577,9 +1602,14 @@ cd() {
 }
 
 func runShellInternal(contextID string, command string) (string, int) {
+	return runShellInternalContext(context.Background(), contextID, command)
+}
+
+func runShellInternalContext(parent context.Context, contextID string, command string) (string, int) {
 	contextID = normalizeContextID(contextID)
-	// Ensure venv exists
-	ensureVenv()
+	// Ensure venv exists. This is pre-launch work, so it must observe the
+	// same cancellation as the command itself.
+	ensureVenv(parent)
 
 	homeDir := os.Getenv("HOME")
 	if homeDir == "" {
@@ -1634,6 +1664,9 @@ func runShellInternal(contextID string, command string) (string, int) {
 	heavy := isHeavyTool(cleanCmd)
 	toolLabel := resources.ToolLogLabel(cleanCmd)
 	waitCtx := commandWaitContext(contextID)
+	if parent != nil && parent.Done() != nil {
+		waitCtx = parent
+	}
 	lease, err := resources.AcquireToolLeaseContext(waitCtx, heavy, toolLabel)
 	if err != nil {
 		if errors.Is(err, resources.ErrToolLeaseWaitTimeout) {
@@ -1658,12 +1691,21 @@ func runShellInternal(contextID string, command string) (string, int) {
 			return commandNotice + fmt.Sprintf("[ERROR] required proxy unavailable: %v", err), -1
 		}
 	}
+	cmdEnv = append(cmdEnv, egress.EnvForChild(contextID)...)
 	cmd.Env = cmdEnv
 
 	// Create new process group for this command so we can kill the
 	// entire tree (bash + children like curl) on timeout.
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setpgid: true,
+	platformutil.ConfigureProcessGroup(cmd)
+	if err := egress.PrepareChildAccess(contextID, workDir,
+		filepath.Join(workDir, ".curlrc"),
+		filepath.Join(workDir, ".wgetrc"),
+		filepath.Join(workDir, ".xalgorix-traffic-ca.pem"),
+	); err != nil {
+		return commandNotice + fmt.Sprintf("[ERROR] egress workspace: %v", err), -1
+	}
+	if err := egress.ApplyChildCredential(cmd, contextID); err != nil {
+		return commandNotice + fmt.Sprintf("[ERROR] egress credential: %v", err), -1
 	}
 
 	// Kill the entire process group on context cancellation/timeout.
@@ -1674,10 +1716,7 @@ func runShellInternal(contextID string, command string) (string, int) {
 	// Fix: use cmd.Cancel to send SIGKILL to the negative PGID, which
 	// kills the entire tree and closes all pipe write ends.
 	cmd.Cancel = func() error {
-		if cmd.Process != nil {
-			// Kill entire process group: negative PID = process group
-			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		}
+		_ = platformutil.KillProcessTree(cmd)
 		return os.ErrProcessDone
 	}
 
@@ -1778,17 +1817,20 @@ func runShellInternal(contextID string, command string) (string, int) {
 
 	exitCode := 0
 	if err != nil {
+		// Cancellation must win over exec.ExitError: a killed process usually
+		// reports *exec.ExitError first, which previously swallowed the
+		// TIMEOUT/canceled classification.
+		switch ctx.Err() {
+		case context.DeadlineExceeded:
+			return commandNotice + fmt.Sprintf("[TIMEOUT] Command killed after %s. Use more targeted scans (fewer ports, specific paths, smaller scope) to stay within the time limit.\nPartial stdout:\n%s\nPartial stderr:\n%s",
+				timeout.Round(time.Second), truncate(stdoutStr), truncate(stderrStr)), -1
+		case context.Canceled:
+			return commandNotice + fmt.Sprintf("[CANCELED] Command canceled.\nPartial stdout:\n%s\nPartial stderr:\n%s",
+				truncate(stdoutStr), truncate(stderrStr)), -1
+		}
 		exitErr := &exec.ExitError{}
 		if errors.As(err, &exitErr) {
 			exitCode = exitErr.ExitCode()
-		} else if ctx.Err() == context.DeadlineExceeded {
-			// Command was killed by timeout
-			return commandNotice + fmt.Sprintf("[TIMEOUT] Command killed after %s. Use more targeted scans (fewer ports, specific paths, smaller scope) to stay within the time limit.\nPartial stdout:\n%s\nPartial stderr:\n%s",
-				timeout.Round(time.Second), truncate(stdoutStr), truncate(stderrStr)), -1
-		} else if ctx.Err() == context.Canceled {
-			// Context was canceled (Stop or watchdog kill)
-			return commandNotice + fmt.Sprintf("Command canceled.\nPartial stdout:\n%s\nPartial stderr:\n%s",
-				truncate(stdoutStr), truncate(stderrStr)), -1
 		}
 	}
 
@@ -1878,7 +1920,7 @@ var (
 // maybeRefreshAptLists runs `apt-get update` once per process, and only when
 // the package lists look empty/stale. It returns the combined output (for
 // diagnostics) and is a no-op on non-apt systems or after the first success.
-func maybeRefreshAptLists() string {
+func maybeRefreshAptLists(parent context.Context) string {
 	aptListsMu.Lock()
 	defer aptListsMu.Unlock()
 	if aptListsRefreshed {
@@ -1905,17 +1947,25 @@ func maybeRefreshAptLists() string {
 	// Plain `apt-get update` (no -qq): the output is captured and surfaced
 	// to the LLM on failure, so suppressing diagnostics here would hide the
 	// mirror-unreachable vs. package-absent distinction needed to debug.
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	ctx, cancel := installContext(parent, 120*time.Second)
 	defer cancel()
 	out, _ := exec.CommandContext(ctx, "bash", "-c", sudoPrefix()+"apt-get update 2>&1").CombinedOutput()
 	return string(out)
+}
+
+// installContext bounds pre-launch package work from the tool call's context.
+func installContext(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	return context.WithTimeout(parent, timeout)
 }
 
 // installPackage installs a system package on demand. Gated behind
 // XALGORIX_ALLOW_AUTO_INSTALL — defaults to true for root and false for
 // non-root, so a stock unprivileged xalgorix invocation can never call
 // apt-get/cargo/npm to install software without the operator's say-so.
-func installPackage(pkg string) string {
+func installPackage(parent context.Context, pkg string) string {
 	// Auto-install gate. Two reasons this is opt-in for non-root:
 	//   1) `apt-get install` runs maintainer scripts as root.
 	//   2) `npm install -g` of an attacker-chosen name (typosquat) gets a
@@ -1985,7 +2035,7 @@ func installPackage(pkg string) string {
 	// pipx-installed tools (Python)
 	if pipxPkg, ok := pipxInstallSpecs[pkg]; ok {
 		installCmd := fmt.Sprintf("pipx install %s 2>&1 || pip3 install %s 2>&1", pipxPkg, pipxPkg)
-		ctx, cancel := context.WithTimeout(context.Background(), 600*time.Second)
+		ctx, cancel := installContext(parent, 600*time.Second)
 		defer cancel()
 		cmd := exec.CommandContext(ctx, "bash", "-c", installCmd)
 		out, err := cmd.CombinedOutput()
@@ -2001,7 +2051,7 @@ func installPackage(pkg string) string {
 		// fallback runs as the current user (no sudo) so it lands in
 		// ~/.cargo/bin and respects user toolchain.
 		installCmd := fmt.Sprintf("%sapt-get install -y -q %s 2>&1 || cargo install %s 2>&1", sudoPrefix(), cargoPkg, cargoPkg)
-		ctx, cancel := context.WithTimeout(context.Background(), 600*time.Second)
+		ctx, cancel := installContext(parent, 600*time.Second)
 		defer cancel()
 		cmd := exec.CommandContext(ctx, "bash", "-c", installCmd)
 		out, err := cmd.CombinedOutput()
@@ -2014,7 +2064,7 @@ func installPackage(pkg string) string {
 	// gem (Ruby) tools
 	if gemPkg, ok := gemTools[pkg]; ok {
 		installCmd := fmt.Sprintf("gem install --no-document %s 2>&1", gemPkg)
-		ctx, cancel := context.WithTimeout(context.Background(), 600*time.Second)
+		ctx, cancel := installContext(parent, 600*time.Second)
 		defer cancel()
 		cmd := exec.CommandContext(ctx, "bash", "-c", installCmd)
 		out, err := cmd.CombinedOutput()
@@ -2026,7 +2076,7 @@ func installPackage(pkg string) string {
 
 	if goPkg, ok := goTools[pkg]; ok {
 		installCmd := fmt.Sprintf("GOBIN=%s/go/bin go install -v %s 2>&1", homeDir, goPkg)
-		ctx, cancel := context.WithTimeout(context.Background(), 600*time.Second)
+		ctx, cancel := installContext(parent, 600*time.Second)
 		defer cancel()
 		cmd := exec.CommandContext(ctx, "bash", "-c", installCmd)
 		out, err := cmd.CombinedOutput()
@@ -2047,7 +2097,7 @@ func installPackage(pkg string) string {
 	// Special handling for npm-installed tools
 	if npmPkg, ok := npmTools[pkg]; ok {
 		installCmd := fmt.Sprintf("npm install -g %s 2>&1", npmPkg)
-		ctx, cancel := context.WithTimeout(context.Background(), 600*time.Second) // 10 min for npm install
+		ctx, cancel := installContext(parent, 600*time.Second) // 10 min for npm install
 		defer cancel()
 		cmd := exec.CommandContext(ctx, "bash", "-c", installCmd)
 		out, err := cmd.CombinedOutput()
@@ -2071,7 +2121,7 @@ func installPackage(pkg string) string {
 		// Minimal/container images ship with /var/lib/apt/lists wiped, so an
 		// install-only call fails with "Unable to locate package" until the
 		// index is populated.
-		maybeRefreshAptLists()
+		maybeRefreshAptLists(parent)
 		installCmd = fmt.Sprintf("DEBIAN_FRONTEND=noninteractive apt-get install -y -q %s 2>&1", pkg)
 	} else if _, err := exec.LookPath("dnf"); err == nil {
 		installCmd = fmt.Sprintf("dnf install -y -q %s 2>&1", pkg)
@@ -2091,7 +2141,7 @@ func installPackage(pkg string) string {
 	// escalating package-manager invocations.
 	installCmd = sudoPrefix() + installCmd
 
-	ctx, cancel := context.WithTimeout(context.Background(), 600*time.Second) // 10 min for pkg install
+	ctx, cancel := installContext(parent, 600*time.Second) // 10 min for pkg install
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "bash", "-c", installCmd)

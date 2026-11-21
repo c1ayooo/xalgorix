@@ -27,19 +27,19 @@
 
 | ID | 状态 | 问题 | 证据位置 | 影响 |
 |---|---|---|---|---|
-| M-1 | 部分修复（2026-11-21） | 运行时配置写入仍持 `settingsMu`；`ws_hub`/`scheduler`/`keypool` 已改走 `configSnapshot()`，其余 handler 的逐字段读取仍待收敛 | `internal/web/settings_env.go`、`server.go`、`ws_hub.go`、`scheduler.go`、`keypool.go` | 已知高频 reader 已消除浅拷贝竞争；未覆盖的 handler 仍有残余风险 |
+| M-1 | ✅已修（2026-11-21） | `settingsMu` 改 RWMutex；`configSnapshot()` 覆盖 status/version/rate-limit/agentmail/auth/LLM settings/provider discovery/scan-session/notify/retention/report；剩余 `s.cfg` 读仅为启动期、持锁 keypool 与 `sess.cfg` 副本 | `internal/web/settings_env.go`、`server.go`、`ws_hub.go`、`scheduler.go`、`keypool.go`、`scan_session.go` | 已闭合 |
 | M-2 | ✅已修（2026-11-21） | QueueState 持久化/恢复 Model、ProviderProfile、CodeScan、SourceRepo、ScanContext/Paths | `internal/web/server.go`、`queue_state.go`；回归 `TestQueueState_PreservesAllConfig` | 已闭合 |
 | M-3 | ✅已修（2026-11-21） | `markQueueStatePaused` 改用 `storage.WriteAtomic` | `internal/web/queue_state.go` | 已闭合 |
-| M-4 | 部分修复（2026-11-21） | narration 事件仍可丢弃（避免阻塞扫描），但已计数并周期日志；tool/claim 事件继续阻塞发送 | `internal/agent/agent.go` | 丢失可观测；narration 仍不能作为完整审计记录 |
+| M-4 | ✅已修（2026-11-21） | narration 仍非阻塞，但丢弃计数进入终态遥测（`dropped_narration`）；tool/claim 事件继续阻塞发送 | `internal/agent/agent.go`、`liveness.go`；`TelemetryStats()` | 已按审计边界收口；narration 不作为完整审计记录 |
 | M-5 | ✅已修（2026-11-21） | scan cleanup 调用 `httpclient.ClearSessionAuth`，同时清理 role A/B | `internal/tools/httpclient/sessionauth.go`、`internal/web/server.go`；回归 `TestClearSessionAuthRemovesBothRoles` | 已闭合 |
 | M-6 | ✅已修（2026-11-21） | 429/quota 路径按实际 endpoint key 冷却；兼容旧 `last` 回退 | `internal/llm/client.go`、`keyrotator.go`；回归 `TestMarkRateLimitedKeyCoolsExactKeyNotLastPick` | 已闭合 |
 | M-7 | ✅已修（2026-11-21） | flow 完成后清空内存 Profile/device_code，持久化 Store 仍是凭据源 | `internal/auth/driver_device.go`；`driver_device_test.go` | 已闭合 |
 | M-8 | ✅已修（2026-11-21） | 写入 clone map，持久化成功后才提交；唯一临时文件 + rename | `internal/llm/keystore.go`；回归 `TestKeyStoreSetRollsBackOnWriteFailure` | 已闭合 |
 | M-9 | ✅已修（2026-11-21） | 响应读取上限 32MB；预览文件改用唯一 `CreateTemp` | `internal/tools/proxy/proxy.go` | 已闭合 |
 | M-10 | ✅已修（2026-11-21） | selector/value 经 JSON 编码注入；检查 Eval 返回值 | `internal/tools/browser/browser.go` | 已闭合 |
-| M-11 | 待动态验证 | 工具外层超时只停止等待，未向工具执行传递本次调用的取消信号 | `internal/agent/agent.go` | 部分忽略 scan context 的工具可能在超时后继续运行 |
-| M-12 | 待动态验证 | 文件路径检查与后续打开之间存在 TOCTOU 窗口 | `internal/sandbox/policy.go`、`internal/tools/fileedit` | 需要并发文件系统写能力，实际可利用性未验证 |
-| M-13 | 待动态验证 | 浏览器、terminal/Python 和代理目的端并不统一受 Go DialGuard 覆盖 | `internal/tools/browser`、`terminal`、`python`、`request_guard.go` | 不能把 Go transport 守卫描述为统一 OS 级 egress 边界 |
+| M-11 | ✅已修（2026-11-21） | `ExecuteContext` 覆盖 terminal/Python/httpclient/proxy；browser 使用 rod `Page.Context`，`actionMu` 内绑定/清理每次调用的 ctx，不关闭 Chromium；未适配工具继续硬超时并计数 | `internal/tools/registry.go`、`internal/agent/agent.go`、`internal/tools/browser/{browser,transport}.go`；`context_cancel_test.go` | 已闭合 |
+| M-12 | ✅已修（2026-11-21） | fileedit 读写改走 `internal/safefile`：openat 逐段 O_NOFOLLOW、fd 基线写临时文件、renameat 原子替换 | `internal/safefile/*`、`internal/tools/fileedit/fileedit.go`；`safefile_test.go` | 已闭合 |
+| M-13 | ✅已修（2026-11-21） | Linux `enforce`：专用 UID/GID + 独立 nftables 表，仅放行 loopback trafficproxy 端口，其余 DROP；terminal/Python 降权并注入代理；browser 在 enforce 下 fail-closed；非 Linux 明确 unmanaged | `internal/egress/{egress,egress_linux,egress_other}.go`、`internal/tools/{terminal,python,browser}`、`internal/trafficproxy/manager.go` | 已闭合 |
 
 ## 前端
 
@@ -62,8 +62,8 @@
 | T-1 | 测试不稳定（2026-11-21 更新：根因已确认，环境性） | `internal/proxy` 关闭测试间歇失败：`TestLocalProxyClose` 曾 race 模式 10 次失败 3 次、普通模式 10 次失败 4 次；全量 race 观察到 `TestConcurrentLocalURLAndClose` 报“remained open after Close”；后续全量普通测试又观察到 `TestManagerCloseBeforeLocalServeStarts` 报“listener remained open when Close ran before Serve”，随后单独重跑该包通过。**2026-11-21 追加**：本机（WSL2，内核 6.6.114.1-microsoft-standard-WSL2）出现接近恒定的失败后，用纯 stdlib 最小复现（`net.Listen("tcp","127.0.0.1:0")` → `Close()` → `DialTimeout` 同地址，10 轮）确认 dial 约 50% 概率在 listener 已 Close 后仍成功——该 host 的 loopback 对“已关闭端口的 dial 探测”不可靠，dial-probe 断言机制在此环境失效，与 proxy 代码无关（三个失败测试均为 T-1 记录的同一批；`internal/proxy` 全部文件 mtime 早于 R1 变更窗口，且与 `internal/platform` 无导入关系） | `internal/proxy/local_test.go`、`local.go`、`manager.go` | 断言机制对 WSL2 loopback 不可靠：修复任务应**替换 dial-probe 断言**（如 listener Close 钩子/确定性关闭状态断言），不得通过放宽断言或增加 sleep 掩盖；产品代码无缺陷。**2026-11-21 修复（R2b）**：local 代理随 MITM 化迁入 `internal/trafficproxy`，三处 dial-probe 断言全部替换为确定性状态断言（`TestLocalProxyClose` 直接断言 Manager closed/listener/server/tunnels 状态 + `LocalURL` 必须失败；`TestConcurrentLocalURLAndClose` 以 LocalURL 失败替代 dial；`TestManagerCloseBeforeLocalServeStarts` 用 listener close 钩子），无放宽、无 sleep |
 | T-2 | ✅已修（2026-11-21） | 新 `webui` CI job：locked install + typecheck + build + `git diff --exit-code internal/web/static` | `.github/workflows/ci.yml` | 已闭合 |
 | T-3 | ✅已修（2026-11-21） | CI 增加 30% 覆盖率下限 | `.github/workflows/ci.yml` | 已闭合 |
-| T-4 | ✅已修（2026-11-21） | 构建矩阵加入 `windows/amd64` | `.github/workflows/ci.yml` | 已闭合 |
-| T-5 | 部分修复（2026-11-21） | PR 增加 `docker compose config` + `helm lint/template`；完整镜像构建仍只在发布 workflow | `.github/workflows/ci.yml`、`docker-compose.yml`、`deploy/chart` | Compose/Helm 模板问题已前置；镜像层未进 PR |
+| T-4 | ✅已修（2026-11-21） | 新增 `internal/platformutil`：Unix/Windows 进程终止、磁盘空间、文件锁；迁移 scanctx/terminal/python/web/auth/resources；`GOOS=windows GOARCH=amd64 go build ./cmd/xalgorix` 通过，CI 恢复 Windows build 矩阵 | `internal/platformutil/*`、`.github/workflows/ci.yml`；Windows 为单进程 kill + LockFileEx，不伪装 Unix 进程组 | 已闭合 |
+| T-5 | ✅已按边界收口（2026-11-21） | PR 保留 `docker compose config`、`helm lint/template`、hadolint、WebUI build stage；完整 Kali 镜像仍只在发布 workflow | `.github/workflows/ci.yml`、`docker-compose.yml`、`deploy/chart` | 已按用户确认的轻量边界闭合 |
 | T-6 | ✅已修（2026-11-21） | release build 前执行 `npm ci && npm run build`，干净树断言继续兜底 | `scripts/release.py` | 已闭合 |
 | T-7 | ✅已修（2026-11-21） | Helm `appVersion` 同步至 `4.6.133` | `deploy/chart/Chart.yaml` | 已闭合 |
 

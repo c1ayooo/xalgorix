@@ -40,9 +40,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
+	"github.com/xalgord/xalgorix/v4/internal/platformutil"
 	"github.com/xalgord/xalgorix/v4/internal/providers"
 )
 
@@ -126,7 +126,7 @@ func (d *codexReuseDriver) Complete(ctx context.Context, e providers.Entry, in C
 		return Profile{}, ErrCodexCredentialsNotFound
 	}
 
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	f, err := platformutil.OpenReadNoFollow(path)
 	if err != nil {
 		return Profile{}, ErrCodexCredentialsNotFound
 	}

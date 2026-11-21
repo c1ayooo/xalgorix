@@ -12,9 +12,9 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
 
+	"github.com/xalgord/xalgorix/v4/internal/platformutil"
 	"github.com/xalgord/xalgorix/v4/internal/storage"
 )
 
@@ -687,12 +687,14 @@ func (s *Server) acquireQueueOwnership(instanceID string) (*queueOwnership, bool
 	if err != nil {
 		return nil, false, fmt.Errorf("open queue ownership lock: %w", err)
 	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+	ok, err := platformutil.TryLockFile(f)
+	if err != nil {
 		_ = f.Close()
-		if errors.Is(err, syscall.EWOULDBLOCK) {
-			return nil, false, nil
-		}
 		return nil, false, fmt.Errorf("lock queue ownership: %w", err)
+	}
+	if !ok {
+		_ = f.Close()
+		return nil, false, nil
 	}
 	return &queueOwnership{file: f, path: path}, true, nil
 }
@@ -723,7 +725,7 @@ func (ownership *queueOwnership) release() {
 	if ownership == nil || ownership.file == nil {
 		return
 	}
-	if err := syscall.Flock(int(ownership.file.Fd()), syscall.LOCK_UN); err != nil {
+	if err := platformutil.UnlockFile(ownership.file); err != nil {
 		log.Printf("Warning: failed to unlock queue ownership %s: %v", ownership.path, err)
 	}
 	if err := ownership.file.Close(); err != nil {

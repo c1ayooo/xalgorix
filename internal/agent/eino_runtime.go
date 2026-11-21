@@ -56,7 +56,13 @@ func (a *Agent) runEinoLoop(systemPrompt string, tokenCount func() int) {
 		Approvals:       a.einoApprovalBroker,
 		InstanceID:      a.scanCtx.ID,
 		ScanContextID:   a.scanCtx.ID,
-		StopCheck:       func() bool { return a.einoFinished.Load() || a.einoFinishAccepted.Load() },
+		ToolTimeout:     a.hardTimeoutFor,
+		OnToolTimeout: func(name string) {
+			if !a.registry.SupportsContext(name) {
+				a.uncooperativeTimeouts.Add(1)
+			}
+		},
+		StopCheck: func() bool { return a.einoFinished.Load() || a.einoFinishAccepted.Load() },
 	})
 	if err != nil {
 		log.Printf("[eino] runtime construction failed for %s: %v", a.scanCtx.ID, err)

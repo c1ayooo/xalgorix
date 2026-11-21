@@ -47,9 +47,9 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
-	"syscall"
 	"time"
 
+	"github.com/xalgord/xalgorix/v4/internal/platformutil"
 	"github.com/xalgord/xalgorix/v4/internal/storage"
 )
 
@@ -361,13 +361,13 @@ func (s *Store) withLock(fn func() error) error {
 	}
 	defer f.Close()
 
-	if err := acquireExclusiveFlock(int(f.Fd()), flockDeadline); err != nil {
+	if err := acquireExclusiveFlock(f, flockDeadline); err != nil {
 		return err
 	}
 	// Explicit unlock is defensive — closing the fd also releases
 	// — but it makes the critical section visible in stack traces
 	// and limits the lock-held window to the precise scope of fn.
-	defer func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN) }()
+	defer func() { _ = platformutil.UnlockFile(f) }()
 
 	return fn()
 }
@@ -380,16 +380,16 @@ func (s *Store) withLock(fn func() error) error {
 // errno so log readers see the cause.
 //
 // Validates: Requirement 4.3.
-func acquireExclusiveFlock(fd int, deadline time.Duration) error {
+func acquireExclusiveFlock(f *os.File, deadline time.Duration) error {
 	end := time.Now().Add(deadline)
 	backoff := 5 * time.Millisecond
 	for {
-		err := syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB)
-		if err == nil {
-			return nil
-		}
-		if !errors.Is(err, syscall.EWOULDBLOCK) {
+		ok, err := platformutil.TryLockFile(f)
+		if err != nil {
 			return fmt.Errorf("auth: flock: %w", err)
+		}
+		if ok {
+			return nil
 		}
 		if !time.Now().Before(end) {
 			return ErrLockTimeout

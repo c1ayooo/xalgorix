@@ -28,7 +28,9 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -172,6 +174,28 @@ func RootCAs() *x509.CertPool {
 // proxy-required mode the forward path fails closed when the configured
 // upstream is unavailable and never dials the destination directly (pinned
 // by TestLocalProxyNeverFallsBackDirect).
+// LocalPort returns the loopback proxy's TCP port. Egress enforcement uses it
+// to allow only the dedicated child UID to reach the proxy.
+func LocalPort() (int, error) {
+	raw, err := LocalURL()
+	if err != nil {
+		return 0, err
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return 0, fmt.Errorf("parse traffic proxy URL: %w", err)
+	}
+	port := u.Port()
+	if port == "" {
+		return 0, fmt.Errorf("traffic proxy URL has no port: %s", raw)
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("traffic proxy URL has invalid port: %s", raw)
+	}
+	return n, nil
+}
+
 func LocalURL() (string, error) {
 	m := defaultManager.Load()
 	if m == nil {

@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"sync"
@@ -303,6 +304,52 @@ func TestSchemaXML_ConcurrentReads(t *testing.T) {
 // recovery path for tool calls whose <function=NAME> open tag was dropped,
 // leaving only <parameter> blocks. Must be conservative: ambiguous/partial
 // sets resolve to nothing.
+func TestExecuteContextCancelsCooperativeTool(t *testing.T) {
+	r := NewRegistry()
+	started := make(chan struct{})
+	r.Register(&Tool{
+		Name: "cooperative",
+		ExecuteContext: func(ctx context.Context, _ map[string]string) (Result, error) {
+			close(started)
+			<-ctx.Done()
+			return Result{}, ctx.Err()
+		},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan Result, 1)
+	go func() {
+		res, _ := r.ExecuteContext(ctx, "cooperative", nil)
+		done <- res
+	}()
+	<-started
+	cancel()
+	select {
+	case res := <-done:
+		if !strings.Contains(res.Error, context.Canceled.Error()) {
+			t.Fatalf("ExecuteContext result = %+v, want cancellation", res)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cooperative tool did not observe cancellation")
+	}
+}
+
+func TestExecuteFallbackStillWorksWithoutContext(t *testing.T) {
+	r := NewRegistry()
+	r.Register(&Tool{
+		Name: "legacy",
+		Execute: func(map[string]string) (Result, error) {
+			return Result{Output: "ok"}, nil
+		},
+	})
+	got, err := r.Execute("legacy", nil)
+	if err != nil || got.Output != "ok" {
+		t.Fatalf("legacy fallback = %+v, %v", got, err)
+	}
+	if r.SupportsContext("legacy") {
+		t.Fatal("tool without ExecuteContext must not report context support")
+	}
+}
+
 func TestMatchByParamsUpdatePlan(t *testing.T) {
 	r := NewRegistry()
 	r.Register(&Tool{Name: "update_plan", Parameters: []Parameter{

@@ -282,7 +282,7 @@ func discoverClientRoutes(ctxID string) (tools.Result, error) {
 		return tools.Result{Error: "browser not launched — launch the target page before discovering client routes"}, nil
 	}
 
-	result, err := s.page.Timeout(30 * time.Second).Eval(discoverClientRoutesScript)
+	result, err := s.contextPage().Timeout(30 * time.Second).Eval(discoverClientRoutesScript)
 	if err != nil {
 		return tools.Result{Error: fmt.Sprintf("client route discovery failed: %v", err)}, nil
 	}

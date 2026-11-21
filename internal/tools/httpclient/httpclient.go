@@ -43,6 +43,9 @@ func Register(r *tools.Registry) {
 		Execute: func(args map[string]string) (tools.Result, error) {
 			return executeWithContext(r.GetScanContextID(), r.RequestGuard(), r.DialGuard(), args)
 		},
+		ExecuteContext: func(ctx context.Context, args map[string]string) (tools.Result, error) {
+			return executeWithContextCtx(ctx, r.GetScanContextID(), r.RequestGuard(), r.DialGuard(), args)
+		},
 	})
 }
 
@@ -85,6 +88,10 @@ func ProbeTarget(ctx context.Context, contextID, targetURL string, dialGuard too
 // applied to every redirect hop before it is followed; dialGuard, when
 // non-nil, to every direct connection (see tools.GuardDials).
 func executeWithContext(contextID string, guard tools.RequestGuard, dialGuard tools.DialGuard, args map[string]string) (tools.Result, error) {
+	return executeWithContextCtx(context.Background(), contextID, guard, dialGuard, args)
+}
+
+func executeWithContextCtx(parent context.Context, contextID string, guard tools.RequestGuard, dialGuard tools.DialGuard, args map[string]string) (tools.Result, error) {
 	targetURL := strings.TrimSpace(args["url"])
 	if targetURL == "" {
 		return tools.Result{}, fmt.Errorf("url is required")
@@ -132,7 +139,11 @@ func executeWithContext(contextID string, guard tools.RequestGuard, dialGuard to
 		parsedURL.Scheme = "https"
 	}
 
-	req, err := http.NewRequest(method, parsedURL.String(), bodyReader)
+	reqCtx := parent
+	if reqCtx == nil {
+		reqCtx = context.Background()
+	}
+	req, err := http.NewRequestWithContext(reqCtx, method, parsedURL.String(), bodyReader)
 	if err != nil {
 		return tools.Result{}, fmt.Errorf("failed to create request: %w", err)
 	}

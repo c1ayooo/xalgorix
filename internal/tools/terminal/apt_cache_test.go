@@ -1,6 +1,7 @@
 package terminal
 
 import (
+	"context"
 	"testing"
 )
 
@@ -21,7 +22,7 @@ func TestMaybeRefreshAptListsRunsAtMostOncePerProcess(t *testing.T) {
 
 	// First call: performs the refresh work (or skips it on a non-apt / fresh
 	// host) and marks the gate so it never runs again this process.
-	_ = maybeRefreshAptLists()
+	_ = maybeRefreshAptLists(context.Background())
 
 	aptListsMu.Lock()
 	refreshed := aptListsRefreshed
@@ -34,7 +35,7 @@ func TestMaybeRefreshAptListsRunsAtMostOncePerProcess(t *testing.T) {
 	// observe the skipped work directly, but a no-op returns the empty string
 	// without touching the network — assert the contract.
 	for i := 0; i < 5; i++ {
-		if got := maybeRefreshAptLists(); got != "" {
+		if got := maybeRefreshAptLists(context.Background()); got != "" {
 			t.Errorf("maybeRefreshAptLists() call #%d = %q, want \"\" (must be a no-op after the first refresh)", i+2, got)
 		}
 	}
@@ -47,7 +48,7 @@ func TestAptListsRefreshedFlagIsResettable(t *testing.T) {
 	aptListsRefreshed = false
 	aptListsMu.Unlock()
 
-	_ = maybeRefreshAptLists()
+	_ = maybeRefreshAptLists(context.Background())
 
 	aptListsMu.Lock()
 	aptListsRefreshed = false // reset

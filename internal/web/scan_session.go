@@ -207,10 +207,10 @@ func (s *Server) executeScanSession(sess *scanSession) {
 	if cfg != nil {
 		sctx.Ledger.SetVOIWeight(cfg.VOIWeight)
 	}
-	egressID := sess.instanceID
-	if strings.TrimSpace(egressID) == "" {
-		egressID = sess.id
-	}
+	// Tools are registered against sctx.ID; the egress boundary must use the
+	// same key or terminal/Python/browser lookups silently miss the enforce
+	// status and skip credential drops / fail-closed checks.
+	egressID := sctx.ID
 	egressStatus, err := egress.PrepareScan(sctx.Ctx, egressID)
 	if err != nil {
 		log.Printf("[egress] refusing scan %s: %v", egressID, err)

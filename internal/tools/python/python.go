@@ -10,13 +10,15 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/xalgord/xalgorix/v4/internal/config"
+	"github.com/xalgord/xalgorix/v4/internal/egress"
+	"github.com/xalgord/xalgorix/v4/internal/platformutil"
 	egressproxy "github.com/xalgord/xalgorix/v4/internal/proxy"
 	"github.com/xalgord/xalgorix/v4/internal/resources"
 	"github.com/xalgord/xalgorix/v4/internal/scanctx"
+	"github.com/xalgord/xalgorix/v4/internal/storage"
 	"github.com/xalgord/xalgorix/v4/internal/tools"
 	"github.com/xalgord/xalgorix/v4/internal/tools/iolimit"
 	"github.com/xalgord/xalgorix/v4/internal/tools/terminal"
@@ -33,11 +35,9 @@ import (
 // blocks well past the timeout. Killing the negative PID (the whole group)
 // reaps those orphans and lets Wait() return. Mirrors internal/tools/terminal.
 func configureProcessGroupKill(cmd *exec.Cmd) {
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	platformutil.ConfigureProcessGroup(cmd)
 	cmd.Cancel = func() error {
-		if cmd.Process != nil {
-			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		}
+		_ = platformutil.KillProcessTree(cmd)
 		return os.ErrProcessDone
 	}
 }
@@ -54,6 +54,9 @@ func Register(r *tools.Registry) {
 		Execute: func(args map[string]string) (tools.Result, error) {
 			return executePythonForContext(r.GetScanContextID(), args)
 		},
+		ExecuteContext: func(ctx context.Context, args map[string]string) (tools.Result, error) {
+			return executePythonForContextCtx(ctx, r.GetScanContextID(), args)
+		},
 	})
 }
 
@@ -62,6 +65,10 @@ func executePython(args map[string]string) (tools.Result, error) {
 }
 
 func executePythonForContext(contextID string, args map[string]string) (tools.Result, error) {
+	return executePythonForContextCtx(context.Background(), contextID, args)
+}
+
+func executePythonForContextCtx(parent context.Context, contextID string, args map[string]string) (tools.Result, error) {
 	if strings.TrimSpace(contextID) == "" {
 		contextID = scanctx.Default().ID
 	}
@@ -96,6 +103,9 @@ func executePythonForContext(contextID string, args map[string]string) (tools.Re
 	}
 
 	waitCtx := pythonWaitContext(contextID)
+	if parent != nil && parent.Done() != nil {
+		waitCtx = parent
+	}
 	lease, err := resources.AcquireToolLeaseContext(waitCtx, false, "python_action")
 	if err != nil {
 		if errors.Is(err, resources.ErrToolLeaseWaitTimeout) {
@@ -142,9 +152,19 @@ func executePythonForContext(contextID string, args map[string]string) (tools.Re
 			return tools.Result{}, fmt.Errorf("required proxy unavailable: %w", err)
 		}
 	}
-	cmdEnv = trafficProxyTLSBundleEnv(cmdEnv)
+	cmdEnv, err = trafficProxyTLSBundleEnv(cmdEnv, cmd.Dir)
+	if err != nil {
+		return tools.Result{}, err
+	}
+	cmdEnv = append(cmdEnv, egress.EnvForChild(contextID)...)
 	cmd.Env = cmdEnv
 	configureProcessGroupKill(cmd)
+	if err := egress.PrepareChildAccess(contextID, cmd.Dir); err != nil {
+		return tools.Result{}, fmt.Errorf("egress workspace: %w", err)
+	}
+	if err := egress.ApplyChildCredential(cmd, contextID); err != nil {
+		return tools.Result{}, fmt.Errorf("egress credential: %w", err)
+	}
 
 	stdout := iolimit.New(1 << 20)
 	stderr := iolimit.New(1 << 19)
@@ -194,13 +214,17 @@ func executePythonForContext(contextID string, args map[string]string) (tools.Re
 	}
 
 	if waitErr != nil {
-		if ctx.Err() == context.DeadlineExceeded {
+		switch ctx.Err() {
+		case context.DeadlineExceeded:
 			b.WriteString(fmt.Sprintf("\n[TIMEOUT: exceeded %ds]", timeoutSec))
-		} else {
-			exitErr := &exec.ExitError{}
-			if errors.As(waitErr, &exitErr) {
-				b.WriteString(fmt.Sprintf("\n[exit code: %d]", exitErr.ExitCode()))
-			}
+			return tools.Result{Output: b.String(), Error: fmt.Sprintf("python_action timed out after %ds", timeoutSec)}, nil
+		case context.Canceled:
+			b.WriteString("\n[CANCELED] python_action canceled")
+			return tools.Result{Output: b.String(), Error: "python_action canceled"}, nil
+		}
+		exitErr := &exec.ExitError{}
+		if errors.As(waitErr, &exitErr) {
+			b.WriteString(fmt.Sprintf("\n[exit code: %d]", exitErr.ExitCode()))
 		}
 	}
 
@@ -280,15 +304,26 @@ func pythonWorkspaceEnv(workDir string) []string {
 // honor them without a second generated file surface. SSL_CERT_FILE points
 // at the combined bundle (traffic CA + system store) so non-intercepted TLS
 // keeps working.
-func trafficProxyTLSBundleEnv(env []string) []string {
+func trafficProxyTLSBundleEnv(env []string, workDir string) ([]string, error) {
 	if !trafficproxy.MITMEnabled() {
-		return env
+		return env, nil
 	}
-	if bundle := trafficproxy.BundlePath(); bundle != "" {
-		env = append(env,
-			"REQUESTS_CA_BUNDLE="+bundle,
-			"SSL_CERT_FILE="+bundle,
-		)
+	bundle := trafficproxy.BundlePath()
+	if bundle == "" {
+		return env, nil
 	}
-	return env
+	// Enforce mode drops Python to a dedicated UID that cannot traverse the
+	// root-only CA directory. Copy the public bundle into the workspace.
+	data, err := os.ReadFile(bundle)
+	if err != nil {
+		return env, fmt.Errorf("read traffic proxy CA bundle: %w", err)
+	}
+	localBundle := filepath.Join(workDir, ".xalgorix-ca-bundle.pem")
+	if err := storage.WriteAtomic(localBundle, data); err != nil {
+		return env, fmt.Errorf("write workspace CA bundle: %w", err)
+	}
+	return append(env,
+		"REQUESTS_CA_BUNDLE="+localBundle,
+		"SSL_CERT_FILE="+localBundle,
+	), nil
 }

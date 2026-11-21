@@ -53,9 +53,17 @@ func lockBrowserAction(ctxID string) *browserStore {
 	}
 }
 
-func withBrowserTransportRecovery(ctxID string, action func() (tools.Result, error)) (result tools.Result, err error) {
+func withBrowserTransportRecovery(ctxID string, action func() (tools.Result, error)) (tools.Result, error) {
+	return withBrowserTransportRecoveryCtx(ctxID, nil, action)
+}
+
+func withBrowserTransportRecoveryCtx(ctxID string, callCtx context.Context, action func() (tools.Result, error)) (result tools.Result, err error) {
 	s := lockBrowserAction(ctxID)
 	defer s.actionMu.Unlock()
+	if callCtx != nil {
+		s.callCtx = callCtx
+		defer func() { s.callCtx = nil }()
+	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			failure, ok := recovered.(error)

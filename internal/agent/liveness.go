@@ -589,6 +589,9 @@ func (a *Agent) emitPlanCompleteFinish(findingCount int, saturated bool) {
 		content += "\n\n" + formatIncompleteSummary(status, reasons)
 	}
 	if summary := scanTelemetrySummary(a.state, status, reasons); summary != "" {
+		if stats := a.TelemetryStats(); stats != "" {
+			summary += stats
+		}
 		a.emit(Event{Type: "message", Content: summary, TotalTokens: a.syncBudgetTokens()})
 	}
 	a.emit(Event{Type: "finished", Content: content, TotalTokens: a.syncBudgetTokens()})

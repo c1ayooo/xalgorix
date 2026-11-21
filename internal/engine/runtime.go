@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/compose"
@@ -54,6 +55,12 @@ type RuntimeConfig struct {
 	Approvals       ApprovalBroker
 	InstanceID      string
 	ScanContextID   string
+	// ToolTimeout is the per-tool hard ceiling. It mirrors the legacy
+	// executeToolAsync safety net and is applied with a 30s grace.
+	ToolTimeout func(string) time.Duration
+	// OnToolTimeout is invoked when that hard ceiling fires, so the agent can
+	// record uncooperative-timeout telemetry.
+	OnToolTimeout func(string)
 	// StopCheck is consulted before every model request. The scan sets it to
 	// "scan complete" so the graph cannot issue another paid model call after
 	// a completed finish: the ADK's tool-node completion and the next model
@@ -83,7 +90,7 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 	if cfg.CheckpointStore == nil {
 		return nil, errors.New("engine: runtime requires a checkpoint store")
 	}
-	baseTools, err := RegistryTools(cfg.Registry)
+	baseTools, err := registryTools(cfg.Registry, cfg.ToolTimeout, cfg.OnToolTimeout)
 	if err != nil {
 		return nil, err
 	}

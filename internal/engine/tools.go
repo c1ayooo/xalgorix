@@ -11,9 +11,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	einoTool "github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/schema"
@@ -21,17 +23,25 @@ import (
 	"github.com/xalgord/xalgorix/v4/internal/tools"
 )
 
+var toolTimeoutGrace = 30 * time.Second
+
 var _ einoTool.InvokableTool = (*RegistryTool)(nil)
 
 // RegistryTool exposes one registered Xalgorix tool to Eino.
 type RegistryTool struct {
-	registry *tools.Registry
-	name     string
+	registry    *tools.Registry
+	name        string
+	hardTimeout func(string) time.Duration
+	onTimeout   func(string)
 }
 
 // RegistryTools returns a deterministic snapshot of every registered tool.
 // The returned adapters read metadata from the registry lazily.
 func RegistryTools(reg *tools.Registry) ([]einoTool.InvokableTool, error) {
+	return registryTools(reg, nil, nil)
+}
+
+func registryTools(reg *tools.Registry, hardTimeout func(string) time.Duration, onTimeout func(string)) ([]einoTool.InvokableTool, error) {
 	if reg == nil {
 		return nil, errors.New("engine: registry is nil")
 	}
@@ -39,7 +49,7 @@ func RegistryTools(reg *tools.Registry) ([]einoTool.InvokableTool, error) {
 	sort.Strings(names)
 	out := make([]einoTool.InvokableTool, 0, len(names))
 	for _, name := range names {
-		out = append(out, &RegistryTool{registry: reg, name: name})
+		out = append(out, &RegistryTool{registry: reg, name: name, hardTimeout: hardTimeout, onTimeout: onTimeout})
 	}
 	return out, nil
 }
@@ -66,22 +76,65 @@ func (t *RegistryTool) Info(context.Context) (*schema.ToolInfo, error) {
 }
 
 // InvokableRun decodes Eino's JSON argument string into the registry's
-// string-valued argument map and executes through Registry.Execute.
-func (t *RegistryTool) InvokableRun(_ context.Context, argumentsInJSON string, _ ...einoTool.Option) (string, error) {
+// string-valued argument map and executes through Registry.ExecuteContext.
+// A configured hard ceiling force-returns even for tools that ignore ctx,
+// mirroring the legacy executeToolAsync safety net.
+func (t *RegistryTool) InvokableRun(ctx context.Context, argumentsInJSON string, _ ...einoTool.Option) (string, error) {
 	args, err := decodeRegistryArgs(argumentsInJSON)
 	if err != nil {
 		return "", fmt.Errorf("engine: tool %q arguments: %w", t.name, err)
 	}
-	result, err := t.registry.Execute(t.name, args)
+	if t.hardTimeout == nil {
+		result, runErr := t.registry.ExecuteContext(ctx, t.name, args)
+		return registryToolOutput(t.name, result, runErr)
+	}
+	limit := t.hardTimeout(t.name)
+	if limit <= 0 {
+		result, runErr := t.registry.ExecuteContext(ctx, t.name, args)
+		return registryToolOutput(t.name, result, runErr)
+	}
+	toolCtx, cancel := context.WithTimeout(ctx, limit+toolTimeoutGrace)
+	defer cancel()
+
+	type outcome struct {
+		result tools.Result
+		err    error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				done <- outcome{err: fmt.Errorf("tool panicked: %v\n%s", recovered, debug.Stack())}
+			}
+		}()
+		result, runErr := t.registry.ExecuteContext(toolCtx, t.name, args)
+		done <- outcome{result: result, err: runErr}
+	}()
+
+	select {
+	case out := <-done:
+		return registryToolOutput(t.name, out.result, out.err)
+	case <-toolCtx.Done():
+		if errors.Is(toolCtx.Err(), context.DeadlineExceeded) {
+			if t.onTimeout != nil {
+				t.onTimeout(t.name)
+			}
+			return "", fmt.Errorf("engine: tool %q exceeded hard timeout %s", t.name, limit)
+		}
+		return "", fmt.Errorf("engine: tool %q canceled: %w", t.name, toolCtx.Err())
+	}
+}
+
+func registryToolOutput(name string, result tools.Result, err error) (string, error) {
 	if err != nil {
-		return "", fmt.Errorf("engine: tool %q: %w", t.name, err)
+		return "", fmt.Errorf("engine: tool %q: %w", name, err)
 	}
 	if !result.Success || strings.TrimSpace(result.Error) != "" {
 		reason := strings.TrimSpace(result.Error)
 		if reason == "" {
 			reason = "execution failed without an error message"
 		}
-		return "", fmt.Errorf("engine: tool %q failed: %s", t.name, reason)
+		return "", fmt.Errorf("engine: tool %q failed: %s", name, reason)
 	}
 	return result.Output, nil
 }
