@@ -288,11 +288,135 @@ func TestProjectedRunFindingsKeepAcceptedPayload(t *testing.T) {
 			Verified: true,
 		}},
 	}
-	items := projectedRunFindings(rec)
+	items := projectedRunFindings([]*ScanRecord{rec})
 	if len(items) != 1 || items[0].DedupKey != dedupFindingKey(rec.Target, rec.Vulns[0]) {
 		t.Fatalf("projection = %+v", items)
 	}
 	if string(items[0].Finding) == "" || items[0].ScanStartedAt.IsZero() {
 		t.Fatalf("projection lost payload/started_at: %+v", items[0])
+	}
+}
+
+// redispatchSiblingFixtures writes three top-level records that share one
+// instance id (REDESIGN D11 fresh-state re-dispatch), ordered so the
+// alphabetically-FIRST sibling is the newest and carries zero findings — the
+// exact shape that made first-wins index lookups drop every real finding.
+func redispatchSiblingFixtures(t *testing.T, s *Server) {
+	t.Helper()
+	writeScanFixture(t, s.dataDir, "shared.example", "2026-05-01", ScanRecord{
+		ID: "aaa-newest", InstanceID: "shared-inst", Target: "shared.example",
+		Status: "stopped", StartedAt: "2026-05-01T18:52:24Z",
+	})
+	writeScanFixture(t, s.dataDir, "shared.example", "2026-05-01", ScanRecord{
+		ID: "bbb-mid", InstanceID: "shared-inst", Target: "shared.example",
+		Status: "finished", StartedAt: "2026-05-01T15:44:43Z",
+		Vulns: []VulnSummary{
+			{ID: "v1", Title: "SQLi", Severity: "critical", Endpoint: "/a"},
+			{ID: "v2", Title: "XSS", Severity: "high", Endpoint: "/b"},
+		},
+	})
+	writeScanFixture(t, s.dataDir, "shared.example", "2026-05-01", ScanRecord{
+		ID: "ccc-oldest", InstanceID: "shared-inst", Target: "shared.example",
+		Status: "stopped", StartedAt: "2026-05-01T18:35:18Z",
+		Vulns: []VulnSummary{
+			{ID: "v3", Title: "RCE", Severity: "critical", Endpoint: "/c"},
+		},
+	})
+}
+
+// TestTaskFindingsMergeRedispatchedSiblings pins the no-DSN task findings path
+// against the shared-instance blind spot: every top-level sibling record of a
+// re-dispatched instance must feed the merged findings, not just the one
+// record the summary index happens to land on.
+func TestTaskFindingsMergeRedispatchedSiblings(t *testing.T) {
+	s := newPlatformTestServer(t)
+	ctx := context.Background()
+	store := s.currentPlatformStore()
+	project, err := store.EnsureDefaultProject(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := store.CreateTask(ctx, project.ID, platform.TaskInput{Name: "Redispatch task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateRun(ctx, task.ID, platform.RunMount{InstanceID: "shared-inst", Mode: "single"}); err != nil {
+		t.Fatal(err)
+	}
+	redispatchSiblingFixtures(t, s)
+
+	findings, err := s.taskFindingsFromScans(ctx, store, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 3 {
+		t.Fatalf("task findings = %d, want all 3 sibling findings merged; got %+v", len(findings), findings)
+	}
+	titles := map[string]bool{}
+	for _, f := range findings {
+		titles[f.Title] = true
+		if f.ScanID == "" || f.ScanTarget != "shared.example" {
+			t.Fatalf("finding %q lost its owning scan identity: %+v", f.Title, f)
+		}
+	}
+	for _, want := range []string{"SQLi", "XSS", "RCE"} {
+		if !titles[want] {
+			t.Fatalf("finding %q missing from merged task findings: %+v", want, findings)
+		}
+	}
+}
+
+// fakeFindingsStore records ReplaceRunFindings calls so the startup backfill
+// can be asserted without PostgreSQL.
+type fakeFindingsStore struct {
+	platform.Repository
+	replaced map[string][]platform.RunFinding
+}
+
+func (f *fakeFindingsStore) ReplaceRunFindings(_ context.Context, runID string, _ time.Time, findings []platform.RunFinding) error {
+	f.replaced[runID] = findings
+	return nil
+}
+
+func (f *fakeFindingsStore) ListTaskFindings(context.Context, string) ([]platform.RunFinding, error) {
+	return nil, nil
+}
+
+func (f *fakeFindingsStore) CountTaskFindings(context.Context, string) (int, error) {
+	return 0, nil
+}
+
+// TestBackfillProjectsRedispatchedSiblingFindings pins the startup backfill
+// against the same blind spot: the projection replaced into run_findings must
+// carry the merged findings of every sibling record, because the backfill
+// overwrites whatever the per-run completion path wrote.
+func TestBackfillProjectsRedispatchedSiblingFindings(t *testing.T) {
+	s := newPlatformTestServer(t)
+	ctx := context.Background()
+	store := s.currentPlatformStore()
+	project, err := store.EnsureDefaultProject(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := store.CreateTask(ctx, project.ID, platform.TaskInput{Name: "Backfill task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(ctx, task.ID, platform.RunMount{InstanceID: "shared-inst", Mode: "single"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	redispatchSiblingFixtures(t, s)
+
+	fake := &fakeFindingsStore{Repository: store, replaced: make(map[string][]platform.RunFinding)}
+	s.SetPlatformStore(fake)
+	s.backfillRunFindingProjections(ctx)
+
+	got, ok := fake.replaced[run.ID]
+	if !ok {
+		t.Fatalf("backfill never replaced findings for run %s", run.ID)
+	}
+	if len(got) != 3 {
+		t.Fatalf("backfill projected %d finding(s) for run %s, want 3 merged; got %+v", len(got), run.ID, got)
 	}
 }

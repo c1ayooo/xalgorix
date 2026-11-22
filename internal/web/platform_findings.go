@@ -18,42 +18,57 @@ import (
 	"github.com/xalgord/xalgorix/v4/internal/platform"
 )
 
-// projectedRunFindings converts one saved ScanRecord's findings into the
-// platform projection shape. Callers build this before handing work to a
-// goroutine so cleanup never races with further record mutation.
-func projectedRunFindings(rec *ScanRecord) []platform.RunFinding {
-	if rec == nil {
-		return nil
+// projectedRunFindings converts the saved ScanRecords behind one run into the
+// platform projection shape. Records are the run's sibling sessions (REDESIGN
+// D11 re-dispatch shares one instance id across several scan.json records), so
+// the corpus merges newest-wins over the same (target, endpoint, title,
+// severity) key the findings list uses — one record alone is a blind spot, not
+// the truth. Callers build this before handing work to a goroutine so cleanup
+// never races with further record mutation.
+func projectedRunFindings(recs []*ScanRecord) []platform.RunFinding {
+	type projected struct {
+		finding platform.RunFinding
+		started string
 	}
-	started := parseScanStartedAt(rec.StartedAt)
-	byKey := make(map[string]platform.RunFinding, len(rec.Vulns))
-	order := make([]string, 0, len(rec.Vulns))
-	for _, v := range rec.Vulns {
-		key := dedupFindingKey(rec.Target, v)
-		if key == "" {
+	byKey := make(map[string]projected)
+	order := make([]string, 0)
+	for _, rec := range recs {
+		if rec == nil {
 			continue
 		}
-		payload, err := json.Marshal(flatFinding{
-			VulnSummary:   v,
-			ScanID:        rec.ID,
-			ScanTarget:    rec.Target,
-			ScanStartedAt: rec.StartedAt,
-		})
-		if err != nil {
-			continue
-		}
-		if _, exists := byKey[key]; !exists {
-			order = append(order, key)
-		}
-		byKey[key] = platform.RunFinding{
-			DedupKey:      key,
-			ScanStartedAt: started,
-			Finding:       payload,
+		for _, v := range rec.Vulns {
+			key := dedupFindingKey(rec.Target, v)
+			if key == "" {
+				continue
+			}
+			if existing, ok := byKey[key]; ok && existing.started >= rec.StartedAt {
+				continue
+			}
+			payload, err := json.Marshal(flatFinding{
+				VulnSummary:   v,
+				ScanID:        rec.ID,
+				ScanTarget:    rec.Target,
+				ScanStartedAt: rec.StartedAt,
+			})
+			if err != nil {
+				continue
+			}
+			if _, exists := byKey[key]; !exists {
+				order = append(order, key)
+			}
+			byKey[key] = projected{
+				finding: platform.RunFinding{
+					DedupKey:      key,
+					ScanStartedAt: parseScanStartedAt(rec.StartedAt),
+					Finding:       payload,
+				},
+				started: rec.StartedAt,
+			}
 		}
 	}
 	out := make([]platform.RunFinding, 0, len(order))
 	for _, key := range order {
-		out = append(out, byKey[key])
+		out = append(out, byKey[key].finding)
 	}
 	return out
 }
@@ -128,11 +143,18 @@ func (s *Server) queueRunFindingProjection(instanceID string, rec *ScanRecord) {
 	if !ok || strings.TrimSpace(instanceID) == "" {
 		return
 	}
-	findings := projectedRunFindings(rec)
-	started := parseScanStartedAt(rec.StartedAt)
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
+		// Merge across every sibling session of the instance, not just the
+		// record that completed: the replace-by-run would otherwise wipe the
+		// findings earlier siblings contributed.
+		recs := s.scanSummaryIndexFor(s.findAllScanSummaries()).lookupAll(rec.InstanceID, rec.ID)
+		findings := projectedRunFindings(recs)
+		var started time.Time
+		if newest := newestSibling(recs); newest != nil {
+			started = parseScanStartedAt(newest.StartedAt)
+		}
 		runs, err := store.RunsByInstanceID(ctx, instanceID)
 		if err != nil {
 			log.Printf("[platform-findings] resolve run for instance %s: %v", instanceID, err)
@@ -165,15 +187,19 @@ func (s *Server) backfillRunFindingProjections(ctx context.Context) {
 	idx := s.scanSummaryIndexFor(s.findAllScanSummaries())
 	projected := 0
 	for _, run := range runs {
-		rec := idx.lookup(run.InstanceID, run.LegacyScanID)
-		if rec == nil {
+		recs := idx.lookupAll(run.InstanceID, run.LegacyScanID)
+		if len(recs) == 0 {
 			continue
 		}
-		started := parseScanStartedAt(rec.StartedAt)
+		var newest *ScanRecord
+		if newest = newestSibling(recs); newest == nil {
+			continue
+		}
+		started := parseScanStartedAt(newest.StartedAt)
 		if started.IsZero() {
 			started = run.CreatedAt
 		}
-		if err := fs.ReplaceRunFindings(ctx, run.ID, started, projectedRunFindings(rec)); err != nil {
+		if err := fs.ReplaceRunFindings(ctx, run.ID, started, projectedRunFindings(recs)); err != nil {
 			log.Printf("[platform-findings] backfill run %s: %v", run.ID, err)
 			continue
 		}
@@ -218,22 +244,20 @@ func (s *Server) taskFindingsFromScans(ctx context.Context, store platform.Repos
 			break
 		}
 		for _, run := range runs {
-			rec := idx.lookup(run.InstanceID, run.LegacyScanID)
-			if rec == nil {
-				continue
-			}
-			for _, v := range rec.Vulns {
-				key := dedupFindingKey(rec.Target, v)
-				candidate := flatFinding{
-					VulnSummary:   v,
-					ScanID:        rec.ID,
-					ScanTarget:    rec.Target,
-					ScanStartedAt: rec.StartedAt,
+			for _, rec := range idx.lookupAll(run.InstanceID, run.LegacyScanID) {
+				for _, v := range rec.Vulns {
+					key := dedupFindingKey(rec.Target, v)
+					candidate := flatFinding{
+						VulnSummary:   v,
+						ScanID:        rec.ID,
+						ScanTarget:    rec.Target,
+						ScanStartedAt: rec.StartedAt,
+					}
+					if existing, ok := deduped[key]; ok && existing.ScanStartedAt >= candidate.ScanStartedAt {
+						continue
+					}
+					deduped[key] = candidate
 				}
-				if existing, ok := deduped[key]; ok && existing.ScanStartedAt >= candidate.ScanStartedAt {
-					continue
-				}
-				deduped[key] = candidate
 			}
 		}
 		if page*pageSize >= total {

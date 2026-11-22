@@ -116,7 +116,12 @@ func friendlyPlatformError(err error) string {
 // scanSummaryIndex indexes the shared events-free scan walk by the two mount
 // keys: instance_id (preferred) and scan record ID (legacy fallback).
 type scanSummaryIndex struct {
-	byInstance map[string]*ScanRecord
+	// byInstance keeps EVERY record claiming the instance, in walk order.
+	// Fresh-state re-dispatches (REDESIGN D11) intentionally create several
+	// records per instance; picking one arbitrarily (first-wins over an
+	// alphabetical walk) silently dropped every sibling's findings from the
+	// projections and task views.
+	byInstance map[string][]*ScanRecord
 	byScanID   map[string]*ScanRecord
 }
 
@@ -124,7 +129,7 @@ type scanSummaryIndex struct {
 // walk. Records are shallow cached copies — read-only use only.
 func (s *Server) scanSummaryIndexFor(entries []scanEntry) *scanSummaryIndex {
 	idx := &scanSummaryIndex{
-		byInstance: make(map[string]*ScanRecord, len(entries)),
+		byInstance: make(map[string][]*ScanRecord, len(entries)),
 		byScanID:   make(map[string]*ScanRecord, len(entries)),
 	}
 	for i := range entries {
@@ -134,9 +139,7 @@ func (s *Server) scanSummaryIndexFor(entries []scanEntry) *scanSummaryIndex {
 			key = rec.ID
 		}
 		if key != "" {
-			if _, ok := idx.byInstance[key]; !ok {
-				idx.byInstance[key] = rec
-			}
+			idx.byInstance[key] = append(idx.byInstance[key], rec)
 		}
 		if rec.ID != "" {
 			if _, ok := idx.byScanID[rec.ID]; !ok {
@@ -147,9 +150,23 @@ func (s *Server) scanSummaryIndexFor(entries []scanEntry) *scanSummaryIndex {
 	return idx
 }
 
+// newestSibling applies the scanDirRecordForRun tie-break (REDESIGN D11):
+// among records sharing an instance id, the newest session wins.
+func newestSibling(recs []*ScanRecord) *ScanRecord {
+	var best *ScanRecord
+	for _, rec := range recs {
+		if best == nil || rec.StartedAt > best.StartedAt {
+			best = rec
+		}
+	}
+	return best
+}
+
+// lookup resolves the single record that represents a run: the newest sibling
+// when several share the instance id, the legacy scan id record otherwise.
 func (idx *scanSummaryIndex) lookup(instanceID, scanID string) *ScanRecord {
 	if instanceID != "" {
-		if rec, ok := idx.byInstance[instanceID]; ok {
+		if rec := newestSibling(idx.byInstance[instanceID]); rec != nil {
 			return rec
 		}
 	}
@@ -159,6 +176,32 @@ func (idx *scanSummaryIndex) lookup(instanceID, scanID string) *ScanRecord {
 		}
 	}
 	return nil
+}
+
+// lookupAll returns every record behind a run: all siblings claiming the
+// instance id, plus the legacy scan id record when it claims a different
+// instance. Findings corpora must merge across siblings — one record per
+// instance is a projection blind spot, not the truth.
+func (idx *scanSummaryIndex) lookupAll(instanceID, scanID string) []*ScanRecord {
+	var out []*ScanRecord
+	seen := make(map[string]struct{})
+	add := func(rec *ScanRecord) {
+		if rec == nil {
+			return
+		}
+		if _, dup := seen[rec.ID]; dup {
+			return
+		}
+		seen[rec.ID] = struct{}{}
+		out = append(out, rec)
+	}
+	for _, rec := range idx.byInstance[instanceID] {
+		add(rec)
+	}
+	if scanID != "" {
+		add(idx.byScanID[scanID])
+	}
+	return out
 }
 
 // RunMissingStatus marks a mount whose scan.json no longer exists and which
@@ -339,15 +382,17 @@ func (s *Server) attachTaskProjections(ctx context.Context, store platform.Repos
 		byTask[r.TaskID] = append(byTask[r.TaskID], r)
 	}
 	for _, r := range runs {
-		rec := idx.lookup(r.InstanceID, r.LegacyScanID)
-		if rec == nil {
+		recs := idx.lookupAll(r.InstanceID, r.LegacyScanID)
+		if len(recs) == 0 {
 			continue
 		}
 		if findingKeys[r.TaskID] == nil {
 			findingKeys[r.TaskID] = make(map[string]struct{})
 		}
-		for _, v := range rec.Vulns {
-			findingKeys[r.TaskID][dedupFindingKey(rec.Target, v)] = struct{}{}
+		for _, rec := range recs {
+			for _, v := range rec.Vulns {
+				findingKeys[r.TaskID][dedupFindingKey(rec.Target, v)] = struct{}{}
+			}
 		}
 	}
 	fs, hasProjection := store.(platform.FindingsStore)
