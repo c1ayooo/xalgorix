@@ -21,10 +21,10 @@ import (
 
 	"golang.org/x/time/rate"
 
-	"github.com/xalgord/xalgorix/v4/internal/config"
-	"github.com/xalgord/xalgorix/v4/internal/providers"
-	"github.com/xalgord/xalgorix/v4/internal/resources"
-	"github.com/xalgord/xalgorix/v4/internal/safe"
+	"github.com/c1ayooo/xalgorix/v4/internal/config"
+	"github.com/c1ayooo/xalgorix/v4/internal/providers"
+	"github.com/c1ayooo/xalgorix/v4/internal/resources"
+	"github.com/c1ayooo/xalgorix/v4/internal/safe"
 )
 
 // Message represents a chat message.
@@ -859,6 +859,7 @@ func (c *Client) resolveRequestEndpoint(ctx context.Context) (Endpoint, error) {
 			return Endpoint{}, err
 		}
 		ep.Model = normalizeEndpointModel(c.cfg.LLMProvider, ep.URL, ep.Model)
+		ep.ExtraHeaders = c.cfg.LLMExtraHeaders
 		return c.applyKeyRotation(ep), nil
 	}
 	url, model, err := c.resolveEndpoint()
@@ -878,7 +879,8 @@ func (c *Client) resolveRequestEndpoint(ctx context.Context) (Endpoint, error) {
 		hs = "anthropic"
 	}
 	return c.applyKeyRotation(Endpoint{
-		URL:         url,
+		ExtraHeaders: c.cfg.LLMExtraHeaders,
+		URL:          url,
 		Model:       model,
 		HeaderStyle: hs,
 		Auth:        AuthAPIKey,
@@ -991,6 +993,13 @@ var unknownHeaderStyleOnce sync.Once
 //
 // Validates: Requirements 2.2, 2.3, 11.2.
 func applyAuthHeaders(req *http.Request, ep Endpoint) {
+	defer func() {
+		for k, v := range ep.ExtraHeaders {
+			if k != "" && v != "" {
+				req.Header.Set(k, v)
+			}
+		}
+	}()
 	switch ep.HeaderStyle {
 	case "anthropic":
 		req.Header.Set("anthropic-version", "2023-06-01")

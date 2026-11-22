@@ -4544,6 +4544,8 @@ func llmProviderLabel(model, apiBase string) string {
 		return "Z.AI"
 	case "zai-coding-plan":
 		return "Z.AI Coding Plan"
+	case "opencode":
+		return "OpenCode"
 	case "":
 		return "Not configured"
 	default:
@@ -4552,8 +4554,9 @@ func llmProviderLabel(model, apiBase string) string {
 }
 
 func llmGatewayName(model, apiBase string) string {
-	if llmProviderKey(model, apiBase) == "vercel" {
-		return "vercel"
+	key := llmProviderKey(model, apiBase)
+	if key == "vercel" || key == "opencode" {
+		return key
 	}
 	return ""
 }
@@ -4577,6 +4580,8 @@ func llmProviderKey(model, apiBase string) string {
 		return "anthropic"
 	case strings.Contains(apiBase, "generativelanguage") || strings.Contains(apiBase, "googleapis"):
 		return "google"
+	case strings.Contains(apiBase, "opencode"):
+		return "opencode"
 	case strings.Contains(apiBase, "deepseek"):
 		return "deepseek"
 	case strings.Contains(apiBase, "groq"):

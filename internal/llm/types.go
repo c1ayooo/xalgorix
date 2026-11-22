@@ -42,6 +42,11 @@ type Endpoint struct {
 	// (provider prefixes already stripped).
 	Model string
 
+	// ExtraHeaders are additional request headers (XALGORIX_LLM_EXTRA_HEADERS),
+	// applied after the auth headers — gateways like OpenCode Go need a
+	// routing header the OpenAI surface cannot express.
+	ExtraHeaders map[string]string
+
 	// HeaderStyle is one of "openai", "anthropic", or "gemini" and
 	// drives both the request body shape and the outbound auth
 	// header switch in client.go.

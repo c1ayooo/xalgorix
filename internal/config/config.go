@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"fmt"
 	"log"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -13,8 +14,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/xalgord/xalgorix/v4/internal/providers"
-	"github.com/xalgord/xalgorix/v4/internal/scanheaders"
+	"github.com/c1ayooo/xalgorix/v4/internal/providers"
+	"github.com/c1ayooo/xalgorix/v4/internal/scanheaders"
 )
 
 // Config holds all Xalgorix configuration.
@@ -24,6 +25,10 @@ type Config struct {
 	LLMProvider         string   // XALGORIX_LLM_PROVIDER — explicit provider ID; keeps provider routing separate from the model name
 	APIBase             string   // XALGORIX_API_BASE — API endpoint
 	APIKey              string   // XALGORIX_API_KEY — API key
+	// LLMExtraHeaders are additional HTTP headers sent on every LLM request
+	// (XALGORIX_LLM_EXTRA_HEADERS, JSON object). Used by gateways that require
+	// a routing/session header (e.g. OpenCode Go's x-opencode-session).
+	LLMExtraHeaders map[string]string
 	APIKeys             []string // XALGORIX_API_KEYS — additional provider API keys rotated to dodge provider rate limits (combined with APIKey)
 	KeyPoolStrategy     string   // XALGORIX_KEY_POOL_STRATEGY — "roundrobin" (default; both keys share load) or "sticky" (overflow failover: one key at a time, switch only on a rate limit)
 	DisableAutoDelegate bool     // XALGORIX_DISABLE_AUTO_DELEGATE — skip the deterministic specialist wave entirely
@@ -208,7 +213,39 @@ type Config struct {
 	LLMTimeoutSeconds int
 
 	// Runtime settings
-	RuntimeBackend string // XALGORIX_RUNTIME_BACKEND — always "native"
+	//
+	// RuntimeBackend selects the tool execution plane:
+	//   "native" — execute inside the platform process (historical behaviour,
+	//              still the default so an upgrade never silently changes how
+	//              commands run);
+	//   "docker" — execute inside a per-project toolbox container.
+	RuntimeBackend string // XALGORIX_RUNTIME_BACKEND: native|docker
+
+	// RuntimeTransport selects how the platform reaches the container runtime
+	// when RuntimeBackend is "docker": "socket" (Docker socket directly) or
+	// "runnerd" (host-side service, recommended for containerised platforms).
+	RuntimeTransport string // XALGORIX_RUNTIME_TRANSPORT: socket|runnerd
+	DockerSocket     string // XALGORIX_DOCKER_SOCKET, default /var/run/docker.sock
+	RunnerSocket     string // XALGORIX_RUNNERD_SOCKET, default /run/xalgorix/runner.sock
+	// ToolboxImage must be digest-pinned in production (":tag@sha256:...").
+	ToolboxImage   string // XALGORIX_TOOLBOX_IMAGE
+	ToolboxProfile string // XALGORIX_TOOLBOX_PROFILE: core|full|web
+	// ToolboxBrowserProxy is the proxy URL handed to Chromium inside the project
+	// container. Chromium ignores HTTP_PROXY, so a containerised browser needs a
+	// name the project network can resolve (e.g. http://xalgorix-proxy:8081).
+	// When browser traffic is proxied, leaving this empty is a fail-closed error.
+	ToolboxBrowserProxy string // XALGORIX_TOOLBOX_BROWSER_PROXY
+	// MaxProjects caps concurrent project containers; 0 = derive from RAM.
+	MaxProjects int // XALGORIX_MAX_PROJECTS
+	// ToolboxConcurrency bounds simultaneous execs inside one container.
+	ToolboxConcurrency int   // XALGORIX_TOOLBOX_CONCURRENCY, default 4
+	ProjectMemMB       int64 // XALGORIX_PROJECT_MEM_MB, default: derived from RAM
+	ProjectPids        int64 // XALGORIX_PROJECT_PIDS, default 512
+	ProjectTmpfsMB     int64 // XALGORIX_PROJECT_TMPFS_MB, default 512
+	ProjectIdleTTLSec  int   // XALGORIX_PROJECT_IDLE_TTL_SECONDS, default 600
+	ProjectMaxLifeSec  int   // XALGORIX_PROJECT_MAX_LIFE_SECONDS, default 21600
+	ToolboxKeepDigests int   // XALGORIX_TOOLBOX_KEEP_DIGESTS, default 3
+
 	Workspace      string // XALGORIX_WORKSPACE — workspace root dir
 	DataDir        string // Active per-installation data root. Defaults to ~/.xalgorix/data/. Override via XALGORIX_DATA_DIR.
 	WorkspaceRoot  string // Resolution root used by Filesystem_Tools when no Scan_Context.ScanDir is in effect. Equals DataDir.
@@ -558,6 +595,7 @@ func load() *Config {
 		LLMProvider:              envOr("XALGORIX_LLM_PROVIDER", ""),
 		APIBase:                  envOr("XALGORIX_API_BASE", ""),
 		APIKey:                   envOr("XALGORIX_API_KEY", ""),
+		LLMExtraHeaders:          envJSONMap("XALGORIX_LLM_EXTRA_HEADERS"),
 		APIKeys:                  ParseAPIKeyList(envOr("XALGORIX_API_KEYS", "")),
 		KeyPoolStrategy:          envOr("XALGORIX_KEY_POOL_STRATEGY", "roundrobin"),
 		DisableAutoDelegate:      envOrBool("XALGORIX_DISABLE_AUTO_DELEGATE", false),
@@ -597,7 +635,21 @@ func load() *Config {
 		GeminiSafetyThreshold: envOr("XALGORIX_GEMINI_SAFETY", "BLOCK_NONE"),
 
 		// Runtime
-		RuntimeBackend:           "native", // Always native in Go version
+		RuntimeBackend:           normalizeRuntimeBackend(envOr("XALGORIX_RUNTIME_BACKEND", "native")),
+		RuntimeTransport:         normalizeRuntimeTransport(envOr("XALGORIX_RUNTIME_TRANSPORT", "socket")),
+		DockerSocket:             envOr("XALGORIX_DOCKER_SOCKET", "/var/run/docker.sock"),
+		RunnerSocket:             envOr("XALGORIX_RUNNERD_SOCKET", "/run/xalgorix/runner.sock"),
+		ToolboxImage:             envOr("XALGORIX_TOOLBOX_IMAGE", ""),
+		ToolboxProfile:           envOr("XALGORIX_TOOLBOX_PROFILE", "core"),
+		ToolboxBrowserProxy:      envOr("XALGORIX_TOOLBOX_BROWSER_PROXY", ""),
+		MaxProjects:              envOrInt("XALGORIX_MAX_PROJECTS", 0),
+		ToolboxConcurrency:       envOrInt("XALGORIX_TOOLBOX_CONCURRENCY", 4),
+		ProjectMemMB:             int64(envOrInt("XALGORIX_PROJECT_MEM_MB", 0)),
+		ProjectPids:              int64(envOrInt("XALGORIX_PROJECT_PIDS", 512)),
+		ProjectTmpfsMB:           int64(envOrInt("XALGORIX_PROJECT_TMPFS_MB", 512)),
+		ProjectIdleTTLSec:        envOrInt("XALGORIX_PROJECT_IDLE_TTL_SECONDS", 600),
+		ProjectMaxLifeSec:        envOrInt("XALGORIX_PROJECT_MAX_LIFE_SECONDS", 21600),
+		ToolboxKeepDigests:       envOrInt("XALGORIX_TOOLBOX_KEEP_DIGESTS", 3),
 		Workspace:                workspace,
 		DataDir:                  dataDir,
 		WorkspaceRoot:            dataDir,
@@ -931,6 +983,17 @@ func loadScanHeaders() []string {
 	return scanheaders.Merge(env, fromFile)
 }
 
+// RuntimeInstanceID is the stable identifier stamped on project container
+// labels. Adoption and garbage collection are scoped by it: one platform
+// instance never touches another's containers, even on a shared host.
+func (c *Config) RuntimeInstanceID() string {
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		host = "xalgorix"
+	}
+	return fmt.Sprintf("%s-%d", host, os.Getpid())
+}
+
 func envOr(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -951,6 +1014,35 @@ func normalizeApprovalMode(v string) string {
 	default:
 		log.Printf("[config] WARN unknown XALGORIX_APPROVAL_MODE=%q; falling back to off (enforce is opt-in and must be spelled exactly)", v)
 		return "off"
+	}
+}
+
+// normalizeRuntimeBackend clamps XALGORIX_RUNTIME_BACKEND onto native|docker.
+// Unknown values fall back to native: silently changing how commands execute
+// (from in-process to containerised) is a far worse failure mode than ignoring a
+// typo, and the operator sees the warning.
+func normalizeRuntimeBackend(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "docker", "container":
+		return "docker"
+	case "", "native":
+		return "native"
+	default:
+		log.Printf("[config] WARN unknown XALGORIX_RUNTIME_BACKEND=%q; falling back to native", v)
+		return "native"
+	}
+}
+
+// normalizeRuntimeTransport clamps XALGORIX_RUNTIME_TRANSPORT onto socket|runnerd.
+func normalizeRuntimeTransport(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "runnerd":
+		return "runnerd"
+	case "", "socket", "docker":
+		return "socket"
+	default:
+		log.Printf("[config] WARN unknown XALGORIX_RUNTIME_TRANSPORT=%q; falling back to socket", v)
+		return "socket"
 	}
 }
 
@@ -1223,4 +1315,18 @@ func envOrChecklist(raw string) string {
 		return "professional"
 	}
 	return "full"
+}
+
+// envJSONMap parses a JSON object environment variable into a string map.
+// Missing/invalid values yield nil (the feature stays off, never fails boot).
+func envJSONMap(key string) map[string]string {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return nil
+	}
+	out := map[string]string{}
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return nil
+	}
+	return out
 }
