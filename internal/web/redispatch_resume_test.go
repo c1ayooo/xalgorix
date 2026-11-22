@@ -69,6 +69,8 @@ func TestReactivateSnapshotRefusesBusyAndMissing(t *testing.T) {
 		t.Fatalf("stopping snapshot must be busy, got err=%v", err)
 	}
 
+	// A "running" snapshot with NO live instance is an orphaned accepted
+	// dispatch (finalization cut short, e.g. SIGKILL mid-stop): retryable.
 	running := "550e8400-e29b-41d4-a716-446655440102"
 	if err := s.saveExactDispatchSnapshot(&ScanRecord{
 		ID: running, InstanceID: running, Status: "running",
@@ -76,8 +78,24 @@ func TestReactivateSnapshotRefusesBusyAndMissing(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("persist running snapshot: %v", err)
 	}
-	if _, err := s.reactivateTerminalDispatchSnapshot(running, req); !errors.Is(err, errDispatchBusy) {
-		t.Fatalf("active snapshot must be busy, got err=%v", err)
+	if ok, err := s.reactivateTerminalDispatchSnapshot(running, req); err != nil || !ok {
+		t.Fatalf("orphaned running snapshot must be retryable: ok=%v err=%v", ok, err)
+	}
+	s.releaseDispatchID(running)
+
+	// A genuinely in-flight instance (live, non-terminal) must stay busy.
+	inflight := "550e8400-e29b-41d4-a716-446655440104"
+	if err := s.saveExactDispatchSnapshot(&ScanRecord{
+		ID: inflight, InstanceID: inflight, Status: "running",
+		Events: []WSEvent{}, Vulns: []VulnSummary{}, SubScans: []SubScanSummary{},
+	}); err != nil {
+		t.Fatalf("persist in-flight snapshot: %v", err)
+	}
+	s.instancesMu.Lock()
+	s.instances[inflight] = &ScanInstance{ID: inflight, Status: "running"}
+	s.instancesMu.Unlock()
+	if _, err := s.reactivateTerminalDispatchSnapshot(inflight, req); !errors.Is(err, errDispatchBusy) {
+		t.Fatalf("in-flight instance must be busy, got err=%v", err)
 	}
 
 	missing := "550e8400-e29b-41d4-a716-446655440103"

@@ -262,12 +262,25 @@ func (s *Server) taskTerminalRun(ctx context.Context, store platform.Repository,
 // notes / ledger / execution checkpoint / engine checkpoint ID continuous.
 func (s *Server) scanDirRecordForRun(instanceID, legacyScanID string) (string, *ScanRecord) {
 	entries := s.findAllScanSummaries()
+	// Multiple records can share an instance id after fresh-state re-dispatches
+	// (REDESIGN D11): prefer the NEWEST so continuity (notes/ledger) and the
+	// replay come from the most recent session, not an ancestor.
+	var best string
+	var bestRec *ScanRecord
+	pick := func(dir string, rec *ScanRecord) {
+		if bestRec == nil || rec.StartedAt > bestRec.StartedAt {
+			best, bestRec = dir, rec
+		}
+	}
 	if instanceID != "" {
 		for i := range entries {
 			if strings.TrimSpace(entries[i].rec.InstanceID) == instanceID {
-				return entries[i].dir, &entries[i].rec
+				pick(entries[i].dir, &entries[i].rec)
 			}
 		}
+	}
+	if best != "" {
+		return best, bestRec
 	}
 	if legacyScanID != "" {
 		for i := range entries {

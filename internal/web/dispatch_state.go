@@ -211,7 +211,21 @@ func (s *Server) reactivateTerminalDispatchSnapshot(instanceID string, req ScanR
 	if strings.EqualFold(rec.Status, "stopping") {
 		return false, fmt.Errorf("%w: instance %s is still stopping", errDispatchBusy, instanceID)
 	}
-	if !isTerminalScanStatus(rec.Status) && !strings.EqualFold(rec.Status, "pending") {
+	// A live, non-terminal instance is genuinely in flight — refuse. A
+	// "running"/"pending" snapshot WITHOUT a live instance is an orphan whose
+	// finalization was cut short (e.g. the process died mid-stop): retryable.
+	s.instancesMu.RLock()
+	live := s.instances[instanceID]
+	s.instancesMu.RUnlock()
+	if live != nil {
+		live.mu.RLock()
+		liveStatus := live.Status
+		live.mu.RUnlock()
+		if !isTerminalScanStatus(liveStatus) {
+			return false, fmt.Errorf("%w: instance %s is %s", errDispatchBusy, instanceID, liveStatus)
+		}
+	}
+	if !isTerminalScanStatus(rec.Status) && !strings.EqualFold(rec.Status, "pending") && !strings.EqualFold(rec.Status, "running") {
 		return false, fmt.Errorf("%w: instance %s is %s", errDispatchBusy, instanceID, rec.Status)
 	}
 	now := time.Now().Format(time.RFC3339Nano)
