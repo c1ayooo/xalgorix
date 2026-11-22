@@ -145,10 +145,11 @@ func main() {
 		args.webUI = true
 	}
 
-	// Auto-update check on every start (skip if --update flag is used since that handles it)
-	if !args.update {
-		autoUpdate()
-	}
+	// No automatic update on start (removed 2026-11-22): a mid-run
+	// download+exec restart killed live scans twice during the TSec exercise.
+	// Updates are operator-initiated only — run `xalgorix --update` (points at
+	// c1ayooo/xalgorix), or set XALGORIX_NO_AUTO_UPDATE=1 as a belt-and-braces
+	// opt-out for older binaries.
 
 	if args.update {
 		fmt.Println("Updating xalgorix to latest version...")
@@ -938,132 +939,6 @@ func handleUninstall() {
 
 	fmt.Println()
 	fmt.Println("✅ Uninstall complete!")
-}
-
-// autoUpdateInterval is how often a CLI invocation may hit the GitHub API.
-// Without a TTL every `xalgorix --target ...` invocation blocks for up to
-// 15s waiting on GitHub — annoying for users and rate-limit-prone.
-const autoUpdateInterval = 6 * time.Hour
-
-// autoUpdateCheckPath returns the timestamp marker for the last successful
-// update check. Using ~/.xalgorix/last_update_check so it survives across
-// invocations and lives next to the rest of our local state.
-func autoUpdateCheckPath() string {
-	home := os.Getenv("HOME")
-	if home == "" {
-		home = "/root"
-	}
-	dir := filepath.Join(home, ".xalgorix")
-	_ = os.MkdirAll(dir, 0o700)
-	return filepath.Join(dir, "last_update_check")
-}
-
-// autoUpdateThrottled returns true when the last update check happened
-// within autoUpdateInterval. Failures to read/write the marker are
-// non-fatal — the worst case is one extra GitHub fetch.
-func autoUpdateThrottled() bool {
-	info, err := os.Stat(autoUpdateCheckPath())
-	if err != nil {
-		return false
-	}
-	return time.Since(info.ModTime()) < autoUpdateInterval
-}
-
-func touchAutoUpdateMarker() {
-	now := time.Now()
-	path := autoUpdateCheckPath()
-	if f, err := os.Create(path); err == nil {
-		f.Close()
-	}
-	_ = os.Chtimes(path, now, now)
-}
-
-// autoUpdate checks GitHub for a newer release and self-updates if found.
-func autoUpdate() {
-	// Opt-out for immutable/managed deployments (containers, packaged installs).
-	// In a container the binary must NOT rewrite itself — updates come from
-	// pulling a new image tag — so the Docker image sets XALGORIX_NO_AUTO_UPDATE=1.
-	if v := strings.TrimSpace(os.Getenv("XALGORIX_NO_AUTO_UPDATE")); v == "1" || strings.EqualFold(v, "true") {
-		return
-	}
-	if autoUpdateThrottled() {
-		return
-	}
-	latestVer, downloadURL := fetchLatestRelease()
-	// Mark the check as performed even on failure so a flaky GitHub doesn't
-	// produce a blocking call on every invocation.
-	touchAutoUpdateMarker()
-	if latestVer == "" || latestVer == version {
-		return
-	}
-
-	if !isNewer(latestVer, version) {
-		return
-	}
-
-	fmt.Printf("\n🔄 New version available: v%s → v%s\n", version, latestVer)
-
-	installPath := resolveInstallPath()
-
-	// Try binary download first (fastest, avoids Go module issues)
-	if downloadURL != "" {
-		fmt.Println("   Downloading update...")
-		if err := installBinary(downloadURL, installPath); err != nil {
-			fmt.Printf("   ⚠️  Download failed: %v (run 'xalgorix --update' manually)\n", err)
-			return
-		}
-	} else {
-		// Fallback to go install
-		fmt.Println("   Installing update via go install...")
-		cmd := exec.Command("go", "install", "-v", "-ldflags", "-X main.version="+latestVer, updateModulePath+"/cmd/xalgorix@v"+latestVer)
-		cmd.Env = append(os.Environ(),
-			"GOPROXY=direct",
-			"GOPRIVATE=github.com/c1ayooo/*",
-			"GOSUMDB=off",
-		)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
-			fmt.Printf("   ⚠️  Auto-update failed: %v (run 'xalgorix --update' manually)\n", err)
-			return
-		}
-
-		// go install puts the binary in $GOPATH/bin — copy to actual install path
-		goPath := os.Getenv("GOPATH")
-		if goPath == "" {
-			goPath = filepath.Join(os.Getenv("HOME"), "go")
-		}
-		goBinPath := filepath.Join(goPath, "bin", "xalgorix")
-		if goBinPath != installPath {
-			if _, statErr := os.Stat(goBinPath); statErr == nil {
-				_ = os.Remove(installPath)
-				mvCmd := exec.Command("mv", goBinPath, installPath)
-				if mvErr := mvCmd.Run(); mvErr != nil {
-					cpCmd := exec.Command("sudo", "sh", "-c", fmt.Sprintf("rm -f %s && mv %s %s", installPath, goBinPath, installPath))
-					if sudoErr := cpCmd.Run(); sudoErr != nil {
-						fmt.Fprintf(os.Stderr, "   ⚠️  Could not copy binary to %s: %v\n", installPath, sudoErr)
-						fmt.Fprintf(os.Stderr, "      New binary is at: %s\n", goBinPath)
-					}
-				}
-				_ = os.Chmod(installPath, 0755) //nolint:gosec // G302: installed binary must be executable
-			}
-		}
-	}
-
-	fmt.Printf("   ✅ Updated to v%s! Restarting...\n\n", latestVer)
-
-	// Re-exec with same args
-	execPath, err := os.Executable()
-	if err != nil {
-		fmt.Printf("   ⚠️  Restart failed: %v (please restart manually)\n", err)
-		os.Exit(0)
-	}
-	execPath, _ = filepath.EvalSymlinks(execPath)
-	execErr := execRestart(execPath, os.Args, os.Environ())
-	if execErr != nil {
-		fmt.Printf("   ⚠️  Restart failed: %v (please restart manually)\n", execErr)
-	}
-	os.Exit(0)
 }
 
 // isNewer returns true if a is newer than b (semver comparison).
