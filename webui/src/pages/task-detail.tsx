@@ -1,6 +1,8 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
-import { ArrowLeft, ChevronRight, FileText, Target } from "lucide-react";
+import { ArrowLeft, ChevronRight, FileText, Pencil, Target } from "lucide-react";
+import { toast } from "sonner";
+import { Textarea } from "@/components/ui/textarea";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -28,13 +30,14 @@ import {
   useTask,
   useTaskFindings,
   useTaskRuns,
+  useUpdateTask,
 } from "@/api/queries";
 import { api } from "@/api/client";
 import { severityRank, timeAgo, cn } from "@/lib/utils";
 import { useI18n } from "@/i18n";
 import { useRunSelection } from "@/hooks/use-run-selection";
 import { RunTraffic } from "@/components/run-traffic";
-import type { Approval, Run } from "@/types/api";
+import type { Approval, Run, Task } from "@/types/api";
 import { dedupFindings, type FlatFinding } from "@/lib/findings";
 
 /** 本页的 tab 词汇（4zreco 交互骨架 × REDESIGN §7.2 内容处方：会话默认 + 消耗）。 */
@@ -292,6 +295,8 @@ export default function TaskDetailPage() {
 
           {/* 概览：合并双栏时代的 态势+概览 —— objective 面板单挂载。 */}
           <TabsContent value="overview" className="mt-0 space-y-4">
+            {/* 任务目标：展示 + 就地编辑（保存不触发运行，区别于「新目标」） */}
+            <TaskGoalOverview task={task} />
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
               <StatCard label={t("taskDetail.statRuns")} value={String(task.run_count ?? 0)} />
               <StatCard label={t("taskDetail.statFindings")} value={String(task.finding_count ?? 0)} />
@@ -594,6 +599,86 @@ function LatestRunColdPath({ run }: { run?: Run }) {
       <span className="font-mono text-[11px]">{run.id}</span>
       <ColdPathBadge state={coldpath.data} />
     </div>
+  );
+}
+
+/**
+ * 概览「任务目标」卡片：展示当前 goal 并支持就地编辑。
+ * 只保存目标、不发起运行（「新目标」按钮是保存+续驱的另一条路径）。
+ */
+function TaskGoalOverview({ task }: { task: Task }) {
+  const { t } = useI18n();
+  const update = useUpdateTask();
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(task.goal ?? "");
+
+  useEffect(() => {
+    setDraft(task.goal ?? "");
+    setEditing(false);
+  }, [task.goal, task.id]);
+
+  function save() {
+    const goal = draft.trim();
+    if (!goal || update.isPending) return;
+    update
+      .mutateAsync({ id: task.id, req: { goal } })
+      .then(() => {
+        setEditing(false);
+        toast.success(t("toast.taskUpdated"));
+      })
+      .catch((err: Error) =>
+        toast.error(`${t("toast.taskFailed")}: ${err.message}`),
+      );
+  }
+
+  return (
+    <Card>
+      <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+        <CardTitle>{t("taskDetail.goalTitle")}</CardTitle>
+        {!editing && (
+          <Button size="sm" variant="outline" onClick={() => setEditing(true)}>
+            <Pencil className="mr-1 h-3.5 w-3.5" />
+            {t("taskDetail.editGoal")}
+          </Button>
+        )}
+      </CardHeader>
+      <CardContent>
+        {editing ? (
+          <div className="space-y-2">
+            <Textarea
+              rows={3}
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              placeholder={t("tasks.goalPlaceholder")}
+            />
+            <div className="flex justify-end gap-2">
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => {
+                  setDraft(task.goal ?? "");
+                  setEditing(false);
+                }}
+                disabled={update.isPending}
+              >
+                {t("common.cancel")}
+              </Button>
+              <Button
+                size="sm"
+                onClick={save}
+                disabled={update.isPending || !draft.trim()}
+              >
+                {t("common.save")}
+              </Button>
+            </div>
+          </div>
+        ) : (
+          <p className="whitespace-pre-wrap text-sm text-foreground">
+            {task.goal?.trim() ? task.goal : t("taskDetail.noGoal")}
+          </p>
+        )}
+      </CardContent>
+    </Card>
   );
 }
 

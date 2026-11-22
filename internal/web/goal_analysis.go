@@ -27,8 +27,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/goalanalysis"
-	"github.com/xalgord/xalgorix/v4/internal/platform"
+	"github.com/c1ayooo/xalgorix/v4/internal/goalanalysis"
+	"github.com/c1ayooo/xalgorix/v4/internal/platform"
 )
 
 // Sentinel errors for the analyzer availability states. They never fail a run:

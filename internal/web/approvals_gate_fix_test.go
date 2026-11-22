@@ -7,9 +7,9 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/xalgord/xalgorix/v4/internal/config"
-	"github.com/xalgord/xalgorix/v4/internal/platform"
-	"github.com/xalgord/xalgorix/v4/internal/scanctx"
+	"github.com/c1ayooo/xalgorix/v4/internal/config"
+	"github.com/c1ayooo/xalgorix/v4/internal/platform"
+	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
 )
 
 // utf8ReplacementChar mirrors utf8.RuneError for the validity probe.

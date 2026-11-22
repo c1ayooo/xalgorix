@@ -41,6 +41,7 @@ import (
 	"github.com/c1ayooo/xalgorix/v4/internal/providers"
 	"github.com/c1ayooo/xalgorix/v4/internal/proxy"
 	"github.com/c1ayooo/xalgorix/v4/internal/resources"
+	"github.com/c1ayooo/xalgorix/v4/internal/runstate"
 	"github.com/c1ayooo/xalgorix/v4/internal/safe"
 	"github.com/c1ayooo/xalgorix/v4/internal/sandbox"
 	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
@@ -2146,6 +2147,7 @@ func (s *Server) initDataDir() {
 			continue
 		}
 		_ = os.RemoveAll(dir)
+		s.deleteScanRecordState(name, name) // the durable row must follow the directory (R6.1)
 		log.Printf("Cleaned up old scan: %s", name)
 	}
 
@@ -3464,6 +3466,7 @@ func (s *Server) handleInstanceAction(w http.ResponseWriter, r *http.Request) {
 
 			savedDir := filepath.Join(s.dataDir, "_saved", instanceID)
 			_ = os.RemoveAll(savedDir)
+			s.deleteScanRecordState(instanceID, instanceID) // saved placeholder row follows the dir (R6.1)
 		}
 
 		scanCfg := *s.cfg
@@ -3881,15 +3884,29 @@ func sanitizeTarget(target string) string {
 }
 
 // saveScanRecordTo saves a scan record to a specific directory.
+//
+// R6.1 (REDESIGN D12): with the process-level scan state backend registered
+// the record lands in PG (the runs mount row's takeover columns + the
+// per-record run_scan_records row) and scan.json is NOT written — the file
+// stopped being the record's durable home. The detail sidecar is skipped for
+// the same reason (PG is the detail read source). nil backend (tests) keeps
+// the file path byte-identical.
 func (s *Server) saveScanRecordTo(rec *ScanRecord, scanDir string) {
 	if scanDir == "" {
 		return
 	}
 
-	// Check disk space before writing (50MB minimum)
+	// Check disk space before writing (50MB minimum). The byte-artifact layer
+	// (tool output archives, traffic packets, uploads) keeps writing here even
+	// in PG mode, so the warning stays on both paths.
 	if avail := diskAvailable(scanDir); avail > 0 && avail < 50*1024*1024 {
 		log.Printf("Warning: low disk space (%d MB available), scan record may fail to save", avail/1024/1024)
 		s.broadcast(WSEvent{Type: "error", Content: fmt.Sprintf("⚠️ Low disk space: %d MB remaining. Scan data may not be saved.", avail/1024/1024)})
+	}
+
+	if b := currentScanStateBackend(); b != nil {
+		s.saveScanRecordToState(b, rec, scanDir)
+		return
 	}
 
 	data, err := json.MarshalIndent(rec, "", "  ")
@@ -3907,6 +3924,32 @@ func (s *Server) saveScanRecordTo(rec *ScanRecord, scanDir string) {
 	// written after scan.json so a reader never sees a sidecar newer than its
 	// source (readScanDetailMeta treats a stale sidecar as absent).
 	writeScanDetailMeta(scanDir, rec)
+}
+
+// saveScanRecordToState is the R6.1 durable record save: the verbatim record
+// JSON into run_scan_records plus the runs mount row's takeover columns (via
+// the backend, one transaction). The error surfaces to the operator —
+// persist-failure is not success (charter §5.2) — and the implementation
+// records the failed watermark; the in-memory record stays authoritative and
+// nothing here blocks the running scan (charter §6.1).
+func (s *Server) saveScanRecordToState(b ScanStateBackend, rec *ScanRecord, scanDir string) {
+	data, err := json.Marshal(rec)
+	if err != nil {
+		log.Printf("Error: failed to marshal scan record: %v", err)
+		return
+	}
+	state := runstate.ScanRecordState{
+		ScanID:       scanStateIDForDir(scanDir),
+		InstanceID:   strings.TrimSpace(rec.InstanceID),
+		ParentTarget: strings.TrimSpace(rec.ParentTarget),
+		ScanDir:      scanStateDirRel(s.dataDir, scanDir),
+		Detail:       data,
+	}
+	if err := b.PutScanRecord(state); err != nil {
+		log.Printf("Error: failed to persist scan record to runs (%s): %v", state.ScanID, err)
+		s.broadcast(WSEvent{Type: "error", Content: fmt.Sprintf("⚠️ Failed to save scan data: %v", err)})
+		return
+	}
 }
 
 // diskAvailable returns available bytes on the filesystem containing path, or 0 on error.
@@ -4232,6 +4275,14 @@ func (s *Server) handleGetScan(w http.ResponseWriter, r *http.Request) {
 		dir, rec := s.findScanByID(scanID)
 		if dir != "" && s.safeToDeleteScanDir(dir) {
 			_ = os.RemoveAll(dir)
+			// The durable record row follows the directory (R6.1): a deleted
+			// scan must not reappear from the sweep.
+			s.deleteScanRecordState(filepath.Base(dir), func() string {
+				if rec != nil {
+					return rec.ID
+				}
+				return ""
+			}())
 		}
 		if rec != nil {
 			for _, entry := range s.findAllScans() {
@@ -4240,6 +4291,7 @@ func (s *Server) handleGetScan(w http.ResponseWriter, r *http.Request) {
 				}
 				if isChildOfScan(rec, &entry.rec) && s.safeToDeleteScanDir(entry.dir) {
 					if err := os.RemoveAll(entry.dir); err == nil {
+						s.deleteScanRecordState(filepath.Base(entry.dir), entry.rec.ID)
 						s.deletePlatformRunsForScan("", entry.rec.ID)
 					}
 				}
@@ -4299,6 +4351,9 @@ func (s *Server) handleGetScan(w http.ResponseWriter, r *http.Request) {
 				legacyScanID = rec.ID
 			}
 			s.deletePlatformRunsForScan(instanceID, legacyScanID)
+			// The dispatch tombstone follows the run (R6.2, PG spec story 9):
+			// a deleted run never re-dispatches.
+			s.deleteDispatchSnapshotState(instanceID)
 		}
 		s.invalidateScanListCache()
 		w.Header().Set("Content-Type", "application/json")
@@ -4419,7 +4474,14 @@ func (s *Server) handleScanEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	var events []WSEvent
 	var total int
-	if dirs := s.sessionDirsForProjection(res, entries); len(dirs) > 1 {
+	if b := currentEventStateBackend(); b != nil {
+		// R6.2 (REDESIGN D12): the durable rows are the panel source — the
+		// run's instance union for run-scoped requests, the session's own
+		// rows otherwise; the legacy file of exactly the resolved directory
+		// stays the pre-import fallback. PG aggregates by instance, so no
+		// sibling directory walk happens here.
+		events, total, ok = scanEventsWindowFromState(b, res, offset, limit)
+	} else if dirs := s.sessionDirsForProjection(res, entries); len(dirs) > 1 {
 		events, total, ok = loadRunEventsWindow(dirs, offset, limit)
 	} else {
 		events, total, ok = loadScanEventsWindow(res.dir, offset, limit)

@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/xalgord/xalgorix/v4/internal/reporting"
+	"github.com/c1ayooo/xalgorix/v4/internal/reporting"
 )
 
 // TestReportingPipelineCopiesPhaseEvidence: the report conversion carries

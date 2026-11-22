@@ -25,8 +25,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/infoitem"
-	"github.com/xalgord/xalgorix/v4/internal/platform"
+	"github.com/c1ayooo/xalgorix/v4/internal/infoitem"
+	"github.com/c1ayooo/xalgorix/v4/internal/platform"
 )
 
 // SetInfoReader wires the optional info cold-path reader. nil falls back to

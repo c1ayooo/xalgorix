@@ -51,9 +51,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/approval"
-	"github.com/xalgord/xalgorix/v4/internal/platform"
-	"github.com/xalgord/xalgorix/v4/internal/scanctx"
+	"github.com/c1ayooo/xalgorix/v4/internal/approval"
+	"github.com/c1ayooo/xalgorix/v4/internal/platform"
+	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
 )
 
 // maxApprovalBodyBytes caps the stored body excerpt (API_CONTRACT §3
@@ -593,65 +593,6 @@ func (s *ApprovalService) resolveOwnership(ctx context.Context, store platform.R
 }
 
 // ── operator allow rules ("approve & remember", REDESIGN §5.2, contract §3.2) ─
-
-// matchRule consults the operator-authored allow rules for a Require verdict.
-// Both gate layers call it (einoApprovalBroker for the command gate,
-// proxyHighRiskGate for the wire gate), so one remembered decision exempts
-// the same intent at either layer. Failure posture: nil store, empty project,
-// and store errors all return nil — a failed rule read must NEVER auto-allow,
-// it only falls back to the normal approval flow. Expired rules do not match
-// (expiry is match-time; the row stays listed for the operator to see).
-// A hit increments the rule's counters (best effort) and broadcasts
-// approval_rule_hit — the audit projection of "why no approval row exists
-// for this call"; the approvals table remains the state authority for rows
-// that DO pend.
-func (s *ApprovalService) matchRule(instanceID string, verdict approval.Verdict) *platform.ApprovalRule {
-	store := s.srv.currentPlatformStore()
-	if store == nil {
-		return nil
-	}
-	if verdict.Kind != approval.KindCommand && verdict.Kind != approval.KindHTTP {
-		return nil
-	}
-	ctx, cancel := storeCtx()
-	defer cancel()
-	projectID, _, _ := s.resolveOwnership(ctx, store, instanceID)
-	if projectID == "" {
-		return nil
-	}
-	rules, err := store.ListApprovalRules(ctx, platform.ApprovalRuleFilter{ProjectID: projectID, Kind: verdict.Kind})
-	if err != nil {
-		log.Printf("[approval] rule consult for run %s failed: %v — falling back to approval", instanceID, err)
-		return nil
-	}
-	now := time.Now()
-	for i := range rules {
-		r := &rules[i]
-		if r.ExpiresAt != nil && !now.Before(*r.ExpiresAt) {
-			continue
-		}
-		switch verdict.Kind {
-		case approval.KindCommand:
-			if !s.policy.MatchCommandRule(verdict.Command, r.Match.Program, r.Match.Contains) {
-				continue
-			}
-		case approval.KindHTTP:
-			if !approval.MatchHTTPRule(verdict.Method, verdict.URL, verdict.Body, r.Match.Method, r.Match.Host, r.Match.PathPrefix, r.Match.Contains) {
-				continue
-			}
-		}
-		if err := store.RecordApprovalRuleHit(ctx, r.ID); err != nil {
-			log.Printf("[approval] rule hit bookkeeping for %s: %v", r.ID, err)
-		}
-		s.srv.broadcastToInstance(instanceID, WSEvent{
-			Type:    "approval_rule_hit",
-			Content: fmt.Sprintf("Approval rule matched — %s allowed without an approval row (%s)", ruleDisplayText(r), r.ID),
-			Rule:    r,
-		})
-		return r
-	}
-	return nil
-}
 
 // ruleDisplayText renders a rule's matching coordinates for the event feed
 // (machine data stays mono in the UI).

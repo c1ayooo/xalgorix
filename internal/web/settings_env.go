@@ -14,8 +14,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/auth"
-	"github.com/xalgord/xalgorix/v4/internal/config"
+	"github.com/c1ayooo/xalgorix/v4/internal/auth"
+	"github.com/c1ayooo/xalgorix/v4/internal/config"
 )
 
 type envSettingDefinition struct {

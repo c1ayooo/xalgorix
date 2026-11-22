@@ -22,13 +22,15 @@ func isPersistableStop(status, stopReason string) bool {
 	}
 }
 
-// loadScanRecordForRewrite loads the scan.json at dir in the shape its
-// writers keep it: a journal-backed record with its recent event tail inline,
-// or a legacy record with its whole embedded event log, which a rewrite must
-// keep. A journal that cannot be read does not block the rewrite; the record
-// is rewritten without an inline tail, as restart recovery already does.
+// loadScanRecordForRewrite loads the record at dir in the shape its writers
+// keep it: a journal-backed record with its recent event tail inline, or a
+// legacy record with its whole embedded event log, which a rewrite must
+// keep. R6.1: the durable row is read first (scan.json stopped being
+// written); a journal that cannot be read does not block the rewrite; the
+// record is rewritten without an inline tail, as restart recovery already
+// does.
 func loadScanRecordForRewrite(dir string) (*ScanRecord, bool) {
-	rec, ok := readScanSummary(filepath.Join(dir, "scan.json"))
+	rec, ok := scanRecordMetaForDir(dir)
 	if !ok {
 		return nil, false
 	}

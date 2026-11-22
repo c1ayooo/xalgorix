@@ -11,7 +11,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/xalgord/xalgorix/v4/internal/storage"
+	"github.com/c1ayooo/xalgorix/v4/internal/storage"
 	"regexp"
 	"runtime"
 	"runtime/debug"
@@ -19,15 +19,15 @@ import (
 	"strings"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/agent"
-	"github.com/xalgord/xalgorix/v4/internal/config"
-	"github.com/xalgord/xalgorix/v4/internal/resources"
-	"github.com/xalgord/xalgorix/v4/internal/safe"
-	"github.com/xalgord/xalgorix/v4/internal/scanctx"
-	"github.com/xalgord/xalgorix/v4/internal/tools/intelligence"
-	"github.com/xalgord/xalgorix/v4/internal/tools/notes"
-	"github.com/xalgord/xalgorix/v4/internal/tools/reporting"
-	"github.com/xalgord/xalgorix/v4/internal/tools/terminal"
+	"github.com/c1ayooo/xalgorix/v4/internal/agent"
+	"github.com/c1ayooo/xalgorix/v4/internal/config"
+	"github.com/c1ayooo/xalgorix/v4/internal/resources"
+	"github.com/c1ayooo/xalgorix/v4/internal/safe"
+	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools/intelligence"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools/notes"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools/reporting"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools/terminal"
 )
 
 // ────────────────────────────────────────────────────────
@@ -672,59 +672,66 @@ func (s *Server) runRegisteredMultiScan(run *multiScanRun, scanCfg *config.Confi
 	s.sendDomesticIM("", 0x00ff88, "🚀 Scan Started", fmt.Sprintf("**Targets:** %s\n**Mode:** %s\n**Total:** %d target(s)", strings.Join(req.Targets, ", "), req.ScanMode, totalTargets))
 
 	interruptedQueue := false
-	for i, target := range req.Targets {
-		// Per-instance stop/pause: Stop All, single-stop, pause, and delete
-		// all flip instance.Status, which we observe here. The global stopReq
-		// is intentionally not consulted (see the admission-loop note above).
-		instance.mu.RLock()
-		instStatus := instance.Status
-		instance.mu.RUnlock()
-		if instStatus == "stopped" || instStatus == "paused" {
-			interruptedQueue = true
-			if instStatus == "paused" {
-				s.broadcastToInstance(instanceID, WSEvent{Type: "paused", Content: "Scan queue paused"})
-			} else if !instanceHasExactStopEvent(instance) {
-				s.broadcastToInstance(instanceID, WSEvent{Type: "stopped", Content: "Scan queue stopped by user"})
+	// Opt-in parallel target batch (P2, XALGORIX_TARGET_CONCURRENCY > 1).
+	// Wildcard and DAST modes keep the serial queue: their per-subdomain
+	// cooldown and child-scan bookkeeping are order-dependent.
+	if limit := targetConcurrencyLimit(len(req.Targets)); limit > 1 && req.ScanMode != "wildcard" && req.ScanMode != "dast" {
+		interruptedQueue = s.runTargetsParallel(instance, scanCfg, req, limit)
+	} else {
+		for i, target := range req.Targets {
+			// Per-instance stop/pause: Stop All, single-stop, pause, and delete
+			// all flip instance.Status, which we observe here. The global stopReq
+			// is intentionally not consulted (see the admission-loop note above).
+			instance.mu.RLock()
+			instStatus := instance.Status
+			instance.mu.RUnlock()
+			if instStatus == "stopped" || instStatus == "paused" {
+				interruptedQueue = true
+				if instStatus == "paused" {
+					s.broadcastToInstance(instanceID, WSEvent{Type: "paused", Content: "Scan queue paused"})
+				} else if !instanceHasExactStopEvent(instance) {
+					s.broadcastToInstance(instanceID, WSEvent{Type: "stopped", Content: "Scan queue stopped by user"})
+				}
+				break
 			}
-			break
+
+			// Update queue state after each target
+			s.saveQueueState(i, req)
+
+			// No per-target timeout — let scans run indefinitely; user uses stop button
+			ctx, cancel := context.WithCancel(context.Background())
+			s.mu.Lock()
+			s.cancelScan = cancel
+			s.mu.Unlock()
+
+			// Store cancel on the instance so per-instance stop can cancel the scan context
+			instance.mu.Lock()
+			instance.cancel = cancel
+			instance.mu.Unlock()
+
+			switch req.ScanMode {
+			case "wildcard":
+				// Each target gets full wildcard treatment: Phase 1 subdomain discovery + Phase 2 per-subdomain scan.
+				// This applies whether the user provides 1 or 300+ root domains.
+				s.runWildcardTarget(ctx, scanCfg, req, target, i, totalTargets)
+			case "dast":
+				s.runDASTTarget(ctx, scanCfg, req, target, i, totalTargets)
+			default:
+				s.runSingleTarget(ctx, scanCfg, req, target, i, totalTargets)
+			}
+
+			instance.mu.RLock()
+			instStatusAfterTarget := instance.Status
+			instance.mu.RUnlock()
+			stopRequested := s.stopReq.Load() || s.instanceInterrupted(instanceID) || ctx.Err() != nil
+			if shouldAdvanceQueueAfterTarget(stopRequested, instStatusAfterTarget) {
+				s.saveQueueState(i+1, req)
+			} else {
+				interruptedQueue = true
+			}
+
+			cancel() // always cancel context after target is done
 		}
-
-		// Update queue state after each target
-		s.saveQueueState(i, req)
-
-		// No per-target timeout — let scans run indefinitely; user uses stop button
-		ctx, cancel := context.WithCancel(context.Background())
-		s.mu.Lock()
-		s.cancelScan = cancel
-		s.mu.Unlock()
-
-		// Store cancel on the instance so per-instance stop can cancel the scan context
-		instance.mu.Lock()
-		instance.cancel = cancel
-		instance.mu.Unlock()
-
-		switch req.ScanMode {
-		case "wildcard":
-			// Each target gets full wildcard treatment: Phase 1 subdomain discovery + Phase 2 per-subdomain scan.
-			// This applies whether the user provides 1 or 300+ root domains.
-			s.runWildcardTarget(ctx, scanCfg, req, target, i, totalTargets)
-		case "dast":
-			s.runDASTTarget(ctx, scanCfg, req, target, i, totalTargets)
-		default:
-			s.runSingleTarget(ctx, scanCfg, req, target, i, totalTargets)
-		}
-
-		instance.mu.RLock()
-		instStatusAfterTarget := instance.Status
-		instance.mu.RUnlock()
-		stopRequested := s.stopReq.Load() || s.instanceInterrupted(instanceID) || ctx.Err() != nil
-		if shouldAdvanceQueueAfterTarget(stopRequested, instStatusAfterTarget) {
-			s.saveQueueState(i+1, req)
-		} else {
-			interruptedQueue = true
-		}
-
-		cancel() // always cancel context after target is done
 	}
 
 	if interruptedQueue {
@@ -938,9 +945,20 @@ func (s *Server) resumeScanDirOrNew(scanDir, target string) (string, bool) {
 	return cleanDir, true
 }
 
+// loadScanRecordFromDir loads a workspace directory's record. R6.1 (REDESIGN
+// D12): with the scan state backend registered the durable run_scan_records
+// row is the authority (scan.json stopped being written); directories whose
+// row the R6.0 importer never landed keep their legacy file as the fallback.
+// nil backend (tests) reads the file byte-identically.
 func loadScanRecordFromDir(scanDir string) (*ScanRecord, bool) {
 	if scanDir == "" {
 		return nil, false
+	}
+	if b := currentScanStateBackend(); b != nil {
+		if rec, ok := loadScanRecordStateFromBackend(b, scanDir); ok {
+			return rec, true
+		}
+		// Fall through: pre-import directories keep their legacy file.
 	}
 	data, err := os.ReadFile(filepath.Join(scanDir, "scan.json"))
 	if err != nil {

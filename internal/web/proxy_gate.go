@@ -36,9 +36,9 @@ package web
 import (
 	"log"
 
-	"github.com/xalgord/xalgorix/v4/internal/approval"
-	"github.com/xalgord/xalgorix/v4/internal/scanctx"
-	"github.com/xalgord/xalgorix/v4/internal/trafficproxy"
+	"github.com/c1ayooo/xalgorix/v4/internal/approval"
+	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
+	"github.com/c1ayooo/xalgorix/v4/internal/trafficproxy"
 )
 
 // proxyHighRiskGate adapts ApprovalService to the proxy hook.
@@ -72,13 +72,20 @@ func (g *proxyHighRiskGate) Adjudicate(attr trafficproxy.Attribution, verdict ap
 	if row, denied := g.svc.fenceDenial(attr.InstanceID, sctx, verdict, g.svc.srv.secretValuesForInstance(attr.InstanceID)); denied {
 		return false, fenceDenialMessage(row), nil
 	}
-	// Operator rule exemption (contract §3.2): the same remembered rules the
-	// command gate consults cover the wire layer — one operator decision
-	// stops asking about this intent at either granularity. This also lets a
-	// host-scoped HTTP rule cover verifier curl retests that ride the
-	// subprocess channel (REDESIGN §5.2's accepted degradation, narrowed).
-	if rule := g.svc.matchRule(attr.InstanceID, verdict); rule != nil {
+	// Scope observer (v4.6): the wire layer is adjudicated by the same
+	// rules + built-in baseline as the command gate, so one decision covers
+	// the same intent at either granularity. deny auto-rejects with a
+	// terminal row; allow exempts without a row.
+	switch obs := g.svc.observeScope(attr.InstanceID, verdict); obs.Decision {
+	case scopeAllow:
 		return true, "", nil
+	case scopeDeny:
+		row, err := g.svc.submitScopeDenial(attr.InstanceID, verdict, obs.Reason, g.svc.srv.secretValuesForInstance(attr.InstanceID))
+		if err != nil {
+			log.Printf("[approval] proxy gate: scope observer denial for run %s could not be recorded: %v", attr.InstanceID, err)
+			return false, "⛔ SCOPE DENIAL — the request matches the project's scope-observer baseline and was NOT sent.", nil
+		}
+		return false, approvalDenialMessage(submitOutcome{Status: row.Status, Row: row}), nil
 	}
 	outcome := g.svc.submit(attr.InstanceID, sctx, verdict, g.svc.srv.secretValuesForInstance(attr.InstanceID))
 	if outcome.Approved {

@@ -8,7 +8,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/xalgord/xalgorix/v4/internal/config"
+	"github.com/c1ayooo/xalgorix/v4/internal/config"
 )
 
 func newTestUserStore(t *testing.T) *userStore {

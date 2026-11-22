@@ -25,15 +25,16 @@ package web
 import (
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 
-	"github.com/xalgord/xalgorix/v4/internal/domainjournal"
-	"github.com/xalgord/xalgorix/v4/internal/infoitem"
-	"github.com/xalgord/xalgorix/v4/internal/scanctx"
+	"github.com/c1ayooo/xalgorix/v4/internal/domainjournal"
+	"github.com/c1ayooo/xalgorix/v4/internal/infoitem"
+	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
 )
 
 // Node kinds (fixed graph columns, left → right): goal → agent → hypothesis
@@ -97,14 +98,67 @@ type explorationView struct {
 	Edges          []explorationEdge `json:"edges"`
 }
 
-// explorationSessionDirs expands the resolved scan identity into the sibling
-// session directories whose journals/ledgers compose THIS target's chain,
-// oldest session first. Instance form: same-target siblings concatenate — a
-// 1:1 re-dispatch continues the same investigation in a fresh session
-// directory (REDESIGN D11), so the run view must span its sessions.
-// Distinct-target siblings of a multi-target dispatch stay out of the graph
-// (a chain is per target) and are disclosed in the note instead. Record-id
-// form stays scoped to that one session (the scan-detail view).
+// explorationSession is one session contributing to the chain: its record id
+// keys every durable read (journal rows, ledger snapshot rows) and dir only
+// anchors the legacy file fallback — it may be empty for a session whose
+// directory retention already removed (R6.2: sessions resolve from the
+// durable record sweep, not from disk).
+type explorationSession struct {
+	scanID string
+	dir    string
+}
+
+// explorationSessions expands the resolved scan identity into the sessions
+// whose journals/ledgers compose THIS target's chain, oldest session first.
+// Instance form: same-target siblings concatenate — a 1:1 re-dispatch
+// continues the same investigation in a fresh session directory (REDESIGN
+// D11), so the run view must span its sessions. Distinct-target siblings of
+// a multi-target dispatch stay out of the graph (a chain is per target) and
+// are disclosed in the note instead. Record-id form stays scoped to that one
+// session (the scan-detail view).
+//
+// R6.2 retirement (REDESIGN D12): with the durable stores registered the
+// sessions enumerate from the PG record sweep keyed by the run's instance id
+// — PG aggregates the run, so no sibling directory walk happens here, and a
+// purged session still contributes its durable rows. The legacy walk
+// (explorationSessionDirs below) serves only the nil-backend (test) file
+// mode, where directories are the durable unit.
+func (s *Server) explorationSessions(res scanResolution, entries []scanEntry) (sessions []explorationSession, otherTargets int) {
+	if !res.instanceForm || res.rec == nil || res.rec.InstanceID == "" {
+		return []explorationSession{{scanID: scanStateIDForDir(res.dir), dir: res.dir}}, 0
+	}
+	if currentEventStateBackend() == nil {
+		dirs, other := s.explorationSessionDirs(res, entries)
+		out := make([]explorationSession, 0, len(dirs))
+		for _, d := range dirs {
+			out = append(out, explorationSession{scanID: scanStateIDForDir(d), dir: d})
+		}
+		return out, other
+	}
+	idx := s.scanSummaryIndexFor(entries)
+	recs := idx.lookupAll(res.rec.InstanceID, res.rec.ID)
+	sort.SliceStable(recs, func(i, j int) bool { return recs[i].StartedAt > recs[j].StartedAt })
+	target := res.rec.Target
+	for _, rec := range recs {
+		if rec.ID == "" {
+			continue
+		}
+		if target != "" && rec.Target != target {
+			otherTargets++
+			continue
+		}
+		sessions = append(sessions, explorationSession{scanID: rec.ID, dir: idx.dirByScanID[rec.ID]})
+	}
+	if len(sessions) == 0 {
+		sessions = []explorationSession{{scanID: scanStateIDForDir(res.dir), dir: res.dir}}
+	}
+	return sessions, otherTargets
+}
+
+// explorationSessionDirs is the pre-R6.2 file-mode sibling walk, kept
+// byte-identical for the nil-backend (test) mode: instance form expands into
+// the same-target sibling session directories, newest-first sorted then
+// reversed to chronological; record-id form stays scoped to one session.
 func (s *Server) explorationSessionDirs(res scanResolution, entries []scanEntry) (dirs []string, otherTargets int) {
 	if !res.instanceForm || res.rec == nil || res.rec.InstanceID == "" {
 		return []string{res.dir}, 0
@@ -159,17 +213,17 @@ func (s *Server) handleScanExploration(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"scan not found"}`, http.StatusNotFound)
 		return
 	}
-	dirs, otherTargets := s.explorationSessionDirs(res, entries)
-	sessions := len(dirs)
+	sessions, otherTargets := s.explorationSessions(res, entries)
+	sessionCount := len(sessions)
 
-	// D11 披露:instance 是 run 身份——重派发让同一 target 名下有多个会话目录
-	// (合并投影),多目标派发让一个 instance 名下有多个 target 的记录(如实注明
-	// 只画本 target 的链,不冒充完整历史)。
+	// D11 披露：instance 是 run 身份——重派发让同一 target 名下有多个会话目录
+	// (合并投影)，多目标派发让一个 instance 名下有多个 target 的记录（如实注明
+	// 只画本 target 的链，不冒充完整历史）。
 	disclosure := ""
-	if sessions > 1 {
+	if sessionCount > 1 {
 		disclosure = fmt.Sprintf(
 			"this run re-dispatched the same target %d times; the projection merges all sibling sessions (oldest → newest)",
-			sessions,
+			sessionCount,
 		)
 	}
 	if otherTargets > 0 {
@@ -185,20 +239,43 @@ func (s *Server) handleScanExploration(w http.ResponseWriter, r *http.Request) {
 		Edges:  []explorationEdge{},
 	}
 
-	// ── ledger.json: current-state authority ─────────────────────────────
+	// ── ledger snapshot: current-state authority ─────────────────────────
 	// Hypothesis titles/states and the structural finding_ref links live
 	// here; the journal supplies history the snapshot may have capped away
 	// (evidence cap) or never recorded as state (observations, delegates).
 	// Across sessions the walk is oldest → newest, so the newest session's
 	// state wins per hypothesis id — the continuity continuation of the
 	// chain, never a silent overwrite of a distinct hypothesis.
+	//
+	// R6.2 (charter §6.3): each session's snapshot resolves through the
+	// ledger read seam — the durable row keyed by the session's record id
+	// once the backend is registered (the store is anchored on the scan id;
+	// the dir only feeds the pre-import file fallback), the legacy ledger.json
+	// file otherwise. Presence follows the same source per session.
 	var ledger map[string]scanctx.Hypothesis
-	for _, dir := range dirs {
-		if _, err := os.Stat(filepath.Join(dir, ledgerFileName)); err != nil {
+	for _, sess := range sessions {
+		store := scanctx.NewLedgerStore()
+		if sess.dir != "" {
+			store.SetPersistPath(sess.dir)
+		}
+		if _, present, rerr := scanctx.LedgerSnapshotRaw(sess.scanID); rerr == nil && present {
+			// Durable row exists: key the store on the scan id so the
+			// backend read resolves (and stable InfoItem ids derive).
+			store.SetScanID(sess.scanID)
+		} else if rerr != nil {
+			log.Printf("[exploration] durable ledger read for %s failed, trying legacy file: %v", sess.scanID, rerr)
+			if sess.dir == "" {
+				continue
+			}
+			if _, serr := os.Stat(filepath.Join(sess.dir, ledgerFileName)); serr != nil {
+				continue
+			}
+		} else if sess.dir == "" {
+			// No durable row and no directory anchor: nothing to read.
+			continue
+		} else if _, serr := os.Stat(filepath.Join(sess.dir, ledgerFileName)); serr != nil {
 			continue
 		}
-		store := scanctx.NewLedgerStore()
-		store.SetPersistPath(dir)
 		store.LoadFromDisk()
 		hyps := store.All()
 		if ledger == nil {
@@ -212,26 +289,40 @@ func (s *Server) handleScanExploration(w http.ResponseWriter, r *http.Request) {
 	ledgerMissing := !view.LedgerPresent
 
 	// ── journal: append-only history ─────────────────────────────────────
+	// R6.2 (charter §6.3): each session's records resolve through the journal
+	// read seam keyed by the session's record id — the PG primary store's
+	// per-scan stream once the backend is registered, the legacy per-scan
+	// file otherwise (the dir anchors that fallback only; a purged session
+	// contributes its durable rows with no file read). Presence = records in
+	// either source; a session with neither contributes nothing.
 	var records []domainjournal.Record
 	journalDamaged := false
-	for _, dir := range dirs {
-		journalPath := filepath.Join(dir, domainjournal.FileName)
-		if _, err := os.Stat(journalPath); errors.Is(err, os.ErrNotExist) {
-			continue
+	for _, sess := range sessions {
+		journalPath := ""
+		if sess.dir != "" {
+			journalPath = filepath.Join(sess.dir, domainjournal.FileName)
 		}
-		sessionRecords, damaged, err := domainjournal.ReadRecords(journalPath)
+		filePresent := journalPath != ""
+		if filePresent {
+			if _, err := os.Stat(journalPath); errors.Is(err, os.ErrNotExist) {
+				filePresent = false
+			}
+		}
+		sessionRecords, damaged, err := domainjournal.ReadRecordsResolved(r.Context(), journalPath, sess.scanID)
 		if err != nil {
 			http.Error(w, `{"error":"failed to read domain journal"}`, http.StatusInternalServerError)
 			return
 		}
-		view.JournalPresent = true
-		journalDamaged = journalDamaged || damaged
-		records = append(records, sessionRecords...)
+		if filePresent || len(sessionRecords) > 0 || damaged {
+			view.JournalPresent = true
+			journalDamaged = journalDamaged || damaged
+			records = append(records, sessionRecords...)
+		}
 	}
 	if !view.JournalPresent {
 		if ledgerMissing {
 			view.Incomplete = true
-			if sessions > 1 {
+			if sessionCount > 1 {
 				view.Note = joinNotes("no domain journal and no ledger snapshot exist in any of this run's sessions", disclosure)
 			} else {
 				view.Note = joinNotes("no domain journal and no ledger snapshot exist for this scan", disclosure)
@@ -243,7 +334,7 @@ func (s *Server) handleScanExploration(w http.ResponseWriter, r *http.Request) {
 		// state only — stated honestly instead of a fabricated history.
 		buildExploration(&view, ledger, nil)
 		view.Incomplete = true
-		if sessions > 1 {
+		if sessionCount > 1 {
 			view.Note = joinNotes("no domain journal exists in any of this run's sessions; the graph is the ledger's current state only (no claim history, delegates or observations)", disclosure)
 		} else {
 			view.Note = joinNotes("no domain journal exists for this scan; the graph is the ledger's current state only (no claim history, delegates or observations)", disclosure)

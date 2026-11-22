@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/domainjournal"
+	"github.com/c1ayooo/xalgorix/v4/internal/domainjournal"
 )
 
 // Read-only audit surfaces (CORE v2.1 §5.2, §6.4 and the §4.3 "human audit
@@ -85,16 +85,25 @@ func (s *Server) handleScanAudit(w http.ResponseWriter, r *http.Request) {
 
 	view := ScanAuditView{ScanID: filepath.Base(scanID)}
 	journalPath := filepath.Join(dir, domainjournal.FileName)
+	journalScanID := filepath.Base(dir)
+	filePresent := true
 	if _, err := os.Stat(journalPath); errors.Is(err, os.ErrNotExist) {
+		filePresent = false
+	}
+	// R6.1 (charter §6.3): the durable source is the PG primary store once
+	// the backend is registered; the per-scan file is the legacy fallback
+	// (pre-R6 directories). Presence = durable records in either source — a
+	// scan with neither must not read as a complete empty history (§5.2).
+	records, damaged, err := domainjournal.ReadRecordsResolved(r.Context(), journalPath, journalScanID)
+	if err != nil {
+		http.Error(w, `{"error":"failed to read domain journal"}`, http.StatusInternalServerError)
+		return
+	}
+	if !filePresent && len(records) == 0 && !damaged {
 		view.JournalPresent = false
 		view.Incomplete = true
 		view.Note = "no domain journal exists for this scan (pre-journal scan or journal disabled); claim history cannot be reconstructed"
 		writeJSONStatus(w, http.StatusOK, view)
-		return
-	}
-	records, damaged, err := domainjournal.ReadRecords(journalPath)
-	if err != nil {
-		http.Error(w, `{"error":"failed to read domain journal"}`, http.StatusInternalServerError)
 		return
 	}
 	view.JournalPresent = true
@@ -121,12 +130,13 @@ func (s *Server) handleScanColdPath(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	state := deriveColdPathSyncState(scanID, journalSourceSeq(dir), s.currentColdPathSyncer(), r.Context())
+	state := deriveColdPathSyncState(scanID, journalSourceSeq(r.Context(), dir), s.currentColdPathSyncer(), r.Context())
 	writeJSONStatus(w, http.StatusOK, state)
 }
 
-// deriveColdPathSyncState combines the file-side source position (always
-// authoritative: JSON is the write source, charter §6.3) with the optional
+// deriveColdPathSyncState combines the durable journal's source position
+// (resolved through the R6.1 read seam: the PG primary store's stream once
+// the backend is registered, the legacy file otherwise — D12) with the
 // PostgreSQL watermark. Derivation stays here so the pending/applied/gap/failed
 // state machine is contract-testable without a database.
 func deriveColdPathSyncState(scanID string, sourceSeq uint64, syncer ColdPathSyncer, ctx context.Context) ColdPathSyncState {
@@ -168,11 +178,13 @@ func deriveColdPathSyncState(scanID string, sourceSeq uint64, syncer ColdPathSyn
 	return state
 }
 
-// journalSourceSeq reads the local journal's highest sequence (0 when absent
-// or unreadable — the audit view reports the absence honestly; the sync view
-// only needs the position).
-func journalSourceSeq(dir string) uint64 {
-	records, _, err := domainjournal.ReadRecords(filepath.Join(dir, domainjournal.FileName))
+// journalSourceSeq reads the journal's highest durable sequence for the scan
+// directory (0 when absent or unreadable — the audit view reports the
+// absence honestly; the sync view only needs the position). R6.1: resolved
+// through the journal read seam — the PG primary store's stream once the
+// backend is registered, the legacy file otherwise.
+func journalSourceSeq(ctx context.Context, dir string) uint64 {
+	records, _, err := domainjournal.ReadRecordsResolved(ctx, filepath.Join(dir, domainjournal.FileName), filepath.Base(dir))
 	if err != nil {
 		return 0
 	}

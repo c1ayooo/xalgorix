@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/config"
+	"github.com/c1ayooo/xalgorix/v4/internal/config"
 )
 
 // A child that a shutdown or signal cut short is not an assessed host.

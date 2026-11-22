@@ -38,24 +38,28 @@ func (s *Server) handleSchedules(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "invalid request body", http.StatusBadRequest)
 			return
 		}
-		if len(req.Targets) == 0 {
-			http.Error(w, "targets are required", http.StatusBadRequest)
-			return
-		}
 		if err := s.validateScanWebhook(req.DiscordWebhook); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
-		}
-		if req.Name == "" {
-			req.Name = "Scheduled Scan " + strings.Join(req.Targets, ", ")
-		}
-		if req.Interval == "" {
-			req.Interval = "daily"
 		}
 		normalizeScheduleActivity(&req)
 		if err := normalizeScheduleTiming(&req); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
+		}
+		if err := validateScheduleTargets(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if req.Name == "" {
+			if len(req.Targets) > 0 {
+				req.Name = "Scheduled Scan " + strings.Join(req.Targets, ", ")
+			} else {
+				req.Name = "Scheduled " + req.mode()
+			}
+		}
+		if req.Interval == "" {
+			req.Interval = "daily"
 		}
 		req.ID = randomSlug()
 		req.Enabled = true
@@ -128,7 +132,7 @@ func (s *Server) handleScheduleDetail(w http.ResponseWriter, r *http.Request) {
 		// a refusal is a synchronous 400 and LastRun stays untouched; a
 		// transient store failure is 503 (retryable, not a config error).
 		authCtx, authCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		taskID, authErr := s.authorizeScheduledScan(authCtx, &snapshot)
+		target, authErr := s.authorizeScheduledScan(authCtx, &snapshot)
 		authCancel()
 		if authErr != nil {
 			if errors.Is(authErr, errScheduleLinkUnavailable) {
@@ -138,8 +142,34 @@ func (s *Server) handleScheduleDetail(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, authErr.Error(), http.StatusBadRequest)
 			return
 		}
+		taskID := target.TaskID
+		// A manual trigger of a create_task schedule mints the task now, so the
+		// operator sees the exact task the run will accumulate into.
+		if snapshot.mode() == ScheduleModeCreateTask && target.Project != nil {
+			created, err := s.createTaskForSchedule(&snapshot, target.Project.ID)
+			if err != nil {
+				http.Error(w, "failed to create task: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			taskID = created.ID
+		}
 
 		req := scanRequestForSchedule(&snapshot)
+		if len(req.Targets) == 0 && target.Project != nil && len(target.Project.Scope.Targets) > 0 {
+			req.Targets = append([]string(nil), target.Project.Scope.Targets...)
+		}
+		if len(snapshot.ContextPaths) > 0 {
+			req.ScanContextPaths = append([]string(nil), snapshot.ContextPaths...)
+		}
+		if taskID != "" {
+			if store := s.currentPlatformStore(); store != nil {
+				taskCtx, taskCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				if task, err := store.GetTask(taskCtx, taskID); err == nil && len(task.ContextPaths) > 0 {
+					req.ScanContextPaths = append([]string(nil), task.ContextPaths...)
+				}
+				taskCancel()
+			}
+		}
 		scanCfg := s.configSnapshot()
 		if scanCfg == nil {
 			http.Error(w, "server configuration unavailable", http.StatusServiceUnavailable)
@@ -153,6 +183,11 @@ func (s *Server) handleScheduleDetail(w http.ResponseWriter, r *http.Request) {
 
 		s.schedulesMu.Lock()
 		sch.LastRun = time.Now()
+		// A manual trigger also rides the execution window: record the
+		// dispatch so the window closer can pause/stop it.
+		if hasExecutionWindow(&snapshot) && instanceID != "" {
+			sch.RuntimeInstanceID = instanceID
+		}
 		diskCopy := *sch // snapshot under lock for race-free disk write
 		s.schedulesMu.Unlock()
 		if err := s.saveScheduleToDisk(&diskCopy); err != nil {
@@ -174,16 +209,16 @@ func (s *Server) handleScheduleDetail(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "invalid request body", http.StatusBadRequest)
 			return
 		}
-		if len(req.Targets) == 0 {
-			http.Error(w, "targets are required", http.StatusBadRequest)
-			return
-		}
 		if err := s.validateScanWebhook(req.DiscordWebhook); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 		normalizeScheduleActivity(&req)
 		if err := normalizeScheduleTiming(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if err := validateScheduleTargets(&req); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -209,6 +244,18 @@ func (s *Server) handleScheduleDetail(w http.ResponseWriter, r *http.Request) {
 		sch.LogoPath = req.LogoPath
 		sch.DiscordWebhook = req.DiscordWebhook
 		sch.Model = req.Model
+		// v4.6: project binding, target mode and the execution window.
+		sch.ProjectID = req.ProjectID
+		sch.Mode = req.Mode
+		sch.TaskID = req.TaskID
+		sch.TaskGoal = req.TaskGoal
+		sch.ContextPaths = req.ContextPaths
+		sch.WindowStart = req.WindowStart
+		sch.WindowEnd = req.WindowEnd
+		sch.WindowEndAction = req.WindowEndAction
+		// A window change invalidates the previous close bookkeeping so the
+		// next end instant is acted on.
+		sch.WindowClosedOn = ""
 
 		// If any timing field changed, or enabled transitioned false -> true, recalculate NextRun
 		if sch.timing() != oldTiming || (sch.Enabled && !oldEnabled) {

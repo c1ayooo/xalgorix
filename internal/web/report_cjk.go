@@ -6,8 +6,8 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/c1ayooo/xalgorix/v4/internal/config"
 	"github.com/go-pdf/fpdf"
-	"github.com/xalgord/xalgorix/v4/internal/config"
 )
 
 // reportPDF wraps *fpdf.Fpdf so the report generator can transparently render

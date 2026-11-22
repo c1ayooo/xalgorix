@@ -100,25 +100,16 @@ func (s *Server) handleScanSecurity(w http.ResponseWriter, r *http.Request) {
 		view.Counters[c] = 0
 	}
 
-	// Newest session first; the cap keeps the newest refusals across the
-	// whole run when it racks them up.
+	// Newest first; the cap keeps the newest refusals across the whole run
+	// when it racks them up. With a state backend registered (R6.1) the tail
+	// comes from the durable journal — the instance union for run-scoped
+	// requests, the session's own rows otherwise; the legacy files remain the
+	// fallback for directories whose rows the import never landed.
 	var blocks []securityBlock
 	truncated := false
-	for i := len(dirs) - 1; i >= 0 && !truncated; i-- {
-		data, err := readJournalTail(filepath.Join(dirs[i], scanEventJournalFile), securityJournalMaxBytes)
-		if err != nil || len(data) == 0 {
-			continue
-		}
-		lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-		for j := len(lines) - 1; j >= 0; j-- {
-			line := strings.TrimSpace(lines[j])
-			if line == "" {
-				continue
-			}
-			var ev WSEvent
-			if json.Unmarshal([]byte(line), &ev) != nil {
-				continue
-			}
+	if events, ok := securityJournalEvents(res, dirs); ok {
+		for i := len(events) - 1; i >= 0 && !truncated; i-- {
+			ev := events[i]
 			category, reason := classifySecurityBlock(&ev)
 			if category == "" {
 				continue
@@ -134,6 +125,39 @@ func (s *Server) handleScanSecurity(w http.ResponseWriter, r *http.Request) {
 				Tool:     ev.ToolName,
 				Reason:   firstLine(reason),
 			})
+		}
+	} else {
+		for i := len(dirs) - 1; i >= 0 && !truncated; i-- {
+			data, err := readJournalTail(filepath.Join(dirs[i], scanEventJournalFile), securityJournalMaxBytes)
+			if err != nil || len(data) == 0 {
+				continue
+			}
+			lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+			for j := len(lines) - 1; j >= 0; j-- {
+				line := strings.TrimSpace(lines[j])
+				if line == "" {
+					continue
+				}
+				var ev WSEvent
+				if json.Unmarshal([]byte(line), &ev) != nil {
+					continue
+				}
+				category, reason := classifySecurityBlock(&ev)
+				if category == "" {
+					continue
+				}
+				if len(blocks) >= securityBlockCap {
+					truncated = true
+					break
+				}
+				view.Counters[category]++
+				blocks = append(blocks, securityBlock{
+					TS:       ev.Timestamp,
+					Category: category,
+					Tool:     ev.ToolName,
+					Reason:   firstLine(reason),
+				})
+			}
 		}
 	}
 	// Chronological order for display (oldest → newest within the cap).
@@ -173,6 +197,50 @@ func classifySecurityBlock(ev *WSEvent) (string, string) {
 		}
 	}
 	return "other", firstLine(text)
+}
+
+// securityJournalTailRows bounds the durable-mode tail: the newest rows the
+// security view considers across the whole run. The file mode caps by bytes
+// (32MB per session); durable payloads are the same trimmed event shapes, so
+// a row cap of this size covers at least what the byte cap yielded while
+// never materializing the full journal.
+const securityJournalTailRows = 20000
+
+// securityJournalEvents reads the newest-first event tail behind this
+// request from the durable journal: the run's instance union when the
+// request addresses the run (D11 — PG aggregates every sibling session's
+// rows by instance id, so no sibling directory enumeration feeds this read),
+// the session's own rows otherwise. ok=false sends the caller to the legacy
+// file loop, which with a backend registered covers only the resolved
+// session's own file (pre-import stragglers).
+func securityJournalEvents(res scanResolution, dirs []string) ([]WSEvent, bool) {
+	b := currentEventStateBackend()
+	if b == nil || len(dirs) == 0 {
+		return nil, false
+	}
+	ctx, cancel := eventStateCtx()
+	defer cancel()
+	if res.instanceForm && res.rec != nil && res.rec.InstanceID != "" {
+		_, total, err := b.LoadEventsByInstance(ctx, res.rec.InstanceID, 0, 1)
+		if err != nil || total == 0 {
+			return nil, false
+		}
+		recs, _, err := b.LoadEventsByInstance(ctx, res.rec.InstanceID, int(max(total-int64(securityJournalTailRows), 0)), securityJournalTailRows)
+		if err != nil {
+			return nil, false
+		}
+		return decodeEventRecords(recs), true
+	}
+	scanID := filepath.Base(filepath.Clean(dirs[0]))
+	_, total, err := b.LoadEventsByScan(ctx, scanID, 0, 1)
+	if err != nil || total == 0 {
+		return nil, false
+	}
+	recs, _, err := b.LoadEventsByScan(ctx, scanID, int(max(total-int64(securityJournalTailRows), 0)), securityJournalTailRows)
+	if err != nil {
+		return nil, false
+	}
+	return decodeEventRecords(recs), true
 }
 
 // readJournalTail reads at most maxBytes from the end of the journal so an

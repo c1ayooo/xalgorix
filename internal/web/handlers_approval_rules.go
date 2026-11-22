@@ -22,7 +22,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/platform"
+	"github.com/c1ayooo/xalgorix/v4/internal/platform"
 )
 
 // handleApprovalRules serves GET (list) and POST (create) on /api/approval-rules.
@@ -70,8 +70,11 @@ func (s *Server) handleApprovalRulesCreate(w http.ResponseWriter, r *http.Reques
 	limitJSONBody(w, r)
 	limitJSONBody(w, r)
 	var req struct {
-		ProjectID             string                     `json:"project_id"`
-		Kind                  string                     `json:"kind"`
+		ProjectID string `json:"project_id"`
+		Kind      string `json:"kind"`
+		// Decision: ""/"allow" = exemption ("approve & remember"),
+		// "deny" = the scope observer auto-rejects matching calls.
+		Decision              string                     `json:"decision"`
 		Match                 platform.ApprovalRuleMatch `json:"match"`
 		Reason                string                     `json:"reason"`
 		ExpiresAt             string                     `json:"expires_at"` // RFC3339, optional
@@ -93,6 +96,7 @@ func (s *Server) handleApprovalRulesCreate(w http.ResponseWriter, r *http.Reques
 	rule, err := store.CreateApprovalRule(r.Context(), platform.ApprovalRuleInput{
 		ProjectID:             req.ProjectID,
 		Kind:                  req.Kind,
+		Decision:              platform.NormalizeApprovalRuleDecision(req.Decision),
 		Match:                 req.Match,
 		Reason:                req.Reason,
 		CreatedBy:             s.operatorIdentity(),

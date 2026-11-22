@@ -9,10 +9,10 @@ import (
 	"errors"
 	"strings"
 
-	"github.com/xalgord/xalgorix/v4/internal/approval"
-	"github.com/xalgord/xalgorix/v4/internal/engine"
-	"github.com/xalgord/xalgorix/v4/internal/platform"
-	"github.com/xalgord/xalgorix/v4/internal/scanctx"
+	"github.com/c1ayooo/xalgorix/v4/internal/approval"
+	"github.com/c1ayooo/xalgorix/v4/internal/engine"
+	"github.com/c1ayooo/xalgorix/v4/internal/platform"
+	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
 )
 
 type einoApprovalBroker struct {
@@ -114,11 +114,19 @@ func (b *einoApprovalBroker) RequestApproval(_ context.Context, req engine.Appro
 		}
 		return row.ID, nil
 	}
-	// Operator rule exemption ("approve & remember", contract §3.2): a
-	// remembered rule allows the call without an interrupt and without a row
-	// — matchRule broadcasts approval_rule_hit as the audit projection.
-	if rule := b.svc.matchRule(b.instanceID, verdict); rule != nil {
+	// Scope observer (v4.6): adjudicates the call against the bound project's
+	// operator rules AND the built-in baseline. allow → no interrupt/no row
+	// (approval_rule_hit is the audit projection); deny → a terminal
+	// scope-observer row (the model receives the ⛔ denial text).
+	switch obs := b.svc.observeScope(b.instanceID, verdict); obs.Decision {
+	case scopeAllow:
 		return "", nil
+	case scopeDeny:
+		row, err := b.svc.submitScopeDenial(b.instanceID, verdict, obs.Reason, b.secretValues())
+		if err != nil || row == nil {
+			return "", err
+		}
+		return row.ID, nil
 	}
 	row, err := b.svc.createPendingRow(b.instanceID, b.sctx, verdict, b.secretValues())
 	if err != nil || row == nil {

@@ -39,7 +39,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/xalgord/xalgorix/v4/internal/safe"
+	"github.com/c1ayooo/xalgorix/v4/internal/safe"
 )
 
 const (

@@ -6,7 +6,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/xalgord/xalgorix/v4/internal/config"
+	"github.com/c1ayooo/xalgorix/v4/internal/config"
 )
 
 // realEnvFile is the env file of the account running the tests, and

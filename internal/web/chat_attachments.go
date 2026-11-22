@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/platform"
+	"github.com/c1ayooo/xalgorix/v4/internal/platform"
 )
 
 // Chat attachments. A conversation turn can carry a file: the operator drops a

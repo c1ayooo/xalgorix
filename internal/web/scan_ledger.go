@@ -16,13 +16,14 @@ package web
 import (
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 
-	"github.com/xalgord/xalgorix/v4/internal/scanctx"
+	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
 )
 
 // ledgerFileName is the on-disk snapshot the LedgerStore persists to. Kept in
@@ -101,8 +102,30 @@ func (s *Server) handleScanLedger(w http.ResponseWriter, r *http.Request) {
 		view.Counts[string(st)] = 0
 	}
 
-	ledgerPath := filepath.Join(dir, ledgerFileName)
-	if _, err := os.Stat(ledgerPath); errors.Is(err, os.ErrNotExist) {
+	// R6.2 (REDESIGN D12): the durable snapshot row is the ledger authority
+	// once the backend is registered — presence/damage read from the row, and
+	// the store anchors on the scan id so its backend read resolves. The
+	// legacy ledger.json file below serves pre-import directories and the
+	// nil-backend (test) file mode, byte-identical to before.
+	ledgerScanID := filepath.Base(filepath.Clean(dir))
+	row, fromBackend, rowErr := scanctx.LedgerSnapshotRaw(ledgerScanID)
+	if rowErr != nil {
+		log.Printf("[ledger] durable snapshot read for %s failed, trying legacy file: %v", ledgerScanID, rowErr)
+		fromBackend = false
+	}
+	if fromBackend {
+		view.LedgerPresent = true
+		var probe struct {
+			Hypotheses []json.RawMessage `json:"hypotheses"`
+		}
+		if json.Unmarshal(row, &probe) != nil {
+			view.LedgerDamaged = true
+			view.Incomplete = true
+			view.Note = "ledger snapshot exists but does not parse; hypotheses below the damage point are unknown"
+			writeJSONStatus(w, http.StatusOK, view)
+			return
+		}
+	} else if _, err := os.Stat(filepath.Join(dir, ledgerFileName)); errors.Is(err, os.ErrNotExist) {
 		view.LedgerPresent = false
 		view.Incomplete = true
 		view.Note = "no ledger snapshot exists for this scan (pre-ledger scan, or the run has not claimed any hypothesis yet)"
@@ -112,12 +135,15 @@ func (s *Server) handleScanLedger(w http.ResponseWriter, r *http.Request) {
 
 	store := scanctx.NewLedgerStore()
 	store.SetPersistPath(dir)
+	if fromBackend {
+		store.SetScanID(ledgerScanID)
+	}
 	loaded := store.LoadFromDisk()
-	if loaded == 0 {
+	if loaded == 0 && !fromBackend {
 		// LoadFromDisk folds both "empty snapshot" and "unparsable snapshot"
 		// into zero. Distinguish them honestly: parse the snapshot shape here
 		// so a corrupt file is reported as damaged, never as a clean ledger.
-		raw, readErr := os.ReadFile(ledgerPath)
+		raw, readErr := os.ReadFile(filepath.Join(dir, ledgerFileName))
 		if readErr == nil {
 			var probe struct {
 				Hypotheses []json.RawMessage `json:"hypotheses"`

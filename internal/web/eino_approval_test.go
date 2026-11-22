@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/engine"
-	"github.com/xalgord/xalgorix/v4/internal/scanctx"
+	"github.com/c1ayooo/xalgorix/v4/internal/engine"
+	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
 )
 
 func TestEinoApprovalBrokerCreatesRowAndResumes(t *testing.T) {

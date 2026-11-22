@@ -22,7 +22,7 @@
 package web
 
 import (
-	"github.com/xalgord/xalgorix/v4/internal/auth"
+	"github.com/c1ayooo/xalgorix/v4/internal/auth"
 )
 
 // maskAuthCredential redacts a credential string for outbound JSON

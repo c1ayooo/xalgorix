@@ -6,7 +6,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/xalgord/xalgorix/v4/internal/config"
+	"github.com/c1ayooo/xalgorix/v4/internal/config"
 )
 
 // H-4 regression: concurrent localized reports must write into the directory

@@ -3,10 +3,10 @@ package web
 import (
 	"testing"
 
-	"github.com/xalgord/xalgorix/v4/internal/agent"
-	"github.com/xalgord/xalgorix/v4/internal/scanctx"
-	"github.com/xalgord/xalgorix/v4/internal/tools"
-	"github.com/xalgord/xalgorix/v4/internal/tools/reporting"
+	"github.com/c1ayooo/xalgorix/v4/internal/agent"
+	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools/reporting"
 )
 
 func TestSummaryReplacementRequiresCandidateIdentityAndPhysicalOwner(t *testing.T) {

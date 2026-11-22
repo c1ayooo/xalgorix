@@ -13,8 +13,9 @@ package web
 // The platform repository is optional (nil = 503, same posture as the
 // cold-path views); scanning never depends on it (charter §6.6). Runs are
 // mount records only — status/timing/counts are projected here from
-// findAllScanSummaries at read time so scan.json stays the single status
-// authority (charter §5.1, REDESIGN §3.1).
+// findAllScanSummaries at read time, which since R6.1 sweeps the durable
+// PG runs scan set first and walks legacy files as the residue fallback
+// (charter §5.1 v3.0, REDESIGN D12).
 //
 // D7 five-dimension isolation status in this milestone (REDESIGN §1 D7):
 //   - row level: every repository list/filter takes projectID (enforced);
@@ -41,7 +42,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/platform"
+	"github.com/c1ayooo/xalgorix/v4/internal/platform"
 )
 
 // runProjectionPageSize caps how many runs a single task view / findings
@@ -481,6 +482,12 @@ func (s *Server) handleProjects(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			writePlatformError(w, err)
 			return
+		}
+		// Seed the scope observer baseline (v4.6) so a fresh project is not
+		// born with an empty rules table: bulk-destruction / upload / web-OSS
+		// writes start out visible and tunable in the rules dialog.
+		if n := s.seedScopeApprovalRules(r.Context(), store, project.ID); n > 0 {
+			log.Printf("[scope-observer] seeded %d baseline rule(s) for project %s", n, project.ID)
 		}
 		writeJSONStatus(w, http.StatusCreated, project)
 	default:

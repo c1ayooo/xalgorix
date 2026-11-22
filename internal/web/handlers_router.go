@@ -6,8 +6,8 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/xalgord/xalgorix/v4/internal/llm"
-	"github.com/xalgord/xalgorix/v4/internal/providers"
+	"github.com/c1ayooo/xalgorix/v4/internal/llm"
+	"github.com/c1ayooo/xalgorix/v4/internal/providers"
 )
 
 // handleProviderKeys handles multi-provider API key management.

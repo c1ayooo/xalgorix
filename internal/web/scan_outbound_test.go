@@ -11,11 +11,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/auth"
-	"github.com/xalgord/xalgorix/v4/internal/config"
-	"github.com/xalgord/xalgorix/v4/internal/llm"
-	"github.com/xalgord/xalgorix/v4/internal/providers"
-	"github.com/xalgord/xalgorix/v4/internal/scopeguard"
+	"github.com/c1ayooo/xalgorix/v4/internal/auth"
+	"github.com/c1ayooo/xalgorix/v4/internal/config"
+	"github.com/c1ayooo/xalgorix/v4/internal/llm"
+	"github.com/c1ayooo/xalgorix/v4/internal/providers"
+	"github.com/c1ayooo/xalgorix/v4/internal/scopeguard"
 )
 
 // stubWebhookDNS pins scopeguard's resolver so these tests never depend on

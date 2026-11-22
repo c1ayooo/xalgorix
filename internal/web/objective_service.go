@@ -19,10 +19,10 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/xalgord/xalgorix/v4/internal/agent"
-	"github.com/xalgord/xalgorix/v4/internal/objective"
-	"github.com/xalgord/xalgorix/v4/internal/platform"
-	"github.com/xalgord/xalgorix/v4/internal/scanctx"
+	"github.com/c1ayooo/xalgorix/v4/internal/agent"
+	"github.com/c1ayooo/xalgorix/v4/internal/objective"
+	"github.com/c1ayooo/xalgorix/v4/internal/platform"
+	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
 )
 
 // objectiveSpecFromPlatform converts the platform objective into the
@@ -129,6 +129,21 @@ func findingSignalFromSummary(v VulnSummary) objective.FindingSignal {
 	}
 }
 
+// openLedgerForRead anchors a read-only ledger store on one scan's durable
+// snapshot (R6.2, REDESIGN D12): when the backend holds a snapshot row for
+// the scan id, the store anchors on that id so its backend read resolves;
+// the dir stays the pre-import file fallback. nil-backend (test) file mode
+// keeps the plain dir anchoring, byte-identical to before.
+func openLedgerForRead(dir string) *scanctx.LedgerStore {
+	store := scanctx.NewLedgerStore()
+	store.SetPersistPath(dir)
+	scanID := filepath.Base(filepath.Clean(dir))
+	if _, present, err := scanctx.LedgerSnapshotRaw(scanID); err == nil && present {
+		store.SetScanID(scanID)
+	}
+	return store
+}
+
 // collectObjectiveSignals reads the accepted findings, the plan counters and
 // the hypothesis ledger of one run directory. Read-only: nothing here writes
 // back into the scan.
@@ -137,15 +152,14 @@ func collectObjectiveSignals(scanDir string) objective.Signal {
 	if strings.TrimSpace(scanDir) == "" {
 		return sig
 	}
-	if rec, ok := readScanSummary(filepath.Join(scanDir, "scan.json")); ok && rec != nil {
+	if rec, ok := scanRecordMetaForDir(scanDir); ok && rec != nil {
 		for _, v := range rec.Vulns {
 			sig.Findings = append(sig.Findings, findingSignalFromSummary(v))
 		}
 		sig.CoveragePlanned = rec.PlanTasksTotal
 		sig.CoverageCompleted = rec.PlanTasksCompleted
 	}
-	ledger := scanctx.NewLedgerStore()
-	ledger.SetPersistPath(scanDir)
+	ledger := openLedgerForRead(scanDir)
 	ledger.LoadFromDisk()
 	for _, h := range ledger.All() {
 		sig.Hypotheses = append(sig.Hypotheses, objective.HypothesisSignal{
@@ -301,8 +315,7 @@ func (s *Server) evaluateTaskObjective(ctx context.Context, store platform.Repos
 			Report: runReport,
 		})
 		if newestDir != "" {
-			ledger := scanctx.NewLedgerStore()
-			ledger.SetPersistPath(newestDir)
+			ledger := openLedgerForRead(newestDir)
 			ledger.LoadFromDisk()
 			latestLedger = ledger
 		}

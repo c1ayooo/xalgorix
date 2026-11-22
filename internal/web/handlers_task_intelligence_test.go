@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/platform"
-	"github.com/xalgord/xalgorix/v4/internal/tools/intelligence"
+	"github.com/c1ayooo/xalgorix/v4/internal/platform"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools/intelligence"
 )
 
 // intelTestTask creates project+task and mounts one run on a scan dir that

@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/config"
+	"github.com/c1ayooo/xalgorix/v4/internal/config"
 )
 
 // claimsRequest attaches verified session claims and a JSON body to a bare

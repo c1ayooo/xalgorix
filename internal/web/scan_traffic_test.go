@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/scanctx"
+	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
 )
 
 // trafficTestScan registers a scan and seeds its traffic archive with the

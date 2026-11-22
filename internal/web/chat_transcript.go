@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/platform"
+	"github.com/c1ayooo/xalgorix/v4/internal/platform"
 )
 
 // The chat page treats a run as a conversation (docs/CHAT_PAGE_REDESIGN.md).
@@ -355,7 +355,9 @@ func (s *Server) buildTranscript(ctx context.Context, store platform.Repository,
 // only), and multi-target dispatches add further sessions — so the transcript
 // merges every sibling session's journal, oldest session first. Resolution
 // follows the same path as the scan detail page so a wildcard child or an
-// imported run lands on the same directories.
+// imported run lands on the same directories. With a state backend registered
+// (R6.1) the merge is one durable instance-union read; the per-session files
+// remain the fallback for runs whose rows the import never landed.
 func (s *Server) transcriptEvents(instanceID string, run *platform.Run) []transcriptItem {
 	entries := s.findAllScanSummaries()
 	// Resolve the INSTANCE first so the D11 sibling expansion applies; the
@@ -378,16 +380,42 @@ func (s *Server) transcriptEvents(instanceID string, run *platform.Run) []transc
 	// rows collapse to the first occurrence. The dedup spans sessions so a
 	// turn mirrored across a continuity boundary still renders once.
 	seen := make(map[string]struct{}, 256)
+	if b := currentEventStateBackend(); b != nil && strings.TrimSpace(instanceID) != "" {
+		if s.appendRunStateTranscript(b, instanceID, seen, &out) {
+			return out
+		}
+	}
 	for _, dir := range dirs {
 		s.appendSessionTranscript(dir, seen, &out)
 	}
 	return out
 }
 
+// appendRunStateTranscript folds the run's durable event union (every sibling
+// session, oldest session first) into the transcript timeline. Reports false
+// when the durable journal has nothing for this run yet — the caller then
+// reads the legacy per-session files.
+func (s *Server) appendRunStateTranscript(b EventStateBackend, instanceID string, seen map[string]struct{}, out *[]transcriptItem) bool {
+	ctx, cancel := eventStateCtx()
+	defer cancel()
+	recs, total, err := b.LoadEventsByInstance(ctx, instanceID, 0, transcriptMaxEvents)
+	if err != nil {
+		log.Printf("[chat] durable transcript read for %s failed, trying legacy files: %v", instanceID, err)
+		return false
+	}
+	if total == 0 {
+		return false
+	}
+	for _, r := range recs {
+		foldTranscriptLine(r.Payload, seen, out)
+	}
+	return true
+}
+
 // appendSessionTranscript folds one session directory's events.jsonl into the
 // run transcript timeline.
 func (s *Server) appendSessionTranscript(dir string, seen map[string]struct{}, out *[]transcriptItem) {
-	f, err := os.Open(filepath.Join(dir, "events.jsonl"))
+	f, err := os.Open(filepath.Join(dir, scanEventJournalFile))
 	if err != nil {
 		return
 	}
@@ -401,112 +429,119 @@ func (s *Server) appendSessionTranscript(dir string, seen map[string]struct{}, o
 		if lines > transcriptMaxEvents {
 			break
 		}
-		var ev struct {
-			Type    string          `json:"type"`
-			Content string          `json:"content"`
-			Tool    string          `json:"tool_name"`
-			Args    json.RawMessage `json:"tool_args"`
-			Output  string          `json:"output"`
-			Error   string          `json:"error"`
-			AgentID string          `json:"agent_id"`
-			At      time.Time       `json:"timestamp"`
-			Phase   int             `json:"current_phase"`
-			Vulns   []struct {
-				ID       string `json:"id"`
-				Title    string `json:"title"`
-				Severity string `json:"severity"`
-				Endpoint string `json:"endpoint"`
-				CVSS     any    `json:"cvss"`
-			} `json:"vulns"`
-			Aborted     bool               `json:"aborted"`
-			AbortReason string             `json:"abort_reason"`
-			Approval    *platform.Approval `json:"approval"`
-		}
-		if err := json.Unmarshal(scanner.Bytes(), &ev); err != nil {
-			continue
-		}
-		at := ev.At
-		if at.IsZero() {
-			at = time.Now()
-		}
-		key := fmt.Sprintf("%s|%s|%s|%s|%s", ev.Type, ev.Tool, ev.Content, ev.Output, at.Format(time.RFC3339))
-		if _, dup := seen[key]; dup {
-			continue
-		}
-		seen[key] = struct{}{}
+		foldTranscriptLine(scanner.Bytes(), seen, out)
+	}
+}
 
-		switch ev.Type {
-		case "message":
-			if strings.TrimSpace(ev.Content) == "" || isToolEcho(ev.Content) {
-				continue
+// foldTranscriptLine turns one journal line (file bytes or a durable row's
+// payload) into transcript items. Unknown event types are skipped rather than
+// guessed, so a future emitter cannot silently inject a fake bubble.
+func foldTranscriptLine(line []byte, seen map[string]struct{}, out *[]transcriptItem) {
+	var ev struct {
+		Type    string          `json:"type"`
+		Content string          `json:"content"`
+		Tool    string          `json:"tool_name"`
+		Args    json.RawMessage `json:"tool_args"`
+		Output  string          `json:"output"`
+		Error   string          `json:"error"`
+		AgentID string          `json:"agent_id"`
+		At      time.Time       `json:"timestamp"`
+		Phase   int             `json:"current_phase"`
+		Vulns   []struct {
+			ID       string `json:"id"`
+			Title    string `json:"title"`
+			Severity string `json:"severity"`
+			Endpoint string `json:"endpoint"`
+			CVSS     any    `json:"cvss"`
+		} `json:"vulns"`
+		Aborted     bool               `json:"aborted"`
+		AbortReason string             `json:"abort_reason"`
+		Approval    *platform.Approval `json:"approval"`
+	}
+	if err := json.Unmarshal(line, &ev); err != nil {
+		return
+	}
+	at := ev.At
+	if at.IsZero() {
+		at = time.Now()
+	}
+	key := fmt.Sprintf("%s|%s|%s|%s|%s", ev.Type, ev.Tool, ev.Content, ev.Output, at.Format(time.RFC3339))
+	if _, dup := seen[key]; dup {
+		return
+	}
+	seen[key] = struct{}{}
+
+	switch ev.Type {
+	case "message":
+		if strings.TrimSpace(ev.Content) == "" || isToolEcho(ev.Content) {
+			return
+		}
+		*out = append(*out, transcriptItem{Kind: "assistant", Role: "agent", Text: ev.Content, AgentID: ev.AgentID, At: at})
+	case "chat_question":
+		// Operator side-question (chat_questions.go): renders like a
+		// human turn; no guidance lifecycle status behind it.
+		if strings.TrimSpace(ev.Content) == "" {
+			return
+		}
+		*out = append(*out, transcriptItem{Kind: "human", Role: "human", Text: ev.Content, At: at})
+	case "chat_reply":
+		// The side-question responder's answer (or its honest failure).
+		// Role "chat" lets the UI badge it apart from main-loop agent
+		// narration; a failed call keeps its row so the operator sees
+		// the error instead of silence.
+		item := transcriptItem{Kind: "assistant", Role: "chat", AgentID: ev.AgentID, At: at}
+		if strings.TrimSpace(ev.Error) != "" {
+			// Text stays the raw error; the UI renders the localized
+			// "answer failed" framing from Status.
+			item.Status = "failed"
+			item.Text = ev.Error
+		} else {
+			item.Text = ev.Content
+		}
+		if strings.TrimSpace(item.Text) == "" {
+			return
+		}
+		*out = append(*out, item)
+	case "tool_call":
+		*out = append(*out, transcriptItem{Kind: "tool_use", Tool: ev.Tool, Args: ev.Args, Text: ev.Content, AgentID: ev.AgentID, Phase: ev.Phase, At: at})
+	case "tool_result":
+		text, cut := truncateTranscript(ev.Output)
+		*out = append(*out, transcriptItem{Kind: "tool_result", Tool: ev.Tool, Output: text, Truncated: cut, AgentID: ev.AgentID, Phase: ev.Phase, At: at})
+	case "approval_requested", "approval_decided":
+		if ev.Approval == nil {
+			return
+		}
+		*out = append(*out, transcriptItem{
+			Kind:   "approval",
+			Text:   approvalTranscriptLine(ev.Type, ev.Approval),
+			Status: ev.Approval.Status,
+			At:     at,
+			Approval: &approvalView{
+				Kind:      ev.Approval.Kind,
+				Status:    ev.Approval.Status,
+				DecidedBy: ev.Approval.DecidedBy,
+				Reason:    ev.Approval.Reason,
+				Decided:   ev.Type == "approval_decided",
+			},
+		})
+	case "finished":
+		status := "finished"
+		if ev.Aborted {
+			status = "aborted"
+			if reason := strings.TrimSpace(ev.AbortReason); reason != "" {
+				status += ": " + reason
 			}
-			*out = append(*out, transcriptItem{Kind: "assistant", Role: "agent", Text: ev.Content, AgentID: ev.AgentID, At: at})
-		case "chat_question":
-			// Operator side-question (chat_questions.go): renders like a
-			// human turn; no guidance lifecycle status behind it.
-			if strings.TrimSpace(ev.Content) == "" {
-				continue
+		}
+		*out = append(*out, transcriptItem{Kind: "system", Text: status, At: at})
+		for _, v := range ev.Vulns {
+			line := strings.TrimSpace(v.Title)
+			if v.Severity != "" {
+				line = fmt.Sprintf("[%s] %s", strings.ToUpper(v.Severity), line)
 			}
-			*out = append(*out, transcriptItem{Kind: "human", Role: "human", Text: ev.Content, At: at})
-		case "chat_reply":
-			// The side-question responder's answer (or its honest failure).
-			// Role "chat" lets the UI badge it apart from main-loop agent
-			// narration; a failed call keeps its row so the operator sees
-			// the error instead of silence.
-			item := transcriptItem{Kind: "assistant", Role: "chat", AgentID: ev.AgentID, At: at}
-			if strings.TrimSpace(ev.Error) != "" {
-				// Text stays the raw error; the UI renders the localized
-				// "answer failed" framing from Status.
-				item.Status = "failed"
-				item.Text = ev.Error
-			} else {
-				item.Text = ev.Content
+			if v.Endpoint != "" {
+				line += " @ " + v.Endpoint
 			}
-			if strings.TrimSpace(item.Text) == "" {
-				continue
-			}
-			*out = append(*out, item)
-		case "tool_call":
-			*out = append(*out, transcriptItem{Kind: "tool_use", Tool: ev.Tool, Args: ev.Args, Text: ev.Content, AgentID: ev.AgentID, Phase: ev.Phase, At: at})
-		case "tool_result":
-			text, cut := truncateTranscript(ev.Output)
-			*out = append(*out, transcriptItem{Kind: "tool_result", Tool: ev.Tool, Output: text, Truncated: cut, AgentID: ev.AgentID, Phase: ev.Phase, At: at})
-		case "approval_requested", "approval_decided":
-			if ev.Approval == nil {
-				continue
-			}
-			*out = append(*out, transcriptItem{
-				Kind:   "approval",
-				Text:   approvalTranscriptLine(ev.Type, ev.Approval),
-				Status: ev.Approval.Status,
-				At:     at,
-				Approval: &approvalView{
-					Kind:      ev.Approval.Kind,
-					Status:    ev.Approval.Status,
-					DecidedBy: ev.Approval.DecidedBy,
-					Reason:    ev.Approval.Reason,
-					Decided:   ev.Type == "approval_decided",
-				},
-			})
-		case "finished":
-			status := "finished"
-			if ev.Aborted {
-				status = "aborted"
-				if reason := strings.TrimSpace(ev.AbortReason); reason != "" {
-					status += ": " + reason
-				}
-			}
-			*out = append(*out, transcriptItem{Kind: "system", Text: status, At: at})
-			for _, v := range ev.Vulns {
-				line := strings.TrimSpace(v.Title)
-				if v.Severity != "" {
-					line = fmt.Sprintf("[%s] %s", strings.ToUpper(v.Severity), line)
-				}
-				if v.Endpoint != "" {
-					line += " @ " + v.Endpoint
-				}
-				*out = append(*out, transcriptItem{Kind: "finding", Text: line, Status: v.ID, At: at})
-			}
+			*out = append(*out, transcriptItem{Kind: "finding", Text: line, Status: v.ID, At: at})
 		}
 	}
 }

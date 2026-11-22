@@ -4,7 +4,7 @@ import (
 	"log"
 	"os"
 
-	"github.com/xalgord/xalgorix/v4/internal/tools/reporting"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools/reporting"
 )
 
 func summaryIsReplaced(candidate, incoming VulnSummary) bool {

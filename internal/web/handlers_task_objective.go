@@ -10,7 +10,7 @@ package web
 import (
 	"net/http"
 
-	"github.com/xalgord/xalgorix/v4/internal/platform"
+	"github.com/c1ayooo/xalgorix/v4/internal/platform"
 )
 
 // handleTaskObjective serves GET /api/tasks/{id}/objective.

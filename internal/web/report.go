@@ -18,8 +18,8 @@ import (
 
 	"github.com/go-pdf/fpdf"
 
-	"github.com/xalgord/xalgorix/v4/internal/methodology"
-	"github.com/xalgord/xalgorix/v4/internal/reporting"
+	"github.com/c1ayooo/xalgorix/v4/internal/methodology"
+	"github.com/c1ayooo/xalgorix/v4/internal/reporting"
 )
 
 type reportPalette struct {

@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/attacksurface"
+	"github.com/c1ayooo/xalgorix/v4/internal/attacksurface"
 )
 
 // handleUploadTargets parses a text file with one target per line.
@@ -155,6 +155,43 @@ func (s *Server) handleUploadLogo(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// uploadSegmentPattern guards the project/task path segments derived from the
+// upload query: both are opaque identifiers (UUID or slug), never paths.
+var uploadSegmentPattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+
+// taskScopedUploadRoot resolves the per-task file directory an upload lands in.
+// It validates that the task (when named) belongs to the project, so a caller
+// cannot write into another project's task directory by guessing an id. A
+// project-scoped upload without a task (task creation: the task does not exist
+// yet) lands under _pending and is re-parented by the caller's context_paths.
+func (s *Server) taskScopedUploadRoot(r *http.Request, projectID, taskID string) (string, error) {
+	if !uploadSegmentPattern.MatchString(projectID) {
+		return "", fmt.Errorf("invalid project_id")
+	}
+	store := s.currentPlatformStore()
+	if store == nil {
+		return "", fmt.Errorf("platform store unavailable")
+	}
+	if _, err := store.GetProject(r.Context(), projectID); err != nil {
+		return "", fmt.Errorf("project %s not found", projectID)
+	}
+	base := filepath.Join(s.dataDir, "projects", projectID, "tasks")
+	if taskID == "" {
+		return filepath.Join(base, "_pending", "files"), nil
+	}
+	if !uploadSegmentPattern.MatchString(taskID) {
+		return "", fmt.Errorf("invalid task_id")
+	}
+	task, err := store.GetTask(r.Context(), taskID)
+	if err != nil {
+		return "", fmt.Errorf("task %s not found", taskID)
+	}
+	if task.ProjectID != projectID {
+		return "", fmt.Errorf("task %s does not belong to project %s", taskID, projectID)
+	}
+	return filepath.Join(base, taskID, "files"), nil
+}
+
 // handleUploadContext accepts one or more scan-context artifacts (OpenAPI/
 // Swagger spec, HAR capture, Postman collection + environment, Burp export,
 // Android app, or plain-text notes) and saves them into a per-upload directory
@@ -203,7 +240,21 @@ func (s *Server) handleUploadContext(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Project/task-scoped landing zone (v4.6): when the caller names a project
+	// (and optionally the task it belongs to), artifacts land under
+	// <dataDir>/projects/<projectID>/tasks/<taskID|_pending>/files/<upload>/
+	// so the task's file directory is the single place its context lives. The
+	// legacy flat <dataDir>/context/ layout stays the default for callers that
+	// do not pass project_id (ad-hoc scans, uploads in the new-scan dialog).
 	contextRoot := filepath.Join(s.dataDir, "context")
+	if projectID := strings.TrimSpace(r.URL.Query().Get("project_id")); projectID != "" {
+		root, err := s.taskScopedUploadRoot(r, projectID, strings.TrimSpace(r.URL.Query().Get("task_id")))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		contextRoot = root
+	}
 	if err := os.MkdirAll(contextRoot, 0700); err != nil {
 		log.Printf("[ERROR] Failed to create context directory: %v", err)
 		http.Error(w, "server error", http.StatusInternalServerError)

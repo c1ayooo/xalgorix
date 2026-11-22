@@ -21,7 +21,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/platform"
+	"github.com/c1ayooo/xalgorix/v4/internal/platform"
 )
 
 // importLegacyPlatformRecords is the startup entry point (called from
@@ -151,8 +151,13 @@ func legacyScheduleToTaskInput(sch *ScanSchedule) platform.TaskInput {
 	if !sch.LastRun.IsZero() {
 		contextMap["legacy_last_run"] = sch.LastRun.UTC().Format(time.RFC3339)
 	}
+	goal := strings.TrimSpace(sch.TaskGoal)
+	if goal == "" {
+		goal = strings.TrimSpace(sch.Instruction)
+	}
 	return platform.TaskInput{
 		Name:        name,
+		Goal:        goal,
 		Instruction: sch.Instruction,
 		PhasePolicy: &platform.PhasePolicy{
 			Phases:         append([]int(nil), sch.Phases...),

@@ -24,7 +24,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/xalgord/xalgorix/v4/internal/agent"
+	"github.com/c1ayooo/xalgorix/v4/internal/agent"
 )
 
 // Invocation modules.
@@ -32,6 +32,9 @@ const (
 	InvocationModuleMCP    = "mcp"
 	InvocationModuleSkills = "skills"
 	InvocationModuleAgents = "agents"
+	// InvocationModuleTools is the built-in tool surface (every tool_result
+	// not owned by another module).
+	InvocationModuleTools = "tools"
 )
 
 // Invocation record statuses.
@@ -86,7 +89,7 @@ var (
 	invocationJournals   = map[string]*invocationJournal{}
 )
 
-var invocationModules = []string{InvocationModuleMCP, InvocationModuleSkills, InvocationModuleAgents}
+var invocationModules = []string{InvocationModuleMCP, InvocationModuleSkills, InvocationModuleAgents, InvocationModuleTools}
 
 // initInvocationJournals wires the journal set to the server's data dir.
 func (s *Server) initInvocationJournals() {
@@ -288,6 +291,20 @@ func deriveInvocationRecords(evt agent.Event, sess *scanSession) {
 		agentID, _ := evt.ToolResult.Metadata["agent_id"].(string)
 		rec := base(InvocationModuleAgents, strings.TrimSpace(evt.ToolArgs["name"]))
 		rec.AgentID = agentID
+		if success {
+			rec.Status = InvocationStatusOK
+			rec.Outcome = truncString(output, 300)
+		} else {
+			rec.Status, rec.Error = InvocationStatusError, truncString(errMsg, 300)
+		}
+		recordInvocation(rec)
+
+	// Every other built-in tool completion (terminal_execute, http_request,
+	// browser_action, the verify_* confirmers, …). Skill/MCP/delegation rows
+	// are claimed above; the remaining tool_result stream is the built-in
+	// surface the Tools page lists.
+	case evt.Type == "tool_result" && evt.ToolName != "":
+		rec := base(InvocationModuleTools, evt.ToolName)
 		if success {
 			rec.Status = InvocationStatusOK
 			rec.Outcome = truncString(output, 300)

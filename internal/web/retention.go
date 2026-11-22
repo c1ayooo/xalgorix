@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/safe"
+	"github.com/c1ayooo/xalgorix/v4/internal/safe"
 )
 
 // reservedTopLevelNames are direct children of Data_Dir that hold system
@@ -211,10 +211,15 @@ func (s *Server) pruneExpiredScans(days int) int {
 		removed++
 		log.Printf("[RETENTION] Deleted scan %s (%s), last activity %s",
 			entry.rec.ID, entry.rec.Target, ref.Format(time.RFC3339))
-		// The authoritative scan.json is gone: remove the mount so a purged
-		// historical run cannot remain "pending" forever and block project
-		// deletion. Findings cascade with the run row.
+		// The authoritative record is gone (directory removed, durable rows
+		// dropped — R6.1/R6.2): remove the mount so a purged historical run
+		// cannot remain "pending" forever and block project deletion, the
+		// dispatch tombstone with it (a deleted run never re-dispatches), and
+		// the panel-state rows via deleteScanRecordState's purge. Findings
+		// cascade with the run row.
+		s.deleteScanRecordState(filepath.Base(entry.dir), entry.rec.ID)
 		s.deletePlatformRunsForScan(entry.rec.InstanceID, entry.rec.ID)
+		s.deleteDispatchSnapshotState(entry.rec.InstanceID)
 
 		// Remove child (wildcard subdomain) scan dirs of this parent.
 		for _, child := range entries {
@@ -223,8 +228,9 @@ func (s *Server) pruneExpiredScans(days int) int {
 			}
 			if isChildOfScan(&entry.rec, &child.rec) && s.safeToDeleteScanDir(child.dir) {
 				if err := os.RemoveAll(child.dir); err == nil {
-					// Remove the child's own imported mount by its record ID;
-					// never reuse a shared parent instance ID here.
+					// Remove the child's own durable row and imported mount by
+					// its record ID; never reuse a shared parent instance ID here.
+					s.deleteScanRecordState(filepath.Base(child.dir), child.rec.ID)
 					s.deletePlatformRunsForScan("", child.rec.ID)
 				}
 			}

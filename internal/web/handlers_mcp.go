@@ -30,9 +30,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/platform"
-	"github.com/xalgord/xalgorix/v4/internal/scopeguard"
-	mcptool "github.com/xalgord/xalgorix/v4/internal/tools/mcp"
+	"github.com/c1ayooo/xalgorix/v4/internal/platform"
+	"github.com/c1ayooo/xalgorix/v4/internal/scopeguard"
+	mcptool "github.com/c1ayooo/xalgorix/v4/internal/tools/mcp"
 )
 
 // handleMcpServers serves GET (list) and POST (create) on /api/mcp-servers.

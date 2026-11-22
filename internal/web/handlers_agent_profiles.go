@@ -21,8 +21,8 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/xalgord/xalgorix/v4/internal/agent"
-	"github.com/xalgord/xalgorix/v4/internal/platform"
+	"github.com/c1ayooo/xalgorix/v4/internal/agent"
+	"github.com/c1ayooo/xalgorix/v4/internal/platform"
 )
 
 // builtinProfileRows renders the code-defined specialists as read-only wire

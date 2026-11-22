@@ -25,8 +25,8 @@ import (
 	cryptorand "crypto/rand"
 	"encoding/hex"
 
+	"github.com/c1ayooo/xalgorix/v4/internal/storage"
 	"github.com/golang-jwt/jwt/v5"
-	"github.com/xalgord/xalgorix/v4/internal/storage"
 )
 
 const (

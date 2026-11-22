@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/xalgord/xalgorix/v4/internal/agent"
-	"github.com/xalgord/xalgorix/v4/internal/tools"
+	"github.com/c1ayooo/xalgorix/v4/internal/agent"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools"
 )
 
 // withInvocationTestJournals points the process-wide journal set at a fresh
@@ -74,10 +74,16 @@ func TestInvocationJournalAppendAndRead(t *testing.T) {
 	}, sess)
 	// Root finish must NOT create a delegation record.
 	deriveInvocationRecords(agent.Event{Type: "finished", Content: "done"}, sess)
-	// Non-matching tool names must not record anything.
+	// Built-in tools land in the tools module (not skills/mcp/agents).
 	deriveInvocationRecords(agent.Event{
 		Type:       "tool_result",
-		ToolName:   "terminal",
+		ToolName:   "terminal_execute",
+		ToolArgs:   map[string]string{"command": "nmap -sV target"},
+		ToolResult: tools.Result{Output: "22/tcp open ssh"},
+	}, sess)
+	// An event without a tool name records nothing.
+	deriveInvocationRecords(agent.Event{
+		Type:       "tool_result",
 		ToolResult: tools.Result{Output: "ok"},
 	}, sess)
 
@@ -140,6 +146,15 @@ func TestInvocationJournalAppendAndRead(t *testing.T) {
 	}
 	if agentItems[1].Name != "authz-logic" || agentItems[1].Args == "" {
 		t.Fatalf("spawn record wrong: %+v", agentItems[1])
+	}
+
+	// Tools module: the built-in call above, newest first.
+	toolItems, total, err := listInvocations(InvocationModuleTools, 1, 50, "", "", "")
+	if err != nil || total != 1 || toolItems[0].Name != "terminal_execute" {
+		t.Fatalf("tool records = %d/%v %+v", total, err, toolItems)
+	}
+	if toolItems[0].Status != InvocationStatusOK || toolItems[0].Args == "" {
+		t.Fatalf("tool record shape wrong: %+v", toolItems[0])
 	}
 
 	// Pagination: page 2 of size 1 returns the second-newest record.
@@ -229,6 +244,8 @@ func TestInvocationRoutesRegistered(t *testing.T) {
 		"/api/mcp-servers/invocations",
 		"/api/skills/invocations",
 		"/api/agent-profiles/invocations",
+		"/api/tools",
+		"/api/tools/invocations",
 	}
 	for _, route := range want {
 		count := 0

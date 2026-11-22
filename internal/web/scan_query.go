@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log"
@@ -11,9 +12,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/config"
-	pdfreport "github.com/xalgord/xalgorix/v4/internal/reporting"
-	"github.com/xalgord/xalgorix/v4/internal/tools/reporting"
+	"github.com/c1ayooo/xalgorix/v4/internal/config"
+	"github.com/c1ayooo/xalgorix/v4/internal/platform"
+	pdfreport "github.com/c1ayooo/xalgorix/v4/internal/reporting"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools/reporting"
 )
 
 // vulnToSummary converts a reporting.Vulnerability to a VulnSummary with all fields.
@@ -248,18 +250,92 @@ func walkScanDirs(root string, fn func(scanJSONPath string)) {
 	}
 }
 
-// findAllScans finds all scan.json files under dataDir and fully parses each
-// (event log included). Structure: dataDir/target/date/slug/scan.json.
+// findAllScans finds all scan records: the durable PG runs scan set first
+// (R6.1 — the runs table owns scan state; scan.json stopped being written),
+// then the file walk for un-imported residue. Structure:
+// dataDir/target/date/slug/scan.json for the legacy entries.
 func (s *Server) findAllScans() []scanEntry {
 	var results []scanEntry
+	seen := make(map[string]struct{})
+	for _, row := range s.sweepRunScanRecords() {
+		rec, ok := decodeScanRecordSummary(row.Detail)
+		if !ok {
+			continue // damaged row: skip it, keep the rest of the set
+		}
+		if rec.ID == "" {
+			rec.ID = row.ScanID
+		}
+		if _, dup := seen[row.ScanID]; dup {
+			continue
+		}
+		seen[row.ScanID] = struct{}{}
+		if rec.ID != "" {
+			seen[rec.ID] = struct{}{}
+		}
+		results = append(results, scanEntry{dir: s.scanDirForStateRow(row), rec: *rec})
+	}
 	walkScanDirs(s.dataDir, func(path string) {
-		rec, ok := loadScanRecordFromDir(filepath.Dir(path))
+		dir := filepath.Dir(path)
+		base := filepath.Base(dir)
+		if _, dup := seen[base]; dup {
+			return
+		}
+		rec, ok := loadScanRecordFromDir(dir)
 		if !ok {
 			return
 		}
-		results = append(results, scanEntry{dir: filepath.Dir(path), rec: *rec})
+		if _, dup := seen[rec.ID]; rec.ID != "" && dup {
+			return
+		}
+		if rec.ID != "" {
+			seen[rec.ID] = struct{}{}
+		}
+		results = append(results, scanEntry{dir: dir, rec: *rec})
 	})
 	return results
+}
+
+// sweepRunScanRecords reads the FULL durable scan set from the platform
+// store ("PG runs 扫描集优先"), looping the keyset-cursor pages until
+// exhausted. A store without rows (file-mode tests) or a sweep error yields
+// what was read — the caller's file walk remains the set-level fallback
+// ("未导入残留"), so file-mode behavior is unchanged.
+func (s *Server) sweepRunScanRecords() []platform.RunScanRecord {
+	store := s.currentPlatformStore()
+	if store == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	var out []platform.RunScanRecord
+	cursor := ""
+	for page := 0; page < maxRunScanSweepPages; page++ {
+		rows, next, err := store.ScanRunRecords(ctx, cursor, runScanSweepPage)
+		if err != nil {
+			log.Printf("[scan] durable scan-set sweep failed at cursor %q, keeping %d rows: %v", cursor, len(out), err)
+			return out
+		}
+		out = append(out, rows...)
+		if next == "" || len(rows) == 0 {
+			return out
+		}
+		cursor = next
+	}
+	log.Printf("[scan] durable scan-set sweep hit the page cap (%d pages); partial set served", maxRunScanSweepPages)
+	return out
+}
+
+const (
+	runScanSweepPage     = 500
+	maxRunScanSweepPages = 200
+)
+
+// scanDirForStateRow rehydrates a sweep row's workspace anchor: the stored
+// dataDir-relative path joined against the CURRENT data dir (an absolute
+// stored path passes through). Empty anchors are patched later from the file
+// walk (既有目录约定) by patchScanRecordDirsFromFiles.
+func (s *Server) scanDirForStateRow(row platform.RunScanRecord) string {
+	return scanStateDirAbs(s.dataDir, row.ScanDir)
 }
 
 // scanSummaryCacheEntry is one memoized, events-free scan record plus the file
@@ -371,16 +447,44 @@ func (s *Server) runScanSummaryWalk(w *scanSummaryWalk) {
 	completed = true
 }
 
-// walkScanSummaries walks the data dir (pruning artifact subtrees via
-// walkScanDirs), parses each scan.json without decoding its event log, and
-// memoizes the result per file keyed by (modtime, size). Subsequent walks only
-// stat each scan.json and re-parse the few that changed. Only
-// runScanSummaryWalk calls it, so at most one walk runs at a time.
+// walkScanSummaries builds the full events-free scan set. R6.1 (REDESIGN
+// D12): the durable PG runs scan set (platform sweep, read fresh per walk —
+// updated_at-fresh by construction) comes first; the file walk then supplies
+// only the residue the sweep does not already cover (un-imported directories,
+// "未导入残留"), keeping its per-file (modtime, size) memo so unchanged
+// scan.json files are neither re-read nor re-parsed. PG rows whose stored
+// anchor is unknown take the file walk's directory for the same record id.
+// Only runScanSummaryWalk calls it, so at most one walk runs at a time.
 func (s *Server) walkScanSummaries() []scanEntry {
-	var results []scanEntry
+	results := []scanEntry{}
 
+	// ── durable set (PG runs scan set) ──────────────────────────────────────
+	// Fresh per walk: every committed save before this walk started is seen —
+	// the same freshness contract the unshared file walk had.
+	emptyDirIDs := make(map[string]int) // record id → results index (anchor patch)
+	pgIDs := make(map[string]struct{})
+	for _, row := range s.sweepRunScanRecords() {
+		rec, ok := decodeScanRecordSummary(row.Detail)
+		if !ok {
+			continue // damaged row: skip it, keep the rest of the set
+		}
+		if rec.ID == "" {
+			rec.ID = row.ScanID
+		}
+		if _, dup := pgIDs[row.ScanID]; dup {
+			continue
+		}
+		pgIDs[row.ScanID] = struct{}{}
+		if rec.ID != "" {
+			pgIDs[rec.ID] = struct{}{}
+		}
+		dir := s.scanDirForStateRow(row)
+		emptyDirIDs[rec.ID] = len(results)
+		results = append(results, scanEntry{dir: dir, rec: *rec})
+	}
+
+	// ── file walk (un-imported residue; per-file memo) ─────────────────────
 	s.scanSummaryCacheMu.Lock()
-	defer s.scanSummaryCacheMu.Unlock()
 	if s.scanSummaryCache == nil {
 		s.scanSummaryCache = make(map[string]scanSummaryCacheEntry)
 	}
@@ -392,19 +496,33 @@ func (s *Server) walkScanSummaries() []scanEntry {
 			return
 		}
 		seen[path] = struct{}{}
+		dir := filepath.Dir(path)
+		base := filepath.Base(dir)
+		if _, dup := pgIDs[base]; dup {
+			return // already served durably — the file is residue, not authority
+		}
 		modNano := info.ModTime().UnixNano()
 		size := info.Size()
+		var rec ScanRecord
 		if c, ok := s.scanSummaryCache[path]; ok && c.modNano == modNano && c.size == size {
-			results = append(results, scanEntry{dir: filepath.Dir(path), rec: c.rec})
-			return
+			rec = c.rec
+		} else {
+			recPtr, ok := readScanSummary(path)
+			if !ok {
+				return
+			}
+			rec = *recPtr
+			s.scanSummaryCache[path] = scanSummaryCacheEntry{modNano: modNano, size: size, rec: rec}
 		}
-		recPtr, ok := readScanSummary(path)
-		if !ok {
-			return
+		if rec.ID != "" {
+			if idx, patched := emptyDirIDs[rec.ID]; patched && results[idx].dir == "" {
+				results[idx].dir = dir // 既有目录约定 patches an unknown anchor
+			}
+			if _, dup := pgIDs[rec.ID]; dup {
+				return // already served durably
+			}
 		}
-		rec := *recPtr
-		s.scanSummaryCache[path] = scanSummaryCacheEntry{modNano: modNano, size: size, rec: rec}
-		results = append(results, scanEntry{dir: filepath.Dir(path), rec: rec})
+		results = append(results, scanEntry{dir: dir, rec: rec})
 	})
 
 	// Drop cache entries for files that no longer exist so deleted scans
@@ -416,6 +534,7 @@ func (s *Server) walkScanSummaries() []scanEntry {
 			}
 		}
 	}
+	s.scanSummaryCacheMu.Unlock()
 
 	if s.scanSummaryWalkHook != nil {
 		s.scanSummaryWalkHook()
@@ -545,13 +664,24 @@ func (s *Server) resolveScanRecordByIDFrom(scanID string, summaries func() []sca
 
 // sessionDirsForProjection expands one resolution into the per-session
 // directories a run-scoped JOURNAL projection must cover, oldest session
-// first. Instance-form requests address the run (the task-detail view), and a
-// 1:1 re-dispatch continues the same investigation in a fresh session
-// directory — so the run's history is the union of its sibling sessions, the
-// same discipline 09d06a3e applied to finding projections via lookupAll.
-// Record-id requests stay scoped to that one session.
+// first.
+//
+// R6.2 retirement (REDESIGN D12): with the durable event store registered the
+// panels read PG — the run aggregates by instance id and every legacy file
+// fallback stays scoped to the resolved session's own directory. The sibling
+// directory walk below therefore serves ONLY the nil-backend (test) file
+// mode, where a 1:1 re-dispatch continues the same investigation in a fresh
+// session directory and the run's history is the union of its sibling
+// sessions (the same discipline 09d06a3e applied to finding projections via
+// lookupAll). Record-id requests stay scoped to that one session in both
+// modes.
 func (s *Server) sessionDirsForProjection(res scanResolution, entries []scanEntry) []string {
 	if !res.instanceForm || res.rec == nil || res.rec.InstanceID == "" {
+		return []string{res.dir}
+	}
+	if currentEventStateBackend() != nil {
+		// Durable mode: PG aggregates the run by instance; no directory walk.
+		// The single dir anchors only this session's legacy fallback read.
 		return []string{res.dir}
 	}
 	idx := s.scanSummaryIndexFor(entries)

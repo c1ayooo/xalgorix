@@ -14,8 +14,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/platformutil"
-	"github.com/xalgord/xalgorix/v4/internal/storage"
+	"github.com/c1ayooo/xalgorix/v4/internal/platformutil"
+	"github.com/c1ayooo/xalgorix/v4/internal/storage"
 )
 
 // saveQueueState records best-effort progress updates after acceptance. The
@@ -477,8 +477,9 @@ func (s *Server) scanRequestForPausedInstance(instanceID string, inst *ScanInsta
 
 	defaultReq.ResumeScanDir = scanDir
 	defaultReq.ResumeScanID = filepath.Base(scanDir)
-	// The summary is enough for the target and skips parsing the event log.
-	if rec, ok := readScanSummary(filepath.Join(scanDir, "scan.json")); ok && rec.Target != "" {
+	// The summary is enough for the target and skips parsing the event log
+	// (durable row first — R6.1 —, legacy file fallback).
+	if rec, ok := scanRecordMetaForDir(scanDir); ok && rec.Target != "" {
 		defaultReq.ResumeActiveTarget = rec.Target
 	} else if len(defaultReq.Targets) > 0 {
 		defaultReq.ResumeActiveTarget = defaultReq.Targets[0]

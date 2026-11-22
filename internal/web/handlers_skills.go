@@ -21,7 +21,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/xalgord/xalgorix/v4/internal/platform"
+	"github.com/c1ayooo/xalgorix/v4/internal/platform"
 )
 
 // handleSkills serves GET (list) and POST (create) on /api/skills.

@@ -5,8 +5,8 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/c1ayooo/xalgorix/v4/internal/tools/reporting"
 	"github.com/weppos/publicsuffix-go/publicsuffix"
-	"github.com/xalgord/xalgorix/v4/internal/tools/reporting"
 )
 
 // wildcardTarget is the normalized view of one user-supplied wildcard-scan

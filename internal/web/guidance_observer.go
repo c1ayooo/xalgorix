@@ -42,9 +42,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/domainjournal"
-	"github.com/xalgord/xalgorix/v4/internal/platform"
-	"github.com/xalgord/xalgorix/v4/internal/scanctx"
+	"github.com/c1ayooo/xalgorix/v4/internal/domainjournal"
+	"github.com/c1ayooo/xalgorix/v4/internal/platform"
+	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
 )
 
 // guidanceMarkerPrefixFmt is the stable marker carrier for path A. gi:<id> is
@@ -55,6 +55,11 @@ const guidanceMarkerPrefixFmt = "[OPERATOR GUIDANCE gi:%s]: "
 // guidanceConsumedTimeout bounds each store flip from the watcher goroutine so
 // a slow store cannot pin a watcher indefinitely.
 const guidanceConsumedTimeout = 3 * time.Second
+
+// guidanceJournalReadTimeout bounds each durable-record read from the watcher
+// goroutine (the PG primary store's stream once the R6.1 backend is
+// registered, the legacy file otherwise).
+const guidanceJournalReadTimeout = 5 * time.Second
 
 // guidanceWatchCapacity is the per-watcher notification buffer. Overflow falls
 // back to a detached goroutine, so notifications are never dropped — there is
@@ -274,7 +279,13 @@ func (w *guidanceWatcher) processLocked(seq uint64) string {
 		w.markStoppedLocked()
 		return "scan context no longer active"
 	}
-	records, _, err := domainjournal.ReadRecords(w.journalPath)
+	// R6.1: resolve the durable records through the journal read seam — the
+	// PG primary store's stream once the backend is registered, the legacy
+	// file otherwise. A read failure leaves the watermark untouched so the
+	// next notification retries the same range.
+	readCtx, cancel := context.WithTimeout(context.Background(), guidanceJournalReadTimeout)
+	records, _, err := domainjournal.ReadRecordsResolved(readCtx, w.journalPath, w.scanCtxID)
+	cancel()
 	if err != nil {
 		log.Printf("[platform] guidance watcher %s: read journal: %v", w.journalPath, err)
 		return ""

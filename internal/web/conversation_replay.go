@@ -23,7 +23,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/xalgord/xalgorix/v4/internal/scanctx"
+	"github.com/c1ayooo/xalgorix/v4/internal/runstate"
+	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
 )
 
 // replayBudgetChars bounds the transcript (~24K tokens at ~4 chars/token).
@@ -34,52 +35,73 @@ const replayBudgetChars = 96_000
 const replayMaxEvents = 400
 
 // conversationReplayTranscript renders the previous session's last events as
-// a chronological transcript (from the session's own scan dir). Empty when
-// the journal is absent or unusable (the caller then falls back to the L3
-// resume briefing alone).
+// a chronological transcript. R6.2 (REDESIGN D12 ⑤): the run's durable
+// event history is the source — the instance union when the replaying
+// context knows its run identity, that scan's own rows otherwise — and the
+// legacy events.jsonl file of the dir remains the pre-import fallback.
+// Empty when neither source has usable rows (the caller then falls back to
+// the L3 resume briefing alone).
 func conversationReplayTranscript(sctx *scanctx.ScanContext) string {
 	if sctx == nil {
 		return ""
 	}
-	return conversationReplayTranscriptFromDir(sctx.ScanDir)
+	// The ScanContext carries no run identity; this variant replays the
+	// session's own durable rows (the scan_session caller passes the run id).
+	return conversationReplayTranscriptFromDir(sctx.ScanDir, "")
 }
 
 // conversationReplayTranscriptFromDir is the dir-parameterized variant: a
-// 1:1 re-dispatch replays the PREVIOUS scan dir's journal even though the
-// new session writes a fresh one.
-func conversationReplayTranscriptFromDir(dir string) string {
+// 1:1 re-dispatch replays the PREVIOUS scan dir's history even though the
+// new session writes a fresh one. instanceID (when non-empty) widens the
+// durable read to the run's whole sibling history — the D12 full-history
+// replay — while dir anchors the legacy file fallback.
+func conversationReplayTranscriptFromDir(dir string, instanceID string) string {
 	if strings.TrimSpace(dir) == "" {
 		return ""
 	}
-	data, err := os.ReadFile(filepath.Join(dir, scanEventJournalFile))
-	if err != nil || len(data) == 0 {
-		return ""
-	}
-	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-	if len(lines) > replayMaxEvents {
-		lines = lines[len(lines)-replayMaxEvents:]
-	}
 	total := 0
 	var kept []string
-	for i := len(lines) - 1; i >= 0; i-- {
-		line := strings.TrimSpace(lines[i])
-		if line == "" {
-			continue
-		}
-		var ev WSEvent
-		if json.Unmarshal([]byte(line), &ev) != nil {
-			continue
-		}
+	fold := func(ev WSEvent) bool {
 		text := renderReplayEvent(&ev)
 		if text == "" {
-			continue
+			return true
 		}
 		if total+len(text) > replayBudgetChars {
-			break
+			return false
 		}
 		total += len(text)
-		// Scanning newest-first and prepending keeps chronological order.
+		// Walking newest-first and prepending keeps chronological order.
 		kept = append([]string{text}, kept...)
+		return true
+	}
+	if events := replayEventsFromState(dir, instanceID); len(events) > 0 {
+		for i := len(events) - 1; i >= 0; i-- {
+			if !fold(events[i]) {
+				break
+			}
+		}
+	} else {
+		data, err := os.ReadFile(filepath.Join(dir, scanEventJournalFile))
+		if err != nil || len(data) == 0 {
+			return ""
+		}
+		lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+		if len(lines) > replayMaxEvents {
+			lines = lines[len(lines)-replayMaxEvents:]
+		}
+		for i := len(lines) - 1; i >= 0; i-- {
+			line := strings.TrimSpace(lines[i])
+			if line == "" {
+				continue
+			}
+			var ev WSEvent
+			if json.Unmarshal([]byte(line), &ev) != nil {
+				continue
+			}
+			if !fold(ev) {
+				break
+			}
+		}
 	}
 	if len(kept) == 0 {
 		return ""
@@ -91,6 +113,53 @@ func conversationReplayTranscriptFromDir(dir string) string {
 		sb.WriteString("\n")
 	}
 	return sb.String()
+}
+
+// replayEventsFromState resolves the replay's durable source rows, oldest
+// first: the run's whole sibling history when the run identity is known
+// (REDESIGN D12 ⑤ — the re-dispatch replays the run's full history, budget
+// unchanged), that scan's own rows otherwise. nil = no durable rows (the
+// caller keeps the legacy file walk; pre-import directories only).
+func replayEventsFromState(dir, instanceID string) []WSEvent {
+	b := currentEventStateBackend()
+	if b == nil {
+		return nil
+	}
+	ctx, cancel := eventStateCtx()
+	defer cancel()
+	tail := func(recs []runstate.EventRecord, totalCount int64, err error) []WSEvent {
+		if err != nil || totalCount == 0 {
+			return nil
+		}
+		return decodeEventRecords(recs)
+	}
+	scanID := scanStateIDForDir(dir)
+	if strings.TrimSpace(instanceID) != "" {
+		_, total, err := b.LoadEventsByInstance(ctx, instanceID, 0, 1)
+		if err != nil || total > 0 {
+			off := 0
+			if total > int64(replayMaxEvents) {
+				off = int(total) - replayMaxEvents
+			}
+			recs, _, rerr := b.LoadEventsByInstance(ctx, instanceID, off, replayMaxEvents)
+			if evs := tail(recs, total, rerr); evs != nil {
+				return evs
+			}
+			if err == nil {
+				return nil // durable union exists but is empty — no rows
+			}
+		}
+	}
+	_, total, err := b.LoadEventsByScan(ctx, scanID, 0, 1)
+	if err != nil || total == 0 {
+		return nil
+	}
+	off := 0
+	if total > int64(replayMaxEvents) {
+		off = int(total) - replayMaxEvents
+	}
+	recs, _, rerr := b.LoadEventsByScan(ctx, scanID, off, replayMaxEvents)
+	return tail(recs, total, rerr)
 }
 
 // renderReplayEvent formats one journal event as a transcript line; "" for

@@ -13,10 +13,10 @@ import (
 	"log"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/agent"
-	"github.com/xalgord/xalgorix/v4/internal/scopeguard"
-	mcptool "github.com/xalgord/xalgorix/v4/internal/tools/mcp"
-	skillstool "github.com/xalgord/xalgorix/v4/internal/tools/skills"
+	"github.com/c1ayooo/xalgorix/v4/internal/agent"
+	"github.com/c1ayooo/xalgorix/v4/internal/scopeguard"
+	mcptool "github.com/c1ayooo/xalgorix/v4/internal/tools/mcp"
+	skillstool "github.com/c1ayooo/xalgorix/v4/internal/tools/skills"
 )
 
 // integrationInputTimeout bounds each platform-store read on the scan-launch

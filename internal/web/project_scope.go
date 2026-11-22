@@ -28,10 +28,11 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"log"
 	"net/http"
 	"strings"
 
-	"github.com/xalgord/xalgorix/v4/internal/platform"
+	"github.com/c1ayooo/xalgorix/v4/internal/platform"
 )
 
 // projectScopeView is the GET/PUT response: the stored boundary, the problems
@@ -116,6 +117,11 @@ func (s *Server) putProjectScope(w http.ResponseWriter, r *http.Request, store p
 	if err != nil {
 		writePlatformError(w, err)
 		return
+	}
+	// Scope observer baseline (v4.6): materialise preset rules for the new
+	// scope hosts so the operator sees what the observer will auto-deny.
+	if n := s.seedScopeApprovalRules(r.Context(), store, project.ID); n > 0 {
+		log.Printf("[scope-observer] seeded %d baseline rule(s) after scope update of %s", n, project.ID)
 	}
 	view := s.buildProjectScopeView(r.Context(), store, project, scopeProblems(project.Scope), "")
 	if view.Fence.Enforce && view.ActiveRuns > 0 {

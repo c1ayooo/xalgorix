@@ -24,9 +24,16 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/xalgord/xalgorix/v4/internal/platform"
-	"github.com/xalgord/xalgorix/v4/internal/tools/intelligence"
+	"github.com/c1ayooo/xalgorix/v4/internal/platform"
+	"github.com/c1ayooo/xalgorix/v4/internal/runstate"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools/intelligence"
 )
+
+// Compile-time pin (R6.2): the runstate store is the durable intelligence
+// backend, so the task-intelligence aggregation reads the run_state_files
+// row through intelligence.LoadSnapshot once cmd/xalgorix registers it (the
+// R6.1 write-wiring residual; this read path is backend-complete here).
+var _ intelligence.Backend = (*runstate.Store)(nil)
 
 // taskIntelItem is one aggregated intel observation plus its projection
 // fields. Item fields are embedded verbatim (fingerprint/kind/title/content/

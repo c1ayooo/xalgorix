@@ -41,9 +41,9 @@ import (
 	"path"
 	"strings"
 
-	"github.com/xalgord/xalgorix/v4/internal/auth"
-	"github.com/xalgord/xalgorix/v4/internal/config"
-	"github.com/xalgord/xalgorix/v4/internal/llm"
+	"github.com/c1ayooo/xalgorix/v4/internal/auth"
+	"github.com/c1ayooo/xalgorix/v4/internal/config"
+	"github.com/c1ayooo/xalgorix/v4/internal/llm"
 )
 
 // errAPIBaseNeedsKey is returned when a scan request moves LLM traffic to a

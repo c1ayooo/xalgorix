@@ -208,6 +208,11 @@ func (s *Server) executeScanSession(sess *scanSession) {
 	// snapshot carries it, and a re-dispatched session's first ledger load
 	// inherits the previous sibling session's chain (charter v3.0 §6.3).
 	sctx.Ledger.SetInstanceID(sess.instanceID)
+	// 同一批 D11 连续性盖章覆盖 notes/coverage/intelligence 三族（R6.1 三快
+	// 照片）：后端模式下快照带 instance，续跑首读继承上一会话的文档。
+	sctx.Notes.SetInstanceID(sess.instanceID)
+	sctx.Coverage.SetInstanceID(sess.instanceID)
+	intelligence.SetInstanceIDForContext(sctx.ID, sess.instanceID)
 	// Link the platform run to the scan-data identity. Runs are mounted at
 	// dispatch time, before this directory exists, so without this write
 	// ProjectScanIDs never learns the id the domain journal and the InfoItem
@@ -492,7 +497,9 @@ func (s *Server) executeScanSession(sess *scanSession) {
 		if replayDir == "" {
 			replayDir = sctx.ScanDir
 		}
-		if transcript := conversationReplayTranscriptFromDir(replayDir); transcript != "" {
+		// R6.2 (REDESIGN D12 ⑤): the replay reads the run's whole durable
+		// sibling history (instance id), the session's legacy file otherwise.
+		if transcript := conversationReplayTranscriptFromDir(replayDir, sess.instanceID); transcript != "" {
 			agnt.SetConversationReplay(transcript)
 		}
 		// 1:1 re-open (REDESIGN D11): a finished record under an explicit
