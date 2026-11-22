@@ -251,6 +251,11 @@ func (s *Server) handleInfoRegion(w http.ResponseWriter, r *http.Request) {
 		writeJSONStatus(w, http.StatusOK, infoRegionResponse{Available: true})
 		return
 	}
+	cursor, err := infoitem.ParseRegionCursor(r.URL.Query().Get("cursor"))
+	if err != nil {
+		writeJSONStatus(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
 	q := infoitem.RegionQuery{
 		ScanIDs:        scanIDs,
 		SubjectKind:    strings.TrimSpace(r.URL.Query().Get("subject_kind")),
@@ -259,6 +264,7 @@ func (s *Server) handleInfoRegion(w http.ResponseWriter, r *http.Request) {
 		Nature:         infoitem.Nature(strings.TrimSpace(r.URL.Query().Get("nature"))),
 		ObservedAfter:  after,
 		ObservedBefore: before,
+		Cursor:         cursor,
 		Limit:          limit,
 	}
 	res, err := reader.Region(r.Context(), q)
@@ -271,6 +277,12 @@ func (s *Server) handleInfoRegion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	res.Items = nonNilItems(res.Items)
+	// HasMore is the keyset-paging form of Truncated: a Reader that only fills
+	// Truncated (in-memory/bounded test adapters) must still tell the caller a
+	// next page exists. The PG store additionally fills NextCursor.
+	if res.Truncated && !res.HasMore {
+		res.HasMore = true
+	}
 	writeJSONStatus(w, http.StatusOK, infoRegionResponse{Available: true, RegionResult: res})
 }
 

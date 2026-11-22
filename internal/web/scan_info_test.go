@@ -101,6 +101,55 @@ func TestInfoRegionUsesProjectScanScopeAndPassesGap(t *testing.T) {
 	}
 }
 
+// The region cursor is a keyset position, not a time filter: it must reach the
+// reader parsed, and has_more/next_cursor must pass through to the dashboard.
+func TestInfoRegionCursorPassthroughAndPagingFields(t *testing.T) {
+	s, projectA, _ := infoTestServer(t)
+	reader := &fakeInfoReader{regionRes: infoitem.RegionResult{
+		Items:      []infoitem.Item{{ID: "i1", ScanID: "inst-a"}},
+		Truncated:  true,
+		HasMore:    true,
+		NextCursor: "2026-11-22T10:00:00Z|i1",
+	}}
+	s.SetInfoReader(reader)
+	rr := infoRequest(t, s, "/api/info/region?project_id="+projectA.ID+
+		"&cursor=2026-11-22T10:00:00Z%7Cii-9&limit=10")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if reader.regionQ.Cursor == nil || reader.regionQ.Cursor.ID != "ii-9" {
+		t.Fatalf("cursor passed to reader = %+v", reader.regionQ.Cursor)
+	}
+	if got := reader.regionQ.Cursor.ObservedAt.UTC().Format("2006-01-02T15:04:05Z"); got != "2026-11-22T10:00:00Z" {
+		t.Fatalf("cursor observed_at = %s", got)
+	}
+	var body struct {
+		HasMore    bool   `json:"has_more"`
+		NextCursor string `json:"next_cursor"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if !body.HasMore || body.NextCursor != "2026-11-22T10:00:00Z|i1" {
+		t.Fatalf("paging fields = %+v", body)
+	}
+}
+
+// A malformed cursor is a client error (400) and must never reach the reader,
+// otherwise a typo would look like a cold-path outage.
+func TestInfoRegionInvalidCursorIsBadRequest(t *testing.T) {
+	s, projectA, _ := infoTestServer(t)
+	reader := &fakeInfoReader{}
+	s.SetInfoReader(reader)
+	rr := infoRequest(t, s, "/api/info/region?project_id="+projectA.ID+"&cursor=not-a-cursor")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("invalid cursor = %d body=%s", rr.Code, rr.Body.String())
+	}
+	if reader.regionQ.Limit != 0 || reader.regionQ.Cursor != nil {
+		t.Fatalf("reader called for invalid cursor: %+v", reader.regionQ)
+	}
+}
+
 func TestInfoContextRejectsCrossProjectScan(t *testing.T) {
 	s, projectA, _ := infoTestServer(t)
 	reader := &fakeInfoReader{}

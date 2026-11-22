@@ -309,6 +309,15 @@ func (s *Store) Region(ctx context.Context, q infoitem.RegionQuery) (infoitem.Re
 	if q.ObservedBefore != nil {
 		add("observed_at <= $%d", *q.ObservedBefore)
 	}
+	// Keyset paging must mirror ORDER BY observed_at DESC, id ASC exactly:
+	// resume strictly after the cursor in that ordering, so rows sharing the
+	// same observed_at cannot be skipped across pages.
+	if q.Cursor != nil {
+		args = append(args, q.Cursor.ObservedAt, q.Cursor.ID)
+		at, id := len(args)-1, len(args)
+		conditions = append(conditions, fmt.Sprintf(
+			"(observed_at < $%d OR (observed_at = $%d AND id > $%d))", at, at, id))
+	}
 	args = append(args, q.Limit+1)
 	query := fmt.Sprintf(`
 		SELECT id, scan_id, source_seq, nature, content, coordinates, source, subject, purpose,
@@ -331,12 +340,24 @@ func (s *Store) Region(ctx context.Context, q infoitem.RegionQuery) (infoitem.Re
 	if err != nil {
 		return infoitem.RegionResult{}, err
 	}
-	return infoitem.RegionResult{
+	res := infoitem.RegionResult{
 		Items:      items.items,
 		Truncated:  items.truncated,
+		HasMore:    items.truncated,
 		Incomplete: incomplete,
 		GapReason:  reason,
-	}, nil
+	}
+	// The cursor is the last row actually returned, not the extra probe row:
+	// keyset conditions are strict, so resuming from it can neither repeat nor
+	// skip a row.
+	if res.HasMore && len(res.Items) > 0 {
+		last := res.Items[len(res.Items)-1]
+		res.NextCursor = infoitem.RegionCursor{
+			ObservedAt: last.Coordinates.ObservedAt,
+			ID:         last.ID,
+		}.String()
+	}
+	return res, nil
 }
 
 // Associate implements bounded relation-edge activation.
@@ -356,11 +377,12 @@ func (s *Store) Associate(ctx context.Context, q infoitem.AssociationQuery) (inf
 		edgeTypes[i] = string(typ)
 	}
 	rows, err := s.pool.Query(ctx, `
-		WITH RECURSIVE walk(start_id, node_id, depth, path, visited) AS (
-			SELECT t.id, t.id, 0, ARRAY[t.id]::text[], ARRAY[t.id]::text[]
+		WITH RECURSIVE walk(start_id, node_id, depth, path, visited, rels) AS (
+			SELECT t.id, t.id, 0, ARRAY[t.id]::text[], ARRAY[t.id]::text[], ARRAY[]::text[]
 			FROM unnest($2::text[]) AS t(id)
 			UNION ALL
-			SELECT w.start_id, nxt.id, w.depth + 1, w.path || nxt.id, w.visited || nxt.id
+			SELECT w.start_id, nxt.id, w.depth + 1, w.path || nxt.id, w.visited || nxt.id,
+			       w.rels || e.type::text
 			FROM walk w
 			JOIN info_item_edges e
 			  ON e.scan_id = $1 AND (e.from_id = w.node_id OR e.to_id = w.node_id)
@@ -374,7 +396,7 @@ func (s *Store) Associate(ctx context.Context, q infoitem.AssociationQuery) (inf
 			  AND (cardinality($4::text[]) = 0 OR e.type = ANY($4::text[]))
 			  AND (ni.nature = 'observed' OR (jsonb_typeof(ni.supports) = 'array' AND jsonb_array_length(ni.supports) > 0))
 		)
-		SELECT DISTINCT ON (node_id) node_id, path, depth
+		SELECT DISTINCT ON (node_id) node_id, path, depth, rels
 		FROM walk
 		WHERE depth > 0
 		ORDER BY node_id, depth, path
@@ -387,11 +409,12 @@ func (s *Store) Associate(ctx context.Context, q infoitem.AssociationQuery) (inf
 		id    string
 		path  []string
 		depth int
+		rels  []string
 	}
 	var paths []hitPath
 	for rows.Next() {
 		var h hitPath
-		if err := rows.Scan(&h.id, &h.path, &h.depth); err != nil {
+		if err := rows.Scan(&h.id, &h.path, &h.depth, &h.rels); err != nil {
 			rows.Close()
 			return infoitem.AssociationResult{}, err
 		}
@@ -417,7 +440,12 @@ func (s *Store) Associate(ctx context.Context, q infoitem.AssociationQuery) (inf
 	hits := make([]infoitem.AssociationHit, 0, len(paths))
 	for _, p := range paths {
 		if item, ok := items[p.id]; ok {
-			hits = append(hits, infoitem.AssociationHit{Item: item, Path: p.path, Depth: p.depth})
+			hits = append(hits, infoitem.AssociationHit{
+				Item:  item,
+				Path:  p.path,
+				Rels:  relationTypes(p.rels),
+				Depth: p.depth,
+			})
 		}
 	}
 	sort.SliceStable(hits, func(i, j int) bool {
@@ -519,6 +547,20 @@ func (s *Store) itemsByIDs(ctx context.Context, scanID string, ids []string) (ma
 type scannedItems struct {
 	items     []infoitem.Item
 	truncated bool
+}
+
+// relationTypes converts the CTE's text[] hop types into the typed vocabulary.
+// Empty input stays nil so the additive JSON field disappears and older
+// consumers keep the exact previous shape.
+func relationTypes(raw []string) []infoitem.RelationType {
+	if len(raw) == 0 {
+		return nil
+	}
+	out := make([]infoitem.RelationType, len(raw))
+	for i, value := range raw {
+		out[i] = infoitem.RelationType(value)
+	}
+	return out
 }
 
 func scanItems(rows pgx.Rows, limit int) (scannedItems, error) {

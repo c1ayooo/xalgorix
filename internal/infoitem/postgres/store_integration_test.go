@@ -264,3 +264,87 @@ func TestStoreRegionAllScansSpansScans(t *testing.T) {
 		t.Fatalf("scoped region leaked items: %+v", scoped.Items)
 	}
 }
+
+// Keyset paging must page through rows that share observed_at without skipping
+// or repeating them (the ordering is observed_at DESC, id ASC), and association
+// hits must carry the real per-hop relation type.
+func TestStoreRegionKeysetPagingAndAssociationRels(t *testing.T) {
+	pool := integrationPool(t)
+	ctx := context.Background()
+	scanID := fmt.Sprintf("keyset-%d", time.Now().UnixNano())
+	store := New(pool)
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM info_item_edges WHERE scan_id=$1`, scanID)
+		_, _ = pool.Exec(context.Background(), `DELETE FROM info_items WHERE scan_id=$1`, scanID)
+		_, _ = pool.Exec(context.Background(), `DELETE FROM info_audit_records WHERE scan_id=$1`, scanID)
+		_, _ = pool.Exec(context.Background(), `DELETE FROM info_sync_watermarks WHERE scan_id=$1`, scanID)
+	})
+
+	// All three items share one observed_at on purpose: the tie-break is id ASC.
+	observedAt := time.Date(2026, 11, 22, 12, 0, 0, 0, time.UTC)
+	ids := []string{"k-1", "k-2", "k-3"}
+	for i, id := range ids {
+		item := testInfoItem(scanID, id, uint64(i+1), infoitem.NatureObserved, nil)
+		item.Coordinates.ObservedAt = observedAt
+		rec := domainjournal.Record{
+			ScanID: scanID, Seq: uint64(i + 1), At: observedAt,
+			Actor:     domainjournal.Actor{Kind: domainjournal.ActorEngine, Source: "keyset-test"},
+			Operation: domainjournal.OpInfoItemProjected, InfoItem: &item,
+		}
+		if i == 1 {
+			// k-2 --supports--> k-1 supplies the hop type assertion below.
+			rec.Relations = []infoitem.Relation{{
+				ScanID: scanID, SourceSeq: uint64(i + 1), FromID: "k-2", ToID: "k-1",
+				Type: infoitem.RelationSupports, Weight: 0.9, CreatedAt: observedAt,
+			}}
+		}
+		if err := store.Apply(ctx, rec); err != nil {
+			t.Fatalf("apply %s: %v", id, err)
+		}
+	}
+
+	page1, err := store.Region(ctx, infoitem.RegionQuery{ScanIDs: []string{scanID}, Limit: 2})
+	if err != nil {
+		t.Fatalf("page1: %v", err)
+	}
+	if len(page1.Items) != 2 || page1.Items[0].ID != "k-1" || page1.Items[1].ID != "k-2" {
+		t.Fatalf("page1 items = %+v", page1.Items)
+	}
+	if !page1.HasMore || !page1.Truncated || page1.NextCursor == "" {
+		t.Fatalf("page1 paging = %+v", page1)
+	}
+
+	cursor, err := infoitem.ParseRegionCursor(page1.NextCursor)
+	if err != nil {
+		t.Fatalf("parse next_cursor: %v", err)
+	}
+	page2, err := store.Region(ctx, infoitem.RegionQuery{
+		ScanIDs: []string{scanID}, Limit: 2, Cursor: cursor,
+	})
+	if err != nil {
+		t.Fatalf("page2: %v", err)
+	}
+	if len(page2.Items) != 1 || page2.Items[0].ID != "k-3" {
+		t.Fatalf("page2 items = %+v", page2.Items)
+	}
+	if page2.HasMore || page2.NextCursor != "" {
+		t.Fatalf("page2 must be the last page: %+v", page2)
+	}
+
+	assoc, err := store.Associate(ctx, infoitem.AssociationQuery{
+		ScanID: scanID, StartIDs: []string{"k-1"}, MaxDepth: 2, Limit: 10,
+	})
+	if err != nil {
+		t.Fatalf("associate: %v", err)
+	}
+	if len(assoc.Hits) != 1 || assoc.Hits[0].Item.ID != "k-2" {
+		t.Fatalf("association hits = %+v", assoc.Hits)
+	}
+	hit := assoc.Hits[0]
+	if len(hit.Rels) != len(hit.Path)-1 {
+		t.Fatalf("rels/path mismatch: path=%v rels=%v", hit.Path, hit.Rels)
+	}
+	if len(hit.Rels) != 1 || hit.Rels[0] != infoitem.RelationSupports {
+		t.Fatalf("hop type = %v, want [supports]", hit.Rels)
+	}
+}

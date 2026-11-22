@@ -256,17 +256,20 @@ interface Guidance {
 项目级 InfoItem 激活入口。`project_id` 必填；`context`/`association` 的 `scan_id` 必须属于该项目。项目过滤通过 platform runs 的 `instance_id`/`legacy_scan_id` 并集实现，**不向 info_items 增加 project_id**。
 
 ```text
-GET /api/info/region?project_id=&subject_kind=&subject=&purpose=&nature=&after=&before=&limit=
-→ { available: true, items: InfoItem[], truncated, incomplete, gap_reason? }
+GET /api/info/region?project_id=&subject_kind=&subject=&purpose=&nature=&after=&before=&limit=&cursor=
+→ { available: true, items: InfoItem[], truncated, has_more, next_cursor?, incomplete, gap_reason? }
 
 GET /api/info/context?project_id=&scan_id=&subject=&subject_kind=&since=&until=&limit=
 → { available: true, items: InfoItem[], truncated, incomplete, gap_reason? }
 
 GET /api/info/association?project_id=&scan_id=&ids=id1,id2&edge_types=supports,...&max_depth=1..3&limit=
-→ { available: true, hits: [{ item: InfoItem, path: string[], depth: number }], truncated, incomplete, gap_reason? }
+→ { available: true, hits: [{ item: InfoItem, path: string[], rels: string[], depth: number }], truncated, incomplete, gap_reason? }
 ```
 
 - `limit` 默认 50、上限 200；关联深度 1..3；`truncated`/`incomplete`/`gap_reason` 必须原样透传。
+- **`hits[].rels`（2026-11-22 增补）**：长度恒为 `len(path)-1`，第 `i` 项是 `path[i] → path[i+1]` 这条边的真实关系类型（`supports|contradicts|references|same_session|same_subject`）。遍历方向不影响类型语义。字段为加性可选：缺失时前端只能中性描边，**不得**用 `item.supports` 反推制造假边。
+- **Region 游标分页（2026-11-22 增补）**：`after`/`before` 是 `observed_at` 的严格时间边界（语义不变，不可当分页用——同一时刻并列行会跨页丢失/重复）。分页用 keyset：`next_cursor` 形如 `<observed_at RFC3339Nano>|<id>`，把上一页的 `next_cursor` 作为 `cursor` 传回即取下一页；排序固定 `observed_at DESC, id ASC`，游标条件为 `observed_at < cursor_at OR (observed_at = cursor_at AND id > cursor_id)`。`has_more` 表示还有下一页；非法 `cursor` 返回 **400**（不是 503）。`RegionResult` 不提供全量总数，前端不得用估算值冒充。
+- **`context` 维持单 Run 语义（2026-11-22 明示）**：`scan_id` 必填且须属该项目，返回该 Run 内固定维度的混合信息视图；跨 Run 语境不是本端点能力，前端不得呈现为跨 Run 切片。
 - 无 PostgreSQL 冷路径时返回 **503**：`{ available: false, reason: "cold_path_disabled", error }`，不得用空数组冒充“无数据”。
 - 有冷路径但读取失败时 `503` + `reason: "cold_path_unavailable"`。
 - InfoItem 形状沿用 `internal/infoitem.Item`：`id/scan_id/source_seq/nature/coordinates/supports/confidence/coordinate_status/...`。

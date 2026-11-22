@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -29,7 +30,43 @@ type RegionQuery struct {
 	ContextEquals  map[string]string `json:"context_equals,omitempty"`
 	ObservedAfter  *time.Time        `json:"observed_after,omitempty"`
 	ObservedBefore *time.Time        `json:"observed_before,omitempty"`
-	Limit          int               `json:"limit,omitempty"`
+	// Cursor is the keyset position for paging. It is NOT a replacement for
+	// ObservedAfter/ObservedBefore: those are strict time boundaries, while the
+	// cursor resumes after the last row of the previous page in the fixed
+	// (observed_at DESC, id ASC) ordering, so ties cannot be skipped.
+	Cursor *RegionCursor `json:"cursor,omitempty"`
+	Limit  int           `json:"limit,omitempty"`
+}
+
+// RegionCursor is one keyset position in the region ordering
+// (observed_at DESC, id ASC). The wire form is `<observed_at RFC3339Nano>|<id>`.
+type RegionCursor struct {
+	ObservedAt time.Time
+	ID         string
+}
+
+// ParseRegionCursor parses the wire form. An empty string means "no cursor"
+// (first page) and is not an error.
+func ParseRegionCursor(raw string) (*RegionCursor, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	at, id, ok := strings.Cut(raw, "|")
+	id = strings.TrimSpace(id)
+	if !ok || id == "" {
+		return nil, errors.New("infoitem: cursor must be <observed_at RFC3339Nano>|<id>")
+	}
+	t, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(at))
+	if err != nil {
+		return nil, fmt.Errorf("infoitem: cursor observed_at must be RFC3339Nano: %w", err)
+	}
+	return &RegionCursor{ObservedAt: t.UTC(), ID: id}, nil
+}
+
+// String renders the wire form used by RegionResult.NextCursor.
+func (c RegionCursor) String() string {
+	return c.ObservedAt.UTC().Format(time.RFC3339Nano) + "|" + c.ID
 }
 
 // Normalize applies bounded defaults without changing the filter meaning.
@@ -57,6 +94,9 @@ func (q RegionQuery) Validate() error {
 	if q.Nature != "" && !q.Nature.Valid() {
 		return fmt.Errorf("infoitem: invalid nature %q", q.Nature)
 	}
+	if q.Cursor != nil && (q.Cursor.ID == "" || q.Cursor.ObservedAt.IsZero()) {
+		return errors.New("infoitem: region cursor requires both observed_at and id")
+	}
 	if q.Limit < 0 || q.Limit > MaxQueryLimit {
 		return fmt.Errorf("infoitem: limit must be within [1,%d]", MaxQueryLimit)
 	}
@@ -65,8 +105,15 @@ func (q RegionQuery) Validate() error {
 
 // RegionResult carries provenance about truncation and cold-path gaps.
 type RegionResult struct {
-	Items      []Item `json:"items"`
-	Truncated  bool   `json:"truncated"`
+	Items     []Item `json:"items"`
+	Truncated bool   `json:"truncated"`
+	// HasMore reports that the query budget cut the result set: a next page
+	// exists. It is the keyset-paging form of Truncated.
+	HasMore bool `json:"has_more"`
+	// NextCursor is the position to pass back as RegionQuery.Cursor. Only set
+	// when HasMore is true. There is deliberately no total count: callers must
+	// not present an estimate as a full result size.
+	NextCursor string `json:"next_cursor,omitempty"`
 	Incomplete bool   `json:"incomplete"`
 	GapReason  string `json:"gap_reason,omitempty"`
 }
@@ -118,9 +165,14 @@ func (q AssociationQuery) Validate() error {
 // AssociationHit describes one reached item and the path that reached it.
 // Path includes the start ID and the final item ID.
 type AssociationHit struct {
-	Item  Item     `json:"item"`
-	Path  []string `json:"path"`
-	Depth int      `json:"depth"`
+	Item Item     `json:"item"`
+	Path []string `json:"path"`
+	// Rels carries the real relation type of each hop:
+	// len(Rels) == len(Path)-1, and Rels[i] is the type of Path[i]→Path[i+1].
+	// Traversal direction does not change the type. Consumers must fall back to
+	// a neutral stroke when it is empty, never infer types from item.supports.
+	Rels  []RelationType `json:"rels,omitempty"`
+	Depth int            `json:"depth"`
 }
 
 type AssociationResult struct {
