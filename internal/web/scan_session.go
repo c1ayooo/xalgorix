@@ -775,6 +775,41 @@ func (r *ScanRecord) markPhaseWorked(phase int) {
 	r.PhasesWorked = append(r.PhasesWorked, phase)
 }
 
+// mirrorInstancePhaseStatus copies the scan record's authoritative per-phase
+// dispositions onto the live instance so /api/instances serves disposition
+// summaries (overview phase narration) without fetching each scan record.
+// Coordinator sessions only — child sessions (ParentTarget set) never own the
+// coordinator's instance view, the same ownership rule mirrorScanIntegrity
+// applies. Both maps are cloned: markPhaseWorked appends into
+// rec.PhasesWorked in place, and instance readers must never observe a
+// backing array that later grows under them.
+func (s *Server) mirrorInstancePhaseStatus(instanceID string, rec *ScanRecord) {
+	if instanceID == "" || rec == nil || rec.ParentTarget != "" || rec.PhaseStatus == nil {
+		return
+	}
+	s.instancesMu.RLock()
+	inst := s.instances[instanceID]
+	s.instancesMu.RUnlock()
+	if inst == nil {
+		return
+	}
+	inst.mu.Lock()
+	inst.PhaseStatus = clonePhaseStatus(rec.PhaseStatus)
+	inst.PhasesWorked = append([]int(nil), rec.PhasesWorked...)
+	inst.mu.Unlock()
+}
+
+func clonePhaseStatus(m map[string]string) map[string]string {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
 func (s *Server) processEvent(evt agent.Event, sess *scanSession) {
 	// Redact provider-internal control tokens from every event surface before
 	// the event is broadcast or persisted. A model occasionally leaks its
@@ -821,6 +856,7 @@ func (s *Server) processEvent(evt agent.Event, sess *scanSession) {
 			if dispositions := sess.agent.PhaseDispositions(); len(dispositions) > 0 {
 				sess.record.PhaseStatus = agent.PhaseStatusMap(dispositions)
 				sess.record.PhaseReasons = agent.PhaseReasonMap(dispositions)
+				s.mirrorInstancePhaseStatus(sess.instanceID, sess.record)
 			}
 		}
 
@@ -1432,6 +1468,7 @@ func (s *Server) capturePlanDisposition(sess *scanSession) {
 	if dispositions := sess.agent.PhaseDispositions(); len(dispositions) > 0 {
 		sess.record.PhaseStatus = agent.PhaseStatusMap(dispositions)
 		sess.record.PhaseReasons = agent.PhaseReasonMap(dispositions)
+		s.mirrorInstancePhaseStatus(sess.instanceID, sess.record)
 	}
 	// The objective evaluation is captured on the same terminal paths as
 	// the plan disposition, so a finished run and an interrupted run both

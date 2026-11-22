@@ -51,6 +51,68 @@ export function phaseStatusLabel(status: PhaseStatus, t: (k: string) => string):
   return t(`phase.status.${status}`);
 }
 
+// A run-shaped snapshot the disposition helpers consume: the same fields
+// phaseVisual reads, taken from either a scan record or a live instance.
+export type PhaseRunView = {
+  status?: string;
+  current?: number;
+  phaseStatus?: Record<string, string>;
+  worked?: number[];
+};
+
+// activePhaseNames returns the formatted names of the phases currently
+// active across the given runs — the union view multi-run dashboards render
+// instead of a single "current phase" (`current_phase` is UI narration only
+// and phases 20/22 are cross-cutting states, so several phases can be
+// active at once while verification overlaps exploration). Deterministic:
+// ordered by phase id.
+export function activePhaseNames(runs: PhaseRunView[]): string[] {
+  const active = new Set<number>();
+  for (const run of runs) {
+    const isRunning = (run.status || "").toLowerCase() === "running";
+    for (const p of PHASES) {
+      if (active.has(p.id)) continue;
+      const { status } = phaseVisual(p.id, {
+        current: run.current,
+        isRunning,
+        phaseStatus: run.phaseStatus,
+        worked: run.worked,
+      });
+      if (status === "active") active.add(p.id);
+    }
+  }
+  return PHASES.filter((p) => active.has(p.id)).map((p) => `${p.id}. ${p.name}`);
+}
+
+// phaseCountSummary tallies per-phase dispositions across the given runs
+// (summed per run — a single running run is the common case) and renders
+// the non-zero counts in fixed order with the localized status labels.
+// Every run contributes all 22 phases, so the result is never empty for a
+// non-empty run list.
+export function phaseCountSummary(
+  runs: PhaseRunView[],
+  t: (k: string) => string,
+): string {
+  const tally = new Map<PhaseStatus, number>();
+  for (const run of runs) {
+    const isRunning = (run.status || "").toLowerCase() === "running";
+    for (const p of PHASES) {
+      const { status } = phaseVisual(p.id, {
+        current: run.current,
+        isRunning,
+        phaseStatus: run.phaseStatus,
+        worked: run.worked,
+      });
+      tally.set(status, (tally.get(status) ?? 0) + 1);
+    }
+  }
+  return (["completed", "blocked", "not_applicable", "pending", "not_selected"] as PhaseStatus[])
+    .map((status) => ({ status, n: tally.get(status) ?? 0 }))
+    .filter((c) => c.n > 0)
+    .map((c) => `${phaseStatusLabel(c.status, t)} ${c.n}`)
+    .join(" · ");
+}
+
 type PhaseVisual = {
   className: string;
   status: PhaseStatus;

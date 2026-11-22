@@ -37,8 +37,8 @@ import {
   useInstances,
   useQueueStatus,
   useScansList,
-  useStatus,
 } from "@/api/queries";
+import { activePhaseNames, phaseCountSummary } from "@/components/phase-progress";
 import { useActiveProjectId } from "@/lib/use-active-project";
 import {
   normalizeSeverity,
@@ -49,7 +49,6 @@ import {
 
 export default function OverviewPage() {
   const { t } = useI18n();
-  const { data: status } = useStatus();
   const projectId = useActiveProjectId();
   const { data: instances, isLoading: instancesLoading, error: instancesError } =
     useInstances(projectId ?? undefined);
@@ -58,6 +57,18 @@ export default function OverviewPage() {
   const events = useEventsStore((s) => s.events);
   const allInstances = instances?.instances ?? [];
   const runningInstances = allInstances.filter((i) => i.status === "running");
+  // Authoritative per-phase dispositions across the project's running runs.
+  // Replaces the global singular "current phase" narration: `current_phase`
+  // is UI narration only, arbitrary with parallel runs, and phases 20/22 are
+  // cross-cutting states — the union of active phases is what the operator
+  // actually needs ("what is being worked right now").
+  const runningRuns = runningInstances.map((i) => ({
+    status: i.status,
+    current: i.current_phase,
+    phaseStatus: i.phase_status,
+    worked: i.phases_worked,
+  }));
+  const activePhases = activePhaseNames(runningRuns);
   const activeInstance = runningInstances[0];
   const activeEventInstanceIds = useMemo(
     () =>
@@ -235,10 +246,10 @@ export default function OverviewPage() {
         />
         <MetricCard
           label={t("overview.metric.phase")}
-          value={status?.current_phase ?? "—"}
+          value={activePhases.length > 0 ? activePhases.length : "—"}
           hint={
-            status?.current_phase
-              ? `${t("overview.metric.phaseHint")}${status.current_phase}`
+            runningInstances.length > 0
+              ? phaseCountSummary(runningRuns, t)
               : t("overview.metric.idle")
           }
           icon={<Layers className="h-3.5 w-3.5" />}
@@ -485,8 +496,8 @@ export default function OverviewPage() {
               />
               <Row
                 icon={<Layers className="h-3.5 w-3.5" />}
-                label={t("overview.ops.currentPhase")}
-                value={status?.current_phase ? `${t("overview.ops.phaseWord")}${status.current_phase}` : t("overview.metric.idle")}
+                label={t("overview.ops.activePhases")}
+                value={activePhases.length > 0 ? activePhases.join(" · ") : "—"}
               />
               <Row
                 icon={<ShieldAlert className="h-3.5 w-3.5" />}

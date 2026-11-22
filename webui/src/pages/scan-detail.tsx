@@ -52,6 +52,9 @@ import {
   PHASES,
   phaseVisual,
   phaseStatusLabel,
+  activePhaseNames,
+  phaseCountSummary,
+  type PhaseRunView,
 } from "@/components/phase-progress";
 import { CopyButton } from "@/components/copy-button";
 import { TokenUsageTab } from "@/components/token-usage";
@@ -413,11 +416,12 @@ export default function ScanDetailPage() {
           <CardHeader>
             <CardTitle className="text-sm">{t("scanDetail.phaseProgress")}</CardTitle>
             <CardDescription>
-              {t("scanDetail.methodologyBefore")} {PHASES.length}{" "}
-              {t("scanDetail.methodologyAfter")}{" "}
-              <span className="text-foreground">
-                {currentPhaseLabel(scan.current_phase, t("overview.ops.phaseWord"))}
-              </span>
+              <PhaseCardSummary
+                status={scan.status}
+                current={scan.current_phase}
+                phaseStatus={scan.phase_status}
+                worked={scan.phases_worked}
+              />
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-3">
@@ -620,10 +624,42 @@ export default function ScanDetailPage() {
   );
 }
 
-function currentPhaseLabel(p?: number, phaseWord = "Phase "): string {
-  if (!p) return "—";
-  const found = PHASES.find((x) => x.id === p);
-  return found ? `${p}. ${found.name}` : `${phaseWord}${p}`;
+// PhaseCardSummary renders the phase card narration from the authoritative
+// per-phase dispositions (`phase_status`, derived from engine evidence in
+// internal/agent/phase_disposition.go). `current_phase` is UI narration only
+// and phases 20/22 are cross-cutting states, so a single "current: phase N"
+// line would misrepresent the scan — active phases are named (several can be
+// active at once while verification overlaps exploration) and the rest tally
+// as disposition counts. The shared helpers fall back to phaseVisual's legacy
+// derivation, keeping records without phase_status consistent with the tiles
+// rendered from the same call.
+function PhaseCardSummary({
+  status,
+  current,
+  phaseStatus,
+  worked,
+}: {
+  status?: string;
+  current?: number;
+  phaseStatus?: Record<string, string>;
+  worked?: number[];
+}) {
+  const { t } = useI18n();
+  const runs: PhaseRunView[] = [{ status, current, phaseStatus, worked }];
+  const active = activePhaseNames(runs);
+  const counts = phaseCountSummary(runs, t);
+  return (
+    <>
+      {active.length > 0 && (
+        <span className="text-foreground">
+          {t("scanDetail.activePrefix")}
+          {active.join(" · ")}
+        </span>
+      )}
+      {active.length > 0 && counts ? " · " : ""}
+      {counts}
+    </>
+  );
 }
 
 function SubdomainProgress({

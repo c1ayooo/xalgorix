@@ -791,6 +791,12 @@ type ScanInstance struct {
 	ScanContext         string        `json:"-"`
 	Vulns               []VulnSummary `json:"vulns,omitempty"`
 	CurrentPhase        int           `json:"current_phase,omitempty"`
+	// PhaseStatus/PhasesWorked mirror the scan record's authoritative
+	// per-phase dispositions (agent.ComputePhaseDispositions) onto the live
+	// instance so the instances list can serve disposition summaries without
+	// fetching each scan record. `current_phase` stays UI narration only.
+	PhaseStatus  map[string]string `json:"phase_status,omitempty"`
+	PhasesWorked []int             `json:"phases_worked,omitempty"`
 	// Wildcard progress is mirrored from the persisted parent record so the
 	// exact instance endpoint can serve a complete snapshot without a data-dir
 	// walk. SubScans intentionally omits `omitempty`: an empty array is the
@@ -2855,6 +2861,8 @@ func (s *Server) handleInstances(w http.ResponseWriter, r *http.Request) {
 			CompanyName:         inst.CompanyName,
 			LogoPath:            inst.LogoPath,
 			CurrentPhase:        inst.CurrentPhase,
+			PhaseStatus:         clonePhaseStatus(inst.PhaseStatus),
+			PhasesWorked:        append([]int(nil), inst.PhasesWorked...),
 			SubScans:            nonNilSubScans(cloneSubScanSummaries(inst.SubScans)),
 			SubScanTotal:        inst.SubScanTotal,
 			SubScanCompleted:    inst.SubScanCompleted,
