@@ -11,6 +11,7 @@ import {
 import {
   ExternalLink,
   Filter,
+  FolderKanban,
   MoreHorizontal,
   RefreshCw,
   Search,
@@ -51,7 +52,7 @@ import {
   useDeleteVuln,
   useFindingsList,
   useFindingsSummary,
-  useScansList,
+  useProjects,
 } from "@/api/queries";
 import { useActiveProjectId } from "@/lib/use-active-project";
 import type { FindingsSummaryResponse } from "@/types/api";
@@ -75,16 +76,20 @@ interface SeverityCounts {
 export default function FindingsPage() {
   const { t } = useI18n();
   const qc = useQueryClient();
-  const { data: scans } = useScansList();
   const del = useDeleteVuln();
   const [pendingDelete, setPendingDelete] = useState<string[] | null>(null);
-  // Scan ids are kept only for the "across N scans" header label and as the
-  // refresh-target count. The findings themselves no longer fan out one
-  // getScan() request per scan; they come from a single server-side walk.
-  const ids = useMemo(() => (scans ?? []).map((s) => s.id), [scans]);
+  const { data: projectsData } = useProjects();
+  const projects = projectsData?.projects ?? [];
 
-  const projectId = useActiveProjectId();
-  const findingsQuery = useFindingsList(projectId ?? undefined);
+  // Page-local scope on top of the global active project (UI_DESIGN §6 keeps
+  // useActiveProjectId as the single scope source): null follows the global
+  // switcher, an explicit choice ("all" or a project id) pins this page until
+  // changed — "all" is the one place cross-project findings are legible.
+  const activeProjectId = useActiveProjectId();
+  const [scopeChoice, setScopeChoice] = useState<string | null>(null);
+  const scope = scopeChoice ?? activeProjectId ?? "all";
+  const scopeProjectId = scope === "all" ? undefined : scope;
+  const findingsQuery = useFindingsList(scopeProjectId);
   const isLoading = findingsQuery.isLoading;
 
   const findings = useMemo<FlatFinding[]>(
@@ -98,8 +103,8 @@ export default function FindingsPage() {
   // and used both for the totals row and for the "updated Xs ago"
   // indicator (sourced from the response's `as_of` field). The shared
   // qk.findingsSummary key means /overview reads the same cache entry.
-  // 项目作用域汇总（契约 §3.2）；useFindingsSummary 内含 10s 轮询与占位数据。
-  const summary = useFindingsSummary(projectId ?? undefined);
+  // 汇总跟随页面作用域（契约 §3.2）；useFindingsSummary 内含 10s 轮询与占位数据。
+  const summary = useFindingsSummary(scopeProjectId);
 
   const [query, setQuery] = useState("");
   const [severity, setSeverity] = useState<string>("all");
@@ -229,10 +234,6 @@ export default function FindingsPage() {
       <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">{t("findings.title")}</h1>
-          <p className="mt-1 text-sm text-muted-foreground">
-            Vulnerabilities across {ids.length} scan{ids.length === 1 ? "" : "s"}, ranked by
-            severity.
-          </p>
         </div>
         <div className="flex flex-col items-stretch gap-2 sm:items-end">
           <div className="grid grid-cols-5 gap-1.5 sm:flex sm:gap-2">
@@ -293,6 +294,20 @@ export default function FindingsPage() {
               className="pl-8"
             />
           </div>
+          <Select value={scope} onValueChange={setScopeChoice}>
+            <SelectTrigger className="w-full sm:w-44" aria-label={t("findings.scope")}>
+              <FolderKanban className="h-3.5 w-3.5" />
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">{t("findings.allProjects")}</SelectItem>
+              {projects.map((p) => (
+                <SelectItem key={p.id} value={p.id}>
+                  {p.name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
           <Select value={severity} onValueChange={setSeverity}>
             <SelectTrigger className="w-full sm:w-44">
               <Filter className="h-3.5 w-3.5" />

@@ -146,6 +146,14 @@ export default function SettingsPage() {
     telegramBotToken: "",
     telegramChatId: "",
     telegramMinSeverity: "",
+    dingtalkWebhook: "",
+    dingtalkSecret: "",
+    dingtalkMinSeverity: "",
+    feishuWebhook: "",
+    feishuSecret: "",
+    feishuMinSeverity: "",
+    wecomWebhook: "",
+    wecomMinSeverity: "",
     notifyScanComplete: false,
   });
   const [envValues, setEnvValues] = useState<Record<string, string>>({});
@@ -200,8 +208,31 @@ export default function SettingsPage() {
     const telegramBotToken = envValue(environment.data, "XALGORIX_TELEGRAM_BOT_TOKEN");
     const telegramChatId = envValue(environment.data, "XALGORIX_TELEGRAM_CHAT_ID");
     const telegramMinSeverity = envValue(environment.data, "XALGORIX_TELEGRAM_MIN_SEVERITY");
+    const dingtalkWebhook = envValue(environment.data, "XALGORIX_DINGTALK_WEBHOOK");
+    const dingtalkSecret = envValue(environment.data, "XALGORIX_DINGTALK_SECRET");
+    const dingtalkMinSeverity = envValue(environment.data, "XALGORIX_DINGTALK_MIN_SEVERITY");
+    const feishuWebhook = envValue(environment.data, "XALGORIX_FEISHU_WEBHOOK");
+    const feishuSecret = envValue(environment.data, "XALGORIX_FEISHU_SECRET");
+    const feishuMinSeverity = envValue(environment.data, "XALGORIX_FEISHU_MIN_SEVERITY");
+    const wecomWebhook = envValue(environment.data, "XALGORIX_WECOM_WEBHOOK");
+    const wecomMinSeverity = envValue(environment.data, "XALGORIX_WECOM_MIN_SEVERITY");
     const notifyScanComplete = envValue(environment.data, "XALGORIX_NOTIFY_SCAN_COMPLETE") === "true";
-    setNotificationForm({ webhook, minSeverity, telegramBotToken, telegramChatId, telegramMinSeverity, notifyScanComplete });
+    setNotificationForm({
+      webhook,
+      minSeverity,
+      telegramBotToken,
+      telegramChatId,
+      telegramMinSeverity,
+      dingtalkWebhook,
+      dingtalkSecret,
+      dingtalkMinSeverity,
+      feishuWebhook,
+      feishuSecret,
+      feishuMinSeverity,
+      wecomWebhook,
+      wecomMinSeverity,
+      notifyScanComplete,
+    });
   }, [environment.data]);
 
   useEffect(() => {
@@ -1065,7 +1096,7 @@ export default function SettingsPage() {
               }
             />
           ) : (
-            <>
+            <div className="space-y-4">
             <Card>
               <CardHeader>
                 <CardTitle>{t("settings.card.discord")}</CardTitle>
@@ -1093,54 +1124,12 @@ export default function SettingsPage() {
                       {t("settings.notifications.keepMaskedWebhook")}
                     </p>
                   </div>
-                  <div className="space-y-2">
-                    <Label>{t("settings.notifications.minSeverity")}</Label>
-                    <Select
-                      value={notificationForm.minSeverity || "__unset__"}
-                      onValueChange={(value) =>
-                        setNotificationForm({
-                          ...notificationForm,
-                          minSeverity: value === "__unset__" ? "" : value,
-                        })
-                      }
-                    >
-                      <SelectTrigger>
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="__unset__">{t("settings.notifications.defaultOption")}</SelectItem>
-                        {["info", "low", "medium", "high", "critical"].map((value) => (
-                          <SelectItem key={value} value={value}>
-                            {value}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                  </div>
-                </div>
-                <Separator />
-                <div className="flex items-center justify-end gap-3">
-                  {savedNotifications && (
-                    <span className="text-xs text-success">{t("settings.savedIndicator")}</span>
-                  )}
-                  <Button
-                    onClick={async () => {
-                      setSavedNotifications(false);
-                      await updateEnvironment.mutateAsync({
-                        XALGORIX_DISCORD_WEBHOOK: notificationForm.webhook,
-                        XALGORIX_DISCORD_MIN_SEVERITY: notificationForm.minSeverity,
-                        XALGORIX_TELEGRAM_BOT_TOKEN: notificationForm.telegramBotToken,
-                        XALGORIX_TELEGRAM_CHAT_ID: notificationForm.telegramChatId,
-                        XALGORIX_TELEGRAM_MIN_SEVERITY: notificationForm.telegramMinSeverity,
-                        XALGORIX_NOTIFY_SCAN_COMPLETE: notificationForm.notifyScanComplete ? "true" : "false",
-                      });
-                      setSavedNotifications(true);
-                      setTimeout(() => setSavedNotifications(false), 2500);
-                    }}
-                    disabled={updateEnvironment.isPending}
-                  >
-                    {updateEnvironment.isPending ? t("settings.saving") : t("settings.notifications.save")}
-                  </Button>
+                  <ChannelMinSeveritySelect
+                    value={notificationForm.minSeverity}
+                    onChange={(value) =>
+                      setNotificationForm({ ...notificationForm, minSeverity: value })
+                    }
+                  />
                 </div>
               </CardContent>
             </Card>
@@ -1186,32 +1175,167 @@ export default function SettingsPage() {
                       className="font-mono"
                     />
                   </div>
+                  <ChannelMinSeveritySelect
+                    value={notificationForm.telegramMinSeverity}
+                    onChange={(value) =>
+                      setNotificationForm({ ...notificationForm, telegramMinSeverity: value })
+                    }
+                  />
+                </div>
+              </CardContent>
+            </Card>
+            <Card>
+              <CardHeader>
+                <CardTitle>{t("settings.card.dingtalk")}</CardTitle>
+                <CardDescription>
+                  {t("settings.notifications.dingtalkDesc")}
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-5">
+                <div className="grid gap-3 lg:grid-cols-[1fr_1fr_220px]">
                   <div className="space-y-2">
-                    <Label>{t("settings.notifications.minSeverity")}</Label>
-                    <Select
-                      value={notificationForm.telegramMinSeverity || "__unset__"}
-                      onValueChange={(value) =>
+                    <Label htmlFor="dingtalk-webhook">{t("settings.notifications.imWebhook")}</Label>
+                    <Input
+                      id="dingtalk-webhook"
+                      value={notificationForm.dingtalkWebhook}
+                      onChange={(e) =>
                         setNotificationForm({
                           ...notificationForm,
-                          telegramMinSeverity: value === "__unset__" ? "" : value,
+                          dingtalkWebhook: e.target.value,
                         })
                       }
-                    >
-                      <SelectTrigger>
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="__unset__">{t("settings.notifications.defaultOption")}</SelectItem>
-                        {["info", "low", "medium", "high", "critical"].map((value) => (
-                          <SelectItem key={value} value={value}>
-                            {value}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
+                      placeholder="https://oapi.dingtalk.com/robot/send?access_token=..."
+                      className="font-mono"
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      {t("settings.notifications.keepMaskedWebhook")}
+                    </p>
                   </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="dingtalk-secret">{t("settings.notifications.signSecret")}</Label>
+                    <Input
+                      id="dingtalk-secret"
+                      value={notificationForm.dingtalkSecret}
+                      onChange={(e) =>
+                        setNotificationForm({
+                          ...notificationForm,
+                          dingtalkSecret: e.target.value,
+                        })
+                      }
+                      placeholder="SEC..."
+                      className="font-mono"
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      {t("settings.notifications.keepMaskedSecret")}
+                    </p>
+                  </div>
+                  <ChannelMinSeveritySelect
+                    value={notificationForm.dingtalkMinSeverity}
+                    onChange={(value) =>
+                      setNotificationForm({ ...notificationForm, dingtalkMinSeverity: value })
+                    }
+                  />
                 </div>
-                <Separator />
+              </CardContent>
+            </Card>
+            <Card>
+              <CardHeader>
+                <CardTitle>{t("settings.card.feishu")}</CardTitle>
+                <CardDescription>
+                  {t("settings.notifications.feishuDesc")}
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-5">
+                <div className="grid gap-3 lg:grid-cols-[1fr_1fr_220px]">
+                  <div className="space-y-2">
+                    <Label htmlFor="feishu-webhook">{t("settings.notifications.imWebhook")}</Label>
+                    <Input
+                      id="feishu-webhook"
+                      value={notificationForm.feishuWebhook}
+                      onChange={(e) =>
+                        setNotificationForm({
+                          ...notificationForm,
+                          feishuWebhook: e.target.value,
+                        })
+                      }
+                      placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/..."
+                      className="font-mono"
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      {t("settings.notifications.keepMaskedWebhook")}
+                    </p>
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="feishu-secret">{t("settings.notifications.signSecret")}</Label>
+                    <Input
+                      id="feishu-secret"
+                      value={notificationForm.feishuSecret}
+                      onChange={(e) =>
+                        setNotificationForm({
+                          ...notificationForm,
+                          feishuSecret: e.target.value,
+                        })
+                      }
+                      placeholder="..."
+                      className="font-mono"
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      {t("settings.notifications.keepMaskedSecret")}
+                    </p>
+                  </div>
+                  <ChannelMinSeveritySelect
+                    value={notificationForm.feishuMinSeverity}
+                    onChange={(value) =>
+                      setNotificationForm({ ...notificationForm, feishuMinSeverity: value })
+                    }
+                  />
+                </div>
+              </CardContent>
+            </Card>
+            <Card>
+              <CardHeader>
+                <CardTitle>{t("settings.card.wecom")}</CardTitle>
+                <CardDescription>
+                  {t("settings.notifications.wecomDesc")}
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-5">
+                <div className="grid gap-3 lg:grid-cols-[1fr_220px]">
+                  <div className="space-y-2">
+                    <Label htmlFor="wecom-webhook">{t("settings.notifications.imWebhook")}</Label>
+                    <Input
+                      id="wecom-webhook"
+                      value={notificationForm.wecomWebhook}
+                      onChange={(e) =>
+                        setNotificationForm({
+                          ...notificationForm,
+                          wecomWebhook: e.target.value,
+                        })
+                      }
+                      placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=..."
+                      className="font-mono"
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      {t("settings.notifications.keepMaskedWebhook")}
+                    </p>
+                  </div>
+                  <ChannelMinSeveritySelect
+                    value={notificationForm.wecomMinSeverity}
+                    onChange={(value) =>
+                      setNotificationForm({ ...notificationForm, wecomMinSeverity: value })
+                    }
+                  />
+                </div>
+              </CardContent>
+            </Card>
+            <Card>
+              <CardHeader>
+                <CardTitle>{t("settings.card.behavior")}</CardTitle>
+                <CardDescription>
+                  {t("settings.notifications.behaviorDesc")}
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-5">
                 <div className="flex items-center justify-between gap-4">
                   <div className="space-y-1">
                     <Label htmlFor="notify-scan-complete">{t("settings.notifications.notifyComplete")}</Label>
@@ -1233,9 +1357,41 @@ export default function SettingsPage() {
                 <p className="text-xs text-muted-foreground">
                   {t("settings.notifications.independentHint")}
                 </p>
+                <Separator />
+                <div className="flex items-center justify-end gap-3">
+                  {savedNotifications && (
+                    <span className="text-xs text-success">{t("settings.savedIndicator")}</span>
+                  )}
+                  <Button
+                    onClick={async () => {
+                      setSavedNotifications(false);
+                      await updateEnvironment.mutateAsync({
+                        XALGORIX_DISCORD_WEBHOOK: notificationForm.webhook,
+                        XALGORIX_DISCORD_MIN_SEVERITY: notificationForm.minSeverity,
+                        XALGORIX_TELEGRAM_BOT_TOKEN: notificationForm.telegramBotToken,
+                        XALGORIX_TELEGRAM_CHAT_ID: notificationForm.telegramChatId,
+                        XALGORIX_TELEGRAM_MIN_SEVERITY: notificationForm.telegramMinSeverity,
+                        XALGORIX_DINGTALK_WEBHOOK: notificationForm.dingtalkWebhook,
+                        XALGORIX_DINGTALK_SECRET: notificationForm.dingtalkSecret,
+                        XALGORIX_DINGTALK_MIN_SEVERITY: notificationForm.dingtalkMinSeverity,
+                        XALGORIX_FEISHU_WEBHOOK: notificationForm.feishuWebhook,
+                        XALGORIX_FEISHU_SECRET: notificationForm.feishuSecret,
+                        XALGORIX_FEISHU_MIN_SEVERITY: notificationForm.feishuMinSeverity,
+                        XALGORIX_WECOM_WEBHOOK: notificationForm.wecomWebhook,
+                        XALGORIX_WECOM_MIN_SEVERITY: notificationForm.wecomMinSeverity,
+                        XALGORIX_NOTIFY_SCAN_COMPLETE: notificationForm.notifyScanComplete ? "true" : "false",
+                      });
+                      setSavedNotifications(true);
+                      setTimeout(() => setSavedNotifications(false), 2500);
+                    }}
+                    disabled={updateEnvironment.isPending}
+                  >
+                    {updateEnvironment.isPending ? t("settings.saving") : t("settings.notifications.save")}
+                  </Button>
+                </div>
               </CardContent>
             </Card>
-            </>
+            </div>
           )}
         </TabsContent>
 
@@ -1340,6 +1496,41 @@ export default function SettingsPage() {
             (components/account-menu.tsx) — this tab was removed to keep the
             settings surface free of duplicated state. */}
       </Tabs>
+    </div>
+  );
+}
+
+// ChannelMinSeveritySelect is the shared per-channel minimum-severity control
+// for the Notifications tab. Every channel card (Discord / Telegram / DingTalk
+// / Feishu / WeCom) renders the same control, so the label, the "__unset__"
+// sentinel and the option list live here once.
+function ChannelMinSeveritySelect({
+  value,
+  onChange,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+}) {
+  const { t } = useI18n();
+  return (
+    <div className="space-y-2">
+      <Label>{t("settings.notifications.minSeverity")}</Label>
+      <Select
+        value={value || "__unset__"}
+        onValueChange={(next) => onChange(next === "__unset__" ? "" : next)}
+      >
+        <SelectTrigger>
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="__unset__">{t("settings.notifications.defaultOption")}</SelectItem>
+          {["info", "low", "medium", "high", "critical"].map((severity) => (
+            <SelectItem key={severity} value={severity}>
+              {severity}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
     </div>
   );
 }

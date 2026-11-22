@@ -668,6 +668,8 @@ func (s *Server) runRegisteredMultiScan(run *multiScanRun, scanCfg *config.Confi
 	if s.telegramConfigured() {
 		s.sendTelegram(0x00ff88, "🚀 Scan Started", fmt.Sprintf("**Targets:** %s\n**Mode:** %s\n**Total:** %d target(s)", strings.Join(req.Targets, ", "), req.ScanMode, totalTargets))
 	}
+	// Domestic IM: scan started
+	s.sendDomesticIM("", 0x00ff88, "🚀 Scan Started", fmt.Sprintf("**Targets:** %s\n**Mode:** %s\n**Total:** %d target(s)", strings.Join(req.Targets, ", "), req.ScanMode, totalTargets))
 
 	interruptedQueue := false
 	for i, target := range req.Targets {
@@ -761,11 +763,13 @@ func (s *Server) sendScanCompletionSummary(discordWebhook string, totalTargets, 
 		if s.telegramConfigured() {
 			s.sendTelegram(0x3b82f6, "✅ Scan Finished - Vulnerabilities Found", desc)
 		}
+		s.sendDomesticIM("", 0x3b82f6, "✅ Scan Finished - Vulnerabilities Found", desc)
 	} else {
 		s.sendDiscordTo(discordWebhook, 0x3b82f6, "✅ Scan Finished", fmt.Sprintf("**Targets:** %d completed\n**Vulnerabilities:** 0 found\n**Completed at:** %s", totalTargets, time.Now().Format("15:04:05 MST")))
 		if s.telegramConfigured() {
 			s.sendTelegram(0x3b82f6, "✅ Scan Finished", fmt.Sprintf("**Targets:** %d completed\n**Vulnerabilities:** 0 found\n**Completed at:** %s", totalTargets, time.Now().Format("15:04:05 MST")))
 		}
+		s.sendDomesticIM("", 0x3b82f6, "✅ Scan Finished", fmt.Sprintf("**Targets:** %d completed\n**Vulnerabilities:** 0 found\n**Completed at:** %s", totalTargets, time.Now().Format("15:04:05 MST")))
 	}
 }
 
@@ -1707,6 +1711,9 @@ func (s *Server) runWildcardTarget(ctx context.Context, scanCfg *config.Config, 
 						if s.telegramConfigured() {
 							s.sendTelegramWithFile(0x3b82f6, "🔴 Vulnerability Found - Report Ready", desc, reportPath)
 						}
+						// IM robot webhooks can't carry the PDF; the text notice
+						// still goes out so the channel learns about the finding.
+						s.sendDomesticIM("", 0x3b82f6, "🔴 Vulnerability Found - Report Ready", desc)
 					}
 				}
 			}

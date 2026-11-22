@@ -1,9 +1,12 @@
 import { Link } from "react-router-dom";
 import { useI18n } from "@/i18n";
 import {
+  Bird,
   CheckCircle2,
   ExternalLink,
+  MessageCircle,
   MessageSquare,
+  MessageSquareText,
   Plug,
   Send,
   ShieldCheck,
@@ -45,6 +48,15 @@ export default function IntegrationsPage() {
   );
   const telegramToken = environment.data?.variables.find(
     (variable) => variable.key === "XALGORIX_TELEGRAM_BOT_TOKEN",
+  );
+  const dingtalkWebhook = environment.data?.variables.find(
+    (variable) => variable.key === "XALGORIX_DINGTALK_WEBHOOK",
+  );
+  const feishuWebhook = environment.data?.variables.find(
+    (variable) => variable.key === "XALGORIX_FEISHU_WEBHOOK",
+  );
+  const wecomWebhook = environment.data?.variables.find(
+    (variable) => variable.key === "XALGORIX_WECOM_WEBHOOK",
   );
 
   const integrations: Integration[] = [
@@ -91,6 +103,48 @@ export default function IntegrationsPage() {
       detail: telegramToken?.hasValue
         ? t("integrations.card.telegramDetailOn")
         : t("integrations.card.telegramDetailOff"),
+    },
+    {
+      key: "dingtalk",
+      name: t("integrations.card.dingtalkName"),
+      description: t("integrations.card.dingtalkDesc"),
+      category: "Notifications",
+      icon: MessageSquareText,
+      configurePath: "/settings?tab=notifications",
+      configureLabel: t("integrations.card.configure"),
+      external: "https://open.dingtalk.com/document/orgapp/custom-robots-send-group-messages",
+      isConfigured: Boolean(dingtalkWebhook?.hasValue),
+      detail: dingtalkWebhook?.hasValue
+        ? t("integrations.card.imDetailOn")
+        : t("integrations.card.dingtalkDetailOff"),
+    },
+    {
+      key: "feishu",
+      name: t("integrations.card.feishuName"),
+      description: t("integrations.card.feishuDesc"),
+      category: "Notifications",
+      icon: Bird,
+      configurePath: "/settings?tab=notifications",
+      configureLabel: t("integrations.card.configure"),
+      external: "https://open.feishu.cn/document/client-docs/bot-v3/add-custom-bot",
+      isConfigured: Boolean(feishuWebhook?.hasValue),
+      detail: feishuWebhook?.hasValue
+        ? t("integrations.card.imDetailOn")
+        : t("integrations.card.feishuDetailOff"),
+    },
+    {
+      key: "wecom",
+      name: t("integrations.card.wecomName"),
+      description: t("integrations.card.wecomDesc"),
+      category: "Notifications",
+      icon: MessageCircle,
+      configurePath: "/settings?tab=notifications",
+      configureLabel: t("integrations.card.configure"),
+      external: "https://developer.work.weixin.qq.com/document/path/91770",
+      isConfigured: Boolean(wecomWebhook?.hasValue),
+      detail: wecomWebhook?.hasValue
+        ? t("integrations.card.imDetailOn")
+        : t("integrations.card.wecomDetailOff"),
     },
     {
       key: "rate-limit",

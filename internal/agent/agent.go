@@ -535,7 +535,7 @@ func NewAgent(cfg *config.Config, name string, events chan Event, localGuard sco
 	// A small iteration cap starves a single-target scan: recon alone consumes
 	// most of it and the report never lands. 0 means unlimited (the engine
 	// translates it past the ADK's implicit 20-iteration floor); a low positive
-	// override is honoured but flagged, because the symptom
+	// override is honored but flagged, because the symptom
 	// (completion=partial, zero findings) looks like a model failure.
 	if cfg.MaxIterations > 0 && cfg.MaxIterations < 20 {
 		log.Printf("[agent] XALGORIX_MAX_ITERATIONS=%d is below the recommended minimum 20 (0 = unlimited) — single-target scans will likely end partial before reporting", cfg.MaxIterations)
@@ -870,7 +870,7 @@ func NewAgent(cfg *config.Config, name string, events chan Event, localGuard sco
 					<-done
 				}
 			}()
-			delegatedTask := buildDelegatedTaskInstruction(task, agentID, a.ctfMission)
+			delegatedTask := buildDelegatedTaskInstruction(task, agentID, a.ctfMission, a.cfgDelegationUnlocked())
 			subAgent.Run(targets, delegatedTask)
 			close(subEvents)
 			<-done
@@ -1038,7 +1038,7 @@ func (a *Agent) reconIncompleteReasons() []string {
 // degenerates into password spraying and disabled-signup probing.
 func (a *Agent) maybeAutoDelegate(targets []string) string {
 	if a == nil || a.state == nil || a.registry == nil || a.agentGraph == nil ||
-		a.delegatedAgentID != "" || a.ctfMission || a.state.DiscoveryMode ||
+		a.delegatedAgentID != "" || a.ctfDelegationBlocked() || a.state.DiscoveryMode ||
 		a.state.ReconOnlyMode || a.state.DelegationAttempted {
 		return ""
 	}
@@ -1342,6 +1342,23 @@ func (a *Agent) appendUserNudge(content string) {
 // available, a lane-using scan type, and at least one lane not
 // operator-disabled. False means intentional single-agent mode: no waves, no
 // decomposition nudges, no reminders — and DelegationAttempted must never be
+// cfgDelegationUnlocked reports whether XALGORIX_ENABLE_CTF_DELEGATE unlocked
+// specialist delegation for CTF/benchmark missions (O1.2,
+// CORE_LOOP_OPTIMIZATION.md). Default off: every single-agent semantic stays
+// byte-identical; DisableAutoDelegate still overrides the unlock.
+func (a *Agent) cfgDelegationUnlocked() bool {
+	return a.cfg != nil && a.cfg.EnableCTFDelegate
+}
+
+// ctfDelegationBlocked reports whether this CTF/benchmark mission is barred
+// from specialist delegation: the default posture (depth-first single-flag
+// doctrine runs one agent) unless the operator unlocked delegation. All other
+// CTF semantics (ProfessionalAssessment=false, advisory-commitment off,
+// single-flag stop-loss doctrine) are untouched by the unlock.
+func (a *Agent) ctfDelegationBlocked() bool {
+	return a.ctfMission && !a.cfgDelegationUnlocked()
+}
+
 // set, because consumers read it as "a specialist wave ran".
 func (a *Agent) delegationEnabled() bool {
 	if a == nil || a.registry == nil {
@@ -1350,7 +1367,7 @@ func (a *Agent) delegationEnabled() bool {
 	if a.cfg != nil && a.cfg.DisableAutoDelegate {
 		return false
 	}
-	if a.ctfMission {
+	if a.ctfDelegationBlocked() {
 		return false
 	}
 	if a.state != nil && (a.state.DiscoveryMode || a.state.ReconOnlyMode) {

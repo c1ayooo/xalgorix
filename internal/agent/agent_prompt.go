@@ -611,10 +611,33 @@ func isExplicitCTFMission(instruction string) bool {
 // contract. Coordinator prose is model-generated and can omit or contradict
 // the system prompt, so every professional child receives the same bounded,
 // evidence-driven completion rules immediately before it starts.
-func buildDelegatedTaskInstruction(task, agentID string, ctfMission bool) string {
+// buildDelegatedTaskInstruction composes a specialist child's assignment.
+// Professional children always get the mandatory lane contract. CTF children
+// keep the raw task by default (the pinned single-flag doctrine,
+// TestBuildDelegatedTaskInstructionPreservesExplicitCTFMission); only when the
+// operator unlocked CTF delegation (O1.2, XALGORIX_ENABLE_CTF_DELEGATE) do
+// they get the benchmark contract: the same claim discipline plus the
+// flag-closure rule the TSec audit showed was skipped (10 flags captured, one
+// finding filed — CORE_LOOP_AUDIT §3 gap ②).
+func buildDelegatedTaskInstruction(task, agentID string, ctfMission, delegateUnlocked bool) string {
 	task = strings.TrimSpace(task)
 	if ctfMission {
-		return task
+		if !delegateUnlocked {
+			return task
+		}
+		owner := strings.TrimSpace(agentID)
+		if owner == "" {
+			owner = "this specialist"
+		}
+		contract := fmt.Sprintf(`MANDATORY DELEGATED-LANE CONTRACT (benchmark mission, owner %s):
+- This is a bounded specialist assignment. Do not spawn or delegate additional agents.
+- Do not stop after the first flag. Repeatedly claim_next_hypothesis for every vulnerability class assigned in the task until that assigned lane has no queued hypothesis left.
+- Close every hypothesis you claim: save control and exploit evidence, and submit every distinct captured flag through report_vulnerability immediately (link it with kind=finding_ref), then continue to the next claim. A captured flag is a result, never a lane-completion signal.
+- Before finish, read_ledger again and confirm no hypothesis you own remains testing or proven without a linked finding. Finish only after the full assigned lane is exhausted.`, owner)
+		if task == "" {
+			return contract
+		}
+		return task + "\n\n" + contract
 	}
 	owner := strings.TrimSpace(agentID)
 	if owner == "" {

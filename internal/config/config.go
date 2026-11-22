@@ -27,6 +27,7 @@ type Config struct {
 	APIKeys             []string // XALGORIX_API_KEYS — additional provider API keys rotated to dodge provider rate limits (combined with APIKey)
 	KeyPoolStrategy     string   // XALGORIX_KEY_POOL_STRATEGY — "roundrobin" (default; both keys share load) or "sticky" (overflow failover: one key at a time, switch only on a rate limit)
 	DisableAutoDelegate bool     // XALGORIX_DISABLE_AUTO_DELEGATE — skip the deterministic specialist wave entirely
+	EnableCTFDelegate   bool     // XALGORIX_ENABLE_CTF_DELEGATE — unlock specialist delegation for CTF/benchmark missions (default off: single-agent doctrine unchanged)
 	DisabledSpecialists []string // XALGORIX_DISABLED_SPECIALISTS — comma-separated lane names to skip
 	Checklist           string   // XALGORIX_CHECKLIST - full or professional
 	LLMProfile          string   // XALGORIX_LLM_PROFILE — active credential pointer "<provider>:<profileId>" (v4.4.22+)
@@ -389,6 +390,18 @@ type Config struct {
 	TelegramChatID      string // XALGORIX_TELEGRAM_CHAT_ID - target chat/channel ID (numeric or @username)
 	TelegramMinSeverity string // XALGORIX_TELEGRAM_MIN_SEVERITY - minimum severity to notify
 
+	// Domestic IM robot notifications (group custom robots; ported from the
+	// 4zreco channel implementations). All webhook URLs embed the robot
+	// credential, so they are treated as secrets and never returned by APIs.
+	DingTalkWebhook     string // XALGORIX_DINGTALK_WEBHOOK - DingTalk custom robot webhook URL (access_token in query)
+	DingTalkSecret      string // XALGORIX_DINGTALK_SECRET - DingTalk sign secret (加签); empty when the robot uses keyword/IP security
+	DingTalkMinSeverity string // XALGORIX_DINGTALK_MIN_SEVERITY - minimum severity to notify
+	FeishuWebhook       string // XALGORIX_FEISHU_WEBHOOK - Feishu/Lark custom robot webhook URL (hook id in path)
+	FeishuSecret        string // XALGORIX_FEISHU_SECRET - Feishu sign secret (加签); empty when signing is off
+	FeishuMinSeverity   string // XALGORIX_FEISHU_MIN_SEVERITY - minimum severity to notify
+	WeComWebhook        string // XALGORIX_WECOM_WEBHOOK - WeCom group robot webhook URL (key in query)
+	WeComMinSeverity    string // XALGORIX_WECOM_MIN_SEVERITY - minimum severity to notify
+
 	// Scan-completion summary notification.
 	// When false (default) the "Scan Finished" summary is suppressed and only
 	// per-vulnerability alerts are sent; set true to also get an end-of-scan summary.
@@ -536,6 +549,7 @@ func load() *Config {
 		APIKeys:                  ParseAPIKeyList(envOr("XALGORIX_API_KEYS", "")),
 		KeyPoolStrategy:          envOr("XALGORIX_KEY_POOL_STRATEGY", "roundrobin"),
 		DisableAutoDelegate:      envOrBool("XALGORIX_DISABLE_AUTO_DELEGATE", false),
+		EnableCTFDelegate:        envOrBool("XALGORIX_ENABLE_CTF_DELEGATE", false),
 		DisabledSpecialists:      envOrStringSlice("XALGORIX_DISABLED_SPECIALISTS"),
 		Checklist:                envOrChecklist(envOr("XALGORIX_CHECKLIST", "full")),
 		LLMProfile:               envOr("XALGORIX_LLM_PROFILE", ""),
@@ -639,6 +653,16 @@ func load() *Config {
 		TelegramBotToken:    envOr("XALGORIX_TELEGRAM_BOT_TOKEN", ""),
 		TelegramChatID:      envOr("XALGORIX_TELEGRAM_CHAT_ID", ""),
 		TelegramMinSeverity: envOr("XALGORIX_TELEGRAM_MIN_SEVERITY", ""),
+
+		// Domestic IM robot notifications
+		DingTalkWebhook:     envOr("XALGORIX_DINGTALK_WEBHOOK", ""),
+		DingTalkSecret:      envOr("XALGORIX_DINGTALK_SECRET", ""),
+		DingTalkMinSeverity: envOr("XALGORIX_DINGTALK_MIN_SEVERITY", ""),
+		FeishuWebhook:       envOr("XALGORIX_FEISHU_WEBHOOK", ""),
+		FeishuSecret:        envOr("XALGORIX_FEISHU_SECRET", ""),
+		FeishuMinSeverity:   envOr("XALGORIX_FEISHU_MIN_SEVERITY", ""),
+		WeComWebhook:        envOr("XALGORIX_WECOM_WEBHOOK", ""),
+		WeComMinSeverity:    envOr("XALGORIX_WECOM_MIN_SEVERITY", ""),
 
 		// Scan-completion summary notification (opt-in; default off).
 		NotifyScanComplete: envOrBool("XALGORIX_NOTIFY_SCAN_COMPLETE", false),

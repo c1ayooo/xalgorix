@@ -68,11 +68,11 @@ func TestBeliefPoolBriefSkipsDelegationPaths(t *testing.T) {
 	seedQueued(sc.Ledger, "idor", "/a", 0.5)
 
 	for name, mutate := range map[string]func(*ScanState){
-		"specialist":       func(s *ScanState) { s.DelegatedAgent = true },
-		"delegation root":  func(s *ScanState) { s.DelegationEnabled = true },
-		"discovery mode":   func(s *ScanState) { s.DiscoveryMode = true },
-		"recon-only mode":  func(s *ScanState) { s.ReconOnlyMode = true },
-		"plan mid-flight":  func(s *ScanState) { s.CTFMission = false },
+		"specialist":      func(s *ScanState) { s.DelegatedAgent = true },
+		"delegation root": func(s *ScanState) { s.DelegationEnabled = true },
+		"discovery mode":  func(s *ScanState) { s.DiscoveryMode = true },
+		"recon-only mode": func(s *ScanState) { s.ReconOnlyMode = true },
+		"plan mid-flight": func(s *ScanState) { s.CTFMission = false },
 	} {
 		state := &ScanState{ScanContextID: ctxID, CTFMission: true}
 		mutate(state)

@@ -283,7 +283,7 @@ func hookForceContinuationFinishGate(state *ScanState, _ map[string]string) Hook
 		return HookResult{}
 	}
 	return HookResult{
-		Block: true,
+		Block:       true,
 		BlockReason: "⛔ RUN RE-OPENED BY THE OPERATOR — this engagement continues. The updated instruction sets the current priorities: sweep the remaining medium 300-point challenges (a-07, a-09, a-12, a-14, a-17) with up to 3 containers active, submit flags the moment you have them, and keep the shelved c-03/a-03 for last. Do not call finish unless the platform starts returning invalid_state.",
 	}
 }

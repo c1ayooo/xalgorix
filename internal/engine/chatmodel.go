@@ -31,19 +31,20 @@ var _ ChatClient = (*llm.Client)(nil)
 type ChatMetaClient interface {
 	ChatWithUsageToolCallsMeta(messages []llm.Message, tools []llm.ToolDefinition) (content string, reasoning string, calls []llm.ToolCall, usage *llm.TokenUsage, err error)
 }
+
 var _ model.ToolCallingChatModel = (*ChatModel)(nil)
 
 // ChatModel adapts one ChatClient to Eino's tool-calling model interface.
 // WithTools returns a copy, so a base model is safe to share across requests.
 type ChatModel struct {
-	client    ChatClient
-	tools     []llm.ToolDefinition
+	client ChatClient
+	tools  []llm.ToolDefinition
 	// onReasoning, when set, receives the accepted response's raw reasoning
 	// text (reasoning models only; empty for plain completions).
 	onReasoning func(string)
-	stopCheck func() bool
-	recovery  ModelRecovery
-	compactor func([]*schema.Message) []*schema.Message
+	stopCheck   func() bool
+	recovery    ModelRecovery
+	compactor   func([]*schema.Message) []*schema.Message
 	// nativeTools is true only when the resolved endpoint understands the
 	// OpenAI `tools`/`tool_calls` wire format. Otherwise the adapter keeps the
 	// provider-neutral XML dialect as a protocol fallback, still returning

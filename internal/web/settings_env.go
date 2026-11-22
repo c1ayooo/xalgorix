@@ -180,6 +180,17 @@ func allEnvSettingDefinitions() []envSettingDefinition {
 		{Key: "XALGORIX_TELEGRAM_BOT_TOKEN", Label: "Telegram bot token", Category: "Notifications", Description: "Bot token from @BotFather. Required to enable Telegram notifications.", Placeholder: "123456789:ABC-DEF...", InputType: "secret", Sensitive: true},
 		{Key: "XALGORIX_TELEGRAM_CHAT_ID", Label: "Telegram chat ID", Category: "Notifications", Description: "Target chat/channel ID. Numeric ID (e.g. -1001234567890) or @channelusername.", Placeholder: "-1001234567890", InputType: "text"},
 		{Key: "XALGORIX_TELEGRAM_MIN_SEVERITY", Label: "Telegram minimum severity", Category: "Notifications", Description: "Minimum severity sent to Telegram.", InputType: "select", Options: []string{"", "info", "low", "medium", "high", "critical"}},
+
+		{Key: "XALGORIX_DINGTALK_WEBHOOK", Label: "DingTalk webhook", Category: "Notifications", Description: "DingTalk custom robot webhook (access_token in the URL). The URL embeds the robot credential and is never returned by APIs.", Placeholder: "https://oapi.dingtalk.com/robot/send?access_token=...", InputType: "secret", Sensitive: true},
+		{Key: "XALGORIX_DINGTALK_SECRET", Label: "DingTalk sign secret", Category: "Notifications", Description: "Signing secret (加签) for the robot's security settings. Leave blank when the robot uses keyword or IP allowlist instead.", Placeholder: "SEC...", InputType: "secret", Sensitive: true},
+		{Key: "XALGORIX_DINGTALK_MIN_SEVERITY", Label: "DingTalk minimum severity", Category: "Notifications", Description: "Minimum severity sent to DingTalk.", InputType: "select", Options: []string{"", "info", "low", "medium", "high", "critical"}},
+
+		{Key: "XALGORIX_FEISHU_WEBHOOK", Label: "Feishu webhook", Category: "Notifications", Description: "Feishu/Lark custom robot webhook (hook id in the path). The URL embeds the robot credential and is never returned by APIs.", Placeholder: "https://open.feishu.cn/open-apis/bot/v2/hook/...", InputType: "secret", Sensitive: true},
+		{Key: "XALGORIX_FEISHU_SECRET", Label: "Feishu sign secret", Category: "Notifications", Description: "Signing secret (加签) for the robot. Leave blank when signing is off.", Placeholder: "...", InputType: "secret", Sensitive: true},
+		{Key: "XALGORIX_FEISHU_MIN_SEVERITY", Label: "Feishu minimum severity", Category: "Notifications", Description: "Minimum severity sent to Feishu.", InputType: "select", Options: []string{"", "info", "low", "medium", "high", "critical"}},
+
+		{Key: "XALGORIX_WECOM_WEBHOOK", Label: "WeCom webhook", Category: "Notifications", Description: "WeCom (企业微信) group robot webhook (key in the URL). The URL embeds the robot credential and is never returned by APIs.", Placeholder: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...", InputType: "secret", Sensitive: true},
+		{Key: "XALGORIX_WECOM_MIN_SEVERITY", Label: "WeCom minimum severity", Category: "Notifications", Description: "Minimum severity sent to WeCom.", InputType: "select", Options: []string{"", "info", "low", "medium", "high", "critical"}},
 		{Key: "XALGORIX_NOTIFY_SCAN_COMPLETE", Label: "Notify on scan completion", Category: "Notifications", Description: "Send the \"Scan Finished\" summary (report ready / clean scan) to the configured channels after every scan. Off by default so only per-vulnerability alerts are sent.", DefaultValue: "false", InputType: "boolean"},
 
 		{Key: "XALGORIX_RATE_LIMIT_REQUESTS", Label: "Rate-limit requests", Category: "Rate limits", Description: "Requests allowed per dashboard rate-limit window.", DefaultValue: "60", InputType: "number"},
@@ -899,6 +910,30 @@ func (s *Server) applyEnvironmentToRuntimeConfig(values map[string]string) {
 		case "XALGORIX_TELEGRAM_MIN_SEVERITY":
 			s.cfg.TelegramMinSeverity = value
 			s.telegramMinSeverity = strings.ToLower(strings.TrimSpace(value))
+		case "XALGORIX_DINGTALK_WEBHOOK":
+			s.cfg.DingTalkWebhook = value
+			s.dingTalkWebhook = strings.TrimSpace(value)
+		case "XALGORIX_DINGTALK_SECRET":
+			s.cfg.DingTalkSecret = value
+			s.dingTalkSecret = strings.TrimSpace(value)
+		case "XALGORIX_DINGTALK_MIN_SEVERITY":
+			s.cfg.DingTalkMinSeverity = value
+			s.dingTalkMinSeverity = strings.ToLower(strings.TrimSpace(value))
+		case "XALGORIX_FEISHU_WEBHOOK":
+			s.cfg.FeishuWebhook = value
+			s.feishuWebhook = strings.TrimSpace(value)
+		case "XALGORIX_FEISHU_SECRET":
+			s.cfg.FeishuSecret = value
+			s.feishuSecret = strings.TrimSpace(value)
+		case "XALGORIX_FEISHU_MIN_SEVERITY":
+			s.cfg.FeishuMinSeverity = value
+			s.feishuMinSeverity = strings.ToLower(strings.TrimSpace(value))
+		case "XALGORIX_WECOM_WEBHOOK":
+			s.cfg.WeComWebhook = value
+			s.weComWebhook = strings.TrimSpace(value)
+		case "XALGORIX_WECOM_MIN_SEVERITY":
+			s.cfg.WeComMinSeverity = value
+			s.weComMinSeverity = strings.ToLower(strings.TrimSpace(value))
 		case "XALGORIX_NOTIFY_SCAN_COMPLETE":
 			enabled := parseBoolSetting(value, false)
 			s.cfg.NotifyScanComplete = enabled
@@ -1040,6 +1075,22 @@ func (s *Server) envSettingValue(key string) string {
 		return cfg.TelegramChatID
 	case "XALGORIX_TELEGRAM_MIN_SEVERITY":
 		return cfg.TelegramMinSeverity
+	case "XALGORIX_DINGTALK_WEBHOOK":
+		return cfg.DingTalkWebhook
+	case "XALGORIX_DINGTALK_SECRET":
+		return cfg.DingTalkSecret
+	case "XALGORIX_DINGTALK_MIN_SEVERITY":
+		return cfg.DingTalkMinSeverity
+	case "XALGORIX_FEISHU_WEBHOOK":
+		return cfg.FeishuWebhook
+	case "XALGORIX_FEISHU_SECRET":
+		return cfg.FeishuSecret
+	case "XALGORIX_FEISHU_MIN_SEVERITY":
+		return cfg.FeishuMinSeverity
+	case "XALGORIX_WECOM_WEBHOOK":
+		return cfg.WeComWebhook
+	case "XALGORIX_WECOM_MIN_SEVERITY":
+		return cfg.WeComMinSeverity
 	case "XALGORIX_NOTIFY_SCAN_COMPLETE":
 		return strconv.FormatBool(s.notifyScanComplete.Load())
 	case "XALGORIX_USERNAME":

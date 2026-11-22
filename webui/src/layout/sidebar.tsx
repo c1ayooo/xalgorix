@@ -1,7 +1,5 @@
 import { NavLink } from "react-router-dom";
 import {
-  Activity,
-  AlertOctagon,
   BadgeCheck,
   Clock,
   FolderKanban,
@@ -140,16 +138,6 @@ export function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
         })}
       </nav>
       <AccountMenu onNavigate={onNavigate} />
-      <div className="border-t border-border px-4 py-3 text-[10px] text-muted-foreground mono">
-        <div className="flex items-center gap-1.5">
-          <Activity className="h-3 w-3" aria-hidden />
-          <span>{t("sidebar.localScanner")}</span>
-        </div>
-        <div className="mt-1 flex items-center gap-1.5 opacity-70">
-          <AlertOctagon className="h-3 w-3" aria-hidden />
-          <span>{t("sidebar.commandHint")}</span>
-        </div>
-      </div>
     </aside>
   );
 }

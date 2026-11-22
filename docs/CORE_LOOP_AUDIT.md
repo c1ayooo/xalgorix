@@ -123,7 +123,7 @@ benchmark 指令要求「拿到 flag 立即提交平台」，**未要求同步 `
 4. **objective 结构化判据**（D10）：任务配 required 判据（flag 数/类覆盖）→ goal gate / goal obligation / goal_analyzed 事件全部激活
 5. **hard 档预算重分配**：e1-e3 系列的 250 分 hard 已证明可解（4 题）——与 medium 并行穿插，不再整体后置；最后 1/3 时间专攻 500 分档
 6. **hint 策略放宽**：hard/medium 卡 15 分钟即用 hint——扣 20% 分远好于 0 分（本轮 0 hint = 严格守纪但过度保守）
-7. ~~spawn_agent 委派~~ → **需 O1.2 引擎开关**（CTF 模式硬拦截 spawn_agent，见缺口①）；开关落地前本条不可执行
+7. ~~spawn_agent 委派~~ → **O1.2 开关已落地**（`XALGORIX_ENABLE_CTF_DELEGATE=true`；CTF 模式默认硬拦截 spawn_agent，见缺口①）；跑分时置 true 即可并行清题
 8. 保留已验证有效项：并发 3、flag 即交、平台域名只走 API、10 分钟止损、禁宿主机 find /
 
 ---

@@ -61,6 +61,7 @@ func TestBuildDelegatedTaskInstructionEnforcesProfessionalLaneExhaustion(t *test
 		"Test the assigned injection hypotheses.",
 		"sub-injection",
 		false,
+		false,
 	)
 	for _, want := range []string{
 		"Test the assigned injection hypotheses.",
@@ -82,7 +83,7 @@ func TestBuildDelegatedTaskInstructionEnforcesProfessionalLaneExhaustion(t *test
 
 func TestBuildDelegatedTaskInstructionPreservesExplicitCTFMission(t *testing.T) {
 	const task = "Solve this CTF and retrieve FLAG{...}."
-	if got := buildDelegatedTaskInstruction(task, "sub-ctf", true); got != task {
+	if got := buildDelegatedTaskInstruction(task, "sub-ctf", true, false); got != task {
 		t.Fatalf("explicit CTF task should remain unchanged, got:\n%s", got)
 	}
 	if !isExplicitCTFMission(task) {
@@ -101,7 +102,7 @@ func TestDelegatedSystemPromptRemovesRootWorkflowContradictions(t *testing.T) {
 	}
 	prompt := agent.buildSystemPrompt(
 		[]string{"https://example.test"},
-		buildDelegatedTaskInstruction("Test assigned SQL injection hypotheses.", "sub-injection", false),
+		buildDelegatedTaskInstruction("Test assigned SQL injection hypotheses.", "sub-injection", false, false),
 		scanctx.RequestRatePolicy{MaxRPS: 2, Source: "test"},
 	)
 	for _, forbidden := range []string{
