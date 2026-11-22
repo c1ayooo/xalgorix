@@ -172,6 +172,7 @@ type ScanState struct {
 	SpecialistProfiles         []specialistProfile
 	BenchmarkIsolated          bool
 	ProfessionalAssessment     bool // non-CTF scan: structural plan, not a fixed iteration quota, governs completion
+	CTFMission                 bool // explicit CTF/benchmark mission: single-agent doctrine; the belief pool brief owns selection order
 	AuthContextKnown           bool // engine evaluated operator/ingested auth before planning
 	AuthContextAvailable       bool // at least one legitimate account/session is available
 	AllowedPhases              []int
@@ -471,6 +472,7 @@ type ScanState struct {
 	DelegationReminders          int             // bounded reminders after ignored/malformed spawn calls
 	LedgerSeeded                 bool            // hypothesis ledger seeded from the plan once
 	LastPlanBrief                string          // last plan brief injected into context; avoids duplicate injection when unchanged
+	BeliefPoolDigest             string          // fingerprint of the schedulable pool last delivered as a belief brief; change-triggered re-delivery
 	PlanSurfaceRevision          string          // fingerprint of the surface the engine-authored plan was built from; a change triggers an engine-owned refresh
 	BrowserPreferenceNudgeCount  int             // tracks whether browser preference warning was emitted for consecutive calls
 	AdvisoryLeadsNudged          map[string]bool // exact CVE/advisory leads already committed to the ledger
@@ -798,6 +800,12 @@ func RegisterDefaultHooks(reg *HookRegistry) {
 	reg.Register(OnIterationStart, hookPlanner)
 	// Registered AFTER the planner so state.Plan exists when we seed the ledger.
 	reg.Register(OnIterationStart, hookLedgerSeed)
+	// Belief pool brief (O1.1, CORE_LOOP_OPTIMIZATION): CTF/benchmark missions
+	// and plan-idle single-agent scans get the VOI-ranked claimable pool as a
+	// change-triggered brief — the claim-discipline vector the delegation
+	// nudge cannot reach. Registered BEFORE the goal obligation so the goal
+	// duty still speaks last.
+	reg.Register(OnIterationStart, hookBeliefPoolBrief)
 	// Registered LAST on iteration start (R-goal): the deferred goal
 	// obligation speaks after the planner's brief — which goes quiet exactly
 	// when the plan is exhausted, the moment the obligation must be heard.

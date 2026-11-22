@@ -1832,6 +1832,7 @@ func (a *Agent) Run(targets []string, instruction string) {
 	// at Run so hooks and the engine spawn from the same set.
 	a.state.SpecialistProfiles = a.mergedSpecialistProfiles()
 	a.state.BenchmarkIsolated = a.benchmarkIsolated
+	a.state.CTFMission = a.ctfMission
 	a.state.ProfessionalAssessment = !a.ctfMission
 	a.state.AuthContextKnown = true
 	a.state.AuthContextAvailable = len(httpclient.ParseAuthHeaders(a.targetAuth)) > 0

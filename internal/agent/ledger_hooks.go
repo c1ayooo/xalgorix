@@ -385,6 +385,81 @@ func seedParamHypotheses(state *ScanState, l *scanctx.LedgerStore) int {
 // plan task notes still describe the remainder.
 const maxSurfaceClassSeed = 6
 
+// ── hookBeliefPoolBrief ──────────────────────────────────────────────────────
+// Belief-loop brief for the forms the delegation nudge never reaches:
+// CTF/benchmark missions (single-agent by design, no specialist lanes) and
+// single-agent professional scans whose structural plan is exhausted. Without
+// it the deterministically seeded ledger only accumulates: the TSec benchmark
+// run seeded 459 hypotheses and claimed zero (CORE_LOOP_AUDIT §3 gap ①).
+//
+// The brief projects the same VOI-weighted schedulable pool ClaimNextAs draws
+// from (charter §4.1 region-activation consumer) into per-turn visibility as
+// an engine Hint — it states selection and stop-loss order, not breadth: the
+// CTF doctrine stays depth-first, the brief only decides WHAT to work next.
+// Re-delivery is content-triggered via the pool digest; an unchanged pool
+// never re-injects.
+func hookBeliefPoolBrief(state *ScanState, _ map[string]string) HookResult {
+	if state == nil || state.DelegatedAgent || state.DelegationEnabled ||
+		state.DiscoveryMode || state.ReconOnlyMode {
+		// Specialist lanes and delegation-enabled coordinators own their claim
+		// discipline via the delegation nudge; recon/discovery never test.
+		return HookResult{}
+	}
+	planIdle := state.Plan != nil && state.PlanBuilt && func() bool {
+		pending, active, _, _ := state.Plan.Counts()
+		return pending == 0 && active == 0
+	}()
+	if !state.CTFMission && !planIdle {
+		return HookResult{}
+	}
+	l := ledgerForState(state)
+	if l == nil {
+		return HookResult{}
+	}
+	pool := l.Schedulable(beliefPoolBriefSize)
+	if len(pool) == 0 {
+		return HookResult{}
+	}
+	digest := beliefPoolDigest(pool)
+	if digest == state.BeliefPoolDigest {
+		return HookResult{}
+	}
+	var b strings.Builder
+	b.WriteString("🧭 BELIEF POOL — next-best open hypotheses (selection & stop-loss order, not a breadth requirement):\n")
+	for _, h := range pool {
+		line := fmt.Sprintf("  • %s [%s] %s%s conf=%.2f", h.ID, h.Status, h.VulnClass, formatLoc(h), h.Confidence)
+		if h.VOIEstimated {
+			line += fmt.Sprintf(" voi=%.2f", h.VOI)
+		}
+		b.WriteString(line + "\n")
+	}
+	b.WriteString("Claim before testing: claim_next_hypothesis, work the claim to proven (link the finding via kind=finding_ref) or rejected (with the baseline), then claim the next. When a claim stalls past its stop-loss, hand it back with update_hypothesis and take the next one — the pool rank decides priority, not instruction order.")
+	return HookResult{Directives: []Directive{{
+		Priority:  DirectivePriorityPlanner,
+		Category:  "belief-pool",
+		DedupeKey: "belief-pool-brief",
+		Content:   b.String(),
+		OnDelivered: func(s *ScanState) {
+			s.BeliefPoolDigest = digest
+		},
+	}}}
+}
+
+// beliefPoolBriefSize bounds the brief's pool projection to the same window
+// the delegation nudge surfaces.
+const beliefPoolBriefSize = 8
+
+// beliefPoolDigest fingerprints the projected pool (insertion order carries the
+// VOI-weighted rank) so claim/status/VOI changes re-deliver while an unchanged
+// ledger does not.
+func beliefPoolDigest(pool []scanctx.Hypothesis) string {
+	parts := make([]string, 0, len(pool))
+	for _, h := range pool {
+		parts = append(parts, fmt.Sprintf("%s:%s:%.2f:%s", h.ID, h.Status, h.Confidence, h.NextAction))
+	}
+	return strings.Join(parts, "|")
+}
+
 // hookAdvisoryLeadCommitment turns an exact advisory lookup into durable work
 // instead of disposable prose. The lookup remains a lead, never proof: this
 // hook only seeds/strengthens the matching hypothesis and forces a route-level
