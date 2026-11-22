@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo } from "react";
 import { useSearchParams } from "react-router-dom";
-import { Database, Filter, Network, RefreshCw } from "lucide-react";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Database, Filter, RefreshCw } from "lucide-react";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import {
   Select,
@@ -11,380 +12,740 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Skeleton } from "@/components/ui/skeleton";
-import {
-  Tabs,
-  TabsContent,
-  TabsList,
-  TabsTrigger,
-} from "@/components/ui/tabs";
-import { EmptyState, ErrorState } from "@/components/states";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { EmptyState } from "@/components/states";
 import { ColdPathBadge } from "@/components/coldpath-badge";
-import { InfoItemCard } from "@/components/info-item-card";
-import { AssociationGraph } from "@/components/association-graph";
+import { InfoSubjectRail } from "@/components/info-subject-rail";
+import { AssociationView } from "@/components/info-views/association-view";
+import { ContextSlice } from "@/components/info-views/context-slice";
+import {
+  InfoDisabled,
+  InfoLoading,
+  InfoNotice,
+  InfoQueryError,
+} from "@/components/info-views/common";
+import { RegionTable } from "@/components/info-views/region-table";
 import {
   useColdPathSync,
   useInfoAssociation,
   useInfoContext,
   useInfoRegion,
   useInstances,
+  useProjects,
+  useTaskRuns,
+  useTasks,
 } from "@/api/queries";
-import { HttpError } from "@/api/client";
 import { useActiveProjectId } from "@/lib/use-active-project";
 import { useI18n } from "@/i18n";
-import { cn } from "@/lib/utils";
-import type {
-  InfoItem,
-  InfoNature,
-} from "@/types/api";
+import type { InfoItem, InfoNature } from "@/types/api";
 
 type Tab = "region" | "association" | "context";
-type AssocScope = "project" | "scan";
 
-function isTab(value: string | null): value is Tab {
-  return value === "region" || value === "association" || value === "context";
+const TABS: Tab[] = ["region", "association", "context"];
+const DEFAULT_DEPTH = 2;
+
+function parseTab(raw: string | null): Tab {
+  return TABS.includes(raw as Tab) ? (raw as Tab) : "region";
 }
 
-function isColdPathDisabled(error: unknown): boolean {
-  return error instanceof HttpError && error.status === 503;
+function parseNature(raw: string | null): InfoNature | "" {
+  return raw === "observed" || raw === "inferred" ? raw : "";
 }
 
-function Notice({ truncated, incomplete, gapReason }: { truncated: boolean; incomplete: boolean; gapReason?: string }) {
-  const { t } = useI18n();
-  if (!truncated && !incomplete) return null;
-  return (
-    <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
-      {truncated && <span>{t("info.truncated")}</span>}
-      {truncated && incomplete && <span> · </span>}
-      {incomplete && (
-        <span>
-          {t("info.incomplete")}
-          {gapReason ? `: ${gapReason}` : ""}
-        </span>
-      )}
-    </div>
-  );
+/** datetime-local input value → RFC3339 for the API (empty stays empty). */
+function toISO(value: string): string | undefined {
+  if (!value) return undefined;
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? undefined : parsed.toISOString();
 }
 
-function DisabledState() {
-  const { t } = useI18n();
-  return (
-    <EmptyState
-      icon={<Database className="h-6 w-6" />}
-      title={t("info.disabled.title")}
-      description={t("info.disabled.description")}
-    />
-  );
-}
-
-function QueryError({ error, onRetry }: { error: unknown; onRetry: () => void }) {
-  const { t } = useI18n();
-  if (isColdPathDisabled(error)) return <DisabledState />;
-  return (
-    <ErrorState
-      title={t("info.error.title")}
-      description={error instanceof Error ? error.message : t("info.error.description")}
-      action={
-        <Button size="sm" variant="outline" onClick={onRetry}>
-          {t("common.retry")}
-        </Button>
-      }
-    />
-  );
-}
-
-function Loading() {
-  return (
-    <div className="space-y-3">
-      <Skeleton className="h-20 w-full" />
-      <Skeleton className="h-20 w-full" />
-      <Skeleton className="h-20 w-full" />
-    </div>
-  );
+function splitList(value: string | null): string[] {
+  return (value ?? "")
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
 }
 
 /**
- * Information space — project-scoped, read-only InfoItem activation surface.
+ * Information space (CORE §4 activation surface). The URL is the only state
+ * authority: `?tab=&project=&task=&run=&subject=&subjectKind=&purpose=&nature=
+ * &after=&before=&cursor=&back=&seed=&edge=&depth=&since=&until=`.
  *
- * Deep link (REDESIGN §7.1): `?tab=` (region|association|context) is synced
- * to the URL on every tab change (settings-tab pattern, replace); `?focus=`
- * is consumed once on arrival (approvals pattern): it prefills the matching
- * input — start item ids on the association tab, the subject filter on the
- * other two — then the URL is cleaned via replaceState so refresh/back do
- * not re-trigger it. The Run selector stays session-local: the default
- * project-wide association scope needs no scan id for a deep link to work.
+ * Layout = scope bar ▸ posture header ▸ subject rail + three views. The subject
+ * rail turns the charter's deterministic subject filter into navigation, and
+ * the region view is a dense table whose expanded row is the full seven-
+ * dimension InfoItem view (including the hypotheses it projects into).
  */
 export default function InfoSpacePage() {
   const { t } = useI18n();
   const [searchParams, setSearchParams] = useSearchParams();
-  const projectId = useActiveProjectId();
-  const [tab, setTab] = useState<Tab>(() => {
-    const raw = searchParams.get("tab");
-    return isTab(raw) ? raw : "region";
-  });
-  const [focusId, setFocusId] = useState<string | null>(() =>
-    searchParams.get("focus"),
-  );
-  const [subject, setSubject] = useState("");
-  const [subjectKind, setSubjectKind] = useState("");
-  const [purpose, setPurpose] = useState("");
-  const [nature, setNature] = useState<InfoNature | "all">("all");
-  const [limit, setLimit] = useState(50);
-  const [scanId, setScanId] = useState("");
-  const [since, setSince] = useState("");
-  const [until, setUntil] = useState("");
-  const [assocScope, setAssocScope] = useState<AssocScope>("project");
-  const [assocIds, setAssocIds] = useState("");
-  const [edgeTypes, setEdgeTypes] = useState("supports,contradicts,references");
-  const [depth, setDepth] = useState(2);
+  const activeProjectId = useActiveProjectId();
+  // Deep links from the ledger may point at another project; honour it read-only
+  // instead of silently querying the wrong whitelist.
+  const projectId = searchParams.get("project") || activeProjectId || "";
 
-  const { data: instancesData } = useInstances(projectId ?? undefined);
-  const instances = instancesData?.instances ?? [];
-  const activeScanId = scanId || instances[0]?.id || "";
+  const tab = parseTab(searchParams.get("tab"));
+  const taskParam = searchParams.get("task") ?? "";
+  const runParam = searchParams.get("run") ?? "";
+  const subject = searchParams.get("subject") ?? "";
+  const subjectKind = searchParams.get("subjectKind") ?? "";
+  const purpose = searchParams.get("purpose") ?? "";
+  const nature = parseNature(searchParams.get("nature"));
+  const after = searchParams.get("after") ?? "";
+  const before = searchParams.get("before") ?? "";
+  const cursor = searchParams.get("cursor") ?? "";
+  const back = searchParams.get("back") ?? "";
+  const since = searchParams.get("since") ?? "";
+  const until = searchParams.get("until") ?? "";
+  const seeds = splitList(searchParams.get("seed"));
+  const edgeTypes = splitList(searchParams.get("edge"));
+  const depth = clampDepth(Number(searchParams.get("depth") ?? DEFAULT_DEPTH));
+  const focusId = searchParams.get("focus");
 
-  // Sync the active tab into the URL (settings-tab pattern).
-  useEffect(() => {
-    if (searchParams.get("tab") === tab) return;
+  function patch(mutate: (sp: URLSearchParams) => void) {
     const sp = new URLSearchParams(searchParams);
-    sp.set("tab", tab);
+    mutate(sp);
     setSearchParams(sp, { replace: true });
-  }, [tab, searchParams, setSearchParams]);
+  }
 
-  // Consume ?focus= once (approvals pattern): prefill the matching input,
-  // keep the id for the region-card highlight, then clean the URL.
+  // `?focus=` is a one-shot deep link (approvals pattern): turn it into a seed,
+  // then clean the URL so refresh/back do not re-trigger it.
   useEffect(() => {
-    const focus = searchParams.get("focus");
-    if (!focus) return;
-    setFocusId(focus);
-    if (tab === "association") {
-      setAssocIds(focus);
-    } else {
-      setSubject(focus);
+    if (!focusId) return;
+    patch((sp) => {
+      sp.delete("focus");
+      if (!sp.get("seed")) sp.set("seed", focusId);
+      sp.set("tab", "association");
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusId]);
+
+  const { data: projectsData } = useProjects();
+  const { data: tasksData } = useTasks(projectId);
+  const { data: instancesData } = useInstances(projectId);
+  const { data: taskRunsData } = useTaskRuns(taskParam || undefined);
+
+  const project = projectsData?.projects.find((p) => p.id === projectId);
+  const tasks = tasksData?.tasks ?? [];
+
+  const runOptions = useMemo(() => {
+    if (taskParam) {
+      const runs = taskRunsData?.items ?? [];
+      return runs
+        .filter((run) => run.instance_id)
+        .map((run) => ({ value: run.instance_id!, label: run.id }));
     }
-    const sp = new URLSearchParams(searchParams);
-    sp.delete("focus");
-    setSearchParams(sp, { replace: true });
-  }, [searchParams, setSearchParams, tab]);
+    return (instancesData?.instances ?? []).map((instance) => ({
+      value: instance.id,
+      label: instance.id,
+    }));
+  }, [taskParam, taskRunsData, instancesData]);
+
+  // Explicit run wins; otherwise the first option (runs are newest-first).
+  const activeRun = runParam || runOptions[0]?.value || "";
 
   const regionParams = useMemo(
     () => ({
-      projectId: projectId ?? "",
+      projectId,
+      taskId: taskParam || undefined,
       subject: subject.trim() || undefined,
       subjectKind: subjectKind.trim() || undefined,
       purpose: purpose.trim() || undefined,
-      nature: nature === "all" ? ("" as const) : nature,
-      limit,
+      nature,
+      after: toISO(after),
+      before: toISO(before),
+      cursor: cursor || undefined,
+      limit: 50,
     }),
-    [projectId, subject, subjectKind, purpose, nature, limit],
+    [projectId, taskParam, subject, subjectKind, purpose, nature, after, before, cursor],
   );
-  const region = useInfoRegion(regionParams, tab === "region");
-  const context = useInfoContext(
-    {
-      projectId: projectId ?? "",
-      scanId: activeScanId,
-      subject: subject.trim() || undefined,
-      subjectKind: subjectKind.trim() || undefined,
-      since: since || undefined,
-      until: until || undefined,
-      limit,
-    },
-    tab === "context" && !!activeScanId,
-  );
+  // The region query is the page's base data: the posture header and the subject
+  // rail read it on every tab, so it is always enabled.
+  const region = useInfoRegion(regionParams, !!projectId);
+
   const association = useInfoAssociation(
-    {
-      projectId: projectId ?? "",
-      scanId: assocScope === "scan" ? activeScanId : undefined,
-      ids: assocIds,
-      edgeTypes: edgeTypes.split(",").map((v) => v.trim()).filter(Boolean),
-      maxDepth: depth,
-      limit,
-    },
-    tab === "association" && !!assocIds,
+    useMemo(
+      () => ({
+        projectId,
+        taskId: taskParam || undefined,
+        scanId: runParam || undefined,
+        ids: seeds.join(","),
+        edgeTypes: edgeTypes.length ? edgeTypes : undefined,
+        maxDepth: depth,
+        limit: 100,
+      }),
+      [projectId, taskParam, runParam, seeds, edgeTypes, depth],
+    ),
+    tab === "association" && !!projectId && seeds.length > 0,
   );
 
-  // Cold-path sync state of the currently selected run. Endpoint failures
-  // degrade silently: the badge simply does not render.
-  const coldpath = useColdPathSync(activeScanId, !!activeScanId);
+  const context = useInfoContext(
+    useMemo(
+      () => ({
+        projectId,
+        scanId: activeRun,
+        subject: subject.trim() || undefined,
+        subjectKind: subjectKind.trim() || undefined,
+        since: toISO(since),
+        until: toISO(until),
+        limit: 100,
+      }),
+      [projectId, activeRun, subject, subjectKind, since, until],
+    ),
+    tab === "context" && !!projectId && !!activeRun,
+  );
 
-  function associate(item: InfoItem) {
-    setAssocIds(item.id);
-    setScanId(item.scan_id);
-    setTab("association");
+  // 冷路径健康章始终跟随当前解析到的 Run（region 也是项目/任务级查询，但同步
+  // 健康是按 Run 计的，标出来源 run 才算如实）。
+  const coldpath = useColdPathSync(activeRun, !!activeRun);
+
+  const items = region.data?.items ?? [];
+  const stats = useMemo(() => summarise(items), [items]);
+
+  function selectSubject(identifier: string, kind: string) {
+    patch((sp) => {
+      if (identifier) sp.set("subject", identifier);
+      else sp.delete("subject");
+      if (kind) sp.set("subjectKind", kind);
+      else sp.delete("subjectKind");
+      sp.delete("cursor");
+      sp.delete("back");
+    });
   }
 
-  const scanSelect = (
-    <Select
-      value={activeScanId}
-      onValueChange={setScanId}
-      disabled={instances.length === 0}
-    >
-      <SelectTrigger className="h-9 w-[240px]"><SelectValue placeholder={t("info.scan.placeholder")} /></SelectTrigger>
-      <SelectContent>
-        {instances.map((inst) => (
-          <SelectItem key={inst.id} value={inst.id}>
-            <span className="font-mono text-xs">{inst.id}</span>
-            <span className="ml-2 text-xs text-muted-foreground">{inst.targets}</span>
-          </SelectItem>
-        ))}
-      </SelectContent>
-    </Select>
-  );
+  function startAssociation(id: string) {
+    patch((sp) => {
+      sp.set("tab", "association");
+      sp.set("seed", id);
+    });
+  }
 
-  const scopeToggle = (
-    <div
-      className="flex items-center gap-1 rounded-md border border-border bg-muted/30 p-1"
-      role="group"
-      aria-label={t("info.association.scope")}
-    >
-      <Button
-        type="button"
-        size="sm"
-        variant={assocScope === "project" ? "default" : "ghost"}
-        onClick={() => setAssocScope("project")}
-      >
-        {t("info.association.scope.project")}
-      </Button>
-      <Button
-        type="button"
-        size="sm"
-        variant={assocScope === "scan" ? "default" : "ghost"}
-        onClick={() => setAssocScope("scan")}
-      >
-        {t("info.association.scope.scan")}
-      </Button>
-    </div>
-  );
+  if (!projectId) {
+    return (
+      <div className="space-y-6">
+        <PageHeader coldpath={null} />
+        <EmptyState
+          title={t("info.noProject.title")}
+          description={t("info.noProject.description")}
+        />
+      </div>
+    );
+  }
 
   return (
-    <div className="space-y-6">
-      <header className="flex flex-wrap items-end justify-between gap-3">
-        <div>
-          <h1 className="text-2xl font-semibold tracking-tight">{t("info.title")}</h1>
-          <p className="mt-1 text-sm text-muted-foreground">{t("info.subtitle")}</p>
-        </div>
-        <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-          <Database className="size-3.5" />
-          {t("info.coldPathHint")}
-          {coldpath.data && !coldpath.error && (
+    <div className="space-y-4">
+      <PageHeader
+        coldpath={
+          coldpath.data && !coldpath.error ? (
+            <ColdPathBadge state={coldpath.data} />
+          ) : null
+        }
+      />
+
+      {/* 作用域条：项目 ▸ 任务 ▸ Run + 时间窗，URL 唯一权威。 */}
+      <Card className="rounded-md">
+        <CardContent className="flex flex-wrap items-center gap-2 p-3">
+          <Badge variant="outline" className="max-w-40">
+            <Database className="size-3" aria-hidden />
+            <span className="truncate">{project?.name ?? t("info.noProject.title")}</span>
+          </Badge>
+          <Select
+            value={taskParam || "all"}
+            onValueChange={(value) =>
+              patch((sp) => {
+                if (value === "all") sp.delete("task");
+                else sp.set("task", value);
+                sp.delete("run");
+                sp.delete("cursor");
+                sp.delete("back");
+              })
+            }
+          >
+            <SelectTrigger className="h-9 w-52" aria-label={t("scopeBar.task")}>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">{t("scopeBar.allTasks")}</SelectItem>
+              {tasks.map((task) => (
+                <SelectItem key={task.id} value={task.id}>
+                  {task.name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          {tab !== "region" && (
+            <Select
+              value={runParam || (tab === "context" ? activeRun : "all")}
+              onValueChange={(value) =>
+                patch((sp) => {
+                  if (value === "all") sp.delete("run");
+                  else sp.set("run", value);
+                })
+              }
+              disabled={runOptions.length === 0}
+            >
+              <SelectTrigger className="h-9 w-56" aria-label={t("scopeBar.run")}>
+                <SelectValue placeholder={t("info.scan.placeholder")} />
+              </SelectTrigger>
+              <SelectContent>
+                {tab === "association" && (
+                  <SelectItem value="all">{t("scopeBar.allRuns")}</SelectItem>
+                )}
+                {runOptions.map((option) => (
+                  <SelectItem key={option.value} value={option.value}>
+                    <span className="font-mono text-xs">{option.label}</span>
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          )}
+          {tab !== "association" && (
             <>
-              <span aria-hidden className="h-3 w-px bg-border" />
-              <ColdPathBadge state={coldpath.data} />
+              <Input
+                type="datetime-local"
+                value={tab === "context" ? since : after}
+                onChange={(event) => {
+                  const value = event.target.value;
+                  patch((sp) => {
+                    const key = tab === "context" ? "since" : "after";
+                    if (value) sp.set(key, value);
+                    else sp.delete(key);
+                    sp.delete("cursor");
+                    sp.delete("back");
+                  });
+                }}
+                aria-label={t("info.context.since")}
+                className="h-9 w-52"
+              />
+              <Input
+                type="datetime-local"
+                value={tab === "context" ? until : before}
+                onChange={(event) => {
+                  const value = event.target.value;
+                  patch((sp) => {
+                    const key = tab === "context" ? "until" : "before";
+                    if (value) sp.set(key, value);
+                    else sp.delete(key);
+                    sp.delete("cursor");
+                    sp.delete("back");
+                  });
+                }}
+                aria-label={t("info.context.until")}
+                className="h-9 w-52"
+              />
             </>
           )}
-        </div>
-      </header>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => {
+              region.refetch();
+              if (tab === "association") association.refetch();
+              if (tab === "context") context.refetch();
+            }}
+            aria-label={t("info.refresh")}
+          >
+            <RefreshCw className="size-3.5" aria-hidden />
+            {t("info.refresh")}
+          </Button>
+        </CardContent>
+      </Card>
 
-      {!projectId ? (
-        <EmptyState title={t("info.noProject.title")} description={t("info.noProject.description")} />
-      ) : (
-        <Tabs value={tab} onValueChange={(v) => setTab(v as Tab)} className="space-y-4">
-          <TabsList>
+      {/* 态势头：口径 = 当前页已加载行，禁止冒充全量。 */}
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+        <Stat label={t("posture.loaded")} value={String(stats.total)} note={t("posture.loadedNote")} />
+        <Stat
+          label={t("posture.nature")}
+          value={`${stats.observed}/${stats.inferred}`}
+          note={t("posture.natureNote")}
+        />
+        <Stat label={t("posture.sources")} value={String(stats.sources)} note={stats.topSource || t("posture.sourcesNote")} />
+        <Stat
+          label={t("posture.coordinates")}
+          value={String(stats.complete)}
+          note={`${stats.partial} ${t("posture.coordinatePartial")}`}
+        />
+      </div>
+
+      <div className="grid gap-4 lg:grid-cols-[15rem_minmax(0,1fr)]">
+        <aside className="rounded-md border border-border bg-card p-3 lg:max-h-[calc(100vh-20rem)]">
+          <InfoSubjectRail
+            items={items}
+            activeSubject={subject}
+            onSelect={selectSubject}
+          />
+        </aside>
+
+        <Tabs
+          value={tab}
+          onValueChange={(value) => patch((sp) => sp.set("tab", value))}
+          className="min-w-0 space-y-3"
+        >
+          <TabsList className="w-full justify-start overflow-x-auto">
             <TabsTrigger value="region">{t("info.tabs.region")}</TabsTrigger>
             <TabsTrigger value="association">{t("info.tabs.association")}</TabsTrigger>
             <TabsTrigger value="context">{t("info.tabs.context")}</TabsTrigger>
           </TabsList>
 
-          <TabsContent value="region" className="space-y-4">
-            <Card className="rounded-md">
-              <CardContent className="flex flex-wrap items-center gap-2 p-4">
-                <Filter className="size-4 text-muted-foreground" />
-                <Input className="h-9 w-48" placeholder={t("info.filter.subjectPlaceholder")} value={subject} onChange={(e) => setSubject(e.target.value)} />
-                <Input className="h-9 w-36" placeholder={t("info.filter.kindPlaceholder")} value={subjectKind} onChange={(e) => setSubjectKind(e.target.value)} />
-                <Input className="h-9 w-44" placeholder={t("info.filter.purposePlaceholder")} value={purpose} onChange={(e) => setPurpose(e.target.value)} />
-                <Select value={nature} onValueChange={(v) => setNature(v as InfoNature | "all")}>
-                  <SelectTrigger className="h-9 w-36"><SelectValue /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="all">{t("info.filter.allNature")}</SelectItem>
-                    <SelectItem value="observed">{t("info.nature.observed")}</SelectItem>
-                    <SelectItem value="inferred">{t("info.nature.inferred")}</SelectItem>
-                  </SelectContent>
-                </Select>
-                <Select value={String(limit)} onValueChange={(v) => setLimit(Number(v))}>
-                  <SelectTrigger className="h-9 w-24"><SelectValue /></SelectTrigger>
-                  <SelectContent>{[25, 50, 100, 200].map((n) => <SelectItem key={n} value={String(n)}>{n}</SelectItem>)}</SelectContent>
-                </Select>
-                <Button size="sm" variant="outline" onClick={() => region.refetch()} aria-label={t("info.refresh")}>
-                  <RefreshCw className="size-3.5" />
-                </Button>
-              </CardContent>
-            </Card>
-            {region.isLoading ? <Loading /> : region.error ? (
-              <QueryError error={region.error} onRetry={() => region.refetch()} />
-            ) : !region.data?.available ? <DisabledState /> : (
-              <div className="space-y-3">
-                <Notice truncated={region.data.truncated} incomplete={region.data.incomplete} gapReason={region.data.gap_reason} />
-                {region.data.items.length === 0 ? (
-                  <EmptyState title={t("info.region.empty.title")} description={t("info.region.empty.description")} />
-                ) : region.data.items.map((item) => (
-                  <InfoItemCard
-                    key={`${item.scan_id}:${item.id}`}
-                    item={item}
-                    onAssociate={associate}
-                    focused={focusId === item.id}
+          <TabsContent value="region" className="mt-0 space-y-3">
+            <RegionFilters
+              subject={subject}
+              subjectKind={subjectKind}
+              purpose={purpose}
+              nature={nature}
+              clear={() =>
+                patch((sp) => {
+                  ["subject", "subjectKind", "purpose", "nature"].forEach((key) =>
+                    sp.delete(key),
+                  );
+                  sp.delete("cursor");
+                  sp.delete("back");
+                })
+              }
+              onChange={(key, value) =>
+                patch((sp) => {
+                  if (value) sp.set(key, value);
+                  else sp.delete(key);
+                  sp.delete("cursor");
+                  sp.delete("back");
+                })
+              }
+            />
+            {region.isLoading && !region.data ? (
+              <InfoLoading rows={4} />
+            ) : region.error ? (
+              <InfoQueryError error={region.error} onRetry={() => region.refetch()} />
+            ) : !region.data?.available ? (
+              <InfoDisabled />
+            ) : items.length === 0 ? (
+              <EmptyState
+                title={t("info.region.empty.title")}
+                description={t("info.region.empty.description")}
+              />
+            ) : (
+              <>
+                <InfoNotice
+                  truncated={region.data.truncated}
+                  incomplete={region.data.incomplete}
+                  gapReason={region.data.gap_reason}
+                />
+                <RegionTable
+                  items={items}
+                  focusedId={seeds[0] ?? null}
+                  onSeed={startAssociation}
+                  onSelectSubject={selectSubject}
+                />
+                <Pager
+                  hasMore={!!region.data.has_more}
+                  nextCursor={region.data.next_cursor}
+                  onNext={(next) =>
+                    patch((sp) => {
+                      sp.set("back", cursor);
+                      sp.set("cursor", next);
+                    })
+                  }
+                  canBack={!!cursor}
+                  onBack={() =>
+                    patch((sp) => {
+                      sp.delete("cursor");
+                      if (back) sp.set("cursor", back);
+                      sp.delete("back");
+                    })
+                  }
+                />
+              </>
+            )}
+          </TabsContent>
+
+          <TabsContent value="association" className="mt-0 space-y-3">
+            {seeds.length > 0 && association.isLoading && !association.data ? (
+              <InfoLoading rows={3} />
+            ) : association.error ? (
+              <InfoQueryError error={association.error} onRetry={() => association.refetch()} />
+            ) : null}
+            {seeds.length === 0 ? (
+              <EmptyState
+                title={t("info.association.empty.title")}
+                description={t("info.association.empty.description")}
+              />
+            ) : (
+              <>
+                {association.data && !association.data.available ? (
+                  <InfoDisabled />
+                ) : (
+                  <>
+                    {association.data && (
+                      <InfoNotice
+                        truncated={association.data.truncated}
+                        incomplete={association.data.incomplete}
+                        gapReason={association.data.gap_reason}
+                      />
+                    )}
+                    <AssociationView
+                      hits={association.data?.hits ?? []}
+                      seeds={seeds}
+                      edgeTypes={edgeTypes}
+                      depth={depth}
+                      onSeedsChange={(next) =>
+                        patch((sp) => {
+                          if (next.length) sp.set("seed", next.join(","));
+                          else sp.delete("seed");
+                        })
+                      }
+                      onEdgeTypesChange={(next) =>
+                        patch((sp) => {
+                          if (next.length) sp.set("edge", next.join(","));
+                          else sp.delete("edge");
+                        })
+                      }
+                      onDepthChange={(next) =>
+                        patch((sp) => sp.set("depth", String(next)))
+                      }
+                      onSeedNode={(id) =>
+                        patch((sp) => {
+                          sp.set("seed", id);
+                        })
+                      }
+                    />
+                    {association.data?.hits.length === 0 && (
+                      <EmptyState
+                        title={t("info.association.empty.title")}
+                        description={t("info.association.empty.description")}
+                      />
+                    )}
+                    {typeof association.data?.scans_consulted === "number" && (
+                      <p className="font-mono text-[10px] text-muted-foreground tabular-nums">
+                        {t("info.association.scansConsulted")}{" "}
+                        {association.data.scans_consulted}
+                      </p>
+                    )}
+                  </>
+                )}
+              </>
+            )}
+          </TabsContent>
+
+          <TabsContent value="context" className="mt-0 space-y-3">
+            {!activeRun ? (
+              <EmptyState
+                title={t("info.context.empty.title")}
+                description={t("info.context.empty.description")}
+              />
+            ) : context.isLoading && !context.data ? (
+              <InfoLoading rows={4} />
+            ) : context.error ? (
+              <InfoQueryError error={context.error} onRetry={() => context.refetch()} />
+            ) : !context.data?.available ? (
+              <InfoDisabled />
+            ) : (
+              <>
+                {context.data && (
+                  <InfoNotice
+                    truncated={context.data.truncated}
+                    incomplete={context.data.incomplete}
+                    gapReason={context.data.gap_reason}
                   />
-                ))}
-              </div>
-            )}
-          </TabsContent>
-
-          <TabsContent value="association" className="space-y-4">
-            <Card className="rounded-md">
-              <CardContent className="flex flex-wrap items-center gap-2 p-4">
-                <Network className="size-4 text-muted-foreground" />
-                {scopeToggle}
-                {assocScope === "scan" && scanSelect}
-                <Input className="h-9 min-w-64 flex-1" placeholder={t("info.association.idsPlaceholder")} value={assocIds} onChange={(e) => setAssocIds(e.target.value)} />
-                <Input className="h-9 w-56" value={edgeTypes} onChange={(e) => setEdgeTypes(e.target.value)} aria-label={t("info.association.edgeTypes")} />
-                <Select value={String(depth)} onValueChange={(v) => setDepth(Number(v))}>
-                  <SelectTrigger className="h-9 w-24"><SelectValue /></SelectTrigger>
-                  <SelectContent>{[1, 2, 3].map((n) => <SelectItem key={n} value={String(n)}>d{n}</SelectItem>)}</SelectContent>
-                </Select>
-              </CardContent>
-            </Card>
-            {!assocIds || (assocScope === "scan" && !activeScanId) ? (
-              <EmptyState title={t("info.association.empty.title")} description={t("info.association.empty.description")} />
-            ) : association.isLoading ? <Loading /> : association.error ? (
-              <QueryError error={association.error} onRetry={() => association.refetch()} />
-            ) : !association.data?.available ? <DisabledState /> : association.data.hits.length === 0 ? (
-              <EmptyState title={t("info.association.empty.title")} description={t("info.association.empty.description")} />
-            ) : (
-              <div className="space-y-3">
-                <div className="flex flex-wrap items-center gap-3">
-                  <Notice truncated={association.data.truncated} incomplete={association.data.incomplete} gapReason={association.data.gap_reason} />
-                  {typeof association.data.scans_consulted === "number" && (
-                    <span className="font-mono text-[11px] text-muted-foreground tabular-nums">
-                      {t("info.association.scansConsulted")} {association.data.scans_consulted}
+                )}
+                <ContextSlice
+                  scanId={activeRun}
+                  scanSelect={
+                    <span className="font-mono text-[11px] text-muted-foreground">
+                      {t("scopeBar.run")}: {activeRun}
                     </span>
-                  )}
-                </div>
-                <AssociationGraph hits={association.data.hits} />
-              </div>
-            )}
-          </TabsContent>
-
-          <TabsContent value="context" className="space-y-4">
-            <Card className="rounded-md">
-              <CardContent className="flex flex-wrap items-center gap-2 p-4">
-                {scanSelect}
-                <Input className="h-9 w-44" placeholder={t("info.filter.subjectPlaceholder")} value={subject} onChange={(e) => setSubject(e.target.value)} />
-                <Input className="h-9 w-56" type="datetime-local" value={since} onChange={(e) => setSince(e.target.value ? new Date(e.target.value).toISOString() : "")} aria-label={t("info.context.since")} />
-                <Input className="h-9 w-56" type="datetime-local" value={until} onChange={(e) => setUntil(e.target.value ? new Date(e.target.value).toISOString() : "")} aria-label={t("info.context.until")} />
-                <Button size="sm" variant="outline" onClick={() => context.refetch()} aria-label={t("info.refresh")}><RefreshCw className="size-3.5" /></Button>
-              </CardContent>
-            </Card>
-            {!activeScanId ? <EmptyState title={t("info.context.empty.title")} description={t("info.context.empty.description")} /> : context.isLoading ? <Loading /> : context.error ? (
-              <QueryError error={context.error} onRetry={() => context.refetch()} />
-            ) : !context.data?.available ? <DisabledState /> : context.data.items.length === 0 ? (
-              <EmptyState title={t("info.context.empty.title")} description={t("info.context.empty.description")} />
-            ) : (
-              <div className="space-y-3">
-                <Notice truncated={context.data.truncated} incomplete={context.data.incomplete} gapReason={context.data.gap_reason} />
-                {context.data.items.map((item) => <InfoItemCard key={`${item.scan_id}:${item.id}`} item={item} />)}
-              </div>
+                  }
+                  items={context.data?.items ?? []}
+                  subject={subject}
+                  since={since}
+                  until={until}
+                  onSubjectChange={(value) =>
+                    patch((sp) => {
+                      if (value) sp.set("subject", value);
+                      else sp.delete("subject");
+                    })
+                  }
+                  onSinceChange={(value) =>
+                    patch((sp) => {
+                      if (value) sp.set("since", value);
+                      else sp.delete("since");
+                    })
+                  }
+                  onUntilChange={(value) =>
+                    patch((sp) => {
+                      if (value) sp.set("until", value);
+                      else sp.delete("until");
+                    })
+                  }
+                />
+              </>
             )}
           </TabsContent>
         </Tabs>
-      )}
+      </div>
     </div>
   );
+}
+
+function PageHeader({ coldpath }: { coldpath: React.ReactNode }) {
+  const { t } = useI18n();
+  return (
+    <header className="flex flex-wrap items-end justify-between gap-3">
+      <div>
+        <h1 className="text-2xl font-semibold tracking-tight">{t("info.title")}</h1>
+        <p className="mt-1 text-sm text-muted-foreground">{t("info.subtitle")}</p>
+      </div>
+      <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+        <Database className="size-3.5" aria-hidden />
+        {t("info.coldPathHint")}
+        {coldpath && (
+          <>
+            <span aria-hidden className="h-3 w-px bg-border" />
+            {coldpath}
+          </>
+        )}
+      </div>
+    </header>
+  );
+}
+
+function RegionFilters({
+  subject,
+  subjectKind,
+  purpose,
+  nature,
+  onChange,
+  clear,
+}: {
+  subject: string;
+  subjectKind: string;
+  purpose: string;
+  nature: InfoNature | "";
+  onChange: (key: string, value: string) => void;
+  clear: () => void;
+}) {
+  const { t } = useI18n();
+  return (
+    <div className="flex flex-wrap items-center gap-2 rounded-md border border-border bg-card p-3">
+      <Filter className="size-4 text-muted-foreground" aria-hidden />
+      <Input
+        value={subject}
+        onChange={(event) => onChange("subject", event.target.value)}
+        placeholder={t("info.filter.subjectPlaceholder")}
+        className="h-9 w-48"
+      />
+      <Input
+        value={subjectKind}
+        onChange={(event) => onChange("subjectKind", event.target.value)}
+        placeholder={t("info.filter.kindPlaceholder")}
+        className="h-9 w-36"
+      />
+      <Input
+        value={purpose}
+        onChange={(event) => onChange("purpose", event.target.value)}
+        placeholder={t("info.filter.purposePlaceholder")}
+        className="h-9 w-44"
+      />
+      <Select
+        value={nature || "all"}
+        onValueChange={(value) => onChange("nature", value === "all" ? "" : value)}
+      >
+        <SelectTrigger className="h-9 w-36" aria-label={t("info.detail.nature")}>
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="all">{t("info.filter.allNature")}</SelectItem>
+          <SelectItem value="observed">{t("info.nature.observed")}</SelectItem>
+          <SelectItem value="inferred">{t("info.nature.inferred")}</SelectItem>
+        </SelectContent>
+      </Select>
+      <Button size="sm" variant="ghost" className="h-9" onClick={clear}>
+        {t("common.clear")}
+      </Button>
+    </div>
+  );
+}
+
+function Pager({
+  hasMore,
+  nextCursor,
+  canBack,
+  onNext,
+  onBack,
+}: {
+  hasMore: boolean;
+  nextCursor?: string;
+  canBack: boolean;
+  onNext: (cursor: string) => void;
+  onBack: () => void;
+}) {
+  const { t } = useI18n();
+  if (!hasMore && !canBack) return null;
+  return (
+    <div className="flex items-center justify-end gap-2">
+      <Button size="sm" variant="outline" disabled={!canBack} onClick={onBack}>
+        {t("common.previous")}
+      </Button>
+      <Button
+        size="sm"
+        variant="outline"
+        disabled={!hasMore || !nextCursor}
+        onClick={() => nextCursor && onNext(nextCursor)}
+      >
+        {t("common.next")}
+      </Button>
+    </div>
+  );
+}
+
+function Stat({
+  label,
+  value,
+  note,
+}: {
+  label: string;
+  value: string;
+  note: string;
+}) {
+  return (
+    <Card>
+      <CardContent className="p-3">
+        <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
+          {label}
+        </div>
+        <div className="mt-0.5 text-xl font-semibold tabular-nums">{value}</div>
+        <div className="truncate text-[10px] text-muted-foreground" title={note}>
+          {note}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function summarise(items: InfoItem[]) {
+  let observed = 0;
+  let complete = 0;
+  let partial = 0;
+  const sources = new Map<string, number>();
+  for (const item of items) {
+    if (item.nature === "observed") observed += 1;
+    if (item.coordinate_status === "complete") complete += 1;
+    else if (item.coordinate_status) partial += 1;
+    const kind = item.coordinates.source?.kind || "unknown";
+    sources.set(kind, (sources.get(kind) ?? 0) + 1);
+  }
+  const topSource =
+    [...sources.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? "";
+  return {
+    total: items.length,
+    observed,
+    inferred: items.length - observed,
+    complete,
+    partial,
+    sources: sources.size,
+    topSource,
+  };
+}
+
+function clampDepth(value: number): number {
+  if (!Number.isFinite(value)) return DEFAULT_DEPTH;
+  return Math.min(3, Math.max(1, Math.trunc(value)));
 }

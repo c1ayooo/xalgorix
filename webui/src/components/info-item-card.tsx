@@ -1,16 +1,17 @@
 import { Network } from "lucide-react";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import { InfoSourceChip } from "@/components/info-source-chip";
+import { NatureBadge } from "@/components/nature-badge";
 import { useI18n } from "@/i18n";
 import { cn } from "@/lib/utils";
 import type { InfoItem } from "@/types/api";
 
 /**
- * One InfoItem in the information space. Observed items use the sky semantic
- * chip; inferred items use violet. Confidence, coordinates and the source scan
- * stay mono because they are machine data. `focused` renders the deep-link
- * highlight (ring-ring/40 — the full-color ring is reserved for ?focus=).
+ * Compact InfoItem summary (task-scoped摘要 + any one-line context). The full
+ * seven-dimension view lives in `info-item-detail`; this card deliberately
+ * stays scannable. nature/source colours come from their single sources so no
+ * surface repeats literal sky/violet/emerald classes.
  */
 export function InfoItemCard({
   item,
@@ -22,35 +23,22 @@ export function InfoItemCard({
   focused?: boolean;
 }) {
   const { t } = useI18n();
-  const observed = item.nature === "observed";
   return (
     <Card className={cn("rounded-md", focused && "ring-1 ring-ring/40")}>
       <CardContent className="space-y-3 p-4">
         <div className="flex flex-wrap items-center gap-2">
-          <Badge
-            variant="outline"
-            className={
-              observed
-                ? "border-sky-500/30 bg-sky-500/10 text-sky-600 dark:text-sky-400"
-                : "border-violet-500/30 bg-violet-500/10 text-violet-600 dark:text-violet-400"
-            }
-          >
-            <span
-              aria-hidden
-              className={
-                observed
-                  ? "mr-1.5 size-1.5 rounded-full bg-sky-500"
-                  : "mr-1.5 size-1.5 rounded-full bg-violet-500"
-              }
-            />
-            {t(observed ? "info.nature.observed" : "info.nature.inferred")}
-          </Badge>
+          <NatureBadge nature={item.nature} />
+          <InfoSourceChip source={item.coordinates.source} />
           <span className="font-mono text-[11px] text-muted-foreground">
             {item.scan_id}
           </span>
-          {typeof item.confidence === "number" && (
-            <span className="font-mono text-[11px] text-muted-foreground tabular-nums">
-              {t("info.confidence")} {(item.confidence * 100).toFixed(0)}%
+          {typeof item.confidence === "number" && item.confidence > 0 && (
+            <span
+              className="font-mono text-[11px] text-muted-foreground tabular-nums"
+              title={t("info.detail.coordinateConfidence")}
+            >
+              {t("info.detail.coordinateConfidence")}{" "}
+              {(item.confidence * 100).toFixed(0)}%
             </span>
           )}
           {item.coordinate_status && (

@@ -1250,19 +1250,23 @@ const server = http.createServer(async (req, res) => {
     }
     const runId = qs.get("scan_id") || state.instances[0]?.id || "run_mock_1";
     const now = Date.now();
+    // Same identity the engine uses for projected evidence
+    // (infoitem.StableEvidenceID), so the ledger → /info deep link and the
+    // "projected into hypotheses" join both resolve in mock mode.
+    const itemId = (n) => `evidence:${runId}:ev_${n}`;
     const item = (n, nature, subject, purpose, text, supports = []) => ({
-      id: `info_${runId}_${n}`,
+      id: itemId(n),
       scan_id: runId,
       source_seq: n,
       nature,
       coordinates: {
         content: { text, media_type: "text/plain" },
-        source: { kind: "tool", name: n % 2 ? "httpx" : "nuclei", agent_id: runId },
+        source: { kind: "tool", name: n % 2 ? "httpx" : "nuclei", agent_id: runId, evidence_id: `ev_${n}` },
         observed_at: new Date(now - n * 60000).toISOString(),
         subject: { kind: "host", identifier: subject },
         purpose,
         context: { phase: n < 3 ? "recon" : "vulnerability-testing", task: "task_mock" },
-        relation_ids: n > 1 ? [`info_${runId}_${n - 1}`] : [],
+        relation_ids: n > 1 ? [itemId(n - 1)] : [],
       },
       supports,
       confidence: nature === "observed" ? 1 : 0.72,
@@ -1272,22 +1276,57 @@ const server = http.createServer(async (req, res) => {
     const items = [
       item(1, "observed", "api.example.com", "endpoint inventory", "GET /api/v1/orders returned 200 with an authenticated session.", []),
       item(2, "observed", "api.example.com", "auth boundary", "Anonymous request to /api/v1/orders returned 401.", []),
-      item(3, "inferred", "api.example.com", "authorization", "IDOR candidate: /api/v1/orders differs by user scope.", [`info_${runId}_1`]),
+      item(3, "inferred", "api.example.com", "authorization", "IDOR candidate: /api/v1/orders differs by user scope.", [itemId(1)]),
       item(4, "observed", "admin.example.com", "surface mapping", "Admin console responds with a login form.", []),
-      item(5, "inferred", "admin.example.com", "weak isolation", "Admin console may share the same session cookie.", [`info_${runId}_4`]),
+      item(5, "inferred", "admin.example.com", "weak isolation", "Admin console may share the same session cookie.", [itemId(4)]),
       item(6, "observed", "api.example.com", "traffic", "TLS certificate CN=api.example.com, issued by mock-ca.", []),
     ];
     if (url.endsWith("/region")) {
       const nature = qs.get("nature");
       const subject = qs.get("subject");
-      const filtered = items.filter((it) => (!nature || it.nature === nature) && (!subject || it.coordinates.subject.identifier.includes(subject)));
-      return send(res, { available: true, items: filtered, truncated: false, incomplete: false });
+      const limit = Math.min(Math.max(Number(qs.get("limit") || 50), 1), 200);
+      const filtered = items
+        .filter((it) => (!nature || it.nature === nature) && (!subject || it.coordinates.subject.identifier.includes(subject)))
+        // Contract ordering: observed_at DESC, id ASC.
+        .sort((a, b) => (a.coordinates.observed_at === b.coordinates.observed_at ? (a.id < b.id ? -1 : 1) : a.coordinates.observed_at < b.coordinates.observed_at ? 1 : -1));
+      // Keyset paging: `<observed_at>|<id>`, strictly after the cursor.
+      const cursor = qs.get("cursor") || "";
+      let start = 0;
+      if (cursor) {
+        const [at, id] = cursor.split("|");
+        start = filtered.findIndex((it) => it.coordinates.observed_at < at || (it.coordinates.observed_at === at && it.id > id));
+        if (start < 0) start = filtered.length;
+      }
+      const page = filtered.slice(start, start + limit);
+      const hasMore = start + limit < filtered.length;
+      const last = page[page.length - 1];
+      return send(res, {
+        available: true,
+        items: page,
+        truncated: hasMore,
+        has_more: hasMore,
+        next_cursor: hasMore && last ? `${last.coordinates.observed_at}|${last.id}` : undefined,
+        incomplete: false,
+      });
     }
     if (url.endsWith("/context")) {
       return send(res, { available: true, items: items.slice(0, 4), truncated: false, incomplete: false });
     }
     if (url.endsWith("/association")) {
-      const hits = items.slice(1, 4).map((it, idx) => ({ item: it, path: [`info_${runId}_1`, it.id], depth: (idx % 2) + 1 }));
+      const maxDepth = Math.min(Math.max(Number(qs.get("max_depth") || 2), 1), 3);
+      const kindFilter = (qs.get("edge_types") || "").split(",").filter(Boolean);
+      const KINDS = ["supports", "contradicts", "references", "same_session", "same_subject"];
+      const hits = items
+        .slice(1, 4)
+        .map((it, idx) => ({
+          item: it,
+          path: [itemId(1), it.id],
+          // Real per-hop types: the dashboard colours by these, never by guessing.
+          rels: [KINDS[idx % KINDS.length]],
+          depth: (idx % 2) + 1,
+        }))
+        .filter((hit) => hit.depth <= maxDepth)
+        .filter((hit) => kindFilter.length === 0 || hit.rels.some((rel) => kindFilter.includes(rel)));
       return send(res, { available: true, hits, truncated: false, incomplete: true, gap_reason: "mock watermark pending" });
     }
     return send(res, { available: false, reason: "unknown_info_endpoint" }, 404);
@@ -2154,6 +2193,10 @@ const server = http.createServer(async (req, res) => {
       kind,
       summary,
       nature,
+      // Mirrors internal/infoitem.StableEvidenceID: the cold-path InfoItem id
+      // of a projected evidence instance. Lets the dashboard deep-link
+      // evidence → information space in mock mode too.
+      info_item_id: `evidence:${scanId}:ev_${n}`,
       ...(source ? { source } : {}),
       confidence,
       created_at: t1,

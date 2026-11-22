@@ -1,5 +1,6 @@
 import { useState } from "react";
-import { ChevronDown, ChevronRight } from "lucide-react";
+import { Link } from "react-router-dom";
+import { ChevronDown, ChevronRight, ExternalLink } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -7,6 +8,7 @@ import { EmptyState } from "@/components/states";
 import { ErrorState } from "@/components/states";
 import { ColdPathBadge } from "@/components/coldpath-badge";
 import { AuditTimeline } from "@/components/audit-timeline";
+import { NatureBadge } from "@/components/nature-badge";
 import { useColdPathSync, useScanLedger } from "@/api/queries";
 import { useI18n } from "@/i18n";
 import { cn } from "@/lib/utils";
@@ -43,22 +45,35 @@ const STATUS_ORDER: LedgerHypothesisStatus[] = [
   "exhausted",
 ];
 
-function EvidenceRow({ ev }: { ev: LedgerEvidence }) {
+function EvidenceRow({
+  ev,
+  projectId,
+}: {
+  ev: LedgerEvidence;
+  projectId?: string;
+}) {
   const { t } = useI18n();
-  const observed = ev.nature === "observed";
   const [open, setOpen] = useState(false);
   const hasBody = Boolean(ev.request || ev.response);
+  // Evidence is a projection of an InfoItem (CORE §3.1/§3.3); the stable id
+  // already arrives from the ledger, so the link only needs the URL contract.
+  const infoHref = ev.info_item_id
+    ? `/info?tab=association&seed=${encodeURIComponent(ev.info_item_id)}${
+        projectId ? `&project=${encodeURIComponent(projectId)}` : ""
+      }`
+    : null;
   return (
     <li className="border-t border-border first:border-t-0">
-      <button
-        type="button"
-        onClick={() => hasBody && setOpen((v) => !v)}
-        className={cn(
-          "flex w-full items-center gap-2 px-3 py-1.5 text-left",
-          hasBody ? "transition-colors hover:bg-accent/40" : "cursor-default",
-        )}
-        aria-expanded={hasBody ? open : undefined}
-      >
+      <div className="flex items-center">
+        <button
+          type="button"
+          onClick={() => hasBody && setOpen((v) => !v)}
+          className={cn(
+            "flex min-w-0 flex-1 items-center gap-2 px-3 py-1.5 text-left",
+            hasBody ? "transition-colors hover:bg-accent/40" : "cursor-default",
+          )}
+          aria-expanded={hasBody ? open : undefined}
+        >
         {hasBody ? (
           open ? (
             <ChevronDown className="h-3 w-3 shrink-0 text-muted-foreground" />
@@ -68,23 +83,7 @@ function EvidenceRow({ ev }: { ev: LedgerEvidence }) {
         ) : (
           <span className="h-3 w-3 shrink-0" />
         )}
-        <span
-          className={cn(
-            "inline-flex shrink-0 items-center gap-1 rounded-full border px-1.5 text-[10px] uppercase tracking-wide",
-            observed
-              ? "border-sky-500/30 bg-sky-500/10 text-sky-600 dark:text-sky-400"
-              : "border-violet-500/30 bg-violet-500/10 text-violet-600 dark:text-violet-400",
-          )}
-        >
-          <span
-            aria-hidden
-            className={cn(
-              "size-1.5 rounded-full",
-              observed ? "bg-sky-500" : "bg-violet-500",
-            )}
-          />
-          {observed ? t("ledger.natureObserved") : t("ledger.natureInferred")}
-        </span>
+        <NatureBadge nature={ev.nature} size="xs" />
         <span className="w-20 shrink-0 truncate font-mono text-[11px] text-muted-foreground">
           {ev.kind}
         </span>
@@ -102,7 +101,18 @@ function EvidenceRow({ ev }: { ev: LedgerEvidence }) {
             {ev.confidence.toFixed(2)}
           </span>
         )}
-      </button>
+        </button>
+        {infoHref && (
+          <Link
+            to={infoHref}
+            className="mr-2 inline-flex shrink-0 items-center gap-0.5 rounded-sm px-1 text-[10px] text-muted-foreground transition-colors hover:bg-accent/40 hover:text-foreground"
+            aria-label={t("ledger.openInfoItem")}
+            title={`${t("ledger.openInfoItem")} · ${ev.info_item_id}`}
+          >
+            <ExternalLink className="size-3" aria-hidden />
+          </Link>
+        )}
+      </div>
       {open && hasBody && (
         <div className="space-y-2 px-3 pb-2">
           {ev.request && (
@@ -121,7 +131,13 @@ function EvidenceRow({ ev }: { ev: LedgerEvidence }) {
   );
 }
 
-function HypothesisRow({ h }: { h: LedgerHypothesis }) {
+function HypothesisRow({
+  h,
+  projectId,
+}: {
+  h: LedgerHypothesis;
+  projectId?: string;
+}) {
   const { t } = useI18n();
   const [open, setOpen] = useState(false);
   const evidence = h.evidence ?? [];
@@ -177,7 +193,7 @@ function HypothesisRow({ h }: { h: LedgerHypothesis }) {
           )}
           <ul className="overflow-hidden rounded-sm border border-border">
             {evidence.map((ev) => (
-              <EvidenceRow key={ev.id} ev={ev} />
+              <EvidenceRow key={ev.id} ev={ev} projectId={projectId} />
             ))}
           </ul>
         </div>
@@ -189,9 +205,12 @@ function HypothesisRow({ h }: { h: LedgerHypothesis }) {
 export function LedgerTab({
   scanId,
   running,
+  projectId,
 }: {
   scanId?: string;
   running?: boolean;
+  /** Owner project of the Run — used by the InfoItem deep link. */
+  projectId?: string;
 }) {
   const { t } = useI18n();
   const { data, isLoading, error, refetch } = useScanLedger(scanId, running);
@@ -268,7 +287,7 @@ export function LedgerTab({
           <CardContent className="p-0">
             <ul>
               {hypotheses.map((h) => (
-                <HypothesisRow key={h.id} h={h} />
+                <HypothesisRow key={h.id} h={h} projectId={projectId} />
               ))}
             </ul>
           </CardContent>

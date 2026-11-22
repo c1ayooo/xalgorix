@@ -1088,6 +1088,10 @@ export interface InfoRegionResult {
   available: boolean;
   items: InfoItem[];
   truncated: boolean;
+  /** Keyset 分页：还有下一页（不是全量总数）。 */
+  has_more?: boolean;
+  /** `<observed_at RFC3339Nano>|<id>`，原样传回 `cursor` 取下一页。 */
+  next_cursor?: string;
   incomplete: boolean;
   gap_reason?: string;
 }
@@ -1103,6 +1107,8 @@ export interface InfoContextResult {
 export interface InfoAssociationHit {
   item: InfoItem;
   path: string[];
+  /** 逐跳关系类型：len(rels) = len(path)-1，第 i 项是 path[i] → path[i+1]。 */
+  rels?: string[];
   depth: number;
 }
 
@@ -1124,8 +1130,12 @@ export interface InfoRegionParams {
   subject?: string;
   purpose?: string;
   nature?: InfoNature | "";
+  /** observed_at 严格时间边界（过滤，不是分页）。 */
   after?: string;
+  /** observed_at 严格时间边界（过滤，不是分页）。 */
   before?: string;
+  /** keyset 游标：上一页响应的 `next_cursor` 原样回传。 */
+  cursor?: string;
   limit?: number;
 }
 
@@ -1483,6 +1493,8 @@ export interface LedgerEvidence {
   source?: string;
   nature?: "observed" | "inferred";
   supports?: string[];
+  /** 冷路径 InfoItem 的稳定链接（`evidence:<scan>:<EV-id>`），可深链到 /info。 */
+  info_item_id?: string;
   confidence?: number;
   created_at: string;
 }

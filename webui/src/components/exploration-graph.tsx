@@ -11,6 +11,13 @@ import { EmptyState, ErrorState } from "@/components/states";
 import { useScanExploration } from "@/api/queries";
 import { useI18n } from "@/i18n";
 import { explorationDot, explorationShortID } from "@/lib/exploration";
+import {
+  EXPLORATION_REL_STROKE,
+  countRelations,
+  curvePath,
+  layoutLayered,
+  relStroke,
+} from "@/lib/layered-graph";
 import { cn } from "@/lib/utils";
 import type { ExplorationKind, ExplorationNode, ExplorationView } from "@/types/api";
 
@@ -81,13 +88,6 @@ export function ExplorationTab({
  * 事实 → 发现；只画投影里结构存在的边，不软匹配不编造。
  */
 
-const COL_W = 230;
-const CARD_W = 196;
-const CARD_H = 62;
-const ROW_H = 78;
-const MARGIN_X = 24;
-const HEADER_H = 34;
-
 /** 固定列序（observation 与 evidence 同居事实列）。 */
 const COL_ORDER: ExplorationKind[] = [
   "goal",
@@ -97,12 +97,16 @@ const COL_ORDER: ExplorationKind[] = [
   "finding",
 ];
 
-const REL_STROKE: Record<string, string> = {
-  claim: "#0ea5e9",
-  yields: "#10b981",
-  proves: "#f59e0b",
-  supports: "#8b5cf6",
+const LAYOUT = {
+  columnWidth: 230,
+  rowHeight: 78,
+  marginX: 24,
+  headerHeight: 34,
+  cardWidth: 196,
+  cardHeight: 62,
 };
+
+const REL_STROKE = EXPLORATION_REL_STROKE;
 
 const REL_LEGEND: { rel: string; key: string }[] = [
   { rel: "claim", key: "explore.rel.claim" },
@@ -126,25 +130,20 @@ export function ExplorationGraph({ view }: { view: ExplorationView }) {
       if (kind === "observation") return COL_ORDER.indexOf("evidence");
       return COL_ORDER.indexOf(kind);
     };
-    const byCol = new Map<number, ExplorationNode[]>();
-    for (const node of view.nodes) {
-      const col = colOf(node.kind);
-      if (col < 0) continue;
-      const list = byCol.get(col) ?? [];
-      list.push(node);
-      byCol.set(col, list);
-    }
-    const positioned: Positioned[] = [];
-    for (const [col, list] of byCol) {
-      list.forEach((node, i) => {
-        positioned.push({
-          ...node,
-          col,
-          x: MARGIN_X + col * COL_W,
-          y: HEADER_H + i * ROW_H,
-        });
-      });
-    }
+    // Shared layered layout (lib/layered-graph) — same geometry the
+    // association graph uses, so the two canvases cannot drift apart.
+    const laid = layoutLayered(
+      view.nodes
+        .map((node) => ({ ...node, column: colOf(node.kind) }))
+        .filter((node) => node.column >= 0),
+      LAYOUT,
+    );
+    const positioned: Positioned[] = laid.positioned.map((entry) => ({
+      ...entry.node,
+      col: entry.column,
+      x: entry.x,
+      y: entry.y,
+    }));
     const posByID = new Map(positioned.map((n) => [n.id, n]));
     const edges = view.edges
       .map((edge) => {
@@ -154,12 +153,18 @@ export function ExplorationGraph({ view }: { view: ExplorationView }) {
         return { from, to, rel: edge.rel };
       })
       .filter((e): e is NonNullable<typeof e> => e !== null);
-    const relCounts: Record<string, number> = {};
-    for (const e of edges) relCounts[e.rel] = (relCounts[e.rel] ?? 0) + 1;
-    const maxRows = Math.max(1, ...COL_ORDER.map((_, col) => (byCol.get(col)?.length ?? 0)));
-    const width = MARGIN_X + COL_ORDER.length * COL_W + 24;
-    const height = Math.max(200, HEADER_H + maxRows * ROW_H + 8);
-    return { positioned, edges, width, height, relCounts };
+    return {
+      positioned,
+      edges,
+      // The column header row is the contract: keep all five columns wide even
+      // when a kind has no nodes yet.
+      width: LAYOUT.marginX + COL_ORDER.length * LAYOUT.columnWidth + 24,
+      height: Math.max(
+        200,
+        LAYOUT.headerHeight + laid.maxRows * LAYOUT.rowHeight + 8,
+      ),
+      relCounts: countRelations(edges),
+    };
   }, [view]);
 
   const posByID = useMemo(() => new Map(positioned.map((n) => [n.id, n])), [positioned]);
@@ -194,31 +199,24 @@ export function ExplorationGraph({ view }: { view: ExplorationView }) {
           {COL_ORDER.map((kind, col) => (
             <text
               key={kind}
-              x={MARGIN_X + col * COL_W + 8}
+              x={LAYOUT.marginX + col * LAYOUT.columnWidth + 8}
               y={20}
               className="fill-muted-foreground text-[10px] uppercase tracking-wide"
             >
               {t(`explore.col.${kind}`)}
             </text>
           ))}
-          {edges.map((edge, i) => {
+          {edges.map((edge, i) => (
             // 右缘中点 → 左缘中点的三次贝塞尔（同列/相邻列均可读）。
-            const x1 = edge.from.x + CARD_W;
-            const y1 = edge.from.y + CARD_H / 2;
-            const x2 = edge.to.x;
-            const y2 = edge.to.y + CARD_H / 2;
-            const mid = (x1 + x2) / 2;
-            return (
-              <path
-                key={`e-${i}`}
-                d={`M ${x1} ${y1} C ${mid} ${y1}, ${mid} ${y2}, ${x2} ${y2}`}
-                fill="none"
-                stroke={REL_STROKE[edge.rel] ?? "#94a3b8"}
-                strokeWidth={1.4}
-                strokeOpacity={0.75}
-              />
-            );
-          })}
+            <path
+              key={`e-${i}`}
+              d={curvePath(edge.from, edge.to, LAYOUT)}
+              fill="none"
+              stroke={relStroke(edge.rel, REL_STROKE)}
+              strokeWidth={1.4}
+              strokeOpacity={0.75}
+            />
+          ))}
           {positioned.map((node) => (
             <g
               key={node.id}
@@ -237,8 +235,8 @@ export function ExplorationGraph({ view }: { view: ExplorationView }) {
               <rect
                 x={node.x}
                 y={node.y}
-                width={CARD_W}
-                height={CARD_H}
+                width={LAYOUT.cardWidth}
+                height={LAYOUT.cardHeight}
                 rx={6}
                 className="fill-card stroke-border"
                 strokeWidth={1}

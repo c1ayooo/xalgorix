@@ -403,7 +403,11 @@ export default function TaskDetailPage() {
 
           {/* 账本：选中 run 的 hypothesis/evidence 快照。 */}
           <TabsContent value="ledger" className="mt-0">
-            <LedgerTab scanId={scopedInstanceId} running={scopedRunning} />
+            <LedgerTab
+              scanId={scopedInstanceId}
+              running={scopedRunning}
+              projectId={task.project_id}
+            />
           </TabsContent>
 
           {/* 探索链路：投影拓扑视角（起点→执行→假设→事实→发现），与播报板同源。 */}

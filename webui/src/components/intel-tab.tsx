@@ -11,7 +11,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { EmptyState, ErrorState } from "@/components/states";
-import { IntelInfoItems } from "@/components/intel-info-items";
+import { IntelInfoSummary } from "@/components/intel-info-summary";
 import { useIntelTriage, useTaskIntelligence } from "@/api/queries";
 import { useI18n } from "@/i18n";
 import { cn } from "@/lib/utils";
@@ -220,9 +220,11 @@ export function IntelTab({
 
   return (
     <div className="space-y-3">
-      {/* 信息项切片：该任务全部 run 的冷路径 InfoItem（区域/关联点亮）。
+      {/* 信息项摘要：完整信息空间在 /info（作用域条 + 主体导航 + 三视图），
+          这里只留计数与最近几条并深链——避免第二份实现漂移。
           project_id 用任务归属项目，不用活跃项目——后端按归属校验 task_id。 */}
-      <IntelInfoItems taskId={taskId} projectId={projectId} />
+      <IntelInfoSummary taskId={taskId} projectId={projectId} />
+      <div className="border-t border-border" aria-hidden />
 
       {/* kind 过滤 chips（带计数）+ 分诊状态过滤。 */}
       <div className="flex flex-wrap items-center gap-2">
