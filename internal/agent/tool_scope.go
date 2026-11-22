@@ -1,6 +1,6 @@
 package agent
 
-import "github.com/xalgord/xalgorix/v4/internal/scanctx"
+import "github.com/c1ayooo/xalgorix/v4/internal/scanctx"
 
 // roleToolScope maps a delegated specialist's canonical role to the tools whose
 // DOCUMENTATION is withheld from its system prompt. Hidden tools stay fully

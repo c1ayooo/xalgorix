@@ -49,8 +49,8 @@ import (
 	"sort"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/platformutil"
-	"github.com/xalgord/xalgorix/v4/internal/storage"
+	"github.com/c1ayooo/xalgorix/v4/internal/platformutil"
+	"github.com/c1ayooo/xalgorix/v4/internal/storage"
 )
 
 // profileIDRE matches the same shape Catalog_Entry.id uses

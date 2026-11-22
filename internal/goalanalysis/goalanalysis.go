@@ -14,7 +14,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/xalgord/xalgorix/v4/internal/platform"
+	"github.com/c1ayooo/xalgorix/v4/internal/platform"
 )
 
 // AnalyzeInput carries everything the analyzer may look at. Goal is required;

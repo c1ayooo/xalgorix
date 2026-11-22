@@ -17,13 +17,56 @@ type scanBudget struct {
 	startedMu sync.RWMutex
 	startedAt time.Time
 
-	toolCalls     atomic.Int64
-	iterations    atomic.Int64
-	tokens        atomic.Int64
-	costNanoUSD   atomic.Int64
-	progress      atomic.Int64
+	toolCalls   atomic.Int64
+	iterations  atomic.Int64
+	tokens      atomic.Int64
+	costNanoUSD atomic.Int64
+	progress    atomic.Int64
+	// activeAgents counts live agents sharing this budget (root + specialists).
+	// With two or more, each reservation keeps a floor free for the others so a
+	// single fast lane cannot eat the shared cap and leave the rest idle.
+	activeAgents  atomic.Int64
 	progressFacts map[string]bool // protected by persistMu
 	progressAt    time.Time       // protected by persistMu
+}
+
+// enter/leave bracket one live agent's participation in the shared budget.
+func (b *scanBudget) enter() {
+	if b == nil {
+		return
+	}
+	b.activeAgents.Add(1)
+}
+
+func (b *scanBudget) leave() {
+	if b == nil {
+		return
+	}
+	b.activeAgents.Add(-1)
+}
+
+// ceiling returns the total usage this agent may reach under fair sharing.
+// With fewer than two live agents it is the configured cap unchanged (single
+// agent behavior stays byte-identical). Otherwise it reserves cap/(n+1) for
+// every other live agent, which bounds any one lane's share while still letting
+// the last agent use the remainder after others finish.
+func (b *scanBudget) ceiling(cap int) int {
+	if b == nil || cap <= 0 {
+		return cap
+	}
+	active := b.activeAgents.Load()
+	if active < 2 {
+		return cap
+	}
+	floor := int64(cap) / (active + 1)
+	if floor < 1 {
+		return cap
+	}
+	limit := int64(cap) - floor*(active-1)
+	if limit < 1 {
+		limit = 1
+	}
+	return int(limit)
 }
 
 func newScanBudget() *scanBudget { return &scanBudget{} }
@@ -80,6 +123,7 @@ func (b *scanBudget) reserveToolCalls(requested, cap int) int {
 		b.toolCalls.Add(int64(requested))
 		return requested
 	}
+	cap = b.ceiling(cap)
 	for {
 		used := b.toolCalls.Load()
 		remaining := int64(cap) - used
@@ -111,6 +155,7 @@ func (b *scanBudget) reserveIteration(cap int) bool {
 		b.iterations.Add(1)
 		return true
 	}
+	cap = b.ceiling(cap)
 	for {
 		used := b.iterations.Load()
 		if used >= int64(cap) {

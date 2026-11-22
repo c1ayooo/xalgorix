@@ -263,3 +263,22 @@ func TestConfig_ResolveModel(t *testing.T) {
 		t.Errorf("expected empty for empty LLM, got %q", api)
 	}
 }
+
+func TestLoad_ReadsToolboxProxyURL(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("SUDO_USER", "")
+	t.Setenv("XALGORIX_DEBUG_CONFIG", "")
+
+	// The env file is the last source load() applies, so this also proves the
+	// value survives the /etc and sudo-user passes.
+	envFile := filepath.Join(home, ".xalgorix.env")
+	if err := os.WriteFile(envFile, []byte("XALGORIX_TOOLBOX_PROXY_URL=http://xalgorix-proxy:8081\n"), 0o600); err != nil {
+		t.Fatalf("write env file: %v", err)
+	}
+
+	cfg := load()
+	if cfg.ToolboxProxyURL != "http://xalgorix-proxy:8081" {
+		t.Fatalf("expected ToolboxProxyURL from XALGORIX_TOOLBOX_PROXY_URL, got %q", cfg.ToolboxProxyURL)
+	}
+}

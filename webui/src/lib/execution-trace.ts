@@ -36,11 +36,16 @@ export interface PlanState {
   /** Number of successful build_plan calls observed (the last one wins). */
   revisions: number;
   updatedAt?: number;
-  /** "event" = task list parsed from events; "none" = not reported. */
-  source: "event" | "none";
-  /** True when history was paginated or a plan payload was truncated. */
+  /**
+   * "projection" = read from GET /api/scans/{id}/plan (authority);
+   * "event" = task list parsed from build_plan/update_plan telemetry (fallback);
+   * "none" = not reported.
+   */
+  source: "event" | "projection" | "none";
+  /** True when history was paginated, a plan payload was truncated, or the
+   *  projection could only serve counters (run predates plan persistence). */
   incomplete: boolean;
-  incompleteReason?: "history" | "truncated" | "unparsable";
+  incompleteReason?: "history" | "truncated" | "unparsable" | "not_persisted";
 }
 
 export interface PlanProgress {

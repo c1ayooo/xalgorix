@@ -42,11 +42,11 @@ import (
 	"strings"
 	"time"
 
-	oobsrv "github.com/xalgord/xalgorix/v4/internal/oob"
-	"github.com/xalgord/xalgorix/v4/internal/scanctx"
-	"github.com/xalgord/xalgorix/v4/internal/scopeguard"
-	"github.com/xalgord/xalgorix/v4/internal/tools"
-	"github.com/xalgord/xalgorix/v4/internal/tools/httpclient"
+	oobsrv "github.com/c1ayooo/xalgorix/v4/internal/oob"
+	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
+	"github.com/c1ayooo/xalgorix/v4/internal/scopeguard"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools/httpclient"
 )
 
 func (a *Agent) registerVerifyXXETool(reg *tools.Registry) {

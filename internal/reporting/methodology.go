@@ -3,7 +3,7 @@ package reporting
 import (
 	"strconv"
 
-	"github.com/xalgord/xalgorix/v4/internal/methodology"
+	"github.com/c1ayooo/xalgorix/v4/internal/methodology"
 )
 
 // MethodologyPhaseNames maps each phase number in the Xalgorix 22-phase

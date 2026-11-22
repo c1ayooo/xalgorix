@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/xalgord/xalgorix/v4/internal/scanctx"
+	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
 )
 
 // ── Authentication coverage (Part 21 cases 21-24) ────────────────────────────

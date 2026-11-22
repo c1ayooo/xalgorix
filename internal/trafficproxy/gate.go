@@ -38,7 +38,7 @@ package trafficproxy
 import (
 	"sync"
 
-	"github.com/xalgord/xalgorix/v4/internal/approval"
+	"github.com/c1ayooo/xalgorix/v4/internal/approval"
 )
 
 // HighRiskGate adjudicates one subprocess-channel high-risk request.

@@ -3,7 +3,7 @@ package agent
 import (
 	"testing"
 
-	"github.com/xalgord/xalgorix/v4/internal/scanctx"
+	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
 )
 
 func newClaimAgent(t *testing.T) *Agent {

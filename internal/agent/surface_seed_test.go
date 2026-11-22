@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/xalgord/xalgorix/v4/internal/attacksurface"
-	"github.com/xalgord/xalgorix/v4/internal/scanctx"
+	"github.com/c1ayooo/xalgorix/v4/internal/attacksurface"
+	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
 )
 
 func newSurfaceAgent(t *testing.T) *Agent {

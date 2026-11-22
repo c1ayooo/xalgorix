@@ -35,6 +35,8 @@ import {
   useAuthProfiles,
   useLLMSettings,
   useProviders,
+  useProjects,
+  useTasks,
 } from "@/api/queries";
 import { cn, menuContentClass, menuItemClass } from "@/lib/utils";
 import type { ScanSchedule } from "@/types/api";
@@ -164,7 +166,27 @@ export default function SchedulesPage() {
   const [logoUploading, setLogoUploading] = useState(false);
   const [discordWebhook, setDiscordWebhook] = useState("");
   const [severityFilter, setSeverityFilter] = useState<string[]>([]);
+  // v4.6 — project binding, target mode and execution window.
+  const [projectId, setProjectId] = useState("");
+  const [targetMode, setTargetMode] = useState<"scan" | "create_task" | "trigger_task">("scan");
+  const [targetTaskId, setTargetTaskId] = useState("");
+  const [taskGoal, setTaskGoal] = useState("");
+  const [windowStart, setWindowStart] = useState("");
+  const [windowEnd, setWindowEnd] = useState("");
+  const [windowEndAction, setWindowEndAction] = useState<"pause" | "finish">("pause");
   const [formError, setFormError] = useState<string | null>(null);
+
+  // Project picker + the tasks of the selected project (trigger_task target).
+  const projectsQuery = useProjects();
+  const projectOptions = useMemo(
+    () => projectsQuery.data?.projects ?? [],
+    [projectsQuery.data],
+  );
+  const projectTasksQuery = useTasks(projectId || undefined);
+  const projectTasks = useMemo(
+    () => projectTasksQuery.data?.tasks ?? [],
+    [projectTasksQuery.data],
+  );
 
   const schedules = useMemo<ScanSchedule[]>(() => {
     let list: ScanSchedule[] = data ?? [];
@@ -224,6 +246,13 @@ export default function SchedulesPage() {
     setDiscordWebhook("");
     setSeverityFilter([]);
     setProviderProfile("");
+    setProjectId("");
+    setTargetMode("scan");
+    setTargetTaskId("");
+    setTaskGoal("");
+    setWindowStart("");
+    setWindowEnd("");
+    setWindowEndAction("pause");
     setFormError(null);
     setDialogOpen(true);
   }
@@ -251,6 +280,13 @@ export default function SchedulesPage() {
     setDiscordWebhook(sch.discord_webhook || "");
     setSeverityFilter(sch.severity_filter || []);
     setProviderProfile(sch.provider_profile || "");
+    setProjectId(sch.project_id || "");
+    setTargetMode(sch.mode || "scan");
+    setTargetTaskId(sch.task_id || "");
+    setTaskGoal(sch.task_goal || "");
+    setWindowStart(sch.window_start || "");
+    setWindowEnd(sch.window_end || "");
+    setWindowEndAction(sch.window_end_action || "pause");
     setFormError(null);
     setDialogOpen(true);
   }
@@ -321,8 +357,23 @@ export default function SchedulesPage() {
       .map((t) => t.trim())
       .filter(Boolean);
 
-    if (targets.length === 0) {
+    // Mode-specific requirements mirror the server's validateScheduleTargets:
+    // scan needs targets, trigger_task needs a task, create_task may rely on
+    // the bound project's scope.
+    if (targetMode === "scan" && targets.length === 0) {
       setFormError(t("schedules.targetsError"));
+      return;
+    }
+    if (targetMode === "trigger_task" && !targetTaskId) {
+      setFormError(t("schedules.taskRequiredError"));
+      return;
+    }
+    if (targetMode === "create_task" && !projectId && targets.length === 0) {
+      setFormError(t("schedules.projectRequiredError"));
+      return;
+    }
+    if (!!windowStart !== !!windowEnd) {
+      setFormError(t("schedules.windowPairError"));
       return;
     }
 
@@ -346,6 +397,15 @@ export default function SchedulesPage() {
       discord_webhook: discordWebhook.trim() || undefined,
       severity_filter: severityFilter.length ? severityFilter : undefined,
       enabled: editingSchedule ? editingSchedule.enabled : true,
+      // v4.6 — project binding, target mode and execution window.
+      project_id: projectId || undefined,
+      mode: targetMode,
+      task_id: targetMode === "trigger_task" ? targetTaskId || undefined : undefined,
+      task_goal: targetMode === "create_task" ? taskGoal.trim() || undefined : undefined,
+      window_start: windowStart || undefined,
+      window_end: windowEnd || undefined,
+      window_end_action:
+        windowStart && windowEnd ? windowEndAction : undefined,
     } as any;
 
     try {
@@ -468,9 +528,24 @@ export default function SchedulesPage() {
                             {formatScheduleWindow(s, t)}
                           </div>
                         )}
+                        {s.window_start && s.window_end && (
+                          <div className="mt-1 text-[11px] text-muted-foreground">
+                            {`⏱ ${s.window_start}–${s.window_end} · ${
+                              s.window_end_action === "finish"
+                                ? t("schedules.windowAction.finish")
+                                : t("schedules.windowAction.pause")
+                            }`}
+                          </div>
+                        )}
                       </td>
                       <td className="px-4 py-3 align-middle max-w-xs truncate mono text-xs text-muted-foreground">
-                        {s.targets.join(", ")}
+                        {s.targets.length > 0
+                          ? s.targets.join(", ")
+                          : s.mode === "trigger_task"
+                            ? t("schedules.targetMode.triggerTask")
+                            : s.mode === "create_task"
+                              ? t("schedules.targetMode.createTask")
+                              : "—"}
                       </td>
                       <td className="px-4 py-3 align-middle text-xs text-muted-foreground">
                         {s.last_run
@@ -555,6 +630,104 @@ export default function SchedulesPage() {
               </div>
             </div>
 
+            {/* v4.6 — 项目绑定与目标模式：定时扫描 / 定时创建新任务 / 触发已有任务 */}
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div className="space-y-2">
+                <Label>{t("schedules.label.project")}</Label>
+                <Select
+                  value={projectId || "default"}
+                  onValueChange={(v) => {
+                    setProjectId(v === "default" ? "" : v);
+                    setTargetTaskId("");
+                  }}
+                >
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="default">{t("schedules.defaultProject")}</SelectItem>
+                    {projectOptions.map((p) => (
+                      <SelectItem key={p.id} value={p.id}>
+                        {p.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <p className="text-[11px] text-muted-foreground">
+                  {t("schedules.projectHint")}
+                </p>
+              </div>
+              <div className="space-y-2">
+                <Label>{t("schedules.label.targetMode")}</Label>
+                <Select
+                  value={targetMode}
+                  onValueChange={(v) =>
+                    setTargetMode(v as "scan" | "create_task" | "trigger_task")
+                  }
+                >
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="scan">{t("schedules.targetMode.scan")}</SelectItem>
+                    <SelectItem value="create_task">
+                      {t("schedules.targetMode.createTask")}
+                    </SelectItem>
+                    <SelectItem value="trigger_task">
+                      {t("schedules.targetMode.triggerTask")}
+                    </SelectItem>
+                  </SelectContent>
+                </Select>
+                <p className="text-[11px] text-muted-foreground">
+                  {t("schedules.targetModeHint")}
+                </p>
+              </div>
+            </div>
+
+            {targetMode === "trigger_task" && (
+              <div className="space-y-2">
+                <Label>{t("schedules.label.targetTask")}</Label>
+                <Select
+                  value={targetTaskId || "none"}
+                  onValueChange={(v) => setTargetTaskId(v === "none" ? "" : v)}
+                  disabled={!projectId}
+                >
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="none">{t("schedules.selectTask")}</SelectItem>
+                    {projectTasks.map((task) => (
+                      <SelectItem key={task.id} value={task.id}>
+                        {task.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <p className="text-[11px] text-muted-foreground">
+                  {projectId
+                    ? t("schedules.targetTaskHint")
+                    : t("schedules.targetTaskProjectFirst")}
+                </p>
+              </div>
+            )}
+
+            {targetMode === "create_task" && (
+              <div className="space-y-2">
+                <Label htmlFor="sched-task-goal">{t("schedules.label.taskGoal")}</Label>
+                <Textarea
+                  id="sched-task-goal"
+                  rows={2}
+                  value={taskGoal}
+                  onChange={(e) => setTaskGoal(e.target.value)}
+                  placeholder={t("schedules.taskGoalPlaceholder")}
+                />
+                <p className="text-[11px] text-muted-foreground">
+                  {t("schedules.taskGoalHint")}
+                </p>
+              </div>
+            )}
+
             <div className="space-y-2">
               <div
                 className={cn(
@@ -637,7 +810,6 @@ export default function SchedulesPage() {
               <Label htmlFor="sched-targets">{t("schedules.label.targets")}</Label>
               <Textarea
                 id="sched-targets"
-                required
                 rows={4}
                 placeholder="example.com&#10;api.example.com"
                 value={targetsText}
@@ -738,6 +910,57 @@ export default function SchedulesPage() {
                 value={instruction}
                 onChange={(e) => setInstruction(e.target.value)}
               />
+            </div>
+
+            {/* v4.6 — 执行时间窗口：仅在窗口内触发；到达结束时间按 pause/finish 处理 */}
+            <Separator />
+            <div className="space-y-2">
+              <Label>{t("schedules.label.executionWindow")}</Label>
+              <div className="grid gap-4 sm:grid-cols-3">
+                <div className="space-y-1.5">
+                  <Label htmlFor="sched-window-start" className="text-[11px] text-muted-foreground">
+                    {t("schedules.windowStart")}
+                  </Label>
+                  <Input
+                    id="sched-window-start"
+                    type="time"
+                    value={windowStart}
+                    onChange={(e) => setWindowStart(e.target.value)}
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <Label htmlFor="sched-window-end" className="text-[11px] text-muted-foreground">
+                    {t("schedules.windowEnd")}
+                  </Label>
+                  <Input
+                    id="sched-window-end"
+                    type="time"
+                    value={windowEnd}
+                    onChange={(e) => setWindowEnd(e.target.value)}
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <Label className="text-[11px] text-muted-foreground">
+                    {t("schedules.windowEndAction")}
+                  </Label>
+                  <Select
+                    value={windowEndAction}
+                    onValueChange={(v) => setWindowEndAction(v as "pause" | "finish")}
+                    disabled={!windowStart || !windowEnd}
+                  >
+                    <SelectTrigger>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="pause">{t("schedules.windowAction.pause")}</SelectItem>
+                      <SelectItem value="finish">{t("schedules.windowAction.finish")}</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
+              <p className="text-[11px] text-muted-foreground">
+                {t("schedules.windowHint")}
+              </p>
             </div>
 
             <div className="space-y-2">

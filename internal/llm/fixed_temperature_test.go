@@ -3,7 +3,7 @@ package llm
 import (
 	"testing"
 
-	"github.com/xalgord/xalgorix/v4/internal/config"
+	"github.com/c1ayooo/xalgorix/v4/internal/config"
 )
 
 // Kimi K2.6 / K3 reject any temperature other than 1 ("only 1 is allowed for

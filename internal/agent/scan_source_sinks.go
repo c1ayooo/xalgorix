@@ -20,9 +20,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/xalgord/xalgorix/v4/internal/scanctx"
-	"github.com/xalgord/xalgorix/v4/internal/tools"
-	"github.com/xalgord/xalgorix/v4/internal/tools/codesearch"
+	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools/codesearch"
 )
 
 // maxSinkSeed caps how many hypotheses a single sink sweep seeds so a large

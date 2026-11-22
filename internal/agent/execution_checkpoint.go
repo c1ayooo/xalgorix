@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/storage"
-	"github.com/xalgord/xalgorix/v4/internal/tools/reporting"
+	"github.com/c1ayooo/xalgorix/v4/internal/storage"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools/reporting"
 )
 
 const executionCheckpointVersion = 1
@@ -238,6 +238,7 @@ func (a *Agent) RestoreExecutionCheckpoint() (bool, error) {
 func (a *Agent) saveExecutionCheckpoint() error {
 	a.updateAssessmentProgress()
 	a.publishAssessmentSnapshot()
+	a.publishPlanSnapshot()
 	path := a.executionCheckpointPath()
 	if path == "" || a.state == nil {
 		return nil

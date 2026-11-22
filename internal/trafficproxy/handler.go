@@ -31,8 +31,8 @@ import (
 
 	xproxy "golang.org/x/net/proxy"
 
-	"github.com/xalgord/xalgorix/v4/internal/proxy"
-	"github.com/xalgord/xalgorix/v4/internal/scanctx"
+	"github.com/c1ayooo/xalgorix/v4/internal/proxy"
+	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
 )
 
 // hopByHopHeaders lists headers that must not be forwarded by a proxy

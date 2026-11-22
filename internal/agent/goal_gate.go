@@ -31,8 +31,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/objective"
-	"github.com/xalgord/xalgorix/v4/internal/tools/reporting"
+	"github.com/c1ayooo/xalgorix/v4/internal/objective"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools/reporting"
 )
 
 // hookGoalFinishGate refuses voluntary finish while required, engine-decidable

@@ -188,3 +188,25 @@
   发现、泳道章全是既有渲染器），不再手写第二套行渲染；规划组保留 PlanRail 概览头。
   手写 RoleRow 删除。
 - 验证：typecheck 0；`go build ./...` 通过；agent/web 包测试通过；`make webui` 已重建。
+
+### 追加轮 4（2026-11-23）：会话页模块注册表 + 计划/Worker 状态投影
+
+- **Planner 区域修复**：数据源从 `build_plan`/`update_plan` tool_call 反推切换为
+  `GET /api/scans/{id}/plan`（引擎 `ScanState.Plan` 的 immutable 投影，owner-loop 回合边界发布）。
+  引擎自建计划不产生那些 tool_call，这是"Planner 常常为空"的根因。终态由
+  `ScanRecord.PlanView` 承接（与 plan 计数同一写入点）；只有计数时返回
+  `partial:"not_persisted"`，不把"明细缺失"渲染成"没有计划"。
+- **模块化**：`sessions/modules/registry.tsx` 驱动左栏与主区（plan / decision / obligation /
+  workers / system），每模块必填 `ring`（七环）与 `authority`，映射表见 `docs/SESSIONS_MODULE_MAP.md`。
+  模块默认常驻，"引擎没产生"显示 absent 空态——旧实现的分组会凭空消失。
+- **Workers 修复**：列表改读 `GET /api/instances/{id}/agents`（agentsgraph 状态权威；终态读
+  `execution-graph.json` 并把持久 `running/queued` 降级为 `failed`）。每行显示自身状态、
+  排队位置、当前认领假设；分组 = 运行中 / 排队 / 已结束（折叠）。删除了"用 run 级 status
+  当 worker 状态"的缺陷（原 `session-rail.tsx`），这是"两个 worker 只有一个在干活却都转圈"的直接原因。
+- **SSE 纪律**：`agent_queued/started/completed/failed` 与 `plan_updated` 只做面板失效
+  （`result_meta` 携带结构化摘要），投影端点仍是权威。
+- **验证**：`go test ./internal/tools/agentsgraph ./internal/scanctx ./internal/agent ./internal/web -race`
+  通过（新增投影/快照/借用/预算 fair-share 用例）；`cd webui && npm run typecheck` 0 错误；
+  `make webui` 重建嵌入产物。
+- **已知限制**：事件缓冲仍是进程内存，`agent_*` 帧可能被 `safeSend(...,0)` 丢弃——因此 UI 只把它
+  当失效信号，投影读取有 6s/10s 兜底轮询。

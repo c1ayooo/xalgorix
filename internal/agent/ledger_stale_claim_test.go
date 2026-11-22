@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/xalgord/xalgorix/v4/internal/scanctx"
+	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
 )
 
 // TestLedgerFinishGateBlocksStaleTestingClaimEarly (P7 baseline): within the

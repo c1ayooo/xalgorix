@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/xalgord/xalgorix/v4/internal/tools"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools"
 )
 
 // malformed_recovery_test.go — regression coverage for the malformed
@@ -79,15 +79,15 @@ func TestAppendUserNudgeDeduplicatesBackToBackIdenticals(t *testing.T) {
 	a := &Agent{}
 	a.appendUserNudge("nudge A")
 	a.appendUserNudge("nudge A")
-	if len(a.messages) != 1 {
-		t.Fatalf("identical back-to-back nudge must not stack, got %d messages", len(a.messages))
+	if len(a.pendingInjects) != 1 {
+		t.Fatalf("identical back-to-back nudge must not stack, got %d queued", len(a.pendingInjects))
 	}
 	a.appendUserNudge("nudge B")
-	if len(a.messages) != 2 {
-		t.Fatalf("a distinct nudge must append, got %d messages", len(a.messages))
+	if len(a.pendingInjects) != 2 {
+		t.Fatalf("a distinct nudge must append, got %d queued", len(a.pendingInjects))
 	}
 	a.appendUserNudge("nudge A")
-	if len(a.messages) != 3 {
-		t.Fatalf("alternating nudges must all append, got %d messages", len(a.messages))
+	if len(a.pendingInjects) != 3 {
+		t.Fatalf("alternating nudges must all append, got %d queued", len(a.pendingInjects))
 	}
 }

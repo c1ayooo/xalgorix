@@ -16,8 +16,8 @@ import {
 import { EmptyState } from "@/components/states";
 import { Transcript } from "@/components/chat/transcript";
 import { SessionComposer } from "@/components/sessions/session-composer";
-import { RoleEventStream } from "@/components/sessions/role-event-stream";
-import { isSessionRole, type SessionRole } from "@/components/sessions/role-events";
+import { findModule } from "@/components/sessions/modules/registry";
+import type { ModuleData } from "@/components/sessions/modules/types";
 import { ScanStatusPill } from "@/components/scan-status-pill";
 import { agentLane, fmtDuration, fmtTokens, isMainAgentLane } from "@/components/chat/format";
 import { useI18n } from "@/i18n";
@@ -26,19 +26,24 @@ import { useLiveSessionKeys } from "@/components/session-item";
 import type { Run, TranscriptItem } from "@/types/api";
 
 /**
- * 会话页工作区（参照右栏）：头部（标题/状态/实时/token/时长/控制）+
- * 按泳道过滤的完整转录 + 主会话 Composer。Worker/System 泳道只读——
- * 引擎没有 per-agent 控制接口，不伪造（方案 §5.5）。
+ * 会话页工作区（右栏）：头部（标题/权威来源/状态/时长/tokens/运行控制）+
+ * 模块主体 + 主会话 Composer。
+ *
+ * 主体解析顺序：主会话（无 ?agent=）→ 完整转录；注册表模块 → module.render；
+ * 其余 ?agent= 值 → 该 worker 泳道的转录过滤（兼容旧深链）。
+ * 模块数据由 sessions-tab 一次查询后传入，模块自身不再各自取数。
  */
 export function SessionWorkspace({
   taskId,
   run,
   lane,
+  data,
 }: {
   taskId: string;
   run: Run | undefined;
-  /** undefined=主会话；plan|decision|system=角色会话；其余=worker 泳道短名。 */
+  /** undefined=主会话；模块 id；或 worker agent_id。 */
   lane?: string;
+  data: ModuleData;
 }) {
   const { t } = useI18n();
   const instanceId = run?.instance_id;
@@ -59,14 +64,8 @@ export function SessionWorkspace({
   const { data: transcriptData } = useTranscript(instanceId, undefined, 500);
   const items = useMemo(() => transcriptData?.items ?? [], [transcriptData]);
 
+  const module = findModule(lane);
   const isMain = !lane;
-  const role: SessionRole | undefined = isSessionRole(lane) ? lane : undefined;
-  // 时长取当前视图的事件跨度：角色会话用 run 级全部事件，主会话排除系统行，
-  // worker 泳道取该泳道行。
-  const filtered = useMemo(
-    () => (role ? items : filterForLane(items, instanceId, lane)),
-    [items, instanceId, lane, role],
-  );
   const laneFilter = useMemo(
     () => (item: TranscriptItem) => filterForLane([item], instanceId, lane).length > 0,
     [instanceId, lane],
@@ -104,14 +103,10 @@ export function SessionWorkspace({
   }
 
   const title = isMain
-    ? (run.title || run.id)
-    : role === "plan"
-      ? t("sessions.groupPlan")
-      : role === "decision"
-        ? t("sessions.groupDecision")
-        : role === "system"
-          ? t("sessions.systemItem")
-          : `${t("sessions.workspaceWorker")} · ${lane}`;
+    ? run.title || run.id
+    : module
+      ? t(module.titleKey ?? module.labelKey)
+      : `${t("sessions.workspaceWorker")} · ${lane}`;
 
   const emptyText = isMain ? (
     <p className="py-10 pl-0 text-center text-muted-foreground text-sm">{t("sessions.mainEmpty")}</p>
@@ -121,11 +116,19 @@ export function SessionWorkspace({
 
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-lg border border-border bg-card">
-      {/* 头部：标题 + 状态 + 实时 + token/时长 + 运行控制（主会话）。 */}
+      {/* 头部：标题 + 权威来源 + 状态 + 实时 + token/时长 + 运行控制（主会话）。 */}
       <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 border-b border-border px-3 py-2 sm:px-4 sm:py-2.5">
         <span className="min-w-0 max-w-56 truncate font-medium text-sm" title={title}>
           {title}
         </span>
+        {module && (
+          <span
+            className="shrink-0 rounded bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground"
+            title={t("sessions.list")}
+          >
+            {module.authority}
+          </span>
+        )}
         <ScanStatusPill status={status} />
         {liveKeys.has(instanceId) && (
           <span className="inline-flex items-center gap-1 rounded bg-emerald-500/10 px-1.5 py-0.5 font-medium text-xs text-emerald-600 dark:text-emerald-400">
@@ -181,8 +184,8 @@ export function SessionWorkspace({
         </div>
       </div>
 
-      {role ? (
-        <RoleEventStream instanceId={instanceId} role={role} running={running} />
+      {module ? (
+        module.render(data)
       ) : (
         <Transcript
           instanceId={instanceId}

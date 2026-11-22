@@ -12,7 +12,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/xalgord/xalgorix/v4/internal/trafficproxy"
+	"github.com/c1ayooo/xalgorix/v4/internal/trafficproxy"
 )
 
 // ErrNotSupported is returned when enforce mode is requested but the platform

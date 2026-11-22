@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/scanctx"
+	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
 )
 
 // ── Hook Events ──────────────────────────────────────────────────────────────
@@ -458,26 +458,30 @@ type ScanState struct {
 	// loading the SQLi skill must never suppress a later GraphQL or JWT
 	// recommendation for a different detected technology.
 	SkillSuggestionsSent         map[string]bool
-	DelegationAttempted          bool            // coordinator called spawn_agent/create_agent
-	DelegationEnabled            bool            // any specialist lane may run this scan; false = intentional single-agent mode (no waves, nudges, or reminders)
-	SingleAgentNoted             bool            // the one-time single-agent-mode notice was emitted
-	ReconGateBlocks              int             // coordinator claim attempts blocked by the recon-first gate (bounded bypass)
-	DelegationDeferReason        string          // last specialist-wave defer reason, for change-triggered diagnostics
-	DelegationDeferDetailEmitted bool            // full-detail defer note emitted once; later defer changes emit compact one-line notes only
-	ReconLaneLaunched            bool            // engine launched the early recon-discovery lane
-	WaveLaunched                 bool            // engine launched the testing specialist wave
-	DirBustingUsedWordlist       bool            // content discovery ran with a real wordlist (-w/--wordlist), not a single targeted probe
-	DelegationNudgeFired         bool            // multi-agent role decomposition nudge sent once
-	DelegationNudgeAt            int             // iteration of the initial decomposition nudge
-	DelegationReminders          int             // bounded reminders after ignored/malformed spawn calls
-	LedgerSeeded                 bool            // hypothesis ledger seeded from the plan once
-	LastPlanBrief                string          // last plan brief injected into context; avoids duplicate injection when unchanged
-	BeliefPoolDigest             string          // fingerprint of the schedulable pool last delivered as a belief brief; change-triggered re-delivery
-	PlanSurfaceRevision          string          // fingerprint of the surface the engine-authored plan was built from; a change triggers an engine-owned refresh
-	BrowserPreferenceNudgeCount  int             // tracks whether browser preference warning was emitted for consecutive calls
-	AdvisoryLeadsNudged          map[string]bool // exact CVE/advisory leads already committed to the ledger
-	OASTVerificationNudged       map[string]bool // raw callback tokens already routed to class-aware verify_oob
-	OASTVerificationReminders    map[string]int  // bounded re-nudges when a positive poll is followed by more polling instead of verify_oob
+	DelegationAttempted          bool   // coordinator called spawn_agent/create_agent
+	DelegationEnabled            bool   // any specialist lane may run this scan; false = intentional single-agent mode (no waves, nudges, or reminders)
+	SingleAgentNoted             bool   // the one-time single-agent-mode notice was emitted
+	ReconGateBlocks              int    // coordinator claim attempts blocked by the recon-first gate (bounded bypass)
+	DelegationDeferReason        string // last specialist-wave defer reason, for change-triggered diagnostics
+	DelegationDeferDetailEmitted bool   // full-detail defer note emitted once; later defer changes emit compact one-line notes only
+	ReconLaneLaunched            bool   // engine launched the early recon-discovery lane
+	WaveLaunched                 bool   // engine launched the testing specialist wave
+	// WaveCount counts engine-launched waves (initial + optional bounded
+	// reschedules). Rescheduling is opt-in (XALGORIX_WAVE_RESCHEDULE) and
+	// capped at 2 so the lifetime delegation budget stays meaningful.
+	WaveCount                   int
+	DirBustingUsedWordlist      bool            // content discovery ran with a real wordlist (-w/--wordlist), not a single targeted probe
+	DelegationNudgeFired        bool            // multi-agent role decomposition nudge sent once
+	DelegationNudgeAt           int             // iteration of the initial decomposition nudge
+	DelegationReminders         int             // bounded reminders after ignored/malformed spawn calls
+	LedgerSeeded                bool            // hypothesis ledger seeded from the plan once
+	LastPlanBrief               string          // last plan brief injected into context; avoids duplicate injection when unchanged
+	BeliefPoolDigest            string          // fingerprint of the schedulable pool last delivered as a belief brief; change-triggered re-delivery
+	PlanSurfaceRevision         string          // fingerprint of the surface the engine-authored plan was built from; a change triggers an engine-owned refresh
+	BrowserPreferenceNudgeCount int             // tracks whether browser preference warning was emitted for consecutive calls
+	AdvisoryLeadsNudged         map[string]bool // exact CVE/advisory leads already committed to the ledger
+	OASTVerificationNudged      map[string]bool // raw callback tokens already routed to class-aware verify_oob
+	OASTVerificationReminders   map[string]int  // bounded re-nudges when a positive poll is followed by more polling instead of verify_oob
 
 	// ── Epoch-based coverage convergence (XALGORIX_EPOCH_COVERAGE) ──
 	// EpochCoverage mirrors cfg.EpochCoverage (set once at scan start) so the
@@ -1263,6 +1267,18 @@ func hookWorkTracker(state *ScanState, args map[string]string) HookResult {
 		state.DelegationAttempted = true
 	}
 
+	// port_scan records an ATTEMPT here; completion is attributed only from
+	// the validated result (hookReconResultTracker), exactly like terminal-run
+	// scanners.
+	if toolName == "port_scan" {
+		if state.ReconCoverage.Attempted == nil {
+			state.ReconCoverage.Attempted = make(map[string]bool)
+		}
+		for _, dim := range reconDimensionsForCommand(toolName) {
+			state.ReconCoverage.Attempted[dim] = true
+		}
+	}
+
 	if toolName == "terminal_execute" {
 		state.TerminalCalls++
 		rawCmd := args["command"]
@@ -1478,6 +1494,9 @@ func isMeaningfulSecurityTestCall(toolName string, args map[string]string) bool 
 	switch toolName {
 	case "terminal_execute":
 		return strings.TrimSpace(args["command"]) != "" && !isTrivialCommand(args["command"])
+	case "port_scan":
+		// A targeted sweep is a real test, not a trivially-issued call.
+		return strings.TrimSpace(args["target"]) != ""
 	case "browser_action":
 		switch strings.ToLower(strings.TrimSpace(args["command"])) {
 		case "", "launch", "snapshot", "wait", "get_url", "screenshot", "close":

@@ -31,8 +31,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/platformutil"
-	"github.com/xalgord/xalgorix/v4/internal/providers"
+	"github.com/c1ayooo/xalgorix/v4/internal/platformutil"
+	"github.com/c1ayooo/xalgorix/v4/internal/providers"
 )
 
 // claudeCredentialPathFn resolves the on-disk path to the Claude

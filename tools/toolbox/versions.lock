@@ -1,0 +1,30 @@
+# Xalgorix toolbox version lock.
+#
+# Every entry here is consumed by install.sh. Tools that are installed by their
+# package manager's own index (apt) are pinned by the image's apt snapshot rather
+# than by a per-package version; Go/Python gems are pinned explicitly so an image
+# digest always reproduces the same toolchain.
+#
+# Empty value = "resolve from the index at build time" (documented exception,
+# used only for tools whose upstream publishes no stable tag). Production images
+# are always referenced by digest, so the resolved version is frozen in the image.
+#
+# Keep sorted. Update via a PR that also refreshes toolpack.yaml.
+
+# Go tools
+GITLEAKS_VERSION=
+GOOGLE_GOBUSTER_VERSION=
+NUCLEI_VERSION=
+SUBHANDLER_VERSION=
+TRUFFLEHOG_VERSION=
+
+# Python (pipx)
+ARJUN_VERSION=
+BANDIT_VERSION=
+IMPACKET_VERSION=
+SEMGREP_VERSION=
+URO_VERSION=
+DIRSEARCH_VERSION=
+
+# Ruby (gem)
+BRAKEMAN_VERSION=

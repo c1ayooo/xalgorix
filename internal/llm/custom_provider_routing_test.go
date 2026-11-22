@@ -7,8 +7,8 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/xalgord/xalgorix/v4/internal/config"
-	"github.com/xalgord/xalgorix/v4/internal/providers"
+	"github.com/c1ayooo/xalgorix/v4/internal/config"
+	"github.com/c1ayooo/xalgorix/v4/internal/providers"
 )
 
 // endpointResolvers runs every no-profile resolution path a scan or a

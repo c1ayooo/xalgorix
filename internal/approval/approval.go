@@ -3,7 +3,7 @@
 //
 // Scope decision (D5, charter red-line "审批默认只拦命令执行+高危 HTTP"):
 //
-//	command — terminal_execute / python_action / browser dangerous operations
+//	command — terminal_execute / python_action / port_scan / browser dangerous operations
 //	          (execute_js, set_cookie, any op carrying code/data), EXCEPT the
 //	          read-only reconnaissance allowlist (passive subfinder/httpx,
 //	          `nmap -sV`, curl GET/HEAD, ...).
@@ -23,6 +23,7 @@ package approval
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/url"
 	"strings"
 )
@@ -122,6 +123,19 @@ func classifyCall(toolName string, args map[string]string) (string, callMaterial
 		return KindCommand, callMaterial{
 			reason:  "python code execution requires approval",
 			command: args["code"],
+		}
+	case "port_scan":
+		// Port/service sweeps are active network probing: command-class so the
+		// operator sees the exact target + port set before it leaves the box.
+		// The rendered command mirrors the gogo invocation so an
+		// "approve & remember" prefix rule covers repeat sweeps of one target.
+		ports := strings.TrimSpace(args["ports"])
+		if ports == "" {
+			ports = "top2"
+		}
+		return KindCommand, callMaterial{
+			reason:  "port/service scan requires approval",
+			command: fmt.Sprintf("gogo -i %s -p %s", strings.TrimSpace(args["target"]), ports),
 		}
 	case "browser_action":
 		return classifyBrowser(args)

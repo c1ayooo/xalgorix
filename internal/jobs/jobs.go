@@ -63,14 +63,34 @@ type Manager struct {
 	client *river.Client[pgx.Tx]
 }
 
+// ManagerOption customises NewManager without breaking its historical signature.
+type ManagerOption func(*managerConfig)
+
+type managerConfig struct {
+	toolbox ToolboxHandlers
+}
+
+// WithToolbox registers the container-runtime janitorial workers on the toolbox
+// queue. Without it the manager only drives the InfoItem cold path, which is the
+// pre-existing behaviour.
+func WithToolbox(handlers ToolboxHandlers) ManagerOption {
+	return func(c *managerConfig) { c.toolbox = handlers }
+}
+
 // NewManager runs River's embedded migrations and constructs a client. It is
 // only called when a DSN is configured.
-func NewManager(ctx context.Context, pool *pgxpool.Pool, processor Processor) (*Manager, error) {
+func NewManager(ctx context.Context, pool *pgxpool.Pool, processor Processor, opts ...ManagerOption) (*Manager, error) {
 	if pool == nil {
 		return nil, errors.New("jobs: nil PostgreSQL pool")
 	}
 	if processor == nil {
 		return nil, errors.New("jobs: nil processor")
+	}
+	var cfg managerConfig
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&cfg)
+		}
 	}
 	migrator, err := rivermigrate.New(riverpgxv5.New(pool), nil)
 	if err != nil {
@@ -82,10 +102,17 @@ func NewManager(ctx context.Context, pool *pgxpool.Pool, processor Processor) (*
 
 	workers := river.NewWorkers()
 	river.AddWorker(workers, &indexWorker{processor: processor})
+	queues := map[string]river.QueueConfig{
+		DefaultQueue: {MaxWorkers: 2},
+	}
+	if cfg.toolbox != nil {
+		registerToolboxWorkers(workers, cfg.toolbox)
+		// Small worker count on purpose: housekeeping must never compete with a
+		// running scan for CPU or for the container runtime's API.
+		queues[ToolboxQueue] = river.QueueConfig{MaxWorkers: 3}
+	}
 	client, err := river.NewClient(riverpgxv5.New(pool), &river.Config{
-		Queues: map[string]river.QueueConfig{
-			DefaultQueue: {MaxWorkers: 2},
-		},
+		Queues:  queues,
 		Workers: workers,
 	})
 	if err != nil {

@@ -6,7 +6,7 @@ import (
 
 	"github.com/go-rod/rod"
 
-	"github.com/xalgord/xalgorix/v4/internal/tools"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools"
 )
 
 func TestContextPageBindsContextWithoutRecursing(t *testing.T) {

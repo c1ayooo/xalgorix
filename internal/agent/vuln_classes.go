@@ -20,7 +20,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/xalgord/xalgorix/v4/internal/tools/skills"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools/skills"
 )
 
 // VulnClassDefinition is the canonical description of one vulnerability class.

@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/resources"
-	"github.com/xalgord/xalgorix/v4/internal/scanctx"
+	"github.com/c1ayooo/xalgorix/v4/internal/resources"
+	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
 )
 
 func TestIsBlockedCommand_DangerousAndObfuscatedInputs(t *testing.T) {

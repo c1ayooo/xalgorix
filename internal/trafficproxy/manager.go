@@ -36,7 +36,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/proxy"
+	"github.com/c1ayooo/xalgorix/v4/internal/proxy"
 )
 
 // Manager owns the loopback proxy listener and the interception state. It is

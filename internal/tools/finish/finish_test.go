@@ -3,7 +3,7 @@ package finish
 import (
 	"testing"
 
-	"github.com/xalgord/xalgorix/v4/internal/tools"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools"
 )
 
 func TestFinishToolReturnsSummaryAndMetadata(t *testing.T) {

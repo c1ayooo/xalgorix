@@ -9,6 +9,7 @@
 package codesearch
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -20,7 +21,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/tools"
+	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools"
 )
 
 var (
@@ -120,6 +122,32 @@ func executeWithContext(contextID string, args map[string]string) (tools.Result,
 		joined := filepath.Join(root, filepath.Clean("/"+sub)) // clean leading .. away
 		if strings.HasPrefix(joined, filepath.Clean(root)) {
 			searchDir = joined
+		}
+	}
+
+	// Container execution plane: ripgrep runs inside the project container where
+	// the cloned source is mounted at the same absolute path.
+	if tools.ContainerActive() {
+		if sc := scanctx.Get(strings.TrimSpace(contextID)); sc != nil {
+			ctx := context.Background()
+			if sc.Ctx != nil {
+				ctx = sc.Ctx
+			}
+			out, shimErr := tools.RunToolshim(ctx, sc, root, map[string]string{
+				"op":    "code_search",
+				"root":  root,
+				"path":  strings.TrimSpace(args["path"]),
+				"query": query,
+				"glob":  strings.TrimSpace(args["glob"]),
+				"max":   strconv.Itoa(max),
+			})
+			if shimErr != nil {
+				return tools.Result{Output: "code_search error: " + shimErr.Error()}, nil
+			}
+			if strings.TrimSpace(out) == "" || strings.HasPrefix(out, "No matches") {
+				return tools.Result{Output: fmt.Sprintf("No matches for /%s/ in source. Try a different pattern or sink class.", query)}, nil
+			}
+			return tools.Result{Output: fmt.Sprintf("Source matches (root=%s):\n\n%s\n\nNext: for each hit, trace the sink back to a reachable HTTP route/handler and the user-controlled input that reaches it, then build a PoC against the LIVE target.", filepath.Base(root), out)}, nil
 		}
 	}
 

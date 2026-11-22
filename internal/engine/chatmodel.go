@@ -15,7 +15,7 @@ import (
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
 
-	"github.com/xalgord/xalgorix/v4/internal/llm"
+	"github.com/c1ayooo/xalgorix/v4/internal/llm"
 )
 
 // ChatClient is the narrow seam the adapter needs. *llm.Client satisfies it.

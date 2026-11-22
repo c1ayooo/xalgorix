@@ -1,0 +1,424 @@
+# Xalgorix toolpack manifest.
+#
+# This file is the single declarative source for "what is in the toolbox image".
+# Consumers:
+#   * toolbox-selftest  — verifies every entry exists and answers --version;
+#   * the platform      — reads it (optionally) to publish tool health and to map
+#                         a requested capability onto a container profile.
+#
+# Schema 1. Unknown fields are ignored by readers; unknown *capabilities* are
+# rejected (a tool must not silently acquire NET_ADMIN).
+#
+# capabilities: NET_RAW | NET_ADMIN | SYS_PTRACE | (empty)
+# profiles:     core | full | web   (the image target that must contain the tool)
+# smoke:        argv that must exit 0 inside the image
+
+schema: 1
+
+tools:
+  # ── Recon / asset discovery ──────────────────────────────────────────────
+  - name: subfinder
+    bin: /root/go/bin/subfinder
+    category: recon
+    purpose: 被动子域枚举（多数据源聚合）
+    capabilities: []
+    profiles: [core]
+    smoke: ["subfinder", "-version"]
+
+  - name: dnsx
+    bin: /root/go/bin/dnsx
+    category: recon
+    purpose: DNS 解析、爆破与记录枚举
+    capabilities: []
+    profiles: [core]
+    smoke: ["dnsx", "-version"]
+
+  - name: assetfinder
+    bin: /root/go/bin/assetfinder
+    category: recon
+    purpose: 从公开来源枚举关联网域
+    capabilities: []
+    profiles: [core]
+    smoke: ["assetfinder", "--help"]
+
+  - name: gau
+    bin: /root/go/bin/gau
+    category: recon
+    purpose: 从归档源收集历史 URL
+    capabilities: []
+    profiles: [core]
+    smoke: ["gau", "--version"]
+
+  - name: waybackurls
+    bin: /root/go/bin/waybackurls
+    category: recon
+    purpose: 从 Wayback Machine 拉取历史 URL
+    capabilities: []
+    profiles: [core]
+    smoke: ["waybackurls", "-h"]
+
+  - name: katana
+    bin: /root/go/bin/katana
+    category: recon
+    purpose: 现代化 Web 爬虫（支持 JS 渲染）
+    capabilities: []
+    profiles: [core]
+    smoke: ["katana", "-version"]
+
+  - name: gospider
+    bin: /root/go/bin/gospider
+    category: recon
+    purpose: 快速 Web 蜘蛛
+    capabilities: []
+    profiles: [core]
+    smoke: ["gospider", "--help"]
+
+  - name: hakrawler
+    bin: /root/go/bin/hakrawler
+    category: recon
+    purpose: 轻量爬虫，提取链接与表单
+    capabilities: []
+    profiles: [core]
+    smoke: ["hakrawler", "-h"]
+
+  # ── HTTP probing / content discovery / fuzzing ───────────────────────────
+  - name: httpx
+    bin: /opt/xalgorix/bin/httpx
+    category: http
+    purpose: HTTP 存活、标题、技术栈与状态码探测
+    capabilities: []
+    profiles: [core]
+    smoke: ["httpx", "-version"]
+
+  - name: nuclei
+    bin: /opt/xalgorix/bin/nuclei
+    category: http
+    purpose: 模板化漏洞扫描（含官方模板库）
+    capabilities: []
+    profiles: [core]
+    smoke: ["nuclei", "-version"]
+
+  - name: ffuf
+    bin: /root/go/bin/ffuf
+    category: fuzz
+    purpose: 目录、参数与虚拟主机模糊测试
+    capabilities: []
+    profiles: [core]
+    smoke: ["ffuf", "-V"]
+
+  - name: gobuster
+    bin: /root/go/bin/gobuster
+    category: fuzz
+    purpose: 目录/DNS/vhost 爆破
+    capabilities: []
+    profiles: [core]
+    smoke: ["gobuster", "version"]
+
+  - name: dirsearch
+    bin: /root/.local/bin/dirsearch
+    category: fuzz
+    purpose: Web 路径扫描
+    capabilities: []
+    profiles: [core]
+    smoke: ["dirsearch", "--version"]
+
+  - name: arjun
+    bin: /root/.local/bin/arjun
+    category: fuzz
+    purpose: HTTP 参数发现
+    capabilities: []
+    profiles: [core]
+    smoke: ["arjun", "--help"]
+
+  - name: uro
+    bin: /root/.local/bin/uro
+    category: utility
+    purpose: URL 列表去重与降噪
+    capabilities: []
+    profiles: [core]
+    smoke: ["uro", "--help"]
+
+  - name: nikto
+    bin: /usr/bin/nikto
+    category: http
+    purpose: Web 服务器配置与已知漏洞扫描
+    capabilities: []
+    profiles: [core]
+    smoke: ["nikto", "-Version"]
+
+  - name: whatweb
+    bin: /usr/bin/whatweb
+    category: http
+    purpose: Web 技术指纹识别
+    capabilities: []
+    profiles: [core]
+    smoke: ["whatweb", "--version"]
+
+  - name: wafw00f
+    bin: /usr/bin/wafw00f
+    category: waf
+    purpose: WAF 存在性探测
+    capabilities: []
+    profiles: [core]
+    smoke: ["wafw00f", "--version"]
+
+  - name: sslscan
+    bin: /usr/bin/sslscan
+    category: tls
+    purpose: TLS 配置与协议/套件审计
+    capabilities: []
+    profiles: [core]
+    smoke: ["sslscan", "--version"]
+
+  # ── Utilities required by runtime auto-install ───────────────────────────
+  - name: python3
+    bin: /usr/bin/python3
+    category: runtime
+    purpose: 执行模型生成的 Python 脚本
+    capabilities: []
+    profiles: [core]
+    smoke: ["python3", "--version"]
+
+  - name: pipx
+    bin: /usr/bin/pipx
+    category: runtime
+    purpose: 隔离安装 Python 工具
+    capabilities: []
+    profiles: [core]
+    smoke: ["pipx", "--version"]
+
+  - name: go
+    bin: /usr/local/go/bin/go
+    category: runtime
+    purpose: 运行时 go install 长尾安全工具
+    capabilities: []
+    profiles: [core]
+    smoke: ["go", "version"]
+
+  - name: rg
+    bin: /usr/bin/rg
+    category: runtime
+    purpose: 白盒源码检索（code_search 后端）
+    capabilities: []
+    profiles: [core]
+    smoke: ["rg", "--version"]
+
+  - name: jq
+    bin: /usr/bin/jq
+    category: utility
+    purpose: JSON 管道处理
+    capabilities: []
+    profiles: [core]
+    smoke: ["jq", "--version"]
+
+  - name: curl
+    bin: /usr/bin/curl
+    category: utility
+    purpose: HTTP 客户端（手工验证与 PoC）
+    capabilities: []
+    profiles: [core]
+    smoke: ["curl", "--version"]
+
+  - name: git
+    bin: /usr/bin/git
+    category: utility
+    purpose: 源码克隆与 Git 泄露利用
+    capabilities: []
+    profiles: [core]
+    smoke: ["git", "--version"]
+
+  - name: toolshim
+    bin: /opt/xalgorix/bin/toolshim
+    category: runtime
+    purpose: 容器内文件读写与代码检索执行器
+    capabilities: []
+    profiles: [core]
+    smoke: ["toolshim", "--help"]
+
+  # ── Network / raw sockets (full profile only) ────────────────────────────
+  - name: nmap
+    bin: /usr/bin/nmap
+    category: network
+    purpose: 端口与服务扫描（SYN/版本/脚本）
+    capabilities: [NET_RAW, NET_ADMIN]
+    profiles: [full]
+    smoke: ["nmap", "--version"]
+
+  - name: masscan
+    bin: /usr/bin/masscan
+    category: network
+    purpose: 大规模快速端口扫描
+    capabilities: [NET_RAW, NET_ADMIN]
+    profiles: [full]
+    smoke: ["masscan", "--version"]
+
+  - name: naabu
+    bin: /root/go/bin/naabu
+    category: network
+    purpose: ProjectDiscovery 端口扫描器
+    capabilities: [NET_RAW]
+    profiles: [full]
+    smoke: ["naabu", "-version"]
+
+  - name: gogo
+    bin: /root/go/bin/gogo
+    category: network
+    purpose: port_scan 工具的后端扫描引擎
+    capabilities: [NET_RAW]
+    profiles: [full]
+    smoke: ["gogo", "-h"]
+
+  - name: arp-scan
+    bin: /usr/bin/arp-scan
+    category: network
+    purpose: 二层主机发现
+    capabilities: [NET_RAW, NET_ADMIN]
+    profiles: [full]
+    smoke: ["arp-scan", "--version"]
+
+  - name: netdiscover
+    bin: /usr/bin/netdiscover
+    category: network
+    purpose: 被动/主动 ARP 网段发现
+    capabilities: [NET_RAW, NET_ADMIN]
+    profiles: [full]
+    smoke: ["netdiscover", "-h"]
+
+  - name: responder
+    bin: /usr/bin/responder
+    category: mitm
+    purpose: LLMNR/NBT-NS/mDNS 投毒与凭据捕获
+    capabilities: [NET_RAW, NET_ADMIN]
+    profiles: [full]
+    smoke: ["responder", "-h"]
+
+  - name: ettercap
+    bin: /usr/bin/ettercap
+    category: mitm
+    purpose: 中间人嗅探与注入
+    capabilities: [NET_RAW, NET_ADMIN]
+    profiles: [full]
+    smoke: ["ettercap", "--version"]
+
+  # ── Exploitation / credentials (full profile only) ───────────────────────
+  - name: sqlmap
+    bin: /usr/bin/sqlmap
+    category: exploit
+    purpose: SQL 注入检测与数据提取
+    capabilities: []
+    profiles: [full]
+    smoke: ["sqlmap", "--version"]
+
+  - name: searchsploit
+    bin: /usr/bin/searchsploit
+    category: exploit
+    purpose: ExploitDB 本地检索
+    capabilities: []
+    profiles: [full]
+    smoke: ["searchsploit", "--version"]
+
+  - name: hydra
+    bin: /usr/bin/hydra
+    category: credentials
+    purpose: 在线口令爆破（多协议）
+    capabilities: []
+    profiles: [full]
+    smoke: ["hydra", "-h"]
+
+  - name: medusa
+    bin: /usr/bin/medusa
+    category: credentials
+    purpose: 并行在线口令爆破
+    capabilities: []
+    profiles: [full]
+    smoke: ["medusa", "-h"]
+
+  - name: john
+    bin: /usr/bin/john
+    category: credentials
+    purpose: 离线口令破解
+    capabilities: []
+    profiles: [full]
+    smoke: ["john", "--list=build-info"]
+
+  - name: hashcat
+    bin: /usr/bin/hashcat
+    category: credentials
+    purpose: GPU/CPU 哈希破解
+    capabilities: []
+    profiles: [full]
+    smoke: ["hashcat", "--version"]
+
+  - name: impacket-secretsdump
+    bin: /root/.local/bin/impacket-secretsdump
+    category: credentials
+    purpose: Windows SAM/NTDS 凭据导出
+    capabilities: []
+    profiles: [full]
+    smoke: ["impacket-secretsdump", "-h"]
+
+  # ── SAST / secret scanning (full profile only) ───────────────────────────
+  - name: semgrep
+    bin: /root/.local/bin/semgrep
+    category: sast
+    purpose: 多语言静态分析
+    capabilities: []
+    profiles: [full]
+    smoke: ["semgrep", "--version"]
+
+  - name: bandit
+    bin: /root/.local/bin/bandit
+    category: sast
+    purpose: Python 安全静态检查
+    capabilities: []
+    profiles: [full]
+    smoke: ["bandit", "--version"]
+
+  - name: gitleaks
+    bin: /root/go/bin/gitleaks
+    category: secrets
+    purpose: Git 历史中的密钥泄露检测
+    capabilities: []
+    profiles: [full]
+    smoke: ["gitleaks", "version"]
+
+  - name: trufflehog
+    bin: /usr/local/bin/trufflehog
+    category: secrets
+    purpose: 高熵密钥与凭据扫描
+    capabilities: []
+    profiles: [full]
+    smoke: ["trufflehog", "--version"]
+
+  - name: brakeman
+    bin: /usr/local/bin/brakeman
+    category: sast
+    purpose: Ruby on Rails 安全审计
+    capabilities: []
+    profiles: [full]
+    smoke: ["brakeman", "--version"]
+
+  - name: gdb
+    bin: /usr/bin/gdb
+    category: debug
+    purpose: 二进制调试（白盒利用）
+    capabilities: [SYS_PTRACE]
+    profiles: [full]
+    smoke: ["gdb", "--version"]
+
+  - name: strace
+    bin: /usr/bin/strace
+    category: debug
+    purpose: 系统调用跟踪（进程行为分析）
+    capabilities: [SYS_PTRACE]
+    profiles: [full]
+    smoke: ["strace", "-V"]
+
+  # ── Browser (web profile only) ───────────────────────────────────────────
+  - name: chromium
+    bin: /usr/bin/chromium
+    category: browser
+    purpose: 无头浏览器，供 browser_action/page_agent 通过 CDP 驱动
+    capabilities: []
+    profiles: [web]
+    smoke: ["chromium", "--version"]

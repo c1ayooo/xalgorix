@@ -38,7 +38,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/providers"
+	"github.com/c1ayooo/xalgorix/v4/internal/providers"
 )
 
 // setupTokenFlowName is the Catalog_Entry.flow value the registry

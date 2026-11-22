@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/xalgord/xalgorix/v4/internal/config"
+	"github.com/c1ayooo/xalgorix/v4/internal/config"
 )
 
 // TestDoChat_MessageContentAsArrayParts regression-tests the Mistral

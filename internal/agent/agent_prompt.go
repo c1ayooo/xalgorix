@@ -7,9 +7,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/xalgord/xalgorix/v4/internal/config"
-	"github.com/xalgord/xalgorix/v4/internal/scanctx"
-	"github.com/xalgord/xalgorix/v4/internal/tools/codesearch"
+	"github.com/c1ayooo/xalgorix/v4/internal/config"
+	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools/codesearch"
 )
 
 // nativeToolPromptRewrite swaps the two blocks of the system prompt that teach
@@ -879,6 +879,11 @@ cat ./live_hosts.txt | grep -E "^\[.*\]" | cut -d' ' -f1 > ./live_urls.txt
 wc -l ./live_hosts.txt
 
 # Port Scanning - comprehensive
+# Prefer the port_scan TOOL (gogo) over hand-built scanner command lines: it
+# returns parsed host/port/service/framework rows, archives the raw JSONL, and
+# attributes recon coverage automatically. Fall back to nmap only when
+# port_scan reports that gogo is not installed.
+port_scan target=TARGET ports=top2
 nmap -sV -sC -T2 --max-rate RATE_LIMIT --scan-delay RATE_DELAY --top-ports 200 --open -oN ./nmap_full.txt --script=http-title,http-headers,http-methods,http-robots.txt TARGET
 nmap -sU -T2 --max-rate RATE_LIMIT --scan-delay RATE_DELAY --top-ports 50 -oN ./nmap_udp.txt TARGET
 

@@ -2,15 +2,22 @@ import { ChevronDown, RotateCw } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { fmtTokens } from "@/components/chat/format";
 import { RailGroup, RailItem } from "@/components/sessions/session-item";
-import { isSessionRole } from "@/components/sessions/role-events";
+import { isWorkerLane } from "@/components/sessions/modules/registry";
+import type {
+  ContentModule,
+  RailEntry,
+  SessionsModuleId,
+} from "@/components/sessions/modules/types";
 import { useStreamBadge } from "@/components/session-item";
 import { useI18n } from "@/i18n";
 import type { Run } from "@/types/api";
 
 /**
- * 会话页左栏（参照 sessions-tab 左列）：折叠开关 / 链路章 / 任务 token 汇总
- * + 角色分组（主 Agent = 任务的各 Run；Worker = 选中 run 的 agent 泳道；
- * System = 选中 run 的系统行）。Planner 无独立数据不显示，不编造（方案 §5.4 A 档）。
+ * 会话页左栏：折叠开关 / 链路章 / 任务 token 汇总 + 角色模块分组。
+ *
+ * 分组不再写死（旧实现固定 plan/decision/system 三组 + 事件推导的 worker 组），
+ * 而是由 modules/registry 的可见模块生成；每组的徽标（如 `2/3`、`+1`）由模块
+ * 自己提供。主 Agent 组仍是任务下的 Run 列表（每个 Run 一段主会话）。
  */
 export function SessionRail({
   runs,
@@ -18,10 +25,7 @@ export function SessionRail({
   onSelectRun,
   lane,
   onLaneChange,
-  lanes,
-  planPresent,
-  decisionPresent,
-  systemPresent,
+  groups,
   liveKeys,
   totalTokens,
   listOpen,
@@ -31,13 +35,10 @@ export function SessionRail({
   runs: Run[];
   selectedInstanceId?: string;
   onSelectRun: (instanceId: string) => void;
-  /** 当前角色/泳道（?agent= 深链语义）：空=主会话；plan|decision|system=角色会话；其余=worker 泳道短名。 */
+  /** 当前角色/泳道（?agent= 深链语义）：空=主会话；模块 id；或 worker agent_id。 */
   lane?: string;
   onLaneChange: (lane: string | undefined) => void;
-  lanes: string[];
-  planPresent: boolean;
-  decisionPresent: boolean;
-  systemPresent: boolean;
+  groups: { module: ContentModule; entry: RailEntry }[];
   liveKeys: Set<string>;
   totalTokens: number;
   listOpen: boolean;
@@ -128,55 +129,17 @@ export function SessionRail({
             {runs.length === 0 && <p className="px-2 py-1 text-muted-foreground text-xs">{t("session.emptyRuns")}</p>}
           </RailGroup>
 
-          {planPresent && (
-            <RailGroup role="plan" label={t("sessions.groupPlan")}>
+          {groups.map(({ module, entry }) => (
+            <RailGroup key={module.id} role={module.id as SessionsModuleId} label={t(entry.labelKey)}>
               <RailItem
-                active={lane === "plan"}
-                status={runs.find((r) => r.instance_id === selectedInstanceId)?.status}
-                title={t("sessions.planItemTitle")}
-                onClick={() => onLaneChange("plan")}
+                active={lane === module.id || (module.id === "workers" && isWorkerLane(lane))}
+                badge={entry.badge}
+                live={entry.live}
+                title={t(entry.labelKey)}
+                onClick={() => onLaneChange(module.id)}
               />
             </RailGroup>
-          )}
-
-          {decisionPresent && (
-            <RailGroup role="decision" label={t("sessions.groupDecision")}>
-              <RailItem
-                active={lane === "decision"}
-                status={runs.find((r) => r.instance_id === selectedInstanceId)?.status}
-                title={t("sessions.decisionItemTitle")}
-                onClick={() => onLaneChange("decision")}
-              />
-            </RailGroup>
-          )}
-
-          {systemPresent && (
-            <RailGroup role="system" label={t("sessions.groupSystem")}>
-              <RailItem
-                active={lane === "system"}
-                title={t("sessions.systemItem")}
-                onClick={() => onLaneChange("system")}
-              />
-            </RailGroup>
-          )}
-
-          {lanes.length > 0 && (
-            <RailGroup role="worker" label={t("sessions.groupWorker")}>
-              {lanes.map((name) => (
-                <RailItem
-                  key={name}
-                  active={!!lane && !isSessionRole(lane) && lane === name}
-                  status={runs.find((r) => r.instance_id === selectedInstanceId)?.status}
-                  live={liveKeys.has(name)}
-                  title={name}
-                  onClick={() => onLaneChange(name)}
-                />
-              ))}
-              {lanes.length === 0 && (
-                <p className="px-2 py-1 text-muted-foreground text-xs">{t("sessions.noWorkers")}</p>
-              )}
-            </RailGroup>
-          )}
+          ))}
         </div>
       </div>
     </div>

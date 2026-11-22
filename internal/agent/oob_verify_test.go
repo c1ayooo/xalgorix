@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	oobsrv "github.com/xalgord/xalgorix/v4/internal/oob"
-	"github.com/xalgord/xalgorix/v4/internal/scanctx"
+	oobsrv "github.com/c1ayooo/xalgorix/v4/internal/oob"
+	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
 )
 
 func newOOBAgent(t *testing.T) *Agent {

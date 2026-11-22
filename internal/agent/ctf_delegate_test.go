@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/xalgord/xalgorix/v4/internal/config"
+	"github.com/c1ayooo/xalgorix/v4/internal/config"
 )
 
 // O1.2 (CORE_LOOP_OPTIMIZATION): XALGORIX_ENABLE_CTF_DELEGATE unlocks

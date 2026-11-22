@@ -3,7 +3,7 @@ package agent
 import (
 	"fmt"
 
-	"github.com/xalgord/xalgorix/v4/internal/config"
+	"github.com/c1ayooo/xalgorix/v4/internal/config"
 )
 
 // opText returns the operator-facing variant of a fixed engine broadcast in

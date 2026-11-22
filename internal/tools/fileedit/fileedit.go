@@ -2,17 +2,18 @@
 package fileedit
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 
-	"github.com/xalgord/xalgorix/v4/internal/config"
-	"github.com/xalgord/xalgorix/v4/internal/safefile"
-	"github.com/xalgord/xalgorix/v4/internal/sandbox"
-	"github.com/xalgord/xalgorix/v4/internal/scanctx"
-	"github.com/xalgord/xalgorix/v4/internal/tools"
+	"github.com/c1ayooo/xalgorix/v4/internal/config"
+	"github.com/c1ayooo/xalgorix/v4/internal/safefile"
+	"github.com/c1ayooo/xalgorix/v4/internal/sandbox"
+	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools"
 )
 
 // Register adds file editing tools to the registry.
@@ -162,11 +163,17 @@ func runEditorWithPolicy(sc *scanctx.ScanContext, args map[string]string) (tools
 		if rerr != nil {
 			return tools.Result{Error: rerr.Error()}, nil
 		}
+		if res, handled := editInProject(sc, "view", canonical, args); handled {
+			return res, nil
+		}
 		return viewFile(canonical, args["view_range"])
 	case "create":
 		canonical, rerr := sandbox.Default().CheckResolve(sc, "fileedit.create", rawPath)
 		if rerr != nil {
 			return tools.Result{Error: rerr.Error()}, nil
+		}
+		if res, handled := editInProject(sc, "create", canonical, args); handled {
+			return res, nil
 		}
 		return createFile(canonical, args["file_text"])
 	case "str_replace":
@@ -174,11 +181,17 @@ func runEditorWithPolicy(sc *scanctx.ScanContext, args map[string]string) (tools
 		if rerr != nil {
 			return tools.Result{Error: rerr.Error()}, nil
 		}
+		if res, handled := editInProject(sc, "str_replace", canonical, args); handled {
+			return res, nil
+		}
 		return replaceInFile(canonical, args["old_str"], args["new_str"])
 	case "insert":
 		canonical, rerr := sandbox.Default().CheckResolve(sc, "fileedit.insert", rawPath)
 		if rerr != nil {
 			return tools.Result{Error: rerr.Error()}, nil
+		}
+		if res, handled := editInProject(sc, "insert", canonical, args); handled {
+			return res, nil
 		}
 		return insertInFile(canonical, args["new_str"], args["insert_line"])
 	default:
@@ -307,9 +320,13 @@ func listFilesForContext(contextID string, args map[string]string) (tools.Result
 	if err != nil {
 		return tools.Result{}, err
 	}
-	canonical, rerr := sandbox.Default().CheckRead(scanctx.Get(strings.TrimSpace(contextID)), "fileedit.list", path)
+	sc := scanctx.Get(strings.TrimSpace(contextID))
+	canonical, rerr := sandbox.Default().CheckRead(sc, "fileedit.list", path)
 	if rerr != nil {
 		return tools.Result{Error: rerr.Error()}, nil
+	}
+	if res, handled := shimInProject(sc, map[string]string{"op": "list", "path": canonical}); handled {
+		return res, nil
 	}
 	return listFilesAtPath(canonical)
 }
@@ -365,6 +382,11 @@ func searchFilesWithPolicy(policy *sandbox.Policy, sc *scanctx.ScanContext, patt
 	}
 	if canonical == "/" || canonical == "/proc" || strings.HasPrefix(canonical, "/proc/") {
 		return tools.Result{Error: fmt.Sprintf("search_files: searching %s (resolves to %s) is not permitted", root, canonical)}, nil
+	}
+	if res, handled := shimInProject(sc, map[string]string{
+		"op": "search", "path": canonical, "pattern": pattern, "include": include,
+	}); handled {
+		return res, nil
 	}
 	return searchFilesAtPath(pattern, canonical, include, searchExclusions(policy.ReadDenyRoots(), canonical))
 }
@@ -451,4 +473,42 @@ func searchFilesAtPath(pattern, path, include string, exclude []string) (tools.R
 	}
 
 	return tools.Result{Output: result}, nil
+}
+
+// shimInProject routes a filesystem operation to the container-side shim when
+// the scan runs on the container execution plane.
+//
+// The platform-side sandbox.Policy check has already run (defence in depth: the
+// shim re-checks containment). Returning handled=false means "no container, use
+// the native implementation", which is what keeps native mode unchanged.
+func shimInProject(sc *scanctx.ScanContext, req map[string]string) (tools.Result, bool) {
+	if sc == nil || !tools.ContainerActive() {
+		return tools.Result{}, false
+	}
+	if req == nil {
+		req = make(map[string]string, 2)
+	}
+	req["root"] = sc.ScanDir
+	ctx := context.Background()
+	if sc.Ctx != nil {
+		ctx = sc.Ctx
+	}
+	out, err := tools.RunToolshim(ctx, sc, sc.ScanDir, req)
+	if err != nil {
+		return tools.Result{Error: err.Error()}, true
+	}
+	return tools.Result{Output: out}, true
+}
+
+// editInProject is the str_replace_editor adapter for shimInProject.
+func editInProject(sc *scanctx.ScanContext, op, canonical string, args map[string]string) (tools.Result, bool) {
+	return shimInProject(sc, map[string]string{
+		"op":          op,
+		"path":        canonical,
+		"view_range":  args["view_range"],
+		"file_text":   args["file_text"],
+		"old_str":     args["old_str"],
+		"new_str":     args["new_str"],
+		"insert_line": args["insert_line"],
+	})
 }

@@ -13,10 +13,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/infoitem"
-	oobsrv "github.com/xalgord/xalgorix/v4/internal/oob"
-	"github.com/xalgord/xalgorix/v4/internal/scanctx"
-	"github.com/xalgord/xalgorix/v4/internal/tools"
+	"github.com/c1ayooo/xalgorix/v4/internal/infoitem"
+	oobsrv "github.com/c1ayooo/xalgorix/v4/internal/oob"
+	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools"
 )
 
 // sleepMagnitudeRe extracts the numeric argument of SLEEP/pg_sleep/WAITFOR-style

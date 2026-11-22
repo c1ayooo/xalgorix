@@ -37,8 +37,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/xalgord/xalgorix/v4/internal/scanctx"
-	"github.com/xalgord/xalgorix/v4/internal/tools"
+	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools"
 )
 
 // ledger returns the scan-shared ledger, or nil if this agent has no scan
@@ -438,7 +438,36 @@ func (a *Agent) claimNextHypothesisTool(args map[string]string) (tools.Result, e
 	if claimErr != nil {
 		return tools.Result{Error: "claim audit/persistence failed: " + claimErr.Error()}, nil
 	}
+	borrowedFromAnotherLane := false
+	if !claimed && a.delegatedAgentID != "" {
+		// Idle-worker borrowing (P1), specialists only: the lane's class-scoped
+		// pool is empty, but another lane's untaken (unowned) queued work
+		// remains. Claiming it keeps a live worker busy instead of idling while
+		// the scan is still uncovering surface. Lane ownership stays a soft hint
+		// (MarkAssigned); hypotheses owned by ANOTHER agent are never stolen.
+		// The coordinator keeps its strict class-filter contract — its claim
+		// output is the documented scheduling surface (M4) and must not drift.
+		if borrowed, ok, err := l.ClaimNextUnassignedAs(owner, scanctx.AuditActorForAgent(owner)); err != nil {
+			return tools.Result{Error: "claim audit/persistence failed: " + err.Error()}, nil
+		} else if ok {
+			got, claimed, borrowedFromAnotherLane = borrowed, true, true
+		}
+	}
 	if !claimed {
+		// Idle with no claimable work is a first-class, observable state: the
+		// worker row must say "no claimable work" instead of looking busy. The
+		// concurrency slot is released on natural completion (delegated agents
+		// are never force-cancelled just to free a slot).
+		if a.delegatedAgentID != "" {
+			a.emit(Event{
+				Type:    "agent_idle",
+				Content: classFilter,
+				Meta: map[string]any{
+					"agent_id":   a.delegatedAgentID,
+					"vuln_class": classFilter,
+				},
+			})
+		}
 		if classFilter != "" {
 			return tools.Result{Output: fmt.Sprintf("No queued %q hypotheses to claim. Use read_ledger(filter=schedulable) to see other classes, or record new ones from recon with record_hypothesis.", classFilter)}, nil
 		}
@@ -446,6 +475,9 @@ func (a *Agent) claimNextHypothesisTool(args map[string]string) (tools.Result, e
 	}
 
 	var b strings.Builder
+	if borrowedFromAnotherLane {
+		fmt.Fprintf(&b, "Borrowed unclaimed work from another lane (your assigned classes were exhausted).\n")
+	}
 	fmt.Fprintf(&b, "Claimed %s — now [%s], owner %s: %s%s (confidence %.2f).\n",
 		got.ID, got.Status, owner, got.VulnClass, formatLoc(got), got.Confidence)
 	if got.VOIEstimated {

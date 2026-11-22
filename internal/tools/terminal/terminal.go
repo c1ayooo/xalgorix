@@ -15,18 +15,20 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/config"
-	"github.com/xalgord/xalgorix/v4/internal/egress"
-	"github.com/xalgord/xalgorix/v4/internal/platformutil"
-	egressproxy "github.com/xalgord/xalgorix/v4/internal/proxy"
-	"github.com/xalgord/xalgorix/v4/internal/resources"
-	"github.com/xalgord/xalgorix/v4/internal/scanctx"
-	"github.com/xalgord/xalgorix/v4/internal/storage"
-	"github.com/xalgord/xalgorix/v4/internal/tools"
-	"github.com/xalgord/xalgorix/v4/internal/tools/iolimit"
-	"github.com/xalgord/xalgorix/v4/internal/trafficproxy"
+	"github.com/c1ayooo/xalgorix/v4/internal/config"
+	"github.com/c1ayooo/xalgorix/v4/internal/egress"
+	"github.com/c1ayooo/xalgorix/v4/internal/platformutil"
+	egressproxy "github.com/c1ayooo/xalgorix/v4/internal/proxy"
+	"github.com/c1ayooo/xalgorix/v4/internal/resources"
+	toolrt "github.com/c1ayooo/xalgorix/v4/internal/runtime"
+	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
+	"github.com/c1ayooo/xalgorix/v4/internal/storage"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools/iolimit"
+	"github.com/c1ayooo/xalgorix/v4/internal/trafficproxy"
 )
 
 const maxOutputLen = 20000
@@ -1787,8 +1789,6 @@ func runShellInternalContext(parent context.Context, contextID string, command s
 	ctx, cancel := context.WithTimeout(waitCtx, timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "bash", "-c", command)
-	cmd.Dir = workDir
 	cmdEnv := commandEnv(homeDir, goPath, workDir, rateRuntime)
 	if config.Get().ProxyRequired || egressproxy.Required() || trafficproxy.Enabled() {
 		cmdEnv, err = trafficproxy.Environment(cmdEnv)
@@ -1797,6 +1797,17 @@ func runShellInternalContext(parent context.Context, contextID string, command s
 		}
 	}
 	cmdEnv = append(cmdEnv, egress.EnvForChild(contextID)...)
+
+	// Container execution plane: identical command string, identical working
+	// directory, identical notice text — only the process namespace changes. The
+	// native path below is deliberately left untouched so that
+	// XALGORIX_RUNTIME_BACKEND=native remains a byte-for-byte fallback.
+	if tools.ContainerActive() {
+		return executeInProjectContainer(ctx, contextID, command, cmdEnv, workDir, commandNotice, timeout, heavy, toolLabel)
+	}
+
+	cmd := exec.CommandContext(ctx, "bash", "-c", command)
+	cmd.Dir = workDir
 	cmd.Env = cmdEnv
 
 	// Create new process group for this command so we can kill the
@@ -1991,6 +2002,77 @@ func runShellInternalContext(parent context.Context, contextID string, command s
 	}
 
 	return commandNotice + formatOutput(stdoutStr, stderrStr, exitCode), exitCode
+}
+
+// containerCallSeq is the per-process monotonic call sequence used for archive
+// naming and runnerd idempotency. It is not per-scan because the value only has
+// to be unique within a project container's lifetime.
+var containerCallSeq atomic.Uint64
+
+// executeInProjectContainer runs the shell command inside the scan's project
+// container. It mirrors the native result formatting exactly so the agent sees
+// the same notices regardless of the execution plane.
+func executeInProjectContainer(
+	ctx context.Context,
+	contextID, command string,
+	hostEnv []string,
+	workDir, commandNotice string,
+	timeout time.Duration,
+	heavy bool,
+	toolLabel string,
+) (string, int) {
+	sc := scanctx.Get(contextID)
+	if sc == nil {
+		return commandNotice + "[ERROR] Container execution requires an active scan context.", -1
+	}
+
+	// Layer 2 throttle is preserved: the container runtime is an additional
+	// backpressure layer, not a replacement for admitting work sensibly.
+	lease, err := resources.AcquireToolLeaseContext(ctx, heavy, toolLabel)
+	if err != nil {
+		if errors.Is(err, resources.ErrToolLeaseWaitTimeout) {
+			return commandNotice + fmt.Sprintf("[THROTTLE] Could not launch %q within %s: %v. The tool launch queue stayed saturated — retry with a lighter/shorter command.", toolLabel, resources.DefaultToolLeaseMaxWait, err), -1
+		}
+		return commandNotice + fmt.Sprintf("[CANCELED] Tool launch canceled before starting %q: %v", toolLabel, err), -1
+	}
+	defer lease.Release()
+
+	archiveDir := filepath.Join(workDir, "tool-outputs")
+	_ = os.MkdirAll(archiveDir, 0o750)
+
+	res, err := tools.RunInProject(ctx, sc, toolrt.ExecSpec{
+		CallSeq:     containerCallSeq.Add(1),
+		Tool:        "terminal_execute",
+		Argv:        []string{"bash", "-lc", command},
+		Cwd:         workDir,
+		Env:         tools.ContainerEnvFor(hostEnv, workDir),
+		Timeout:     timeout,
+		StdoutLimit: iolimit.DefaultStdoutLimit,
+		StderrLimit: iolimit.DefaultStderrLimit,
+		ArtifactDir: archiveDir,
+		Heavy:       heavy,
+	})
+	if err != nil {
+		return commandNotice + fmt.Sprintf("[ERROR] project container: %v", err), -1
+	}
+
+	stdoutStr := res.Stdout
+	if res.StdoutTruncated {
+		stdoutStr += "\n[output truncated at 1 MiB]"
+	}
+	stderrStr := res.Stderr
+	if res.StderrTruncated {
+		stderrStr += "\n[stderr truncated at 512 KiB]"
+	}
+	if res.TimedOut {
+		return commandNotice + fmt.Sprintf("[TIMEOUT] Command killed after %s. Use more targeted scans (fewer ports, specific paths, smaller scope) to stay within the time limit.\nPartial stdout:\n%s\nPartial stderr:\n%s",
+			timeout.Round(time.Second), truncate(stdoutStr), truncate(stderrStr)), -1
+	}
+	if res.Canceled {
+		return commandNotice + fmt.Sprintf("[CANCELED] Command canceled.\nPartial stdout:\n%s\nPartial stderr:\n%s",
+			truncate(stdoutStr), truncate(stderrStr)), -1
+	}
+	return commandNotice + formatOutput(stdoutStr, stderrStr, res.ExitCode), res.ExitCode
 }
 
 func isCommandNotFound(output string) bool {

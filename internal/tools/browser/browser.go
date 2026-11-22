@@ -23,15 +23,15 @@ import (
 	"github.com/go-rod/rod/lib/launcher"
 	"github.com/go-rod/rod/lib/proto"
 
-	"github.com/xalgord/xalgorix/v4/internal/config"
-	"github.com/xalgord/xalgorix/v4/internal/egress"
-	egressproxy "github.com/xalgord/xalgorix/v4/internal/proxy"
-	"github.com/xalgord/xalgorix/v4/internal/resources"
-	"github.com/xalgord/xalgorix/v4/internal/sandbox"
-	"github.com/xalgord/xalgorix/v4/internal/scanctx"
-	"github.com/xalgord/xalgorix/v4/internal/tools"
-	"github.com/xalgord/xalgorix/v4/internal/tools/terminal"
-	"github.com/xalgord/xalgorix/v4/internal/trafficproxy"
+	"github.com/c1ayooo/xalgorix/v4/internal/config"
+	"github.com/c1ayooo/xalgorix/v4/internal/egress"
+	egressproxy "github.com/c1ayooo/xalgorix/v4/internal/proxy"
+	"github.com/c1ayooo/xalgorix/v4/internal/resources"
+	"github.com/c1ayooo/xalgorix/v4/internal/sandbox"
+	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools/terminal"
+	"github.com/c1ayooo/xalgorix/v4/internal/trafficproxy"
 )
 
 // browserCacheDir is the on-disk root for every browser cache, extension
@@ -457,6 +457,14 @@ func ensureBrowser(ctxID, proxy string) error {
 		}
 		return nil
 	}
+
+	// Container execution plane: Chromium runs inside the scan's project
+	// container and the platform attaches over CDP. The native launcher below is
+	// untouched so XALGORIX_RUNTIME_BACKEND=native keeps its exact behaviour.
+	if tools.ContainerActive() {
+		return s.launchBrowserInProject(ctxID, requiredProxy)
+	}
+
 	if requiredProxy {
 		// The agent's browser_action proxy argument must not override the
 		// operator's required outbound route. The loopback bridge handles

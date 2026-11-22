@@ -34,6 +34,7 @@ export const qk = {
   authStatus: ["auth", "status"] as const,
   status: ["status"] as const,
   version: ["version"] as const,
+  runtime: ["runtime"] as const,
   scans: ["scans"] as const,
   // Paginated scans share the ["scans"] prefix so existing
   // invalidateQueries({ queryKey: qk.scans }) calls refresh them too.
@@ -94,6 +95,10 @@ export const qk = {
     ["skills", "invocations", params] as const,
   agentInvocations: (params: InvocationListParams) =>
     ["agent-profiles", "invocations", params] as const,
+  // 内置工具：只读目录 + 调用记录（目录慢变，无轮询；记录 15s 轮询）。
+  toolCatalog: ["tools", "catalog"] as const,
+  toolInvocations: (params: InvocationListParams) =>
+    ["tools", "invocations", params] as const,
   // RBAC account management (admin-only page).
   users: ["users"] as const,
 };
@@ -880,6 +885,33 @@ export function useTaskRuns(id?: string) {
 
 /** 会话转录：分页读最新一页；运行中短间隔轮询（SSE 之外无需新通道）。 */
 /** 会话侧栏：项目内全部 run（含任务名、标题、置顶、归档）。 */
+// Worker 池投影（会话页 Workers 组的权威来源）。运行中 6s 轮询兜底，SSE 的
+// agent_* 帧由组件侧失效触发即时重取。终态一次拉取即可（checkpoint 投影
+// 不会再变），但仍给长间隔兜底以覆盖"最后一批 agent 收尾"的时序。
+export function useInstanceAgents(instanceId?: string, live = false) {
+  return useQuery({
+    queryKey: ["instance-agents", instanceId ?? "none"],
+    queryFn: () => api.instanceAgents(instanceId!),
+    enabled: !!instanceId,
+    retry: false,
+    refetchInterval: live ? 6000 : false,
+    placeholderData: (prev) => prev,
+  });
+}
+
+// 计划状态投影（Planner 组与 PlanRail 的权威来源）。计划变更很稀疏：
+// 运行中 10s 低频兜底 + plan_updated SSE 即时失效。
+export function useScanPlan(instanceId?: string, live = false) {
+  return useQuery({
+    queryKey: ["scan-plan", instanceId ?? "none"],
+    queryFn: () => api.scanPlan(instanceId!),
+    enabled: !!instanceId,
+    retry: false,
+    refetchInterval: live ? 10000 : false,
+    placeholderData: (prev) => prev,
+  });
+}
+
 export function useProjectConversations(projectId?: string, includeArchived = false) {
   return useQuery({
     queryKey: ["conversation", "project", projectId ?? "none", includeArchived],
@@ -1291,6 +1323,21 @@ export function useSkillInvocations(params: InvocationListParams) {
 export function useAgentInvocations(params: InvocationListParams) {
   return useInvocationsQuery(qk.agentInvocations(params), () =>
     api.listInvocations("agents", params));
+}
+
+export function useToolCatalog() {
+  return useQuery({
+    queryKey: qk.toolCatalog,
+    queryFn: api.listTools,
+    placeholderData: (prev) => prev,
+    staleTime: 5 * 60_000,
+    retry: false,
+  });
+}
+
+export function useToolInvocations(params: InvocationListParams) {
+  return useInvocationsQuery(qk.toolInvocations(params), () =>
+    api.listInvocations("tools", params));
 }
 
 /** invalidateIntegration 刷新同前缀的定义缓存（三模块共用 mutation 收尾）。 */

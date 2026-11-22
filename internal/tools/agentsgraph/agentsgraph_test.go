@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/tools"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools"
 )
 
 func agentIDFromResult(t *testing.T, metadata map[string]any) string {

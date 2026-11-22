@@ -29,8 +29,8 @@ import (
 	"log"
 	"strings"
 
-	"github.com/xalgord/xalgorix/v4/internal/infoitem"
-	"github.com/xalgord/xalgorix/v4/internal/scanctx"
+	"github.com/c1ayooo/xalgorix/v4/internal/infoitem"
+	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
 )
 
 // Budgets for the cross-scan annotations (M4). Kept small and deterministic.

@@ -8,7 +8,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	infopg "github.com/xalgord/xalgorix/v4/internal/infoitem/postgres"
+	infopg "github.com/c1ayooo/xalgorix/v4/internal/infoitem/postgres"
 )
 
 func TestPGCheckpointStoreRoundTrip(t *testing.T) {

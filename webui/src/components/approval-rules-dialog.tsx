@@ -133,6 +133,17 @@ function RuleList({
                 <span className="min-w-0 flex-1 truncate mono text-sm font-medium">
                   {ruleMatchText(rule)}
                 </span>
+                <span
+                  className={
+                    rule.decision === "deny"
+                      ? "shrink-0 rounded-sm border border-destructive/40 bg-destructive/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-destructive"
+                      : "shrink-0 rounded-sm border border-border bg-muted px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-muted-foreground"
+                  }
+                >
+                  {rule.decision === "deny"
+                    ? t("approvalRules.decisionDeny")
+                    : t("approvalRules.decisionAllow")}
+                </span>
                 {expired && (
                   <span className="shrink-0 rounded-sm border border-border bg-muted px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-muted-foreground">
                     {t("approvalRules.expired")}
@@ -226,6 +237,8 @@ function RuleCreateForm({
   const [host, setHost] = useState("");
   const [pathPrefix, setPathPrefix] = useState("");
   const [expiresInDays, setExpiresInDays] = useState("30");
+  // v4.6: allow = 豁免（approve & remember）；deny = 范围观测 Agent 自动拒绝。
+  const [decision, setDecision] = useState<"allow" | "deny">("allow");
 
   const valid =
     !!projectId &&
@@ -240,6 +253,7 @@ function RuleCreateForm({
     const req: ApprovalRuleRequest = {
       project_id: projectId,
       kind,
+      decision,
       match,
     };
     if (expiresInDays !== "never") {
@@ -258,6 +272,21 @@ function RuleCreateForm({
 
   return (
     <div className="space-y-3 rounded-md border border-border bg-card p-4">
+      <div className="space-y-1">
+        <Label>{t("approvalRules.fieldDecision")}</Label>
+        <Select value={decision} onValueChange={(v) => setDecision(v as "allow" | "deny")}>
+          <SelectTrigger>
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="allow">{t("approvalRules.decisionAllow")}</SelectItem>
+            <SelectItem value="deny">{t("approvalRules.decisionDeny")}</SelectItem>
+          </SelectContent>
+        </Select>
+        <p className="text-[11px] text-muted-foreground">
+          {t("approvalRules.decisionHint")}
+        </p>
+      </div>
       {kind === "command" ? (
         <>
           <div className="space-y-1">

@@ -15,12 +15,12 @@ import (
 
 	"github.com/cloudwego/eino/schema"
 
-	"github.com/xalgord/xalgorix/v4/internal/engine"
-	"github.com/xalgord/xalgorix/v4/internal/llm"
-	"github.com/xalgord/xalgorix/v4/internal/tools"
-	"github.com/xalgord/xalgorix/v4/internal/tools/browser"
-	"github.com/xalgord/xalgorix/v4/internal/tools/notes"
-	"github.com/xalgord/xalgorix/v4/internal/tools/terminal"
+	"github.com/c1ayooo/xalgorix/v4/internal/engine"
+	"github.com/c1ayooo/xalgorix/v4/internal/llm"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools/browser"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools/notes"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools/terminal"
 )
 
 type einoObserver struct {

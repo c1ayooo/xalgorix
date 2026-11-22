@@ -3,7 +3,7 @@ package agent
 import (
 	"testing"
 
-	"github.com/xalgord/xalgorix/v4/internal/llm"
+	"github.com/c1ayooo/xalgorix/v4/internal/llm"
 )
 
 // TestAlignPruneCutoff exercises the regression case the review flagged:

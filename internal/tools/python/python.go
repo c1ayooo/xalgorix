@@ -11,19 +11,21 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/config"
-	"github.com/xalgord/xalgorix/v4/internal/egress"
-	"github.com/xalgord/xalgorix/v4/internal/platformutil"
-	egressproxy "github.com/xalgord/xalgorix/v4/internal/proxy"
-	"github.com/xalgord/xalgorix/v4/internal/resources"
-	"github.com/xalgord/xalgorix/v4/internal/scanctx"
-	"github.com/xalgord/xalgorix/v4/internal/storage"
-	"github.com/xalgord/xalgorix/v4/internal/tools"
-	"github.com/xalgord/xalgorix/v4/internal/tools/iolimit"
-	"github.com/xalgord/xalgorix/v4/internal/tools/terminal"
-	"github.com/xalgord/xalgorix/v4/internal/trafficproxy"
+	"github.com/c1ayooo/xalgorix/v4/internal/config"
+	"github.com/c1ayooo/xalgorix/v4/internal/egress"
+	"github.com/c1ayooo/xalgorix/v4/internal/platformutil"
+	egressproxy "github.com/c1ayooo/xalgorix/v4/internal/proxy"
+	"github.com/c1ayooo/xalgorix/v4/internal/resources"
+	toolrt "github.com/c1ayooo/xalgorix/v4/internal/runtime"
+	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
+	"github.com/c1ayooo/xalgorix/v4/internal/storage"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools/iolimit"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools/terminal"
+	"github.com/c1ayooo/xalgorix/v4/internal/trafficproxy"
 )
 
 // configureProcessGroupKill starts cmd in its own process group and installs a
@@ -124,6 +126,12 @@ func executePythonForContextCtx(parent context.Context, contextID string, args m
 
 	ctx, cancel := context.WithTimeout(waitCtx, time.Duration(timeoutSec)*time.Second)
 	defer cancel()
+
+	// Container execution plane. The native path below is unchanged so
+	// XALGORIX_RUNTIME_BACKEND=native stays a byte-for-byte fallback.
+	if tools.ContainerActive() {
+		return executePythonInContainer(ctx, contextID, code, timeoutSec)
+	}
 
 	cmd := exec.CommandContext(ctx, pythonBin, "-c", code)
 	// Resolve the python child's working directory in this priority order so
@@ -253,6 +261,80 @@ func executePythonForContextCtx(parent context.Context, contextID string, args m
 		b.WriteString("(no output)")
 	}
 
+	return tools.Result{Output: b.String()}, nil
+}
+
+var pythonContainerSeq atomic.Uint64
+
+// executePythonInContainer runs the script inside the scan's project container.
+// Output formatting mirrors the native branch so the agent's view is identical.
+func executePythonInContainer(ctx context.Context, contextID, code string, timeoutSec int) (tools.Result, error) {
+	sc := scanctx.Get(contextID)
+	if sc == nil {
+		return tools.Result{Error: "python_action requires an active scan context for container execution"}, nil
+	}
+	workDir := sc.ScanDir
+	if workDir == "" {
+		if wd := terminal.GetWorkDirForContext(contextID); wd != "" {
+			workDir = wd
+		} else {
+			workDir = config.Get().WorkspaceRoot
+		}
+	}
+	workDir = filepath.Clean(workDir)
+
+	res, err := tools.RunInProject(ctx, sc, toolrt.ExecSpec{
+		CallSeq:     pythonContainerSeq.Add(1),
+		Tool:        "python_action",
+		Argv:        []string{"python3", "-c", code},
+		Cwd:         workDir,
+		Timeout:     time.Duration(timeoutSec) * time.Second,
+		StdoutLimit: iolimit.DefaultStdoutLimit,
+		StderrLimit: iolimit.DefaultStderrLimit,
+		ArtifactDir: filepath.Join(workDir, "tool-outputs"),
+	})
+	if err != nil {
+		return tools.Result{Error: fmt.Sprintf("python_action container error: %v", err)}, nil
+	}
+
+	var b strings.Builder
+	if res.Stdout != "" {
+		out := res.Stdout
+		if len(out) > 15000 {
+			out = out[:15000] + "\n... [OUTPUT TRUNCATED]"
+		}
+		b.WriteString(out)
+		if res.StdoutTruncated {
+			b.WriteString("\n... [OUTPUT TRUNCATED: exceeded 1MB]")
+		}
+	}
+	if res.Stderr != "" {
+		if b.Len() > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString("STDERR:\n")
+		errOut := res.Stderr
+		if len(errOut) > 5000 {
+			errOut = errOut[:5000] + "\n... [TRUNCATED]"
+		}
+		b.WriteString(errOut)
+		if res.StderrTruncated {
+			b.WriteString("\n... [STDERR TRUNCATED: exceeded 512KB]")
+		}
+	}
+	switch {
+	case res.TimedOut:
+		b.WriteString(fmt.Sprintf("\n[TIMEOUT: exceeded %ds]", timeoutSec))
+		return tools.Result{Output: b.String(), Error: fmt.Sprintf("python_action timed out after %ds", timeoutSec)}, nil
+	case res.Canceled:
+		b.WriteString("\n[CANCELED] python_action canceled")
+		return tools.Result{Output: b.String(), Error: "python_action canceled"}, nil
+	case res.ExitCode != 0:
+		b.WriteString(fmt.Sprintf("\n[exit code: %d]", res.ExitCode))
+	}
+	if b.Len() == 0 {
+		b.WriteString("(no output)")
+	}
 	return tools.Result{Output: b.String()}, nil
 }
 

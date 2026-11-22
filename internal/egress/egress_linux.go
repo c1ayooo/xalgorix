@@ -15,7 +15,7 @@ import (
 	"sync"
 	"syscall"
 
-	"github.com/xalgord/xalgorix/v4/internal/trafficproxy"
+	"github.com/c1ayooo/xalgorix/v4/internal/trafficproxy"
 )
 
 var (

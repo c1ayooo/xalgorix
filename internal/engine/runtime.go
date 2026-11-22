@@ -20,7 +20,7 @@ import (
 
 	einoTool "github.com/cloudwego/eino/components/tool"
 
-	"github.com/xalgord/xalgorix/v4/internal/tools"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools"
 )
 
 // GuardVerdict is the application-level pre-tool decision. Allowed=false

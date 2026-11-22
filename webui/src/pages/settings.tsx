@@ -35,6 +35,7 @@ import {
 } from "@/components/ui/alert-dialog";
 import { Switch } from "@/components/ui/switch";
 import { ErrorState } from "@/components/states";
+import { RuntimeStatusCard } from "@/components/runtime-status-card";
 import {
   useAuthProfiles,
   useDeleteAuthProfile,
@@ -468,6 +469,8 @@ export default function SettingsPage() {
           {t("settings.subtitle")}
         </p>
       </header>
+
+      <RuntimeStatusCard />
 
       <Tabs value={activeTab} onValueChange={changeTab}>
         <TabsList className="flex h-auto flex-wrap">

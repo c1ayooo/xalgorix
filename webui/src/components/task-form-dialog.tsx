@@ -78,6 +78,10 @@ export function TaskFormDialog({
   // 区块供编辑确认；分析 notes 作为一行灰字提示（不落盘，仅会话内可见）。
   const [analyzing, setAnalyzing] = useState(false);
   const [goalNotes, setGoalNotes] = useState("");
+  // v4.6 上下文文件：创建/编辑时上传，落点为后端项目任务目录
+  // <dataDir>/projects/<projectId>/tasks/<taskId>/files/，路径写回 context_paths。
+  const [files, setFiles] = useState<File[]>([]);
+  const [existingPaths, setExistingPaths] = useState<string[]>([]);
 
   useEffect(() => {
     if (!open) return;
@@ -108,6 +112,8 @@ export function TaskFormDialog({
     }
     setGoalNotes("");
     setAnalyzing(false);
+    setFiles([]);
+    setExistingPaths(task?.context_paths ?? []);
   }, [open, task]);
 
   // 分析目标（R-goal）：一次 LLM 意图分析，草案预填 objective 区块。
@@ -172,7 +178,20 @@ export function TaskFormDialog({
       ? update.mutateAsync({ id: task!.id, req })
       : create.mutateAsync({ projectId, req });
     mutation
-      .then((saved) => {
+      .then(async (saved) => {
+        // Upload after the task exists so the server writes into THIS task's
+        // file directory (project/task-scoped landing zone) and the returned
+        // path is appended to context_paths.
+        if (files.length > 0) {
+          const res = await api.uploadContext(files, {
+            projectId,
+            taskId: saved.id,
+          });
+          await update.mutateAsync({
+            id: saved.id,
+            req: { context_paths: [...existingPaths, res.path] },
+          });
+        }
         toast.success(editing ? t("toast.taskUpdated") : t("toast.taskCreated"));
         onOpenChange(false);
         if (!editing) onCreated?.(saved);
@@ -246,6 +265,32 @@ export function TaskFormDialog({
               onChange={(e) => setInstruction(e.target.value)}
               placeholder={t("tasks.instructionPlaceholder")}
             />
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="task-context-files">{t("tasks.fieldContextFiles")}</Label>
+            <TextInput
+              id="task-context-files"
+              type="file"
+              multiple
+              onChange={(e) => setFiles(Array.from(e.target.files ?? []))}
+            />
+            <p className="text-[11px] text-muted-foreground">
+              {t("tasks.contextFilesHint")}
+            </p>
+            {(existingPaths.length > 0 || files.length > 0) && (
+              <ul className="space-y-0.5 text-[11px] text-muted-foreground">
+                {existingPaths.map((p) => (
+                  <li key={p} className="truncate mono">
+                    {p}
+                  </li>
+                ))}
+                {files.map((f) => (
+                  <li key={f.name} className="truncate mono">
+                    ↑ {f.name}
+                  </li>
+                ))}
+              </ul>
+            )}
           </div>
           <div className="grid grid-cols-2 gap-3">
             <div className="space-y-1.5">

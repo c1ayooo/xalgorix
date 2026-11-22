@@ -26,16 +26,16 @@ import (
 	"strings"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/llm"
-	"github.com/xalgord/xalgorix/v4/internal/scanctx"
-	"github.com/xalgord/xalgorix/v4/internal/tools"
-	"github.com/xalgord/xalgorix/v4/internal/tools/browser"
-	"github.com/xalgord/xalgorix/v4/internal/tools/httpclient"
-	"github.com/xalgord/xalgorix/v4/internal/tools/notes"
-	oobtool "github.com/xalgord/xalgorix/v4/internal/tools/oob"
-	"github.com/xalgord/xalgorix/v4/internal/tools/reporting"
-	"github.com/xalgord/xalgorix/v4/internal/tools/terminal"
-	"github.com/xalgord/xalgorix/v4/internal/tools/websearch"
+	"github.com/c1ayooo/xalgorix/v4/internal/llm"
+	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools/browser"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools/httpclient"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools/notes"
+	oobtool "github.com/c1ayooo/xalgorix/v4/internal/tools/oob"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools/reporting"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools/terminal"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools/websearch"
 )
 
 const (

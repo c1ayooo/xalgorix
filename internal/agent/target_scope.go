@@ -221,6 +221,35 @@ func (a *Agent) shouldBlockForTargetScope(toolName string, toolArgs map[string]s
 	if len(pins) == 0 && !a.singleHostScope {
 		return false, ""
 	}
+	// port_scan carries its target and port set as separate parameters, so the
+	// command-string rules below never see them. Enforce both boundaries
+	// explicitly: the single-host domain scope and the port-pin limit
+	// (including CIDR sweeps that cover a pinned host).
+	if lowerTool == "port_scan" {
+		target := strings.ToLower(strings.TrimSpace(toolArgs["target"]))
+		if a.singleHostScope && target != "" && a.otherOrganizationHost(target) {
+			return true, fmt.Sprintf(
+				"%s belongs to a different organization than the scan target. This is a single-host scan: "+
+					"do not port-scan third-party infrastructure found in its pages, redirects, or JavaScript.",
+				target)
+		}
+		ports := strings.ToLower(strings.TrimSpace(toolArgs["ports"]))
+		if ports == "" {
+			ports = "top2"
+		}
+		for h := range pins {
+			if !mentionsHost(target, h) && !cidrCoversHost(target, h) {
+				continue
+			}
+			if !scanStaysOnPorts("port_scan -p "+ports, pins[h]) {
+				list := pinnedPortList(pins[h])
+				return true, fmt.Sprintf(
+					"%s is in scope only on port %s, the port the scan target names. A port_scan of other "+
+						"ports on this host reaches separate services outside this engagement: set ports=%s "+
+						"and keep testing %s:%s.", h, list, list, h, list)
+			}
+		}
+	}
 	fetchTool := a.singleHostScope && fetchDestinationTools[lowerTool]
 	keys := make([]string, 0, len(toolArgs))
 	for k := range toolArgs {
@@ -505,6 +534,21 @@ func pinnedPortViolation(pins map[string]map[string]bool, value string) (bool, s
 
 func mentionsHost(text, host string) bool {
 	return regexp.MustCompile(`(?:^|[^a-z0-9.-])` + regexp.QuoteMeta(host) + `(?:[^a-z0-9.-]|$)`).MatchString(text)
+}
+
+// cidrCoversHost reports whether host (an IP literal) falls inside cidr. A
+// non-CIDR target or a non-literal host never matches — this only exists to
+// stop a subnet sweep from silently reaching a port-pinned host.
+func cidrCoversHost(cidr, host string) bool {
+	if !strings.Contains(cidr, "/") {
+		return false
+	}
+	_, ipnet, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ipnet.Contains(ip)
 }
 
 // scanStaysOnPorts reports whether a port-scan command lists its ports

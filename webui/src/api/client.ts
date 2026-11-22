@@ -38,6 +38,7 @@ import type {
   ScanTrafficView,
   SettingsBackup,
   SettingsImportResult,
+  RuntimeStatus,
   StatusResponse,
   Task,
   TaskIntelResponse,
@@ -58,6 +59,8 @@ import type {
   ColdPathSyncState,
   ScanAuditView,
   ExplorationView,
+  ScanPlanView,
+  InstanceAgentsView,
   InfoContextParams,
   InfoContextResult,
   InfoRegionParams,
@@ -67,6 +70,7 @@ import type {
   AgentProfileRequest,
   InvocationList,
   InvocationListParams,
+  ToolCatalog,
   McpServer,
   McpServerPatch,
   McpServerRequest,
@@ -268,11 +272,12 @@ function listQuery(params: ListParams): string {
 }
 
 /** 调用记录端点按模块路由（handlers_invocations.go）。 */
-type InvocationListModule = "mcp" | "skills" | "agents";
+type InvocationListModule = "mcp" | "skills" | "agents" | "tools";
 const INVOCATION_PATHS: Record<InvocationListModule, string> = {
   mcp: "/api/mcp-servers/invocations",
   skills: "/api/skills/invocations",
   agents: "/api/agent-profiles/invocations",
+  tools: "/api/tools/invocations",
 };
 
 /**
@@ -318,6 +323,8 @@ export const api = {
 
   status: () => http<StatusResponse>("/api/status"),
   version: () => http<VersionInfo>("/api/version"),
+  // 工具执行面只读投影（容器数/队列/镜像 digest/健康度）。
+  runtimeStatus: () => http<RuntimeStatus>("/api/runtime"),
   listScans: () => http<ScanListItem[] | null>("/api/scans"),
   // 服务端汇总的发现计数（契约 §3.2 支持可选 project_id）。
   findingsSummary: (projectId?: string) =>
@@ -387,6 +394,12 @@ export const api = {
   instance: (id: string) => http<ScanInstance>(`/api/instances/${id}`),
   instanceEvents: (id: string) =>
     http<WSEvent[]>(`/api/instances/${id}/events`),
+  // Worker 池投影：每个委派 agent 的真实生命周期 + 并发上限/排队。
+  // 面板读状态，不读事件（宪章 §5.1/§6）。
+  instanceAgents: (id: string) =>
+    http<InstanceAgentsView>(`/api/instances/${id}/agents`),
+  // 计划状态投影：任务图/来源/计数；PlanRail 的唯一权威数据源。
+  scanPlan: (id: string) => http<ScanPlanView>(`/api/scans/${id}/plan`),
   // 分页历史（会话控制台"加载更早"回翻；契约同 instances events 端点）。
   runEventsPage: (id: string, offset: number, limit = 100) =>
     http<WSEvent[]>(
@@ -426,12 +439,22 @@ export const api = {
       timeoutMs: 120_000,
     });
   },
-  uploadContext: (files: File[]) => {
+  uploadContext: (
+    files: File[],
+    // v4.6: project/task-scoped landing zone. With projectId (and optionally
+    // taskId) the server writes to <dataDir>/projects/<pid>/tasks/<tid>/files/
+    // and validates that the task belongs to the project.
+    opts?: { projectId?: string; taskId?: string },
+  ) => {
     const body = new FormData();
     // Multiple artifacts (e.g. a Postman collection + its environment) are sent
     // under the same "file" field; the server saves them into one directory and
     // parses them together.
     for (const f of files) body.append("file", f);
+    const params = new URLSearchParams();
+    if (opts?.projectId) params.set("project_id", opts.projectId);
+    if (opts?.taskId) params.set("task_id", opts.taskId);
+    const query = params.toString();
     return http<{
       path: string;
       filename: string;
@@ -439,7 +462,7 @@ export const api = {
       endpoints: number;
       formats: string[];
       has_auth: boolean;
-    }>("/api/upload-context", {
+    }>(`/api/upload-context${query ? `?${query}` : ""}`, {
       method: "POST",
       body,
       // APK/HAR parsing can take a little while, but a KB spec is instant —
@@ -933,6 +956,9 @@ export const api = {
     http<AgentProfile>(`/api/agent-profiles/${encodeURIComponent(id)}`, { method: "PATCH", json: patch }),
   deleteAgentProfile: (id: string) =>
     http<{ ok: boolean }>(`/api/agent-profiles/${encodeURIComponent(id)}`, { method: "DELETE" }),
+
+  // 内置工具目录（只读静态目录，不代表单个 Run 的启用状态）。
+  listTools: () => http<ToolCatalog>("/api/tools"),
 
   // 调用记录（跨扫描检索投影，只读）。
   listInvocations: (module: InvocationListModule, params: InvocationListParams = {}) => {

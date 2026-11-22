@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/xalgord/xalgorix/v4/internal/tools/skills"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools/skills"
 )
 
 // ── Directive composition (Part 21: hook delivery) ───────────────────────────

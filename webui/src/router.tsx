@@ -21,6 +21,7 @@ import ApprovalsPage from "@/pages/approvals"
 import ChatPage from "@/pages/chat"
 import InfoSpacePage from "@/pages/info-space"
 import McpServersPage from "@/pages/mcp-servers"
+import ToolsPage from "@/pages/tools"
 import SkillsPage from "@/pages/skills"
 import AgentProfilesPage from "@/pages/agent-profiles"
 import UsersPage from "@/pages/users"
@@ -63,6 +64,7 @@ const routes: RouteObject[] = [
       { path: "findings", element: <FindingsPage /> },
       { path: "reports", element: <ReportsPage /> },
       { path: "mcp", element: <McpServersPage /> },
+      { path: "tools", element: <ToolsPage /> },
       { path: "skills", element: <SkillsPage /> },
       { path: "agents", element: <AgentProfilesPage /> },
       { path: "live", element: <LivePage /> },

@@ -346,6 +346,26 @@ export interface StatusResponse {
   running_instances: number;
 }
 
+/**
+ * 工具运行时（执行面）只读投影。/api/runtime 返回的字段全部是派生值：
+ * 容器实际状态由运行时持有，期望态与调和水位在 PostgreSQL。
+ */
+export interface RuntimeStatus {
+  backend: "native" | "docker";
+  transport?: "socket" | "runnerd" | string;
+  profile?: "core" | "full" | "web" | string;
+  image?: string;
+  image_digest?: string;
+  project_limit: number;
+  projects_active: number;
+  exec_queue_depth: number;
+  project_slot_used: number;
+  project_slot_max: number;
+  healthy: boolean;
+  reason?: string;
+  reconciled_at: string;
+}
+
 export interface VersionInfo {
   version: string;
   ai?: {
@@ -680,6 +700,30 @@ export interface ScanSchedule {
   // Mirrors ScanRequest.provider_profile; persisted on the schedule
   // and re-applied on each trigger.
   provider_profile?: string;
+
+  // ── project binding & target mode (v4.6) ────────────────────────────────
+  // Project the schedule is bound to; every dispatch is scope-checked against
+  // its scope (D7). Empty keeps the legacy implicit-default-project behavior.
+  project_id?: string;
+  // What a tick does:
+  //   "scan"         launch a scan from `targets` (legacy default);
+  //   "create_task"  create a NEW task in the bound project, then run it;
+  //   "trigger_task" run the existing `task_id`.
+  mode?: "scan" | "create_task" | "trigger_task";
+  task_id?: string;
+  // Goal of the task created by a create_task tick.
+  task_goal?: string;
+  // Per-task context files attached to a created task.
+  context_paths?: string[];
+
+  // ── execution window (v4.6) ─────────────────────────────────────────────
+  // Daily execution window "HH:MM" in `timezone`; both empty = always eligible.
+  // A start after the end is a cross-midnight window.
+  window_start?: string;
+  window_end?: string;
+  // What happens to the running dispatch when the window closes.
+  window_end_action?: "pause" | "finish";
+  runtime_instance_id?: string;
 }
 
 // Response shape of GET /api/findings/summary. Polled every 10s by the
@@ -1031,6 +1075,9 @@ export interface ApprovalRule {
   project_id: string;
   project_name?: string;
   kind: "command" | "http";
+  // allow = 豁免（approve & remember，历史语义）；deny = 范围观测 Agent 自动拒绝。
+  // 空值等价 allow。
+  decision?: "allow" | "deny";
   match: ApprovalRuleMatch;
   reason?: string;
   created_by?: string;
@@ -1044,6 +1091,7 @@ export interface ApprovalRule {
 export interface ApprovalRuleRequest {
   project_id: string;
   kind: "command" | "http";
+  decision?: "allow" | "deny";
   match: ApprovalRuleMatch;
   reason?: string;
   expires_at?: string;
@@ -1062,6 +1110,8 @@ export interface TaskRequest {
   instruction?: string;
   phase_policy?: TaskPhasePolicy;
   schedule?: TaskSchedule | null;
+  /** 任务上下文文件（上传落点为项目所属任务目录）。 */
+  context_paths?: string[];
   /** Structured objective; null clears it (PATCH), undefined leaves it. */
   objective?: Objective | null;
 }
@@ -1435,6 +1485,31 @@ export interface McpServerPatch {
   timeout_seconds?: number;
 }
 
+// ── 内置工具目录（GET /api/tools，只读） ──
+
+/** 一个内置工具参数。 */
+export interface ToolCatalogParameter {
+  name: string;
+  required: boolean;
+  desc?: string;
+}
+
+/** 一个内置工具（目录项，不代表本 Run 的实际启用状态）。 */
+export interface ToolCatalogEntry {
+  name: string;
+  /** 稳定分类 key（terminal/network/browser/...），前端经 i18n 渲染。 */
+  category: string;
+  description: string;
+  /** 审批类别：command/http/browser；缺省 = 不参与审批闸。 */
+  approval?: string;
+  parameters?: ToolCatalogParameter[];
+}
+
+export interface ToolCatalog {
+  tools: ToolCatalogEntry[];
+  categories: string[];
+}
+
 /** GET /api/skills — 用户技能（内置语料在引擎侧，不在此列）。 */
 export interface UserSkill {
   id: string;
@@ -1693,4 +1768,71 @@ export interface ChatAttachment {
   path: string;
   name: string;
   size: number;
+}
+
+/** 计划任务投影（PlanTask = 意图 Intent，宪章 §2）。 */
+export interface PlanTaskView {
+  id: string;
+  title: string;
+  phase: number;
+  vuln_class?: string;
+  endpoint?: string;
+  status: "pending" | "active" | "completed" | "skipped" | string;
+  depends_on?: string[];
+  notes?: string;
+  disposition?: string;
+  /** auto* / llm：引擎自建 vs 模型自建（来源必须保留，§3.5）。 */
+  origin?: string;
+  prerequisite?: boolean;
+  whole_target?: boolean;
+}
+
+export interface PlanCountersView {
+  total: number;
+  completed: number;
+  skipped: number;
+  unfinished: number;
+}
+
+/** GET /api/scans/{id}/plan —— 计划的只读状态投影（替代事件反推）。 */
+export interface ScanPlanView {
+  present: boolean;
+  source: "engine" | "model" | "mixed" | "none";
+  plan_revision?: string;
+  surface_revision?: string;
+  current_phase?: number;
+  counters: PlanCountersView;
+  tasks: PlanTaskView[];
+  /** partial=true：只能给出计数，任务明细未持久化/被裁剪，禁止渲染成空计划。 */
+  partial?: boolean;
+  partial_reason?: "not_persisted" | "truncated" | "cold_path" | string;
+}
+
+/** 单个委派 agent 的状态投影（worker 行的权威来源）。 */
+export interface DelegatedAgent {
+  agent_id: string;
+  lane: string;
+  status: "queued" | "running" | "completed" | "failed";
+  task?: string;
+  target?: string;
+  started_at?: string;
+  completed_at?: string;
+  error?: string;
+  queued_position?: number;
+  partial_events?: number;
+  collected?: boolean;
+  claimed_hypotheses?: {
+    id: string;
+    vuln_class?: string;
+    endpoint?: string;
+    status?: string;
+  }[];
+}
+
+/** GET /api/instances/{id}/agents —— worker 池投影（运行中/排队/上限）。 */
+export interface InstanceAgentsView {
+  available: boolean;
+  concurrency: { limit: number; running: number; queued: number };
+  agents: DelegatedAgent[];
+  partial_reason?: "checkpoint" | "no_run" | string;
 }

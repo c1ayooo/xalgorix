@@ -17,6 +17,7 @@ import {
   Cable,
   Sparkles,
   Bot,
+  Wrench,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useVersion } from "@/api/queries";
@@ -63,6 +64,7 @@ const NAV_GROUPS: {
     items: [
       { to: "/schedules", labelKey: "nav.schedules", icon: Clock },
       { to: "/reports", labelKey: "nav.reports", icon: FileText },
+      { to: "/tools", labelKey: "nav.tools", icon: Wrench },
       { to: "/mcp", labelKey: "nav.mcp", icon: Cable },
       { to: "/skills", labelKey: "nav.skills", icon: Sparkles },
       { to: "/agents", labelKey: "nav.agents", icon: Bot },

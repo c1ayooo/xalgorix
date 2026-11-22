@@ -1,6 +1,7 @@
 import {
   Brain,
   CheckCircle2,
+  CircleAlert,
   Clock,
   Crosshair,
   History,
@@ -50,7 +51,7 @@ export function RailGroup({
   label,
   children,
 }: {
-  role: "main" | "plan" | "decision" | "system" | "worker";
+  role: "main" | "plan" | "decision" | "system" | "obligation" | "workers" | "worker";
   label: string;
   children: React.ReactNode;
 }) {
@@ -63,7 +64,9 @@ export function RailGroup({
           ? Crosshair
           : role === "system"
             ? History
-            : Radio;
+            : role === "obligation"
+              ? CircleAlert
+              : Radio;
   return (
     <div className="flex flex-col gap-0.5">
       <div className="flex items-center gap-1.5 px-2 py-1 font-medium text-muted-foreground text-xs">
@@ -79,12 +82,15 @@ export function RailItem({
   active,
   status,
   live,
+  badge,
   title,
   onClick,
 }: {
   active: boolean;
   status?: string;
   live?: boolean;
+  /** 计数徽标，例如运行中 `2/3`、义务缺口 `4`。 */
+  badge?: string;
   title: string;
   onClick: () => void;
 }) {
@@ -105,6 +111,11 @@ export function RailItem({
       >
         {sessionStatusIcon(status) ?? <span className="size-3.5 shrink-0" />}
         <span className="min-w-0 flex-1 truncate font-medium text-sm">{title}</span>
+        {badge && (
+          <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground tabular-nums">
+            {badge}
+          </span>
+        )}
         {live && (
           <span className="inline-flex shrink-0 items-center gap-1 rounded bg-emerald-500/10 px-1.5 py-0.5 font-medium text-[10px] text-emerald-600 dark:text-emerald-400">
             <span className="size-1 animate-pulse rounded-full bg-emerald-500" aria-hidden />

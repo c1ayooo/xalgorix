@@ -14,6 +14,7 @@ package agent
 import (
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -54,7 +55,8 @@ func reconDimensionsForCommand(cmd string) []string {
 		add(reconDimSubdomains)
 	}
 	if strings.Contains(cmd, "nmap") || strings.Contains(cmd, "naabu") ||
-		strings.Contains(cmd, "masscan") || strings.Contains(cmd, "-p ") ||
+		strings.Contains(cmd, "masscan") || strings.Contains(cmd, "gogo") ||
+		strings.Contains(cmd, "port_scan") || strings.Contains(cmd, "-p ") ||
 		(strings.Contains(cmd, "port") && strings.Contains(cmd, "curl")) {
 		add(reconDimServices)
 	}
@@ -208,9 +210,10 @@ func reconDimEvidenceSatisfied(dim, cmd, out string) bool {
 // ports; "host seems down" without -Pn is inconclusive, not coverage.
 func serviceScanEvidence(out, cmd string) bool {
 	l := strings.ToLower(out)
-	if strings.Contains(cmd, "naabu") || strings.Contains(cmd, "masscan") {
-		// These tools print only port lists; an empty valid scan is a valid
-		// negative. Any non-error output counts.
+	if strings.Contains(cmd, "naabu") || strings.Contains(cmd, "masscan") ||
+		strings.Contains(cmd, "gogo") || strings.Contains(cmd, "port_scan") {
+		// These tools print only port/service summaries; an empty valid scan
+		// is a valid negative. Any non-error output counts.
 		return true
 	}
 	for _, m := range []string{"scan report", "nmap done", "host is up",
@@ -274,6 +277,12 @@ var techHeaderFlagRe = regexp.MustCompile(`(?:^|[\s=])(?:-si|-i|--head|--include
 func techFingerprintCommand(cmd string) bool {
 	if strings.Contains(cmd, "whatweb") || strings.Contains(cmd, "wappalyzer") ||
 		strings.Contains(cmd, "wafw00f") {
+		return true
+	}
+	// gogo reports service banners and frameworks in the same pass as the
+	// port sweep, so a port_scan attempts both service_discovery and
+	// tech_fingerprint. Completion is still gated on framework evidence.
+	if strings.Contains(cmd, "gogo") || strings.Contains(cmd, "port_scan") {
 		return true
 	}
 	if (strings.Contains(cmd, "curl") || strings.Contains(cmd, "httpx")) &&
@@ -365,6 +374,19 @@ func techFingerprintEvidence(out, cmd string) bool {
 	if strings.Contains(cmd, "whatweb") || strings.Contains(cmd, "wappalyzer") ||
 		strings.Contains(cmd, "wafw00f") {
 		return true
+	}
+	if strings.Contains(cmd, "gogo") || strings.Contains(cmd, "port_scan") {
+		// port_scan renders "frameworks=N" in its summary header. A zero count
+		// is a valid negative for SERVICE discovery but proves nothing about
+		// the technology stack, so fingerprint coverage stays open.
+		if i := strings.Index(out, "frameworks="); i >= 0 {
+			if fields := strings.Fields(out[i+len("frameworks="):]); len(fields) > 0 {
+				if n, err := strconv.Atoi(fields[0]); err == nil {
+					return n > 0
+				}
+			}
+		}
+		return false
 	}
 	l := strings.ToLower(out)
 	return strings.Contains(l, "server:") || strings.Contains(l, "x-powered-by") ||
@@ -480,6 +502,34 @@ func hookReconResultTracker(state *ScanState, args map[string]string) HookResult
 		}
 		return HookResult{}
 	}
+	// port_scan is a first-class tool, not a terminal command: without an
+	// explicit branch here its results never complete a dimension and the
+	// planner keeps re-asking for a port sweep that already ran.
+	if toolName == "port_scan" {
+		if state.ReconCoverage.FailedAttempts == nil {
+			state.ReconCoverage.FailedAttempts = make(map[string]int)
+		}
+		if errStr != "" {
+			state.ReconCoverage.FailedAttempts[reconDimServices]++
+			return HookResult{}
+		}
+		low := strings.ToLower(out)
+		// A missing binary, a timeout or a cancel means the sweep did not
+		// cover the target: count a failed attempt, never completion.
+		if strings.Contains(low, "gogo binary not found") ||
+			strings.Contains(low, "[timeout]") || strings.Contains(low, "[canceled]") ||
+			reconRunFailed(low, false) {
+			state.ReconCoverage.FailedAttempts[reconDimServices]++
+			return HookResult{}
+		}
+		markReconDimensionComplete(state, reconDimServices)
+		if reconDimEvidenceSatisfied(reconDimTech, "port_scan", out) {
+			markReconDimensionComplete(state, reconDimTech)
+		}
+		maybeRecordDiscoveredHosts(state, "port_scan", out)
+		return HookResult{}
+	}
+
 	if toolName != "terminal_execute" {
 		return HookResult{}
 	}

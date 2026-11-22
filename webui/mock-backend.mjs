@@ -1348,6 +1348,117 @@ const server = http.createServer(async (req, res) => {
     return send(res, events);
   }
 
+  // -------- Worker pool projection (state, not telemetry) -------------------
+  // 契约：GET /api/instances/{id}/agents（API_CONTRACT §3.6a）。刻意给出
+  // "2 running + 1 queued + 已完成" 的混合状态，便于验证会话页不会再让
+  // 已结束的 worker 与运行中的 worker 长得一样。
+  const instAgentsMatch = url.match(/^\/api\/instances\/([^/]+)\/agents$/);
+  if (instAgentsMatch && method === "GET") {
+    const inst = state.instances.find((i) => i.id === instAgentsMatch[1]);
+    if (!inst) {
+      return send(res, {
+        available: false,
+        concurrency: { limit: 0, running: 0, queued: 0 },
+        agents: [],
+        partial_reason: "no_run",
+      });
+    }
+    const started = new Date(Date.now() - 8 * 60_000).toISOString();
+    return send(res, {
+      available: true,
+      concurrency: { limit: 3, running: 2, queued: 1 },
+      agents: [
+        {
+          agent_id: `${inst.id}-sub-1`,
+          lane: "injection-serverside",
+          status: "running",
+          task: "Own ONLY the injection-serverside lane",
+          started_at: started,
+          partial_events: 2,
+          claimed_hypotheses: [
+            { id: "h_mock_sqli", vuln_class: "sqli", endpoint: "/api/search", status: "testing" },
+          ],
+        },
+        {
+          agent_id: `${inst.id}-sub-2`,
+          lane: "client-source",
+          status: "running",
+          task: "Own ONLY the client-source lane",
+          started_at: started,
+          claimed_hypotheses: [
+            { id: "h_mock_xss", vuln_class: "xss", endpoint: "/comment", status: "testing" },
+          ],
+        },
+        {
+          agent_id: `${inst.id}-sub-3`,
+          lane: "business-logic",
+          status: "queued",
+          task: "Own ONLY the business-logic lane",
+          queued_position: 1,
+        },
+        {
+          agent_id: `${inst.id}-sub-0`,
+          lane: "recon-discovery",
+          status: "completed",
+          started_at: new Date(Date.now() - 20 * 60_000).toISOString(),
+          completed_at: new Date(Date.now() - 12 * 60_000).toISOString(),
+          collected: true,
+        },
+      ],
+    });
+  }
+
+  // -------- Plan projection (authority = engine plan) ----------------------
+  // 契约：GET /api/scans/{id}/plan（API_CONTRACT §3.6a）。source=mixed 演示
+  // "引擎任务 + 模型任务"的来源保留，partial 保持 false。
+  const scanPlanMatch = url.match(/^\/api\/scans\/([^/]+)\/plan$/);
+  if (scanPlanMatch && method === "GET") {
+    const tasks = [
+      { id: "recon-surface", title: "Enumerate the attack surface", phase: 1, status: "completed", origin: "auto" },
+      { id: "recon-inventory", title: "Save the endpoint inventory", phase: 2, status: "completed", origin: "auto" },
+      {
+        id: "test-sqli",
+        title: "Test SQL injection on discovered parameters",
+        phase: 6,
+        vuln_class: "sqli",
+        endpoint: "/api/search",
+        status: "active",
+        origin: "auto-plan",
+        depends_on: ["recon-inventory"],
+      },
+      {
+        id: "test-xss",
+        title: "Test reflected XSS in the comment form",
+        phase: 7,
+        vuln_class: "xss",
+        endpoint: "/comment",
+        status: "pending",
+        origin: "llm",
+        depends_on: ["recon-inventory"],
+      },
+      {
+        id: "test-authz",
+        title: "Test horizontal access control on orders",
+        phase: 5,
+        vuln_class: "idor",
+        endpoint: "/api/orders",
+        status: "skipped",
+        disposition: "blocked_missing_second_identity",
+        origin: "auto",
+      },
+    ];
+    return send(res, {
+      present: true,
+      source: "mixed",
+      plan_revision: "surf-mock-1",
+      surface_revision: "surf-mock-1",
+      current_phase: 6,
+      counters: { total: tasks.length, completed: 2, skipped: 1, unfinished: 2 },
+      tasks,
+      partial: false,
+    });
+  }
+
   // -------- R5: Info space (project-scoped, read-only) ----------------------
   if (method === "GET" && url.startsWith("/api/info/")) {
     const qs = new URLSearchParams(req.url.split("?")[1] || "");

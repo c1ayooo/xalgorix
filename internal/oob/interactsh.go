@@ -23,7 +23,7 @@ import (
 
 	ishclient "github.com/projectdiscovery/interactsh/pkg/client"
 	ishserver "github.com/projectdiscovery/interactsh/pkg/server"
-	"github.com/xalgord/xalgorix/v4/internal/config"
+	"github.com/c1ayooo/xalgorix/v4/internal/config"
 )
 
 const (
