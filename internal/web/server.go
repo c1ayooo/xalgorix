@@ -2218,6 +2218,10 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 				DiscordWebhook:           req.DiscordWebhook,
 				DiscordWebhookConfigured: req.DiscordWebhook != "" || s.discordWebhook != "",
 				TelegramConfigured:       s.telegramConfigured(),
+				// Saved targets never ran: keep the wire contract's empty-array
+				// shape (nil would marshal as null for GET /api/scans/{id}).
+				Events: []WSEvent{},
+				Vulns:  []VulnSummary{},
 			}
 			s.saveScanRecordTo(rec, savedDir)
 		}
@@ -2821,7 +2825,7 @@ func (s *Server) handleInstances(w http.ResponseWriter, r *http.Request) {
 			CompanyName:         inst.CompanyName,
 			LogoPath:            inst.LogoPath,
 			CurrentPhase:        inst.CurrentPhase,
-			SubScans:            cloneSubScanSummaries(inst.SubScans),
+			SubScans:            nonNilSubScans(cloneSubScanSummaries(inst.SubScans)),
 			SubScanTotal:        inst.SubScanTotal,
 			SubScanCompleted:    inst.SubScanCompleted,
 			SubScanRunning:      inst.SubScanRunning,
@@ -3058,6 +3062,11 @@ func (s *Server) handleInstanceAction(w http.ResponseWriter, r *http.Request) {
 			s.hydrateTerminalIntegrity(exact)
 			exact.mu.RLock()
 			events := append([]WSEvent(nil), exact.events...)
+			if events == nil {
+				// Non-nil: a pending/just-admitted instance has no events yet,
+				// but the snapshot contract is an empty array, not null.
+				events = []WSEvent{}
+			}
 			response := instanceResponseLocked(exact)
 			response.InstanceID = exact.ID
 			response.Events = &events
@@ -3225,7 +3234,7 @@ func (s *Server) handleInstanceAction(w http.ResponseWriter, r *http.Request) {
 		}{
 			InstanceID:  inst.ID,
 			Status:      inst.Status,
-			SubScans:    cloneSubScanSummaries(inst.SubScans),
+			SubScans:    nonNilSubScans(cloneSubScanSummaries(inst.SubScans)),
 			WorkStarted: inst.WorkStarted,
 		}
 		inst.mu.RUnlock()
@@ -3957,12 +3966,26 @@ func (s *Server) handleQueueStatus(w http.ResponseWriter, r *http.Request) {
 		for _, entry := range entries {
 			totalRemaining += len(entry.state.Targets) - entry.state.CurrentIdx
 		}
+		// Map values bypass struct-tag protection: nil slices inside the literal
+		// would marshal as JSON null, so normalize before encoding.
+		targets := state.Targets
+		if targets == nil {
+			targets = []string{}
+		}
+		severityFilter := state.SeverityFilter
+		if severityFilter == nil {
+			severityFilter = []string{}
+		}
+		phases := state.Phases
+		if phases == nil {
+			phases = []int{}
+		}
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"available":                 true,
 			"queue_count":               len(entries),
 			"total_remaining":           totalRemaining,
 			"instance_id":               state.InstanceID,
-			"targets":                   state.Targets,
+			"targets":                   targets,
 			"current_idx":               state.CurrentIdx,
 			"remaining":                 len(state.Targets) - state.CurrentIdx,
 			"instruction":               state.Instruction,
@@ -3970,8 +3993,8 @@ func (s *Server) handleQueueStatus(w http.ResponseWriter, r *http.Request) {
 			"started_at":                state.StartedAt,
 			"paused":                    state.Paused,
 			"name":                      state.Name,
-			"severity_filter":           state.SeverityFilter,
-			"phases":                    state.Phases,
+			"severity_filter":           severityFilter,
+			"phases":                    phases,
 			"recon_mode":                normalizeActivityMode(state.ReconMode),
 			"scan_intensity":            normalizeActivityMode(state.ScanIntensity),
 			"company_name":              state.CompanyName,

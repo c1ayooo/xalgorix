@@ -947,7 +947,8 @@ func loadScanRecordFromDir(scanDir string) (*ScanRecord, bool) {
 		return nil, false
 	}
 	if rec.EventsJournal {
-		rec.Events = nil
+		// Non-nil seed: a zero-event journal must marshal as [] not null.
+		rec.Events = []WSEvent{}
 		total, _, err := walkEventJournal(scanDir, func(_ int, event WSEvent) { rec.Events = append(rec.Events, event) })
 		if err != nil {
 			return nil, false
@@ -1687,6 +1688,7 @@ func (s *Server) runWildcardTarget(ctx context.Context, scanCfg *config.Config, 
 						StartedAt:                time.Now().Format(time.RFC3339),
 						Status:                   "finished",
 						FinishedAt:               time.Now().Format(time.RFC3339),
+						Events:                   []WSEvent{},
 						Vulns:                    []VulnSummary{},
 						CompanyName:              req.CompanyName,
 						LogoPath:                 req.LogoPath,
