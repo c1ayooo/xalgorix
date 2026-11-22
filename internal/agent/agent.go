@@ -215,6 +215,7 @@ type Agent struct {
 	scanFinished               atomic.Bool
 	finishAccepted             atomic.Bool                        // set when the finish gate accepts a finish call; StopCheck reads it because AfterTool (completeWithFinish) can race the ADK's next model turn
 	goalAchievedEmitted        atomic.Bool                        // once-only guard for the R-goal auto-stop (goal_achieved)
+	forceContinuation          atomic.Bool                        // 1:1 re-open of a finished run (REDESIGN D11): suppress the plan-complete auto-finalize the restored checkpoint would re-fire
 	runCancel                  atomic.Pointer[context.CancelFunc] // set by runLoop; completeWithFinish cancels it so the ADK graph stops before another model call
 	nextTemperature            atomic.Pointer[float64]            // one-shot per-role temperature for the next model turn
 	scanCtx                    *scanctx.ScanContext               // per-session state (vulns, notes, terminal, browser)
@@ -273,8 +274,8 @@ type Agent struct {
 
 	// initialIter and resumeBriefing preserve iteration count and previous execution
 	// history when a scan is resumed/restarted across server restarts.
-	initialIter         int
-	resumeBriefing      string
+	initialIter    int
+	resumeBriefing string
 	// replayTranscript carries the 1:1 hot-resume projection of the previous
 	// session's conversation (built by the web layer from events.jsonl). It is
 	// prompt context only — the state authority remains scan.json + notes +
@@ -1803,6 +1804,10 @@ func (a *Agent) Run(targets []string, instruction string) {
 	if a.state == nil {
 		a.state = NewScanState()
 	}
+	if a.forceContinuation.Load() && a.state != nil {
+		a.state.ForceContinuation = true
+	}
+
 	a.state.Iteration = a.initialIter
 	// A scan resumed after a server restart must not repeat the
 	// full-detail specialist-wave defer wall: the persisted record already
@@ -2223,6 +2228,14 @@ func (a *Agent) SetResumeBriefing(s string) {
 // is the L3 resume briefing alone). Call before Run().
 func (a *Agent) SetConversationReplay(s string) {
 	a.replayTranscript = strings.TrimSpace(s)
+}
+
+// SetForceContinuation marks a 1:1 re-open of a finished run (REDESIGN D11):
+// the restored execution checkpoint says "plan complete", but the operator
+// explicitly re-dispatched, so the plan-complete auto-finalize must not
+// re-fire on the first turn. Call before Run().
+func (a *Agent) SetForceContinuation() {
+	a.forceContinuation.Store(true)
 }
 
 // SetDeferNoteDetailEmitted marks that the full-detail specialist-wave

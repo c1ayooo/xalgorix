@@ -194,7 +194,10 @@ var errDispatchBusy = errors.New("dispatch is busy")
 //
 // Returns reactivated=false with a nil error when no snapshot exists (a
 // save-only or purged history): the caller then dispatches through the
-// standard fresh path under the same id.
+// standard fresh path under the same id. A leftover "pending" snapshot is
+// also reopened: this entry point is only reachable when the run's scan.json
+// is terminal, so a pending snapshot there is an orphaned accepted dispatch
+// (e.g. a previous attempt that died before registration) — retryable.
 func (s *Server) reactivateTerminalDispatchSnapshot(instanceID string, req ScanRequest) (bool, error) {
 	s.dispatchMu.Lock()
 	defer s.dispatchMu.Unlock()
@@ -208,7 +211,7 @@ func (s *Server) reactivateTerminalDispatchSnapshot(instanceID string, req ScanR
 	if strings.EqualFold(rec.Status, "stopping") {
 		return false, fmt.Errorf("%w: instance %s is still stopping", errDispatchBusy, instanceID)
 	}
-	if !isTerminalScanStatus(rec.Status) {
+	if !isTerminalScanStatus(rec.Status) && !strings.EqualFold(rec.Status, "pending") {
 		return false, fmt.Errorf("%w: instance %s is %s", errDispatchBusy, instanceID, rec.Status)
 	}
 	now := time.Now().Format(time.RFC3339Nano)

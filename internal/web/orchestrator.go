@@ -10,6 +10,8 @@ import (
 	mathrand "math/rand"
 	"os"
 	"path/filepath"
+
+	"github.com/xalgord/xalgorix/v4/internal/storage"
 	"regexp"
 	"runtime"
 	"runtime/debug"
@@ -22,6 +24,7 @@ import (
 	"github.com/xalgord/xalgorix/v4/internal/resources"
 	"github.com/xalgord/xalgorix/v4/internal/safe"
 	"github.com/xalgord/xalgorix/v4/internal/scanctx"
+	"github.com/xalgord/xalgorix/v4/internal/tools/intelligence"
 	"github.com/xalgord/xalgorix/v4/internal/tools/notes"
 	"github.com/xalgord/xalgorix/v4/internal/tools/reporting"
 	"github.com/xalgord/xalgorix/v4/internal/tools/terminal"
@@ -70,6 +73,10 @@ func (e *tombstonedDispatchError) Error() string {
 // runMultiScan processes targets sequentially, one at a time.
 // Each target is scanned in a fully isolated scanSession.
 func (s *Server) runMultiScan(req ScanRequest, scanCfg *config.Config, instanceIDs ...string) {
+	// Round-0 goal analysis (R-goal, goal_analysis.go): a task-sourced run
+	// whose goal is still unstructured gets one analyzer call before the
+	// agent starts. No-op for legacy requests and structured tasks.
+	s.roundZeroGoalAnalysis(&req)
 	run, err := s.registerMultiScan(req, instanceIDs...)
 	if err != nil {
 		// registerMultiScan has logged why it refused.
@@ -236,6 +243,13 @@ func (s *Server) registerMultiScan(req ScanRequest, instanceIDs ...string) (*mul
 	}
 	if existing != nil {
 		replaceableResumePlaceholder := req.IsResume && isReplaceableResumePlaceholder(existing)
+		// 1:1 re-dispatch (REDESIGN D11): a live entry rebuilt from a terminal
+		// run's scan.json is an inert display copy — the re-dispatch replaces
+		// it, same as a resume placeholder. Only the controlled task-run
+		// entry point sets ResumeIntent.
+		if !replaceableResumePlaceholder && req.ResumeIntent && isTerminalScanStatus(existing.Status) {
+			replaceableResumePlaceholder = true
+		}
 		if !replaceableResumePlaceholder {
 			s.instancesMu.Unlock()
 			delete(s.dispatchReservations, instanceID)
@@ -298,6 +312,26 @@ func (s *Server) registerMultiScan(req ScanRequest, instanceIDs ...string) (*mul
 
 // runRegisteredMultiScan runs a scan queue that registerMultiScan registered,
 // and releases its queue ownership lock when the queue ends.
+
+// copyContinuityState carries the durable agent memory of a 1:1 re-dispatch
+// (REDESIGN D11) — notes, ledger, intelligence — from the previous scan dir
+// into the fresh one. Missing files are fine (a first re-dispatch of a run
+// whose predecessor predates them). storage.WriteAtomic keeps the house
+// durability rule.
+func (s *Server) copyContinuityState(fromDir, toDir string) {
+	for _, f := range []string{"notes.json", "ledger.json", "intelligence.json"} {
+		data, err := os.ReadFile(filepath.Join(fromDir, f))
+		if err != nil {
+			continue
+		}
+		if err := storage.WriteAtomic(filepath.Join(toDir, f), data); err != nil {
+			log.Printf("[platform] continuity copy failed for %s: %v", f, err)
+		} else {
+			log.Printf("[platform] continuity: carried %s from previous scan dir", f)
+		}
+	}
+}
+
 func (s *Server) runRegisteredMultiScan(run *multiScanRun, scanCfg *config.Config) {
 	req := run.req
 	instanceID := run.instanceID
@@ -944,6 +978,11 @@ func subdomainTargetsFromRecord(rec *ScanRecord) []string {
 // runSingleTarget handles a single-site mode scan for one target.
 func (s *Server) runSingleTarget(ctx context.Context, scanCfg *config.Config, req ScanRequest, target string, idx, total int) {
 	scanDir, resumed := s.scanDirForResume(req, target)
+	// 1:1 re-dispatch continuity (REDESIGN D11): durable agent memory travels
+	// from the previous scan dir into this fresh one.
+	if req.RedispatchFromDir != "" {
+		s.copyContinuityState(req.RedispatchFromDir, scanDir)
+	}
 	s.saveQueueState(idx, req, queueProgress{
 		ActiveTarget:  target,
 		ActiveScanDir: scanDir,
@@ -970,6 +1009,9 @@ func (s *Server) runSingleTarget(ctx context.Context, scanCfg *config.Config, re
 	})
 
 	sess := &scanSession{
+		objective:          req.Objective,
+		objectiveProjectID: req.ObjectiveProjectID,
+		objectiveTaskID:    req.ObjectiveTaskID,
 		id:                 filepath.Base(scanDir),
 		target:             target,
 		scanDir:            scanDir,
@@ -986,6 +1028,7 @@ func (s *Server) runSingleTarget(ctx context.Context, scanCfg *config.Config, re
 		genReport:          true,
 		resetState:         !resumed,
 		instanceID:         req.InstanceID,
+		redispatchFromDir:  req.RedispatchFromDir,
 		parentCtx:          ctx,
 		scanMode:           "single",
 		companyName:        req.CompanyName,
@@ -1198,6 +1241,9 @@ func (s *Server) runWildcardTarget(ctx context.Context, scanCfg *config.Config, 
 		// skipNotesCleanup=true prevents cleanup() from deleting the notes store,
 		// keeping them available for collectSubdomains' Layer 3 (notes fallback).
 		discoverySess := &scanSession{
+			objective:          req.Objective,
+			objectiveProjectID: req.ObjectiveProjectID,
+			objectiveTaskID:    req.ObjectiveTaskID,
 			id:                 filepath.Base(scanDir),
 			target:             target,
 			scanDir:            scanDir,
@@ -1252,6 +1298,7 @@ func (s *Server) runWildcardTarget(ctx context.Context, scanCfg *config.Config, 
 		// Now clean up the discovery notes (deferred from skipNotesCleanup)
 		if discoveryCtxID != "" {
 			notes.CleanupContext(discoveryCtxID)
+			intelligence.CleanupContext(discoveryCtxID)
 			log.Printf("[wildcard] Cleaned up discovery notes context: %s", discoveryCtxID)
 		}
 	}
@@ -1556,6 +1603,9 @@ func (s *Server) runWildcardTarget(ctx context.Context, scanCfg *config.Config, 
 			vulnCountBefore := len(reporting.GetVulnerabilitiesForContext(parentReportingCtxID))
 
 			subSess := &scanSession{
+				objective:            req.Objective,
+				objectiveProjectID:   req.ObjectiveProjectID,
+				objectiveTaskID:      req.ObjectiveTaskID,
 				id:                   filepath.Base(subScanDir),
 				target:               subdomain,
 				parentTarget:         target,

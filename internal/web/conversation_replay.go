@@ -1,24 +1,24 @@
 package web
 
-// conversation_replay.go — hot-resume ladder L2 (REDESIGN 2026-11-22): rebuild
-// a bounded projection of the previous session's conversation from the scan
+// conversation_replay.go — hot-resume ladder L2 (REDESIGN D11): rebuild a
+// bounded projection of the previous session's conversation from the scan
 // dir's events.jsonl so a 1:1 task:run re-dispatch starts warm instead of
-// cold. L1 (eino ADK checkpoint Resume) is in-process-only in the current
-// eino version — Runtime.Resume needs the interrupt targetID that exists only
-// inside the live interrupt event, so a cross-process resume cannot use it;
-// that is documented in REDESIGN, not silently dropped.
+// cold, plus the stale-checkpoint drop that makes the re-open actually run.
 //
-// This is deliberately a TRANSCRIPT, not a structural message replay: journal
-// events carry no tool-call ids, and fabricating OpenAI-style
-// tool_call/tool-response pairs would couple the resumed session to a
-// synthetic protocol state. A formatted transcript inside one user message is
-// provider-agnostic and honest about what it is: a projection, not state
-// authority (charter §6 — events cannot replay the same decision; scan.json +
-// notes + ledger remain authoritative).
+// L1 (eino ADK checkpoint Resume) is in-process-only in the current eino
+// version: Runtime.Resume needs the interrupt targetID that exists only
+// inside the live interrupt event, and checkpoints are never written at
+// user stop. Worse, a checkpoint SAVED BY CANCEL makes the next rt.Run
+// resume the finished graph and exit instantly (observed on the first 1:1
+// re-dispatches, 2026-11-22) — so a re-open DROPS the stale checkpoint via
+// dropStaleEngineCheckpoints instead of resuming it.
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -34,13 +34,24 @@ const replayBudgetChars = 96_000
 const replayMaxEvents = 400
 
 // conversationReplayTranscript renders the previous session's last events as
-// a chronological transcript. Empty when the journal is absent or unusable
-// (the caller then falls back to the L3 resume briefing alone).
+// a chronological transcript (from the session's own scan dir). Empty when
+// the journal is absent or unusable (the caller then falls back to the L3
+// resume briefing alone).
 func conversationReplayTranscript(sctx *scanctx.ScanContext) string {
-	if sctx == nil || strings.TrimSpace(sctx.ScanDir) == "" {
+	if sctx == nil {
 		return ""
 	}
-	data, err := os.ReadFile(filepath.Join(sctx.ScanDir, scanEventJournalFile))
+	return conversationReplayTranscriptFromDir(sctx.ScanDir)
+}
+
+// conversationReplayTranscriptFromDir is the dir-parameterized variant: a
+// 1:1 re-dispatch replays the PREVIOUS scan dir's journal even though the
+// new session writes a fresh one.
+func conversationReplayTranscriptFromDir(dir string) string {
+	if strings.TrimSpace(dir) == "" {
+		return ""
+	}
+	data, err := os.ReadFile(filepath.Join(dir, scanEventJournalFile))
 	if err != nil || len(data) == 0 {
 		return ""
 	}
@@ -129,4 +140,26 @@ func replayTrim(s string, max int) string {
 		return s
 	}
 	return string(runes[:max]) + "…"
+}
+
+// dropStaleEngineCheckpoints removes the engine-level checkpoint for this
+// instance and any per-scan fallback copies, so a 1:1 re-open starts a fresh
+// ADK run instead of resuming a finished graph. Missing files are fine.
+func dropStaleEngineCheckpoints(dataDir string, sctx *scanctx.ScanContext) {
+	if sctx == nil || sctx.ID == "" {
+		return
+	}
+	sum := sha256.Sum256([]byte(sctx.ID))
+	paths := []string{
+		filepath.Join(dataDir, "_engine", "checkpoints", hex.EncodeToString(sum[:])+".ckpt"),
+	}
+	if sctx.ScanDir != "" {
+		matches, _ := filepath.Glob(filepath.Join(sctx.ScanDir, "*.ckpt"))
+		paths = append(paths, matches...)
+	}
+	for _, p := range paths {
+		if err := os.Remove(p); err == nil {
+			log.Printf("[platform] dropped stale engine checkpoint %s for re-open", p)
+		}
+	}
 }

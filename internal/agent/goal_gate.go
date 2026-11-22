@@ -261,3 +261,29 @@ func criterionKindDetail(c ObjectiveCriterion) string {
 		return c.Kind
 	}
 }
+
+// forceContinuationFinishValve bounds how many times the model may attempt
+// finish after the operator re-opened a finished run (REDESIGN D11) before
+// an honest finish is allowed.
+const forceContinuationFinishValve = 10
+
+// hookForceContinuationFinishGate refuses model-initiated finish while the
+// operator's 1:1 re-open (SetForceContinuation) is active. The restored
+// checkpoint looks "done", so the model's rational first move is finish —
+// but the re-open means there is new, re-prioritized work per the updated
+// instruction. Registered right after the gatekeeper (so FinishAttempts is
+// already counted) and ahead of the ledger/goal gates; stands down after
+// forceContinuationFinishValve so a genuinely exhausted run still closes.
+func hookForceContinuationFinishGate(state *ScanState, _ map[string]string) HookResult {
+	if state == nil || state.DelegatedAgent || !state.ForceContinuation {
+		return HookResult{}
+	}
+	state.ForceContinuationFinishAttempts++
+	if state.ForceContinuationFinishAttempts > forceContinuationFinishValve {
+		return HookResult{}
+	}
+	return HookResult{
+		Block: true,
+		BlockReason: "⛔ RUN RE-OPENED BY THE OPERATOR — this engagement continues. The updated instruction sets the current priorities: sweep the remaining medium 300-point challenges (a-07, a-09, a-12, a-14, a-17) with up to 3 containers active, submit flags the moment you have them, and keep the shelved c-03/a-03 for last. Do not call finish unless the platform starts returning invalid_state.",
+	}
+}

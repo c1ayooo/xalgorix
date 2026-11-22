@@ -484,8 +484,28 @@ func (s *Server) executeScanSession(sess *scanSession) {
 		// only — the state authority remains scan.json + notes + ledger
 		// (charter §6). Falls back to the L3 briefing alone when the journal
 		// is absent.
-		if transcript := conversationReplayTranscript(sctx); transcript != "" {
+		replayDir := sess.redispatchFromDir
+		if replayDir == "" {
+			replayDir = sctx.ScanDir
+		}
+		if transcript := conversationReplayTranscriptFromDir(replayDir); transcript != "" {
 			agnt.SetConversationReplay(transcript)
+		}
+		// 1:1 re-open (REDESIGN D11): a finished record under an explicit
+		// re-dispatch means the operator re-opened the run — suppress the
+		// plan-complete auto-finalize the restored checkpoint would re-fire,
+		// and re-open the record instead of instantly re-finishing.
+		log.Printf("[REOPEN] record status=%q resetState=%v — re-open branch reached", sess.record.Status, sess.resetState)
+		if sess.record.Status == "finished" {
+			// The engine checkpoint for this instance (ID = scan dir basename)
+			// was saved by the previous session's cancel — rt.Run with that
+			// checkpoint ID would RESUME the already-finished graph and end
+			// instantly (observed 18:06/18:13). A re-open deliberately starts
+			// a fresh ADK run; continuity comes from the replay/briefing.
+			dropStaleEngineCheckpoints(s.dataDir, sctx)
+			agnt.SetForceContinuation()
+			sess.record.Status = "running"
+			sess.record.FinishedAt = ""
 		}
 		if briefing := formatResumeBriefing(sess.record, sctx.ID); briefing != "" {
 			agnt.SetResumeBriefing(briefing)
@@ -541,6 +561,7 @@ func (s *Server) executeScanSession(sess *scanSession) {
 	// record setup; a stop racing this point either makes this check fail or
 	// observes the registered agent and sets its stopped flag before Run works.
 	if status, _ := s.instanceRunStatus(sess.instanceID); sess.instanceID != "" && status != "running" {
+		log.Printf("[RESUME-GATE] instance %s observed status %q before Run — stopping agent", sess.instanceID, status)
 		agnt.Stop()
 	}
 	agnt.Run([]string{sess.target}, instruction)

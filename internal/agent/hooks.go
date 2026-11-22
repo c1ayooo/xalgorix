@@ -128,6 +128,14 @@ type ScanState struct {
 	ReconCoverage  ReconCoverage
 	ScannerUsed    bool
 	FinishAttempts int
+	// ForceContinuation marks a 1:1 re-open of a finished run (REDESIGN D11):
+	// the operator explicitly re-dispatched, so model-initiated finish is
+	// refused for a bounded number of attempts (forceContinuationFinishValve)
+	// while the updated instruction's priorities are still actionable.
+	ForceContinuation bool
+	// ForceContinuationFinishAttempts counts finish attempts under
+	// ForceContinuation, independent of FinishAttempts.
+	ForceContinuationFinishAttempts int
 	// FinishRecoveryPending labels only the next charged request after a
 	// rejected finish in token telemetry.
 	FinishRecoveryPending    bool
@@ -142,22 +150,36 @@ type ScanState struct {
 	ReportFinishRecoveryAttempts int
 	ReportRetryLimitReached      bool
 	DiscoveryMode                bool
-	ReconOnlyMode                bool
-	SingleHostScope              bool // single-target scan: subdomains are neither enumerated nor owed coverage (target_scope.go)
-	DelegatedAgent               bool
-	DelegatedAgentID             string
-	LaneScoped                   bool
-	AssignedClasses              []string
-	BenchmarkIsolated            bool
-	ProfessionalAssessment       bool // non-CTF scan: structural plan, not a fixed iteration quota, governs completion
-	AuthContextKnown             bool // engine evaluated operator/ingested auth before planning
-	AuthContextAvailable         bool // at least one legitimate account/session is available
-	AllowedPhases                []int
-	PassiveReconGuardActive      bool
-	PassiveReconGuardDone        bool
-	PassiveReconSourceKeys       map[string]bool
-	PassiveReconPassiveLookups   int
-	PassiveReconBlockedActive    int
+	// Objective is the operator-stated goal of this scan (nil = none).
+	Objective *ObjectiveSpec
+	// GoalObligation (R-goal) is the deferred closing obligation: the open
+	// required criteria rendered when the plan-exhausted tail wanted to
+	// finalize with the goal unmet. Delivered once per distinct content by
+	// hookGoalObligation; GoalObligationCount bounds the deferrals so an
+	// unreachable goal still terminates honestly.
+	GoalObligation          string
+	GoalObligationDelivered string
+	GoalObligationCount     int
+	ReconOnlyMode           bool
+	SingleHostScope         bool // single-target scan: subdomains are neither enumerated nor owed coverage (target_scope.go)
+	DelegatedAgent          bool
+	DelegatedAgentID        string
+	LaneScoped              bool
+	AssignedClasses         []string
+	// SpecialistProfiles is the merged delegation vocabulary for this scan
+	// (builtin specialists + operator-authored profiles) — set at Run so
+	// hooks (delegation nudge) render the same set the engine can spawn.
+	SpecialistProfiles         []specialistProfile
+	BenchmarkIsolated          bool
+	ProfessionalAssessment     bool // non-CTF scan: structural plan, not a fixed iteration quota, governs completion
+	AuthContextKnown           bool // engine evaluated operator/ingested auth before planning
+	AuthContextAvailable       bool // at least one legitimate account/session is available
+	AllowedPhases              []int
+	PassiveReconGuardActive    bool
+	PassiveReconGuardDone      bool
+	PassiveReconSourceKeys     map[string]bool
+	PassiveReconPassiveLookups int
+	PassiveReconBlockedActive  int
 	// ScanDepth is the explicit depth mode: "deep" enforces the full-
 	// methodology recon requirements (service enumeration, parameter
 	// discovery), "standard" treats them as recommended. It is derived once
@@ -738,6 +760,7 @@ func RegisterDefaultHooks(reg *HookRegistry) {
 	// hook sees the freshly validated coverage state.
 	reg.Register(OnToolResult, hookReconResultTracker)
 	reg.Register(OnToolResult, hookSkillLoadTracker)
+	reg.Register(OnToolResult, hookMcpCallAuditor)
 	reg.Register(OnToolResult, hookAuthCoverageTracker)
 	reg.Register(OnToolResult, hookVerifierEvidenceBridge)
 	reg.Register(OnToolResult, hookWAFDetector)
@@ -753,9 +776,19 @@ func RegisterDefaultHooks(reg *HookRegistry) {
 	reg.Register(OnToolResult, hookExternalReferenceTracker)
 	reg.Register(OnToolResult, hookReportVulnerabilityTracker)
 	reg.Register(OnFinishAttempt, hookFinishGatekeeper)
+	// Registered right after the gatekeeper (REDESIGN D11): a 1:1 re-open of a
+	// finished run must not be re-finished by the model on turn one — its block
+	// reason wins over ledger/goal gates while the re-open is active.
+	reg.Register(OnFinishAttempt, hookForceContinuationFinishGate)
 	// Registered AFTER the gatekeeper so its coverage BlockReason wins when both
 	// block; this gate only adds the "proven-but-unreported" precision check.
 	reg.Register(OnFinishAttempt, hookLedgerFinishGate)
+	// Registered LAST (R-goal): the operator goal is the closing obligation —
+	// its rejection reason surfaces once methodology/coverage/ledger gates
+	// pass, so the model sees exactly which acceptance lines are still open.
+	// No objective (legacy scans, specialists) → HookResult{} passthrough,
+	// byte-identical to pre-R-goal behavior.
+	reg.Register(OnFinishAttempt, hookGoalFinishGate)
 	reg.Register(OnEmptyResponse, hookEmptyResponseHandler)
 	reg.Register(OnNoToolResponse, hookNoToolHandler)
 	reg.Register(OnIterationStart, hookDeepReconDirector)
@@ -765,6 +798,10 @@ func RegisterDefaultHooks(reg *HookRegistry) {
 	reg.Register(OnIterationStart, hookPlanner)
 	// Registered AFTER the planner so state.Plan exists when we seed the ledger.
 	reg.Register(OnIterationStart, hookLedgerSeed)
+	// Registered LAST on iteration start (R-goal): the deferred goal
+	// obligation speaks after the planner's brief — which goes quiet exactly
+	// when the plan is exhausted, the moment the obligation must be heard.
+	reg.Register(OnIterationStart, hookGoalObligation)
 	reg.Register(OnHealthyResponse, hookResetOnSuccess)
 	reg.Register(OnContextPrune, hookResetOnPrune)
 }
@@ -2176,7 +2213,7 @@ func hookStuckTracker(state *ScanState, args map[string]string) HookResult {
 // advance or reset the repeated-probe counters.
 func isAdministrativeTool(name string) bool {
 	switch name {
-	case "add_note", "read_notes", "update_plan", "finish", "read_skill", "list_skills", "search_skills", "agentmail", "read_ledger", "record_hypothesis", "update_hypothesis", "add_hypothesis_evidence", "claim_next_hypothesis", "report_vulnerability":
+	case "add_note", "read_notes", "update_plan", "finish", "read_skill", "list_skills", "search_skills", "read_ledger", "record_hypothesis", "update_hypothesis", "add_hypothesis_evidence", "claim_next_hypothesis", "report_vulnerability":
 		return true
 	}
 	return false
@@ -2491,7 +2528,7 @@ var localOnlyTools = map[string]bool{
 	"report_vulnerability": true, "submit_verdict": true, "finish": true,
 	"str_replace_editor": true, "list_files": true, "search_files": true,
 	"read_tool_output": true, "scan_source_sinks": true, "scan_source_routes": true,
-	"ingest_har": true, "agentmail": true,
+	"ingest_har": true,
 }
 
 var targetNetworkCommandPattern = regexp.MustCompile(`(?i)\b(?:curl|wget|httpx|nmap|ffuf|nuclei|nikto|sqlmap|dig|nslookup|ping)\b|\b(?:requests\.|urllib\.|aiohttp\.|http\.client|fetch\()`)
@@ -2785,6 +2822,26 @@ func hookFinishGatekeeper(state *ScanState, args map[string]string) HookResult {
 			}
 		}
 		return HookResult{}
+	}
+
+	// ── Evidence obligation ──
+	// A scan that recorded findings must have ledger evidence: the report gate
+	// projects every durable finding into the ledger as a finding_ref evidence
+	// record. A non-zero finding count with zero evidence therefore means the
+	// projection was bypassed or lost, and finishing would leave the
+	// information space empty while the finding list is not. Refuse the first
+	// attempts with an actionable instruction instead of silently accepting an
+	// inconsistent scan.
+	if state.FinishAttempts <= 2 && state.ScanContextID != "" {
+		if sc := scanctx.Get(state.ScanContextID); sc != nil && sc.Vulns != nil && sc.Ledger != nil {
+			if sc.Vulns.Count() > 0 && sc.Ledger.EvidenceCount() == 0 {
+				return HookResult{
+					Block: true,
+					BlockReason: "⚠️ UNRECORDED EVIDENCE: this scan has persisted findings but the hypothesis ledger holds no evidence for them. " +
+						"Record the observation that proves the finding (add_hypothesis_evidence with the request/response you used, nature=observed) so the information space and the report agree, then finish.",
+				}
+			}
+		}
 	}
 
 	// ── Mandatory Out-of-Band (OAST) Probing Gate ──

@@ -471,8 +471,18 @@ type ScanRequest struct {
 	// Critical: a client must not be able to set InstanceID to spoof
 	// broadcasts to another scan, or set IsResume to bypass the resume
 	// codepath's safety checks.
-	InstanceID           string   `json:"-"` // parent instance ID, threaded server-side
-	IsResume             bool     `json:"-"` // true when auto-resuming after restart
+	InstanceID string `json:"-"` // parent instance ID, threaded server-side
+	IsResume   bool   `json:"-"` // true when auto-resuming after restart
+	// ResumeIntent marks the controlled 1:1 task:run re-dispatch (REDESIGN
+	// D11): it may replace a rebuilt-from-disk copy of a terminal run in the
+	// live map, which the paused-resume placeholder path would refuse.
+	ResumeIntent         bool     `json:"-"`
+	// RedispatchFromDir points a 1:1 re-dispatch at the previous scan dir
+	// (REDESIGN D11): the new session copies durable continuity files
+	// (notes/ledger/intelligence) from it and replays its conversation, while
+	// the scan state itself starts fresh — the finished-record state machine
+	// is never re-entered.
+	RedispatchFromDir    string   `json:"-"`
 	ResumeQueueStatePath string   `json:"-"`
 	ResumeActiveTarget   string   `json:"-"`
 	ResumeScanDir        string   `json:"-"`
@@ -1510,6 +1520,13 @@ func (s *Server) Start() error {
 		// with status counts and honest presence/damage flags (scan_ledger.go).
 		if strings.HasSuffix(r.URL.Path, "/ledger") && r.Method == http.MethodGet {
 			s.handleScanLedger(w, r)
+			return
+		}
+		// GET /api/scans/{id}/exploration — read-only exploration projection
+		// (shared node/edge model for the 探索链路 graph + 播报板 stream;
+		// scan_exploration.go). Checked before the generic detail handler.
+		if strings.HasSuffix(r.URL.Path, "/exploration") && r.Method == http.MethodGet {
+			s.handleScanExploration(w, r)
 			return
 		}
 		// GET /api/scans/{id}/traffic — read-only raw HTTP exchange archive
@@ -3505,6 +3522,7 @@ type scanSession struct {
 	discoveryMode       bool
 	genReport           bool
 	resetState          bool
+	redispatchFromDir   string // 1:1 re-dispatch: previous scan dir for continuity copy + replay (REDESIGN D11)
 	instanceID          string               // parent instance ID for multi-instance tracking
 	parentCtx           context.Context      // parent target context; canceled by exact stop
 	scanMode            string               // single, wildcard, dast — persisted so dashboard shows correct mode

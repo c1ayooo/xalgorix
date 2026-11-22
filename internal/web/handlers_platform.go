@@ -36,7 +36,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -788,9 +787,8 @@ func (s *Server) handleTaskRunStart(w http.ResponseWriter, r *http.Request, stor
 		return
 	}
 	var resumeDir string
-	var resumeRec *ScanRecord
 	if hasTerminal {
-		resumeDir, resumeRec = s.scanDirRecordForRun(terminalRun.InstanceID, terminalRun.LegacyScanID)
+		resumeDir, _ = s.scanDirRecordForRun(terminalRun.InstanceID, terminalRun.LegacyScanID)
 	}
 
 	// Targets: request override, else the project scope defaults.
@@ -899,14 +897,16 @@ func (s *Server) handleTaskRunStart(w http.ResponseWriter, r *http.Request, stor
 		// hot-resume ladder (checkpoint → conversation replay → briefing)
 		// picks the agent's starting context in scan_session.
 		instanceID = terminalRun.InstanceID
-		if resumeDir != "" && resumeRec != nil {
-			req.IsResume = true
-			req.ResumeScanDir = resumeDir
-			req.ResumeScanID = filepath.Base(resumeDir)
-			req.ResumeActiveTarget = firstNonEmptyString(resumeRec.Target, targets[0])
-			req.ResumeIterations = resumeRec.Iterations
-			req.ResumeTotalTokens = resumeRec.TotalTokens
-			req.ResumeToolCalls = resumeRec.ToolCalls
+		// Fresh scan state (REDESIGN D11): re-entering the finished-record
+		// state machine via IsResume instantly re-finalizes the run, so the
+		// re-dispatch starts clean under the same identity. Continuity is
+		// carried instead: durable notes/ledger/intelligence are copied from
+		// the previous scan dir (orchestrator) and the conversation is
+		// replayed from its journal (scan_session), so the agent resumes warm
+		// without resuming the state machine.
+		req.ResumeIntent = true
+		if resumeDir != "" {
+			req.RedispatchFromDir = resumeDir
 		}
 	} else {
 		instanceID = strings.TrimSpace(req.DispatchID)
@@ -969,6 +969,11 @@ func (s *Server) handleTaskRunStart(w http.ResponseWriter, r *http.Request, stor
 			map[bool]string{true: "reactivated", false: "absent; queue state is the acceptance"}[reactivated])
 		req.Name = strings.TrimSpace(req.Name)
 		req.InstanceID = instanceID
+		// Transfer ownership to the orchestrator exactly like the fresh path:
+		// without this the handler's flock blocks runMultiScan's own queue
+		// acquisition ("queue is owned by another process") and the lock
+		// leaks past the handler's return.
+		req.queueOwnership = ownership
 		if err := s.saveQueueStateDurable(0, req); err != nil {
 			if abortErr := s.abortPendingDispatchSnapshot(instanceID, "queue_state_persist_failed"); abortErr != nil {
 				log.Printf("[scan] failed to terminalize dispatch %s after queue-state error: %v", instanceID, abortErr)

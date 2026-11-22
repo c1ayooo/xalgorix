@@ -101,7 +101,7 @@ func (a *Agent) stopForHook(result HookResult) bool {
 	}
 	content := result.EmitMessage
 	if content == "" {
-		content = "Scan stopped before complete assessment; saved findings are preserved."
+		content = a.op("Scan stopped before complete assessment; saved findings are preserved.", "扫描在完成完整评估前停止；已保存的发现不受影响。")
 	}
 	a.emit(Event{Type: "finished", Content: content, TotalTokens: a.syncBudgetTokens(), Aborted: true, AbortReason: result.StopReason})
 	if a.cancel != nil {
@@ -112,14 +112,14 @@ func (a *Agent) stopForHook(result HookResult) bool {
 
 func (a *Agent) emitContextStop() {
 	if deadline, ok := a.scanDeadline(); ok && !time.Now().Before(deadline) {
-		a.stopForHook(HookResult{StopReason: "resource_budget", EmitMessage: "Scan stopped: original duration budget exhausted; saved findings are preserved."})
+		a.stopForHook(HookResult{StopReason: "resource_budget", EmitMessage: a.op("Scan stopped: original duration budget exhausted; saved findings are preserved.", "扫描已停止：原定时长预算耗尽；已保存的发现不受影响。")})
 		return
 	}
 	if a.livenessExpired.Load() || a.semanticIdleRemaining() <= 0 {
-		a.stopForHook(HookResult{StopReason: "stuck_loop_limit", EmitMessage: "Scan stopped: no new assessment evidence within the active recovery deadline; saved findings are preserved."})
+		a.stopForHook(HookResult{StopReason: "stuck_loop_limit", EmitMessage: a.op("Scan stopped: no new assessment evidence within the active recovery deadline; saved findings are preserved.", "扫描已停止：恢复时限内无新评估证据；已保存的发现不受影响。")})
 		return
 	}
-	a.emit(Event{Type: "finished", Content: "Scan interrupted; unfinished work can resume.", TotalTokens: a.syncBudgetTokens(), Resumable: true})
+	a.emit(Event{Type: "finished", Content: a.op("Scan interrupted; unfinished work can resume.", "扫描已中断；未完成的工作可以恢复。"), TotalTokens: a.syncBudgetTokens(), Resumable: true})
 }
 
 // Accepted evidence advances a durable graph-wide signal. Model turns, logs,
@@ -238,7 +238,7 @@ func (a *Agent) semanticLivenessCheck() HookResult {
 		if a.tryAdvancePastStuck() {
 			return HookResult{}
 		}
-		return HookResult{StopReason: "stuck_loop_limit", EmitMessage: "Scan stopped: active recovery deadline exhausted without new assessment evidence; saved findings are preserved."}
+		return HookResult{StopReason: "stuck_loop_limit", EmitMessage: a.op("Scan stopped: active recovery deadline exhausted without new assessment evidence; saved findings are preserved.", "扫描已停止：活跃恢复时限耗尽且无新评估证据；已保存的发现不受影响。")}
 	}
 	progress := a.AssessmentProgress()
 	if progress > a.state.LastAssessmentProgress {
@@ -256,7 +256,7 @@ func (a *Agent) semanticLivenessCheck() HookResult {
 		if a.tryAdvancePastStuck() {
 			return HookResult{}
 		}
-		return HookResult{StopReason: "stuck_loop_limit", EmitMessage: "Scan stopped: bounded recovery produced no new assessment evidence. Assessment remains partial; saved findings are preserved."}
+		return HookResult{StopReason: "stuck_loop_limit", EmitMessage: a.op("Scan stopped: bounded recovery produced no new assessment evidence. Assessment remains partial; saved findings are preserved.", "扫描已停止：有界恢复未产生新评估证据。评估仍不完整；已保存的发现不受影响。")}
 	}
 	// Slow-scan safeguard: on a scan whose iterations are slow (seconds each), the
 	// 160-iteration counter above may not reach its limit before the wall-clock
@@ -404,6 +404,12 @@ func (a *Agent) planCompleteFindingIdleLimit() int {
 // caller must then return from the run loop). Must be called exactly once per
 // iteration — it mutates the idle counter.
 func (a *Agent) autoFinalizeIfPlanComplete() bool {
+	// 1:1 re-open (REDESIGN D11): the operator explicitly re-dispatched a
+	// finished run — the restored checkpoint would otherwise re-fire the
+	// plan-complete tail on the first turn. Keep testing instead.
+	if a.forceContinuation.Load() {
+		return false
+	}
 	limit, saturated := a.finishTailMode()
 	if limit <= 0 {
 		return false // not in a terminal mode, or that mode's tail is disabled
@@ -430,6 +436,14 @@ func (a *Agent) autoFinalizeIfPlanComplete() bool {
 		return false
 	}
 	if a.leadVerificationWindowHolds() {
+		return false
+	}
+	// R-goal (goal_gate.go): the plan being done is not the goal being
+	// achieved. While a required criterion is still open, convert this tail
+	// firing into a bounded goal obligation and keep the loop alive; after
+	// goalObligationLimit deferrals the finalize proceeds so an unreachable
+	// goal still terminates honestly.
+	if open := goalGateOpenCriteria(a.state); len(open) > 0 && a.deferFinalizeForGoalObligation(open) {
 		return false
 	}
 	// Record the model's still-open leads before the ledger is settled, so the
@@ -502,7 +516,7 @@ func (a *Agent) restartIdleTailOnNewLead() bool {
 	a.state.LeadIdleResets++
 	a.state.FindingIdleIterations = 0
 	a.state.FindingIdleSince = time.Time{}
-	a.emit(Event{Type: "message", Content: fmt.Sprintf("🔁 New hypothesis recorded: the diminishing-returns tail restarted (%d/%d restarts used).", a.state.LeadIdleResets, maxLeadIdleResets), TotalTokens: a.syncBudgetTokens()})
+	a.emit(Event{Type: "message", Content: a.opf("🔁 New hypothesis recorded: the diminishing-returns tail restarted (%d/%d restarts used).", "🔁 已记录新假设：收益递减尾段已重启（%d/%d 次重启）。", a.state.LeadIdleResets, maxLeadIdleResets), TotalTokens: a.syncBudgetTokens()})
 	return true
 }
 
