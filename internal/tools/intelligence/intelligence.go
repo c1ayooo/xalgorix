@@ -1,9 +1,12 @@
 // Package intelligence provides the record_intelligence tool: structured,
 // operator-facing intel (credentials / leads / sensitive data) the agent
-// captures during a run. Items persist per scan dir as intelligence.json and
-// are aggregated at task level by the web layer (GET /api/tasks/{id}/intelligence),
-// where operator triage lives as a separate human annotation (platform store),
-// never overwriting the observed record.
+// captures during a run. Items persist in the PG primary store
+// (run_state_files, kind=intelligence) via Backend from R6.1 (charter v3.0
+// §6.3); the per-scan-dir intelligence.json remains as the legacy/test-mode
+// path and read fallback. Items are aggregated at task level by the web
+// layer (GET /api/tasks/{id}/intelligence), where operator triage lives as
+// a separate human annotation (platform store), never overwriting the
+// observed record.
 //
 // Scope boundary: this tool records TARGET-side intel only — findings-class
 // data the operator's engagement produced. Operator-side secrets (provider
@@ -25,10 +28,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/sandbox"
-	"github.com/xalgord/xalgorix/v4/internal/scanctx"
-	"github.com/xalgord/xalgorix/v4/internal/storage"
-	"github.com/xalgord/xalgorix/v4/internal/tools"
+	"github.com/c1ayooo/xalgorix/v4/internal/sandbox"
+	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
+	"github.com/c1ayooo/xalgorix/v4/internal/storage"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools"
 )
 
 // Kind vocabulary. Deliberately small: each kind maps to one triage column in
@@ -54,8 +57,11 @@ const (
 	maxIntelFieldLen   = 512
 )
 
-// intelFileName is the per-scan snapshot the store persists to (atomic writes
-// via storage.WriteAtomic — the shared primitive, not a hand-rolled
+// intelFileName is the legacy per-scan snapshot file. From R6.1 (charter
+// v3.0 §6.3) the durable home is the run_state_files row
+// (scan_id, kind=intelligence) via Backend; the file remains only as the
+// test-mode path and the straggler/import read fallback (atomic writes via
+// storage.WriteAtomic — the shared primitive, not a hand-rolled
 // temp+rename).
 const intelFileName = "intelligence.json"
 
@@ -98,6 +104,11 @@ type intelStore struct {
 	byFingerprint map[string]int // fingerprint -> index into items
 	seq           int
 	persistPath   string
+	// instanceID stamps the run_state_files row (D11): a re-dispatched
+	// session shares it with its predecessor, whose snapshot the first
+	// LoadFromDiskForContext inherits via the continuity read. Empty until
+	// the session wiring stamps it (the ledger precedent).
+	instanceID string
 }
 
 func getIntelStoreForContext(contextID string) *intelStore {
@@ -117,8 +128,9 @@ func getIntelStoreForContext(contextID string) *intelStore {
 	return s
 }
 
-// SetPersistPathForContext configures disk persistence for one context:
-// <scanDir>/intelligence.json.
+// SetPersistPathForContext configures legacy file persistence for one
+// context: <scanDir>/intelligence.json (ignored for writes while a Backend
+// is registered).
 func SetPersistPathForContext(contextID, dir string) {
 	s := getIntelStoreForContext(contextID)
 	s.mu.Lock()
@@ -128,6 +140,17 @@ func SetPersistPathForContext(contextID, dir string) {
 	} else {
 		s.persistPath = ""
 	}
+}
+
+// SetInstanceIDForContext stamps the run identity (D11) on one context's
+// store. With the backend registered, snapshots carry it and a
+// re-dispatched session's first LoadFromDiskForContext inherits the previous
+// sibling session's intel via the instance continuity read.
+func SetInstanceIDForContext(contextID, instanceID string) {
+	s := getIntelStoreForContext(contextID)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.instanceID = strings.TrimSpace(instanceID)
 }
 
 // ResetForContext clears the in-memory items of one context (fresh dispatch
@@ -148,15 +171,42 @@ func CleanupContext(contextID string) {
 	delete(intelStores, contextID)
 }
 
-// LoadFromDiskForContext restores items from the persist path. Merge-only:
-// items already in memory are never clobbered by an older snapshot. The
-// returned error distinguishes a failed restore from a genuinely empty set —
-// a corrupt snapshot must never read as "no intel recorded" (charter §5.2
-// honesty discipline).
+// LoadFromDiskForContext restores items into this (empty or partial) store.
+// Snapshot source order with the backend registered (charter v3.0 §6.3):
+//
+//  1. this scan's own snapshot (run_state_files, kind=intelligence);
+//  2. the newest sibling session's snapshot for the stamped instance — the
+//     D11 continuity read: a re-dispatched session has no snapshot of its
+//     own yet and inherits the previous session's intel instead of starting
+//     empty;
+//  3. the legacy intelligence.json file — straggler resilience only (crash
+//     leftovers between backend registration and import); never a write
+//     target while a backend is registered.
+//
+// Without a backend the behavior is identical to the pre-R6.1 file mode.
+// Merge-only: items already in memory are never clobbered by an older
+// snapshot. The returned error distinguishes a failed restore from a
+// genuinely empty set — a corrupt snapshot must never read as "no intel
+// recorded" (charter §5.2 honesty discipline).
 func LoadFromDiskForContext(contextID string) (int, error) {
 	s := getIntelStoreForContext(contextID)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if b := currentBackend(); b != nil {
+		if data, _, ok, err := b.LoadIntelSnapshot(contextID); err != nil {
+			log.Printf("[intelligence] Warning: state snapshot load failed for %s: %v", contextID, err)
+		} else if ok {
+			return s.mergeSnapshotLocked(data, fmt.Sprintf("state snapshot %s", contextID), contextID)
+		}
+		if s.instanceID != "" {
+			if data, _, source, ok, err := b.LoadLatestIntelSnapshotForInstance(s.instanceID, contextID); err != nil {
+				log.Printf("[intelligence] Warning: continuity load failed for %s/%s: %v", s.instanceID, contextID, err)
+			} else if ok {
+				return s.mergeSnapshotLocked(data, fmt.Sprintf("state continuity %s (from sibling %s)", s.instanceID, source), contextID)
+			}
+		}
+	}
 
 	if s.persistPath == "" {
 		return 0, nil
@@ -168,10 +218,17 @@ func LoadFromDiskForContext(contextID string) (int, error) {
 		}
 		return 0, fmt.Errorf("intelligence restore: %w", err)
 	}
+	return s.mergeSnapshotLocked(data, s.persistPath, contextID)
+}
+
+// mergeSnapshotLocked decodes one snapshot and merges unseen items into the
+// store. Caller holds s.mu. A corrupt snapshot returns an error — it must
+// never read as "nothing recorded" (charter §5.2).
+func (s *intelStore) mergeSnapshotLocked(data []byte, source, contextID string) (int, error) {
 	var snap intelSnapshot
 	if err := json.Unmarshal(data, &snap); err != nil {
-		log.Printf("[intelligence] Warning: failed to parse %s: %v", s.persistPath, err)
-		return 0, fmt.Errorf("intelligence restore failed: corrupt snapshot at %s: %w", s.persistPath, err)
+		log.Printf("[intelligence] Warning: failed to parse %s: %v", source, err)
+		return 0, fmt.Errorf("intelligence restore failed: corrupt snapshot at %s: %w", source, err)
 	}
 	count := 0
 	for _, item := range snap.Items {
@@ -193,15 +250,16 @@ func LoadFromDiskForContext(contextID string) (int, error) {
 		s.seq = snap.Seq
 	}
 	if count > 0 {
-		log.Printf("[intelligence] Loaded %d intel items from: %s (context=%s)", count, s.persistPath, contextID)
+		log.Printf("[intelligence] Loaded %d intel items from: %s (context=%s)", count, source, contextID)
 	}
 	return count, nil
 }
 
 // marshalSnapshot serializes the store. Must be called with s.mu held.
-// Returns (nil, "") when persistence is disabled.
+// Returns (nil, "") when persistence is disabled (no file path AND no
+// backend).
 func (s *intelStore) marshalSnapshot() ([]byte, string) {
-	if s.persistPath == "" {
+	if s.persistPath == "" && currentBackend() == nil {
 		return nil, ""
 	}
 	snap := intelSnapshot{Version: 1, Seq: s.seq, Items: s.items}
@@ -214,9 +272,22 @@ func (s *intelStore) marshalSnapshot() ([]byte, string) {
 }
 
 // persist writes the snapshot. The caller holds s.mu: the durable write
-// happens under the state lock so snapshots reach disk in the order they were
-// taken (notes/ledger discipline).
+// happens under the state lock so snapshots reach the durable home in the
+// order they were taken (notes/ledger discipline). With the backend
+// registered the snapshot is a whole-snapshot upsert into the
+// run_state_files row (scan_id, kind=intelligence) — intelligence.json is
+// never written (charter v3.0 §6.3).
 func (s *intelStore) persist() error {
+	if b := currentBackend(); b != nil {
+		data, _ := s.marshalSnapshot()
+		if data == nil {
+			return nil
+		}
+		if err := b.SaveIntelSnapshot(s.contextID, s.instanceID, int64(s.seq), data); err != nil {
+			return fmt.Errorf("intelligence durable write failed: %w", err)
+		}
+		return nil
+	}
 	data, path := s.marshalSnapshot()
 	if data == nil || path == "" {
 		return nil
@@ -231,11 +302,32 @@ func (s *intelStore) persist() error {
 	return nil
 }
 
-// LoadSnapshot reads one on-disk snapshot for the web layer's task-level
-// aggregation. A missing file returns (nil, nil) — an honest "no intel
-// recorded in this run". A corrupt snapshot returns an error the caller must
-// surface, never folded into empty (charter §5.2 discipline).
+// LoadSnapshot reads one intel snapshot for the web layer's task-level
+// aggregation. With the backend registered, the durable row of the scan
+// whose directory the path names is consulted first (the dir name is the
+// scan id — the same identity the importer keys rows by); the legacy
+// intelligence.json file remains the fallback for sessions without a row
+// (pre-import runs). A missing snapshot returns (nil, nil) — an honest "no
+// intel recorded in this run". A corrupt snapshot (file or row) returns an
+// error the caller must surface, never folded into empty (charter §5.2
+// discipline). Sibling continuity is NOT resolved here: the aggregation
+// merges sibling sessions itself, and the R6.2 read switch replaces this
+// seam wholesale.
 func LoadSnapshot(path string) ([]Item, error) {
+	if b := currentBackend(); b != nil {
+		scanID := filepath.Base(filepath.Dir(path))
+		data, _, ok, err := b.LoadIntelSnapshot(scanID)
+		if err != nil {
+			return nil, fmt.Errorf("intelligence snapshot %s: %w", scanID, err)
+		}
+		if ok {
+			var snap intelSnapshot
+			if err := json.Unmarshal(data, &snap); err != nil {
+				return nil, fmt.Errorf("intelligence snapshot %s does not parse: %w", scanID, err)
+			}
+			return snap.Items, nil
+		}
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {

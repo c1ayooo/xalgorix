@@ -17,15 +17,24 @@ import (
 	"strings"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/coldpath"
-	"github.com/xalgord/xalgorix/v4/internal/config"
-	"github.com/xalgord/xalgorix/v4/internal/platform"
-	"github.com/xalgord/xalgorix/v4/internal/proxy"
-	"github.com/xalgord/xalgorix/v4/internal/resources"
-	"github.com/xalgord/xalgorix/v4/internal/scanheaders"
-	"github.com/xalgord/xalgorix/v4/internal/trafficproxy"
-	"github.com/xalgord/xalgorix/v4/internal/tui"
-	"github.com/xalgord/xalgorix/v4/internal/web"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/c1ayooo/xalgorix/v4/internal/coldpath"
+	"github.com/c1ayooo/xalgorix/v4/internal/config"
+	"github.com/c1ayooo/xalgorix/v4/internal/domainjournal"
+	"github.com/c1ayooo/xalgorix/v4/internal/jobs"
+	"github.com/c1ayooo/xalgorix/v4/internal/platform"
+	"github.com/c1ayooo/xalgorix/v4/internal/proxy"
+	"github.com/c1ayooo/xalgorix/v4/internal/resources"
+	"github.com/c1ayooo/xalgorix/v4/internal/runstate"
+	toolrt "github.com/c1ayooo/xalgorix/v4/internal/runtime"
+	runtimepg "github.com/c1ayooo/xalgorix/v4/internal/runtime/postgres"
+	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
+	"github.com/c1ayooo/xalgorix/v4/internal/scanheaders"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools/intelligence"
+	"github.com/c1ayooo/xalgorix/v4/internal/trafficproxy"
+	"github.com/c1ayooo/xalgorix/v4/internal/tui"
+	"github.com/c1ayooo/xalgorix/v4/internal/web"
 )
 
 // version can be set by the release build with -ldflags. Tagged Go installs
@@ -40,11 +49,11 @@ var version string
 const updateRepoSlug = "c1ayooo/xalgorix"
 
 // updateModulePath is the module reference used by the go-install fallback.
-// A fork that keeps the upstream module path cannot be resolved by module
-// path — go fetches github.com/xalgord/... from upstream — so this constant
-// MUST match the fork's own go.mod module declaration. With the upstream
-// path kept, the fallback fails LOUDLY (module-path mismatch) instead of
-// silently installing upstream code; publish release assets named
+// A fork that keeps the upstream module path cannot be resolved by its own
+// module path — go would fetch the upstream repository — so this constant
+// MUST match the fork's own go.mod module declaration. With a mismatched
+// path the fallback fails LOUDLY (module-path mismatch) instead of silently
+// installing upstream code; publish release assets named
 // xalgorix-<goos>-<goarch> so the binary-download path is used instead.
 const updateModulePath = "github.com/c1ayooo/xalgorix/v4"
 
@@ -313,6 +322,76 @@ func main() {
 		fmt.Fprintf(os.Stderr, "❌ PostgreSQL store failed to start (REDESIGN D12): %v\n", err)
 		fmt.Fprintln(os.Stderr, "   Fix the DSN / database, then start again — the engine will not run unpersisted.")
 		os.Exit(1)
+	}
+
+	// -------------------------------------------------------------------------
+	// Tool execution plane (optional). Native execution is the default and keeps
+	// the historical behaviour bit-for-bit; XALGORIX_RUNTIME_BACKEND=docker moves
+	// each scan's tool calls into a per-project toolbox container.
+	//
+	// A container backend the operator asked for is a hard requirement: starting
+	// degraded would silently run every scan locally, which is the exact opposite
+	// of the requested isolation.
+	// -------------------------------------------------------------------------
+	if cfg.RuntimeBackend == "docker" {
+		stopToolRuntime, setupErr := setupToolRuntime(context.Background(), cfg)
+		if setupErr != nil {
+			fmt.Fprintf(os.Stderr, "❌ tool runtime failed to start: %v\n", setupErr)
+			fmt.Fprintln(os.Stderr, "   Fix the container runtime configuration, or set XALGORIX_RUNTIME_BACKEND=native.")
+			os.Exit(1)
+		}
+		defer stopToolRuntime()
+	}
+
+	// -------------------------------------------------------------------------
+	// R6.0/R6.1 run-state store: pre-R6 scan directories' state files are
+	// parsed into the PG primary store (one-shot per scan, watermark-guarded),
+	// and the store stays alive as the engine's persistence backend — the
+	// ledger state authority persists here from R6.1 on (charter v3.0 §6.3).
+	// Directories are never modified; per-scan failures are recorded on the
+	// watermark and never fatal to startup.
+	// -------------------------------------------------------------------------
+	rsStore, rsErr := runstate.Open(context.Background(), cfg.DatabaseURL)
+	if rsErr != nil {
+		fmt.Fprintf(os.Stderr, "❌ run-state store failed to start (REDESIGN D12): %v\n", rsErr)
+		fmt.Fprintln(os.Stderr, "   Fix the DSN / database, then start again — the engine will not run unpersisted.")
+		os.Exit(1)
+	} else {
+		stats, importErr := rsStore.ImportDataDir(context.Background(), cfg.DataDir)
+		if importErr != nil {
+			fmt.Fprintf(os.Stderr, "[runstate] state import error: %v\n", importErr)
+		} else if stats.Scans > 0 || stats.Failed > 0 {
+			log.Printf("[runstate] state import: %d imported, %d skipped, %d failed (%d events, %d journal rows, %d dispatches)",
+				stats.Scans, stats.Skipped, stats.Failed, stats.Events, stats.JournalRows, stats.Dispatches)
+		}
+		// Ledger state authority → PG (R6.1). Registered once; nil backend
+		// (tests) keeps the legacy ledger.json file path.
+		scanctx.SetLedgerBackend(rsStore)
+		// Domain audit journal → PG (R6.1, charter §5.2/§6.3). Appends land
+		// in run_journal ((scan_id, seq) idempotent, rows stamped with the
+		// instance id); a failed append is returned to the mutation caller
+		// and recorded as a failed watermark by the store. nil backend
+		// (tests) keeps the legacy domain_journal.jsonl file path
+		// byte-for-byte.
+		domainjournal.SetBackend(rsStore)
+		// Conversation/telemetry event journal → PG run_events (R6.1 events
+		// slice, charter §5/§6). Appends land in run_events ((scan_id, seq)
+		// idempotent, rows stamped with the instance id); a failed append is
+		// returned to the mutation caller and recorded as a failed watermark
+		// by the store. nil backend (tests) keeps the legacy events.jsonl
+		// file path byte-for-byte.
+		web.SetEventStateBackend(rsStore)
+		scanctx.SetStateFilesBackend(rsStore)
+		intelligence.SetBackend(rsStore)
+		// Scan record → PG (R6.1 runs-table takeover of scan.json, charter
+		// §5.1/D12). Every record safe point lands the verbatim record in
+		// run_scan_records plus the runs mount row's takeover columns
+		// ((scan_id) idempotent, instance stamped at the write boundary); a
+		// failed save is returned and recorded as a failed watermark by the
+		// store. With this registered scan.json is never written again — nil
+		// backend (tests) keeps the legacy scan.json file path byte-for-byte.
+		web.SetScanStateBackend(rsStore)
+		defer rsStore.Close()
 	}
 
 	// -------------------------------------------------------------------------
@@ -1150,5 +1229,133 @@ func (a coldPathSyncAdapter) SyncState(ctx context.Context, scanID string) (web.
 		Status:     wm.Status,
 		LastError:  wm.LastError,
 		UpdatedAt:  wm.UpdatedAt,
+	}, nil
+}
+
+// noopColdProcessor satisfies jobs.Processor for the toolbox-only manager. The
+// InfoItem cold path has its own River client (coldpath.Service); this one only
+// carries container housekeeping, and River requires a processor to start.
+type noopColdProcessor struct{}
+
+func (noopColdProcessor) ProcessRange(context.Context, string, string, uint64, uint64) error {
+	return nil
+}
+
+// setupToolRuntime wires the container execution plane and its janitorial
+// workers. The returned stop function reverses everything in shutdown order:
+// stop accepting work, stop project containers, close the transport and pool.
+func setupToolRuntime(ctx context.Context, cfg *config.Config) (func(), error) {
+	if strings.TrimSpace(cfg.ToolboxImage) == "" {
+		return nil, fmt.Errorf("XALGORIX_TOOLBOX_IMAGE is required when XALGORIX_RUNTIME_BACKEND=docker")
+	}
+	driver, err := toolrt.Open(ctx, toolrt.Config{
+		Backend:      toolrt.BackendDocker,
+		Transport:    toolrt.Transport(cfg.RuntimeTransport),
+		SocketPath:   cfg.DockerSocket,
+		RunnerSocket: cfg.RunnerSocket,
+		InstanceID:   cfg.RuntimeInstanceID(),
+		Image:        cfg.ToolboxImage,
+		Profile:      cfg.ToolboxProfile,
+		ProjectLimit: cfg.MaxProjects,
+		ExecLimit:    cfg.ToolboxConcurrency,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
+	if err != nil {
+		_ = driver.Close()
+		return nil, fmt.Errorf("tool runtime pool: %w", err)
+	}
+	store := runtimepg.New(pool)
+	instanceID := cfg.RuntimeInstanceID()
+	tb := toolrt.NewToolbox(driver, store, instanceID, cfg.ToolboxImage, cfg.ToolboxProfile)
+	tb.RecordHealth = func(ctx context.Context, h toolrt.ImageHealthReport) error {
+		return store.RecordImageHealth(ctx, runtimepg.ImageHealth{
+			ImageDigest: h.ImageDigest,
+			Profile:     h.Profile,
+			Passed:      h.Passed,
+			Failed:      h.Failed,
+			Report:      h.Report,
+		})
+	}
+	toolrt.SetActive(driver)
+	toolrt.SetStateStore(store)
+	toolrt.SetToolbox(tb)
+
+	mgr, err := jobs.NewManager(ctx, pool, noopColdProcessor{}, jobs.WithToolbox(tb))
+	if err != nil {
+		toolrt.SetActive(nil)
+		toolrt.SetStateStore(nil)
+		toolrt.SetToolbox(nil)
+		pool.Close()
+		_ = driver.Close()
+		return nil, err
+	}
+	if err := mgr.Start(ctx); err != nil {
+		pool.Close()
+		_ = driver.Close()
+		return nil, err
+	}
+
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	go func() {
+		// Startup pass: adopt surviving containers, finish half-applied state,
+		// then keep the janitorial jobs flowing on a ticker. River supplies
+		// retries/visibility; the ticker is only the trigger.
+		_ = tb.Adopt(runCtx)
+		_ = tb.ReconcileOnce(runCtx)
+		if err := mgr.EnqueueToolboxUnique(runCtx, jobs.PrefetchImageJobArgs{
+			Image: cfg.ToolboxImage, Profile: cfg.ToolboxProfile,
+		}, time.Hour); err != nil {
+			log.Printf("[runtime] enqueue image prefetch: %v", err)
+		}
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		ticks := 0
+		for {
+			select {
+			case <-runCtx.Done():
+				return
+			case <-ticker.C:
+				ticks++
+				_ = mgr.EnqueueToolboxUnique(runCtx, jobs.GCJobArgs{InstanceID: instanceID}, time.Minute)
+				if ticks%2 == 0 {
+					_ = mgr.EnqueueToolboxUnique(runCtx, jobs.ReapIdleJobArgs{
+						InstanceID: instanceID, IdleTTLSeconds: cfg.ProjectIdleTTLSec,
+						MaxLifeSeconds: cfg.ProjectMaxLifeSec,
+					}, 2*time.Minute)
+				}
+				if ticks%60 == 0 {
+					_ = mgr.EnqueueToolboxUnique(runCtx, jobs.ImageGCJobArgs{
+						KeepDigests: cfg.ToolboxKeepDigests,
+					}, time.Hour)
+				}
+			}
+		}
+	}()
+
+	return func() {
+		cancelRun()
+		stopCtx, cancelStop := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancelStop()
+		// Project containers are stopped explicitly: leaving them running after
+		// the platform exits would strand privileged network state until GC.
+		if lister, ok := driver.(interface {
+			ListProjects(context.Context) ([]toolrt.ProjectState, error)
+		}); ok {
+			if list, listErr := lister.ListProjects(stopCtx); listErr == nil {
+				for _, p := range list {
+					_ = driver.StopProject(stopCtx, p.ProjectID, 5*time.Second)
+				}
+			}
+		}
+		_ = mgr.Stop(stopCtx)
+		toolrt.SetActive(nil)
+		toolrt.SetStateStore(nil)
+		toolrt.SetToolbox(nil)
+		_ = driver.Close()
+		pool.Close()
 	}, nil
 }

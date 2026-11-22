@@ -12,6 +12,10 @@
 -- the write boundary. The D11 fill-once legacy_scan_id linkage retires with
 -- scan.json: identity no longer depends on after-the-fact backfill.
 --
+-- Opaque payload columns are TEXT, not JSONB: engine content (tool
+-- output text embedded in events/journal/ledger) can contain NUL-byte
+-- escapes that JSONB rejects (SQLSTATE 22P05), and these documents are
+-- decoded wholesale — TEXT preserves byte fidelity exactly.
 -- What deliberately stays OUT of PG (byte artifacts, file layer):
 -- tool-output archives, traffic raw packets, uploads, report deliverables,
 -- and the scan working directory itself (sandbox scratch).
@@ -29,7 +33,7 @@ ALTER TABLE runs ADD COLUMN IF NOT EXISTS scan_finished_at   TIMESTAMPTZ NULL;
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS scan_current_phase INT  NOT NULL DEFAULT 0;
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS scan_plan_total     INT NOT NULL DEFAULT 0;
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS scan_plan_completed INT NOT NULL DEFAULT 0;
-ALTER TABLE runs ADD COLUMN IF NOT EXISTS scan_detail JSONB NULL;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS scan_detail TEXT NULL;
 
 CREATE INDEX IF NOT EXISTS runs_scan_status_idx
     ON runs (scan_status, scan_started_at DESC);
@@ -44,7 +48,7 @@ CREATE TABLE IF NOT EXISTS run_events (
     seq         BIGINT      NOT NULL,
     type        TEXT        NOT NULL DEFAULT '',
     occurred_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    payload     JSONB       NOT NULL DEFAULT '{}'::jsonb,
+    payload     TEXT        NOT NULL DEFAULT '',
     PRIMARY KEY (scan_id, seq)
 );
 
@@ -59,7 +63,7 @@ CREATE TABLE IF NOT EXISTS run_journal (
     instance_id TEXT        NOT NULL DEFAULT '',
     seq         BIGINT      NOT NULL,
     occurred_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    record      JSONB       NOT NULL,
+    record      TEXT        NOT NULL,
     PRIMARY KEY (scan_id, seq)
 );
 
@@ -75,7 +79,7 @@ CREATE TABLE IF NOT EXISTS run_ledger_snapshots (
     scan_id     TEXT        NOT NULL PRIMARY KEY,
     instance_id TEXT        NOT NULL DEFAULT '',
     seq         BIGINT      NOT NULL DEFAULT 0,
-    data        JSONB       NOT NULL,
+    data        TEXT        NOT NULL,
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -90,7 +94,7 @@ CREATE TABLE IF NOT EXISTS run_state_files (
     kind        TEXT        NOT NULL,
     instance_id TEXT        NOT NULL DEFAULT '',
     seq         BIGINT      NOT NULL DEFAULT 0,
-    data        JSONB       NOT NULL,
+    data        TEXT        NOT NULL,
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (scan_id, kind)
 );
@@ -100,7 +104,7 @@ CREATE TABLE IF NOT EXISTS run_state_files (
 -- in-process reservation read these; PG becomes their home in R6.1.
 CREATE TABLE IF NOT EXISTS dispatch_snapshots (
     instance_id TEXT        NOT NULL PRIMARY KEY,
-    data        JSONB       NOT NULL,
+    data        TEXT        NOT NULL,
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 

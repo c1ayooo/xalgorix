@@ -4,9 +4,9 @@ package config
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"log"
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -21,14 +21,14 @@ import (
 // Config holds all Xalgorix configuration.
 type Config struct {
 	// LLM settings
-	LLM                 string   // XALGORIX_LLM — provider-native model ID (for example, "gpt-5.6" or "zai-org/glm-4.5")
-	LLMProvider         string   // XALGORIX_LLM_PROVIDER — explicit provider ID; keeps provider routing separate from the model name
-	APIBase             string   // XALGORIX_API_BASE — API endpoint
-	APIKey              string   // XALGORIX_API_KEY — API key
+	LLM         string // XALGORIX_LLM — provider-native model ID (for example, "gpt-5.6" or "zai-org/glm-4.5")
+	LLMProvider string // XALGORIX_LLM_PROVIDER — explicit provider ID; keeps provider routing separate from the model name
+	APIBase     string // XALGORIX_API_BASE — API endpoint
+	APIKey      string // XALGORIX_API_KEY — API key
 	// LLMExtraHeaders are additional HTTP headers sent on every LLM request
 	// (XALGORIX_LLM_EXTRA_HEADERS, JSON object). Used by gateways that require
 	// a routing/session header (e.g. OpenCode Go's x-opencode-session).
-	LLMExtraHeaders map[string]string
+	LLMExtraHeaders     map[string]string
 	APIKeys             []string // XALGORIX_API_KEYS — additional provider API keys rotated to dodge provider rate limits (combined with APIKey)
 	KeyPoolStrategy     string   // XALGORIX_KEY_POOL_STRATEGY — "roundrobin" (default; both keys share load) or "sticky" (overflow failover: one key at a time, switch only on a rate limit)
 	DisableAutoDelegate bool     // XALGORIX_DISABLE_AUTO_DELEGATE — skip the deterministic specialist wave entirely
@@ -235,6 +235,12 @@ type Config struct {
 	// name the project network can resolve (e.g. http://xalgorix-proxy:8081).
 	// When browser traffic is proxied, leaving this empty is a fail-closed error.
 	ToolboxBrowserProxy string // XALGORIX_TOOLBOX_BROWSER_PROXY
+	// ToolboxProxyURL is the general egress proxy URL for tool traffic inside
+	// the project container (HTTP(S)_PROXY/ALL_PROXY). It must be reachable
+	// from the project network; the platform's loopback traffic proxy is not.
+	// Empty is only valid when no proxy is required — a proxy-required or
+	// traffic-proxy-enabled run fails closed instead of dialing directly.
+	ToolboxProxyURL string // XALGORIX_TOOLBOX_PROXY_URL
 	// MaxProjects caps concurrent project containers; 0 = derive from RAM.
 	MaxProjects int // XALGORIX_MAX_PROJECTS
 	// ToolboxConcurrency bounds simultaneous execs inside one container.
@@ -246,9 +252,9 @@ type Config struct {
 	ProjectMaxLifeSec  int   // XALGORIX_PROJECT_MAX_LIFE_SECONDS, default 21600
 	ToolboxKeepDigests int   // XALGORIX_TOOLBOX_KEEP_DIGESTS, default 3
 
-	Workspace      string // XALGORIX_WORKSPACE — workspace root dir
-	DataDir        string // Active per-installation data root. Defaults to ~/.xalgorix/data/. Override via XALGORIX_DATA_DIR.
-	WorkspaceRoot  string // Resolution root used by Filesystem_Tools when no Scan_Context.ScanDir is in effect. Equals DataDir.
+	Workspace     string // XALGORIX_WORKSPACE — workspace root dir
+	DataDir       string // Active per-installation data root. Defaults to ~/.xalgorix/data/. Override via XALGORIX_DATA_DIR.
+	WorkspaceRoot string // Resolution root used by Filesystem_Tools when no Scan_Context.ScanDir is in effect. Equals DataDir.
 	// DatabaseURL points at the required PostgreSQL primary store (charter
 	// v3.0 / REDESIGN D12): state and panel data are persisted there; an
 	// empty DSN is a startup configuration error (fail-fast in main).
@@ -286,7 +292,7 @@ type Config struct {
 	// DwellMaxCalls caps tool calls per private-IPv4 endpoint (benchmark
 	// rotation discipline, dwell_guard.go). 0 = off.
 	DwellMaxCalls int // XALGORIX_DWELL_MAX_CALLS
-	MinIterations      int  // XALGORIX_MIN_ITERATIONS — minimum testing floor (default 50)
+	MinIterations int // XALGORIX_MIN_ITERATIONS — minimum testing floor (default 50)
 	// IterationDelaySec optionally pauses (in seconds) between agent reasoning
 	// iterations to pace LLM request velocity and conserve provider rolling-window
 	// quotas. 0 = disabled (default). XALGORIX_ITERATION_DELAY.
@@ -642,6 +648,7 @@ func load() *Config {
 		ToolboxImage:             envOr("XALGORIX_TOOLBOX_IMAGE", ""),
 		ToolboxProfile:           envOr("XALGORIX_TOOLBOX_PROFILE", "core"),
 		ToolboxBrowserProxy:      envOr("XALGORIX_TOOLBOX_BROWSER_PROXY", ""),
+		ToolboxProxyURL:          envOr("XALGORIX_TOOLBOX_PROXY_URL", ""),
 		MaxProjects:              envOrInt("XALGORIX_MAX_PROJECTS", 0),
 		ToolboxConcurrency:       envOrInt("XALGORIX_TOOLBOX_CONCURRENCY", 4),
 		ProjectMemMB:             int64(envOrInt("XALGORIX_PROJECT_MEM_MB", 0)),

@@ -10,10 +10,10 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/xalgord/xalgorix/v4/internal/domainjournal"
-	"github.com/xalgord/xalgorix/v4/internal/infoitem"
-	"github.com/xalgord/xalgorix/v4/internal/infoitem/postgres"
-	"github.com/xalgord/xalgorix/v4/internal/jobs"
+	"github.com/c1ayooo/xalgorix/v4/internal/domainjournal"
+	"github.com/c1ayooo/xalgorix/v4/internal/infoitem"
+	"github.com/c1ayooo/xalgorix/v4/internal/infoitem/postgres"
+	"github.com/c1ayooo/xalgorix/v4/internal/jobs"
 )
 
 // crashRecoveryPool connects to the integration database. The crash-recovery

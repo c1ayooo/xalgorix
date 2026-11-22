@@ -29,6 +29,7 @@ func (s *FileStore) CreateApprovalRule(_ context.Context, in ApprovalRuleInput) 
 		ID:                    uuid.NewString(),
 		ProjectID:             in.ProjectID,
 		Kind:                  in.Kind,
+		Decision:              NormalizeApprovalRuleDecision(in.Decision),
 		Match:                 in.Match,
 		Reason:                in.Reason,
 		CreatedBy:             in.CreatedBy,

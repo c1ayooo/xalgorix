@@ -13,7 +13,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	infopg "github.com/xalgord/xalgorix/v4/internal/infoitem/postgres"
+	infopg "github.com/c1ayooo/xalgorix/v4/internal/infoitem/postgres"
 )
 
 // integrationRepo mirrors the infoitem/postgres integration pattern: tests

@@ -1,5 +1,12 @@
--- 0009_intel_triage.sql — operator triage annotations for recorded intelligence
+-- 0014_intel_triage.sql — operator triage annotations for recorded intelligence
 -- (task detail 情报 tab, REDESIGN §7.2 任务详情页).
+--
+-- Renumbered from 0009 → 0014: 0009 collided with 0009_approval_rule_decision,
+-- which made loadMigrations() fail with "duplicate migration version 9" on a
+-- fresh database (platform.Open then aborted startup). Version numbers are
+-- append-only, so this file keeps its original statements unchanged; the
+-- CREATE TABLE IF NOT EXISTS below makes a replay on a database that already
+-- applied it under the old 0009 number a no-op.
 --
 -- Field-authority separation (charter §5): the intel ITEMS themselves are
 -- observed engine records and stay immutable in <scanDir>/intelligence.json —
@@ -13,7 +20,8 @@
 -- implementation as approval_rules 0006).
 --
 -- The info-model migrator (migrate.go) applies this file inside the same
--- advisory-locked transaction as 0001–0008; single statement, no data backfill.
+-- advisory-locked transaction as the other migrations; single statement, no
+-- data backfill.
 
 CREATE TABLE IF NOT EXISTS intel_triage (
     task_id     UUID        NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,

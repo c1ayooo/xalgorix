@@ -91,6 +91,25 @@ type Repository interface {
 	// directory; findings cascade with the run rows.
 	DeleteRunsByScanIdentity(ctx context.Context, instanceID, legacyScanID string) (int, error)
 
+	// ── runs state sweep (R6.1, REDESIGN D12: runs table takes over scan.json) ─
+	// ScanRunRecords sweeps the full per-scan-record durable set — every run
+	// scan record's takeover state (the run_scan_records rows the web layer's
+	// record safe point and the R6.0 directory importer write). This is the
+	// read source for the web layer's findAllScanSummaries: "PG runs 扫描集
+	// 优先，文件 walk 兜底（未导入残留）". Keyset-cursor pagination sized for
+	// that sweep's scale (a few thousand records): cursor "" starts, the
+	// returned next cursor feeds the next call, "" again = exhausted. Rows
+	// order by scan_id so repeated sweeps interleave cleanly.
+	ScanRunRecords(ctx context.Context, cursor string, limit int) ([]RunScanRecord, string, error)
+	// PutRunScanRecord upserts one per-record row — the file store's write
+	// counterpart of the PG safe point, so tests drive the same path the PG
+	// store serves (web unit tests bridge their in-memory backend to it).
+	PutRunScanRecord(ctx context.Context, rec RunScanRecord) error
+	// DeleteRunScanRecord drops one per-record row — the deletion/retention
+	// counterpart of PutRunScanRecord (a purged scan must not reappear from
+	// the sweep). Absent rows are a no-op.
+	DeleteRunScanRecord(ctx context.Context, scanID string) error
+
 	// ── legacy import (R1, REDESIGN §8) ─────────────────────────────────────
 	// LegacyScanIDs returns the set of already-imported scan IDs so the
 	// importer can skip without write attempts.

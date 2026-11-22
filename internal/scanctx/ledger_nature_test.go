@@ -6,8 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/xalgord/xalgorix/v4/internal/domainjournal"
-	"github.com/xalgord/xalgorix/v4/internal/infoitem"
+	"github.com/c1ayooo/xalgorix/v4/internal/domainjournal"
+	"github.com/c1ayooo/xalgorix/v4/internal/infoitem"
 )
 
 func TestEvidenceNatureDefaultsToInferred(t *testing.T) {

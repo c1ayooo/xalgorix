@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/platformutil"
+	"github.com/c1ayooo/xalgorix/v4/internal/platformutil"
 )
 
 // TerminalState provides per-session terminal process tracking,

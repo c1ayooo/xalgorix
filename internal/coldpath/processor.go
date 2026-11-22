@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/xalgord/xalgorix/v4/internal/domainjournal"
+	"github.com/c1ayooo/xalgorix/v4/internal/domainjournal"
 )
 
 // Applier is implemented by the PostgreSQL InfoItem store.
@@ -41,7 +41,12 @@ func (p *Processor) ProcessRange(ctx context.Context, scanID, scanDir string, fr
 	if err != nil {
 		return err
 	}
-	records, _, err := domainjournal.ReadRecords(path)
+	// R6.1 (charter §6.3): the journal's durable source is the PG primary
+	// store once the backend is registered — the file path is only the
+	// legacy fallback (pre-R6 directories whose import has not produced
+	// rows). A backend read error surfaces instead of silently reading a
+	// stale file (D12 red line).
+	records, _, err := domainjournal.ReadRecordsResolved(ctx, path, scanID)
 	if err != nil {
 		return err
 	}

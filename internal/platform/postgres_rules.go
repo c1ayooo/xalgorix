@@ -16,7 +16,7 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-const approvalRuleColumns = `id, project_id, kind, match, reason, created_by,
+const approvalRuleColumns = `id, project_id, kind, decision, match, reason, created_by,
 	COALESCE(created_from_approval_id::text, ''), created_at, expires_at, hit_count, last_hit_at`
 
 func scanApprovalRuleRow(row pgx.Row) (*ApprovalRule, error) {
@@ -24,7 +24,7 @@ func scanApprovalRuleRow(row pgx.Row) (*ApprovalRule, error) {
 		r         ApprovalRule
 		matchJSON []byte
 	)
-	if err := row.Scan(&r.ID, &r.ProjectID, &r.Kind, &matchJSON, &r.Reason,
+	if err := row.Scan(&r.ID, &r.ProjectID, &r.Kind, &r.Decision, &matchJSON, &r.Reason,
 		&r.CreatedBy, &r.CreatedFromApprovalID, &r.CreatedAt, &r.ExpiresAt, &r.HitCount, &r.LastHitAt); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
@@ -56,7 +56,7 @@ func scanApprovalRuleRows(rows pgx.Rows) ([]ApprovalRule, error) {
 			r         ApprovalRule
 			matchJSON []byte
 		)
-		if err := rows.Scan(&r.ID, &r.ProjectID, &r.Kind, &matchJSON, &r.Reason,
+		if err := rows.Scan(&r.ID, &r.ProjectID, &r.Kind, &r.Decision, &matchJSON, &r.Reason,
 			&r.CreatedBy, &r.CreatedFromApprovalID, &r.CreatedAt, &r.ExpiresAt, &r.HitCount, &r.LastHitAt); err != nil {
 			return nil, fmt.Errorf("platform/postgres: scan approval rule: %w", err)
 		}
@@ -102,9 +102,9 @@ func (s *Store) CreateApprovalRule(ctx context.Context, in ApprovalRuleInput) (*
 	}
 	id := uuid.NewString()
 	if _, err := s.exec(ctx, `
-		INSERT INTO approval_rules (id, project_id, kind, match, reason, created_by, created_from_approval_id, created_at, expires_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-		id, projectArg, in.Kind, matchJSON, in.Reason, in.CreatedBy, fromArg, time.Now().UTC(), expiresArg); err != nil {
+		INSERT INTO approval_rules (id, project_id, kind, decision, match, reason, created_by, created_from_approval_id, created_at, expires_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+		id, projectArg, in.Kind, NormalizeApprovalRuleDecision(in.Decision), matchJSON, in.Reason, in.CreatedBy, fromArg, time.Now().UTC(), expiresArg); err != nil {
 		return nil, fmt.Errorf("platform/postgres: create approval rule: %w", err)
 	}
 	return s.getApprovalRule(ctx, id)

@@ -7,6 +7,7 @@ package domainjournal
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,8 +18,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/infoitem"
-	"github.com/xalgord/xalgorix/v4/internal/storage"
+	"github.com/c1ayooo/xalgorix/v4/internal/infoitem"
+	"github.com/c1ayooo/xalgorix/v4/internal/storage"
 )
 
 const (
@@ -260,15 +261,35 @@ func (r Record) Validate() error {
 // Journal serializes one scan's durable records. It is safe for concurrent
 // Append calls; all state mutations for a scan must flow through this writer.
 type Journal struct {
-	path   string
-	scanID string
+	path       string
+	scanID     string
+	instanceID string // run identity (D11) — stamped on backend rows
 
 	mu      sync.Mutex
 	lastSeq uint64
 }
 
+// SetInstanceID stamps the run identity (D11) on this journal. With the PG
+// backend registered, every run_journal row carries it for run-level
+// aggregation; the file mode ignores the metadata.
+func (j *Journal) SetInstanceID(instanceID string) {
+	if j == nil {
+		return
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.instanceID = strings.TrimSpace(instanceID)
+}
+
 // Open loads an existing journal and repairs only an incomplete trailing line.
 // It never fabricates missing sequence numbers; gaps are surfaced by Project.
+//
+// With the PG backend registered (R6.1), the durable sequence watermark is
+// seeded from the backend's stream: the file is no longer the durable source,
+// so a damaged legacy tail must not disable the journal, and a same-scan
+// continuation must append AFTER every durable record — re-using a durable
+// sequence would silently rewrite audit history through the backend's
+// idempotent upsert.
 func Open(path, scanID string) (*Journal, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, errors.New("domainjournal: path is required")
@@ -279,9 +300,13 @@ func Open(path, scanID string) (*Journal, error) {
 	if err := storage.EnsureSecureDir(filepath.Dir(path)); err != nil {
 		return nil, err
 	}
+	backend := currentBackend()
 	records, _, err := ReadRecords(path)
 	if err != nil {
-		return nil, err
+		if backend == nil {
+			return nil, err
+		}
+		records = nil
 	}
 	j := &Journal{path: path, scanID: scanID}
 	for _, rec := range records {
@@ -292,7 +317,31 @@ func Open(path, scanID string) (*Journal, error) {
 			j.lastSeq = rec.Seq
 		}
 	}
+	if backend != nil {
+		durable, err := backendLastSeq(backend, scanID)
+		if err != nil {
+			return nil, fmt.Errorf("domainjournal: open %q: durable seq: %w", path, err)
+		}
+		if durable > j.lastSeq {
+			j.lastSeq = durable
+		}
+	}
 	return j, nil
+}
+
+// backendLastSeq returns the scan's durable max sequence in the backend.
+func backendLastSeq(b Backend, scanID string) (uint64, error) {
+	sources, err := b.LoadJournalSources(context.Background())
+	if err != nil {
+		return 0, err
+	}
+	var last uint64
+	for _, src := range sources {
+		if src.ScanID == scanID && src.LastSeq > last {
+			last = src.LastSeq
+		}
+	}
+	return last, nil
 }
 
 // Path returns the journal path.
@@ -387,6 +436,21 @@ func (j *Journal) Append(rec Record) (Record, error) {
 	}
 	if len(data) > MaxRecordBytes {
 		return rec, fmt.Errorf("domainjournal: record is %d bytes, max %d", len(data), MaxRecordBytes)
+	}
+	// R6.1 (charter v3.0 §6.3): with the PG backend registered the durable
+	// home is run_journal — the file is no longer written (D12 red line).
+	// The fsync semantics move into the backend's synchronous transaction;
+	// the append path stays serialized on j.mu, the watermark advances only
+	// after the durable write succeeds, and a failed append leaves the
+	// sequence reusable exactly like a failed file append. The failure
+	// watermark is recorded by the implementation (charter §6.4).
+	if b := currentBackend(); b != nil {
+		if err := b.AppendJournalRecord(rec.ScanID, j.instanceID, rec); err != nil {
+			return rec, fmt.Errorf("domainjournal: append: %w", err)
+		}
+		j.lastSeq = rec.Seq
+		notifyObservers(j.path, rec.ScanID, rec.Seq)
+		return rec, nil
 	}
 	data = append(data, '\n')
 	if err := storage.AppendSync(j.path, data); err != nil {

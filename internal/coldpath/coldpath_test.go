@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/domainjournal"
-	"github.com/xalgord/xalgorix/v4/internal/infoitem/postgres"
+	"github.com/c1ayooo/xalgorix/v4/internal/domainjournal"
+	"github.com/c1ayooo/xalgorix/v4/internal/infoitem/postgres"
 )
 
 type fakeApplier struct {

@@ -11,9 +11,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/domainjournal"
-	"github.com/xalgord/xalgorix/v4/internal/infoitem"
-	"github.com/xalgord/xalgorix/v4/internal/storage"
+	"github.com/c1ayooo/xalgorix/v4/internal/domainjournal"
+	"github.com/c1ayooo/xalgorix/v4/internal/infoitem"
+	"github.com/c1ayooo/xalgorix/v4/internal/storage"
 )
 
 // HypothesisStatus is the lifecycle state of an attack hypothesis in the
@@ -226,6 +226,7 @@ type LedgerStore struct {
 	evSeq   int               // evidence ID sequence
 
 	scanID      string
+	instanceID  string // run identity (D11) — stamps snapshots and drives continuity load
 	persistPath string
 	journal     *domainjournal.Journal
 	voiWeight   float64
@@ -262,6 +263,21 @@ func (ls *LedgerStore) SetScanID(scanID string) {
 	ls.mu.Lock()
 	defer ls.mu.Unlock()
 	ls.scanID = truncate(strings.TrimSpace(scanID), maxHypothesisFieldLen)
+}
+
+// SetInstanceID stamps the run identity (D11) on the ledger. With the PG
+// backend registered, snapshots carry it and a re-dispatched session's first
+// LoadFromDisk inherits the previous sibling session's snapshot via the
+// instance continuity read instead of starting empty. The domain journal is
+// stamped too (R6.1): run_journal rows carry the same identity for run-level
+// aggregation; the file mode ignores the metadata.
+func (ls *LedgerStore) SetInstanceID(instanceID string) {
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
+	ls.instanceID = strings.TrimSpace(instanceID)
+	if ls.journal != nil {
+		ls.journal.SetInstanceID(ls.instanceID)
+	}
 }
 
 // Upsert inserts a new hypothesis or merges into an existing one that shares
@@ -511,6 +527,19 @@ func (ls *LedgerStore) ClaimNext(vulnClass, agentID string) (Hypothesis, bool) {
 // ClaimNextAs atomically claims with an explicit actor and audits the claim
 // before committing ownership.
 func (ls *LedgerStore) ClaimNextAs(vulnClass, agentID string, actor domainjournal.Actor) (Hypothesis, bool, error) {
+	return ls.claimNextAs(vulnClass, agentID, false, actor)
+}
+
+// ClaimNextUnassignedAs is the idle-worker borrowing path: it only considers
+// queued hypotheses that carry no lane owner (or are already owned by this
+// agent). MarkAssigned lane seeding stays a soft hint — a lane with nothing
+// claimable must not strand another lane's untaken work, which was one cause of
+// "two workers, only one is doing anything".
+func (ls *LedgerStore) ClaimNextUnassignedAs(agentID string, actor domainjournal.Actor) (Hypothesis, bool, error) {
+	return ls.claimNextAs("", agentID, true, actor)
+}
+
+func (ls *LedgerStore) claimNextAs(vulnClass, agentID string, unassignedOnly bool, actor domainjournal.Actor) (Hypothesis, bool, error) {
 	classFilter := strings.ToLower(strings.TrimSpace(vulnClass))
 	owner := truncate(strings.TrimSpace(agentID), maxHypothesisFieldLen)
 
@@ -523,6 +552,9 @@ func (ls *LedgerStore) ClaimNextAs(vulnClass, agentID string, actor domainjourna
 			continue
 		}
 		if classFilter != "" && h.VulnClass != classFilter {
+			continue
+		}
+		if unassignedOnly && h.AssignedTo != "" && h.AssignedTo != owner {
 			continue
 		}
 		// Strictly better score replaces the candidate; equal scores keep the
@@ -801,8 +833,7 @@ func (ls *LedgerStore) Merge(other *LedgerStore) int {
 			log.Printf("[ledger] Warning: merge audit failed: %v", err)
 		}
 	}
-	data, path := ls.marshalLocked()
-	if err := ls.writeFile(data, path); err != nil {
+	if err := ls.persistLocked(); err != nil {
 		log.Printf("[ledger] Warning: merged ledger snapshot failed: %v", err)
 	}
 	ls.mu.Unlock()
@@ -857,13 +888,40 @@ func (ls *LedgerStore) FormatForContext() string {
 	return b.String()
 }
 
-// LoadFromDisk merges a persisted ledger into this (empty or partial) store.
+// LoadFromDisk merges the durable ledger into this (empty or partial) store.
+// Snapshot source order with the PG backend registered (charter v3.0 §6.3):
+//
+//  1. this scan's own snapshot;
+//  2. the newest sibling session's snapshot for the stamped instance — the
+//     D11 continuity read: a re-dispatched session has no snapshot of its own
+//     yet and inherits the previous session's chain instead of starting empty
+//     (the structural replacement for the ledger.json continuity copy);
+//  3. the legacy ledger.json file — straggler resilience only (crash
+//     leftovers between backend registration and import); never a write
+//     target while a backend is registered.
+//
+// Without a backend the behavior is byte-identical to v2.1 file mode.
 // Existing in-memory hypotheses (by dedup key) are preserved; only unseen
-// hypotheses from disk are inserted, so a resume never clobbers live state.
-// Returns the number of hypotheses loaded.
+// hypotheses from the snapshot are inserted, so a resume never clobbers live
+// state. Returns the number of hypotheses loaded.
 func (ls *LedgerStore) LoadFromDisk() int {
 	ls.mu.Lock()
 	defer ls.mu.Unlock()
+
+	if b := currentLedgerBackend(); b != nil {
+		if data, _, ok, err := b.LoadLedgerSnapshot(ls.scanID); err != nil {
+			log.Printf("[ledger] Warning: PG snapshot load failed for %s: %v", ls.scanID, err)
+		} else if ok {
+			return ls.mergeSnapshotLocked(data, fmt.Sprintf("pg snapshot %s", ls.scanID))
+		}
+		if ls.instanceID != "" {
+			if data, _, source, ok, err := b.LoadLatestLedgerSnapshotForInstance(ls.instanceID, ls.scanID); err != nil {
+				log.Printf("[ledger] Warning: PG continuity load failed for %s/%s: %v", ls.instanceID, ls.scanID, err)
+			} else if ok {
+				return ls.mergeSnapshotLocked(data, fmt.Sprintf("pg continuity %s (from sibling %s)", ls.instanceID, source))
+			}
+		}
+	}
 
 	if ls.persistPath == "" {
 		return 0
@@ -872,9 +930,15 @@ func (ls *LedgerStore) LoadFromDisk() int {
 	if err != nil {
 		return 0
 	}
+	return ls.mergeSnapshotLocked(data, ls.persistPath)
+}
+
+// mergeSnapshotLocked decodes one ledger snapshot and merges unseen
+// hypotheses into the store. Caller holds ls.mu.
+func (ls *LedgerStore) mergeSnapshotLocked(data []byte, source string) int {
 	var snap ledgerSnapshot
 	if err := json.Unmarshal(data, &snap); err != nil {
-		log.Printf("[ledger] Warning: failed to parse %s: %v", ls.persistPath, err)
+		log.Printf("[ledger] Warning: failed to parse snapshot from %s: %v", source, err)
 		return 0
 	}
 	count := 0
@@ -915,7 +979,7 @@ func (ls *LedgerStore) LoadFromDisk() int {
 		ls.evSeq = snap.EvSeq
 	}
 	if count > 0 {
-		log.Printf("[ledger] Loaded %d hypotheses from: %s", count, ls.persistPath)
+		log.Printf("[ledger] Loaded %d hypotheses from: %s", count, source)
 	}
 	return count
 }
@@ -932,7 +996,7 @@ type ledgerSnapshot struct {
 // marshalLocked serializes the store. Must be called with ls.mu held. Returns
 // (nil, "") when persistence is disabled.
 func (ls *LedgerStore) marshalLocked() ([]byte, string) {
-	if ls.persistPath == "" {
+	if ls.persistPath == "" && currentLedgerBackend() == nil {
 		return nil, ""
 	}
 	snap := ledgerSnapshot{

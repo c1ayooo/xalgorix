@@ -2,12 +2,13 @@ package scanctx
 
 import (
 	"fmt"
+	"log"
 	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/domainjournal"
-	"github.com/xalgord/xalgorix/v4/internal/infoitem"
+	"github.com/c1ayooo/xalgorix/v4/internal/domainjournal"
+	"github.com/c1ayooo/xalgorix/v4/internal/infoitem"
 )
 
 func engineActor(source string) domainjournal.Actor {
@@ -52,6 +53,12 @@ func (ls *LedgerStore) EnableJournal(dir string) error {
 	j, err := domainjournal.Open(filepath.Join(dir, domainjournal.FileName), ls.scanID)
 	if err != nil {
 		return err
+	}
+	// The journal can be opened after the instance stamp (test construction
+	// order); carry the ledger's run identity over either way so backend rows
+	// are stamped (R6.1). File mode ignores the metadata.
+	if ls.instanceID != "" {
+		j.SetInstanceID(ls.instanceID)
 	}
 	ls.journal = j
 	return nil
@@ -218,8 +225,24 @@ func (ls *LedgerStore) mutateHypothesisAs(hypID string, actor domainjournal.Acto
 	return cp.clone(), nil
 }
 
+// persistLocked writes the full snapshot to the durable home. Caller holds
+// ls.mu. With the PG backend registered (charter v3.0 §6.3) the snapshot is
+// a single-row upsert in run_ledger_snapshots; a failure is returned to the
+// mutation caller (persist-failure is not success, §5.2) and recorded on the
+// run-state watermark by the implementation — the in-memory state stays
+// authoritative and the next successful mutation re-persists everything.
 func (ls *LedgerStore) persistLocked() error {
 	data, path := ls.marshalLocked()
+	if data == nil {
+		return nil
+	}
+	if b := currentLedgerBackend(); b != nil {
+		if err := b.SaveLedgerSnapshot(ls.scanID, ls.instanceID, int64(ls.seq), data); err != nil {
+			log.Printf("[ledger] Warning: PG snapshot save failed for %s (in-memory state stays authoritative): %v", ls.scanID, err)
+			return err
+		}
+		return nil
+	}
 	return ls.writeFile(data, path)
 }
 

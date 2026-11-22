@@ -4,7 +4,7 @@ import (
 	"log"
 	"sync"
 
-	"github.com/xalgord/xalgorix/v4/internal/resources"
+	"github.com/c1ayooo/xalgorix/v4/internal/resources"
 )
 
 // BrowserState provides per-session browser instance tracking,

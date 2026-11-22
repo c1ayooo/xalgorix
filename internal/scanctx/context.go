@@ -15,7 +15,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/safe"
+	"github.com/c1ayooo/xalgorix/v4/internal/safe"
 )
 
 // RequestRatePolicy is the per-scan outbound request budget. MaxRPS is kept as
@@ -131,15 +131,23 @@ func New(id, scanDir string) *ScanContext {
 		// JournalLastSeq/health surface the absence explicitly.
 		_ = ledger.EnableJournal(scanDir)
 	}
+	// R6.1: the bounded state documents (notes, coverage) carry the same scan
+	// identity as the ledger — their run_state_files rows are keyed by it and
+	// the D11 continuity reads need it. Instance ids are stamped by the
+	// session wiring (the ledger precedent, scan_session.SetInstanceID).
+	notes := NewNoteStore()
+	notes.SetScanID(id)
+	coverage := NewCoverageStore()
+	coverage.SetScanID(id)
 	return &ScanContext{
 		ID:          id,
 		ScanDir:     scanDir,
 		Vulns:       NewVulnStore(),
-		Notes:       NewNoteStore(),
+		Notes:       notes,
 		Terminal:    NewTerminalState(),
 		Browser:     NewBrowserState(),
 		Ledger:      ledger,
-		Coverage:    NewCoverageStore(),
+		Coverage:    coverage,
 		Tokens:      tokens,
 		ToolOutputs: NewToolArchive(scanDir),
 		Traffic:     NewTrafficArchive(scanDir),

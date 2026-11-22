@@ -14,7 +14,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/xalgord/xalgorix/v4/internal/storage"
+	"github.com/c1ayooo/xalgorix/v4/internal/storage"
 )
 
 // FileStore is the no-DSN degradation of the platform repository
@@ -49,6 +49,13 @@ type fileSnapshot struct {
 	// IntelTriage rows: operator labels on recorded intelligence (0009
 	// mirror; the observed items themselves live in scan dirs).
 	IntelTriage []IntelTriage `json:"intel_triage,omitempty"`
+	// Per-scan-record durable rows (R6.1 runs-table takeover of scan.json,
+	// migration 0016's file mirror): the web layer's record safe point lands
+	// one row per scan record here via PutRunScanRecord, and ScanRunRecords
+	// sweeps them for the full scan set. Empty in file-mode web tests that
+	// never write records — their summaries fall back to the legacy scan.json
+	// walk byte-identically.
+	RunScanRecords []runScanRecordWire `json:"run_scan_records,omitempty"`
 }
 
 // approvalWire persists the approval record while suppressing the projected

@@ -3,7 +3,7 @@ package scanctx
 import (
 	"math"
 
-	"github.com/xalgord/xalgorix/v4/internal/domainjournal"
+	"github.com/c1ayooo/xalgorix/v4/internal/domainjournal"
 )
 
 // MaxVOIWeight bounds how much an uncalibrated VOI estimate may alter the

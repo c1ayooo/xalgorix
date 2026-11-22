@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/domainjournal"
-	"github.com/xalgord/xalgorix/v4/internal/infoitem/postgres"
+	"github.com/c1ayooo/xalgorix/v4/internal/domainjournal"
+	"github.com/c1ayooo/xalgorix/v4/internal/infoitem/postgres"
 )
 
 type watermarkReader interface {
@@ -60,7 +60,13 @@ func (r *Reconciler) Run(ctx context.Context, interval time.Duration) {
 }
 
 // ReconcileOnce enqueues every journal whose durable last sequence is ahead of
-// its PostgreSQL watermark.
+// its PostgreSQL watermark. Sources are both journal families: legacy
+// per-scan files under the data root (pre-R6 directories; the R6.0 importer
+// keeps the directories) and the PG primary store's run_journal streams —
+// from R6.1 production journals have no file, so crash catch-up enumerates
+// the durable stream through the process backend (charter §6.4). Applying a
+// range is idempotent, so a scan present in both families may be enqueued
+// twice without double-applying.
 func (r *Reconciler) ReconcileOnce(ctx context.Context) error {
 	var errs []error
 	err := filepath.WalkDir(r.root, func(path string, entry fs.DirEntry, walkErr error) error {
@@ -120,5 +126,46 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) error {
 	if err != nil {
 		errs = append(errs, err)
 	}
+	if err := r.reconcilePGSources(ctx, &errs); err != nil {
+		errs = append(errs, err)
+	}
 	return errors.Join(errs...)
+}
+
+// reconcilePGSources enqueues the missing tail of every run_journal stream
+// reported by the process backend. The relative scan dir passed downstream
+// is the scan id itself — scan directories are named by scan id, so the
+// processor's legacy file fallback resolves the conventional path (and is
+// simply absent for journals that only ever lived in PG).
+func (r *Reconciler) reconcilePGSources(ctx context.Context, errs *[]error) error {
+	backend := domainjournal.CurrentBackend()
+	if backend == nil {
+		return nil
+	}
+	sources, err := backend.LoadJournalSources(ctx)
+	if err != nil {
+		// The backstop being unable to see the durable streams is itself a
+		// visible failure (charter §6.4) — reported, never silent; the file
+		// family above has already been processed.
+		return fmt.Errorf("coldpath: journal sources: %w", err)
+	}
+	for _, src := range sources {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		wm, wmErr := r.store.Watermark(ctx, src.ScanID)
+		if wmErr != nil {
+			*errs = append(*errs, fmt.Errorf("%s: watermark: %w", src.ScanID, wmErr))
+			continue
+		}
+		if src.LastSeq <= wm.AppliedSeq {
+			continue
+		}
+		if enqueueErr := r.enqueuer.EnqueueRange(ctx, src.ScanID, src.ScanID, wm.AppliedSeq+1, src.LastSeq); enqueueErr != nil {
+			*errs = append(*errs, fmt.Errorf("%s: enqueue: %w", src.ScanID, enqueueErr))
+		}
+	}
+	return nil
 }

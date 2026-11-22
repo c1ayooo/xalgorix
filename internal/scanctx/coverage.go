@@ -19,6 +19,13 @@ type CoverageStore struct {
 	// coordinator may consume without re-running the probe itself — one
 	// shallow child request still closes nothing.
 	verified map[string]map[string]struct{}
+
+	// R6.1 durable-home identity (see coverage_checkpoint.go): the
+	// run_state_files row stamp (scan_id, instance_id) and a monotonic write
+	// counter for watermark comparisons.
+	scanID     string
+	instanceID string
+	writeSeq   int64
 }
 
 // NewCoverageStore creates an empty shared coverage matrix.

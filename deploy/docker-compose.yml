@@ -1,0 +1,148 @@
+# deploy/docker-compose.yml — one-command local stack for Xalgorix (REDESIGN D12).
+#
+# PostgreSQL is the required deployment dependency since charter v3.0 / R6:
+# state and panel data live in PG; files carry only byte artifacts (tool
+# outputs, traffic packets, uploads, the sandbox scratch workspace).
+#
+#   docker compose -f deploy/docker-compose.yml up -d      # all-in-one (default)
+#
+# ── Deployment shapes ────────────────────────────────────────────────────────
+# Default = all-in-one (unchanged): `db` + `app` with the batteries-included
+# image, tools executed in the app container (XALGORIX_RUNTIME_BACKEND=native).
+# Both services are unprofiled, so the command above keeps working.
+#
+# Split = slim control plane (`app-split`) + host-side `runnerd` + per-project
+# toolbox containers, sharing the same PostgreSQL. It is opt-in via the `split`
+# profile; `allinone` is the implicit default shape, so `--profile allinone` is
+# accepted as a synonym. Compose always enables services without a profile, so
+# name the split platform explicitly to avoid also starting `app`:
+#
+#   XALGORIX_TOOLBOX_IMAGE=repo@sha256:<64hex> XALGORIX_TOOLBOX_PROXY_URL=... \
+#     docker compose -f deploy/docker-compose.yml --profile split up -d app-split
+#
+# Split prerequisites:
+#   * toolbox image digest-pinned (a tag is refused unless
+#     XALGORIX_ALLOW_UNPINNED_TOOLBOX=1, for development only),
+#   * XALGORIX_TOOLBOX_PROXY_URL pointing at a proxy reachable from the
+#     per-project network (the docker backend fails closed without it),
+#   * a host data directory mounted at the SAME absolute path in the platform
+#     container and read by runnerd (scan paths are handed to the daemon
+#     verbatim for bind mounts).
+#
+# The app reads XALGORIX_DATABASE_URL from your environment (see the
+# environment block below). The bundled Postgres is plain upstream — no
+# extensions required; pgvector stays out until a concrete similarity
+# consumer exists (charter §6.2).
+
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: xalgorix
+      POSTGRES_PASSWORD: xalgorix
+      POSTGRES_DB: xalgorix
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - xalgorix_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U xalgorix -d xalgorix"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # ── All-in-one (default) ───────────────────────────────────────────────────
+  app:
+    image: ghcr.io/c1ayooo/xalgorix:latest
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      XALGORIX_DATABASE_URL: postgres://xalgorix:xalgorix@db:5432/xalgorix?sslmode=disable
+      XALGORIX_DATA_DIR: /data
+      # ── Tool execution plane ────────────────────────────────────────────────
+      # Leave XALGORIX_RUNTIME_BACKEND=native (the default) to execute tools in
+      # this container, exactly as before.
+      #
+      # Set it to "docker" to run each scan's tool calls in a per-project
+      # toolbox container. Two transports are supported:
+      #   runnerd — the platform talks to a host-side runnerd over its own
+      #             socket (recommended; the platform never sees docker.sock).
+      #   socket  — the platform mounts /var/run/docker.sock directly (fastest
+      #             to try; equivalent to granting host root).
+      # The `split` profile below is the packaged version of this shape.
+      # XALGORIX_RUNTIME_BACKEND: docker
+      # XALGORIX_RUNTIME_TRANSPORT: runnerd
+      # XALGORIX_RUNNERD_SOCKET: /run/xalgorix/runner.sock
+      # XALGORIX_TOOLBOX_IMAGE: ghcr.io/c1ayooo/xalgorix-toolbox:VERSION-core@sha256:...
+      # XALGORIX_TOOLBOX_PROFILE: core
+    ports:
+      - "127.0.0.1:9137:9137"
+    volumes:
+      - xalgorix_data:/data
+      # runnerd transport (recommended). Requires runnerd on the host:
+      #   XALGORIX_TOOLBOX_IMAGE=... runnerd --socket /run/xalgorix/runner.sock
+      # - /run/xalgorix:/run/xalgorix
+      # socket transport (development only — grants host root):
+      # - /var/run/docker.sock:/var/run/docker.sock
+    # The engine drives real terminal/browser tooling and — in the default
+    # posture — needs broad privileges (see AGENTS.md 授权边界: --privileged
+    # is the established posture, not a defect).
+    privileged: true
+
+  # ── Split (opt-in) ─────────────────────────────────────────────────────────
+  # Slim control plane: same binary, no security tooling, no privileged mode.
+  app-split:
+    profiles: ["split"]
+    image: ghcr.io/c1ayooo/xalgorix:${XALGORIX_SLIM_TAG:-slim}
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      runnerd:
+        condition: service_started
+    environment:
+      XALGORIX_DATABASE_URL: postgres://xalgorix:xalgorix@db:5432/xalgorix?sslmode=disable
+      XALGORIX_DATA_DIR: ${XALGORIX_DATA_DIR:-/srv/xalgorix/data}
+      XALGORIX_RUNTIME_BACKEND: docker
+      XALGORIX_RUNTIME_TRANSPORT: runnerd
+      XALGORIX_RUNNERD_SOCKET: /run/xalgorix/runner.sock
+      # Must be digest-pinned (repo@sha256:<64hex>); tag references are refused.
+      XALGORIX_TOOLBOX_IMAGE: ${XALGORIX_TOOLBOX_IMAGE:-}
+      XALGORIX_TOOLBOX_PROFILE: ${XALGORIX_TOOLBOX_PROFILE:-core}
+      # Reachable from the per-project network; the docker backend fails closed
+      # when proxy is required and this is empty.
+      XALGORIX_TOOLBOX_PROXY_URL: ${XALGORIX_TOOLBOX_PROXY_URL:-}
+    ports:
+      # 9138 by default so a stray `--profile split up` cannot collide with the
+      # all-in-one app above; set XALGORIX_SPLIT_PORT=9137 if it is stopped.
+      - "127.0.0.1:${XALGORIX_SPLIT_PORT:-9138}:9137"
+    volumes:
+      # Host bind mount at an identical absolute path — required for the
+      # daemon-side bind mounts of scan directories.
+      - ${XALGORIX_DATA_DIR:-/srv/xalgorix/data}:${XALGORIX_DATA_DIR:-/srv/xalgorix/data}
+      - ${XALGORIX_RUNNERD_DIR:-/run/xalgorix}:/run/xalgorix
+
+  # Host-side runtime service: owns docker.sock and exposes only the
+  # ensure/exec/stop/remove/inspect/list/capacity surface over a unix socket.
+  # Build it with `make image-runnerd` (Dockerfile target `runnerd`).
+  runnerd:
+    profiles: ["split"]
+    image: ${XALGORIX_RUNNERD_IMAGE:-xalgorix-runnerd:dev}
+    restart: unless-stopped
+    command: ["--socket", "/run/xalgorix/runner.sock"]
+    environment:
+      XALGORIX_TOOLBOX_IMAGE: ${XALGORIX_TOOLBOX_IMAGE:-}
+      XALGORIX_TOOLBOX_PROFILE: ${XALGORIX_TOOLBOX_PROFILE:-core}
+      XALGORIX_MAX_PROJECTS: ${XALGORIX_MAX_PROJECTS:-0}
+      XALGORIX_TOOLBOX_CONCURRENCY: ${XALGORIX_TOOLBOX_CONCURRENCY:-4}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${XALGORIX_RUNNERD_DIR:-/run/xalgorix}:/run/xalgorix
+      - ${XALGORIX_DATA_DIR:-/srv/xalgorix/data}:${XALGORIX_DATA_DIR:-/srv/xalgorix/data}
+
+volumes:
+  xalgorix_pgdata:
+  xalgorix_data:

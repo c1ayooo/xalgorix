@@ -1,4 +1,9 @@
-// Package notes provides the notes tool for agent memory with disk persistence.
+// Package notes provides the notes tool for agent memory with durable
+// persistence. From R6.1 (charter v3.0 §6.3) snapshots live in the PG
+// primary store (run_state_files, kind=notes) via the scanctx.StateFilesBackend
+// seam — the same seam the scanctx.NoteStore family uses, so one
+// registration covers both; the per-scan notes.json remains as the legacy
+// file path and read fallback.
 package notes
 
 import (
@@ -11,9 +16,9 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/xalgord/xalgorix/v4/internal/sandbox"
-	"github.com/xalgord/xalgorix/v4/internal/scanctx"
-	"github.com/xalgord/xalgorix/v4/internal/tools"
+	"github.com/c1ayooo/xalgorix/v4/internal/sandbox"
+	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools"
 )
 
 // ── Per-instance note stores ──
@@ -26,10 +31,17 @@ type noteStore struct {
 	mu sync.RWMutex
 	// contextID is the owning ScanContext.ID for this store. Captured at
 	// creation time so writeFile can look up the active ScanContext for
-	// Path_Policy resolution (sc.ScanDir-relative roots).
+	// Path_Policy resolution (sc.ScanDir-relative roots) and as the
+	// run_state_files row key (scan_id).
 	contextID   string
 	store       map[string]string
 	persistPath string
+	// instanceID stamps the run_state_files row (D11): a re-dispatched
+	// session shares it with its predecessor, whose snapshot the first
+	// LoadFromDiskForContext inherits via the continuity read. Stamped by
+	// the session wiring (the ledger precedent).
+	instanceID string
+	writeSeq   int64 // monotonic write counter for watermark comparisons
 }
 
 func getNoteStoreByID(id string) *noteStore {
@@ -72,7 +84,8 @@ func getNoteStoreForContext(contextID string) *noteStore {
 	return s
 }
 
-// SetPersistPath configures the directory where notes.json will be saved.
+// SetPersistPath configures the directory where notes.json will be saved
+// (legacy file mode; ignored for writes while the backend is registered).
 func SetPersistPath(dir string) {
 	s := getNoteStore()
 	s.mu.Lock()
@@ -84,6 +97,17 @@ func SetPersistPath(dir string) {
 	}
 }
 
+// SetInstanceIDForContext stamps the run identity (D11) on one context's
+// store. With the backend registered, snapshots carry it and a
+// re-dispatched session's first LoadFromDiskForContext inherits the previous
+// sibling session's notes via the instance continuity read.
+func SetInstanceIDForContext(contextID, instanceID string) {
+	s := getNoteStoreForContext(contextID)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.instanceID = strings.TrimSpace(instanceID)
+}
+
 // ResetNotes clears all notes for the active scan context.
 func ResetNotes() {
 	s := getNoteStore()
@@ -92,46 +116,92 @@ func ResetNotes() {
 	s.mu.Unlock()
 }
 
-// LoadFromDisk loads notes from the persist path if it exists.
+// LoadFromDisk loads notes from the durable home if one exists (backend
+// snapshot → instance continuity → legacy file, the charter §6.3 read order;
+// see loadLocked for the source discipline). Lenient: a missing or corrupt
+// snapshot reads as "nothing loaded" (the CLI contract).
 func LoadFromDisk() int {
 	s := getNoteStore()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.loadLocked()
+}
+
+// loadLocked resolves the newest durable snapshot into this (empty or
+// partial) store. Source order with the backend registered (charter v3.0
+// §6.3):
+//
+//  1. this scan's own snapshot (run_state_files, kind=notes);
+//  2. the newest sibling session's snapshot for the stamped instance — the
+//     D11 continuity read;
+//  3. the legacy notes.json file — straggler resilience only (crash
+//     leftovers between backend registration and import); never a write
+//     target while a backend is registered.
+//
+// Without a backend the behavior is identical to the pre-R6.1 file mode.
+// Existing in-memory notes are preserved (merge-only); returns the number of
+// notes loaded. Caller holds s.mu.
+func (s *noteStore) loadLocked() int {
+	if b := scanctx.CurrentStateFilesBackend(); b != nil {
+		if data, _, ok, err := b.LoadStateFileSnapshot(s.contextID, scanctx.StateFileKindNotes); err != nil {
+			log.Printf("[notes] Warning: state snapshot load failed for %s: %v", s.contextID, err)
+		} else if ok {
+			n, _ := s.mergeLocked(data, fmt.Sprintf("state snapshot %s/%s", s.contextID, scanctx.StateFileKindNotes))
+			return n
+		}
+		if s.instanceID != "" {
+			if data, _, source, ok, err := b.LoadLatestStateFileSnapshotForInstance(s.instanceID, s.contextID, scanctx.StateFileKindNotes); err != nil {
+				log.Printf("[notes] Warning: continuity load failed for %s/%s: %v", s.instanceID, s.contextID, err)
+			} else if ok {
+				n, _ := s.mergeLocked(data, fmt.Sprintf("state continuity %s (from sibling %s)", s.instanceID, source))
+				return n
+			}
+		}
+	}
 
 	if s.persistPath == "" {
 		return 0
 	}
-
 	data, err := os.ReadFile(s.persistPath)
 	if err != nil {
 		return 0
 	}
+	n, _ := s.mergeLocked(data, s.persistPath)
+	return n
+}
 
+// mergeLocked decodes one notes snapshot (the bare string map, the same
+// bytes notes.json always carried) and merges unseen keys into the store.
+// Caller holds s.mu. Returns the count of newly merged keys; a corrupt
+// snapshot returns the parse error (already warned about) so a strict caller
+// can surface it instead of folding it into "nothing recorded"
+// (charter §5.2).
+func (s *noteStore) mergeLocked(data []byte, source string) (int, error) {
 	loaded := make(map[string]string)
 	if err := json.Unmarshal(data, &loaded); err != nil {
-		log.Printf("[notes] Warning: failed to parse %s: %v", s.persistPath, err)
-		return 0
+		log.Printf("[notes] Warning: failed to parse notes snapshot from %s: %v", source, err)
+		return 0, err
 	}
-
 	count := 0
 	for k, v := range loaded {
-		if _, exists := s.store[k]; !exists {
-			s.store[k] = v
-			count++
+		if _, exists := s.store[k]; exists {
+			continue
 		}
+		s.store[k] = v
+		count++
 	}
-
 	if count > 0 {
-		log.Printf("[notes] Loaded %d notes from disk: %s", count, s.persistPath)
+		log.Printf("[notes] Loaded %d notes from: %s", count, source)
 	}
-	return count
+	return count, nil
 }
 
 // marshalSnapshot serializes the current store. Must be called with s.mu held.
-// Returns the serialized data and the persist path. If persistPath is empty,
-// returns nil data (meaning no write is needed).
+// Returns the serialized data and the persist path. If persistence is
+// disabled (no file path AND no backend), returns nil data (meaning no write
+// is needed).
 func (s *noteStore) marshalSnapshot() ([]byte, string) {
-	if s.persistPath == "" {
+	if s.persistPath == "" && scanctx.CurrentStateFilesBackend() == nil {
 		return nil, ""
 	}
 	data, err := json.MarshalIndent(s.store, "", "  ")
@@ -142,7 +212,28 @@ func (s *noteStore) marshalSnapshot() ([]byte, string) {
 	return data, s.persistPath
 }
 
-// writeFile persists serialized data to disk. Safe to call without holding s.mu.
+// saveSnapshot persists the serialized snapshot to the durable home. Caller
+// holds s.mu (the write happens under the state lock so snapshots reach the
+// durable home in the order they were taken — notes/ledger discipline). With
+// the backend registered the snapshot is a whole-snapshot upsert into the
+// run_state_files row (scan_id, kind=notes) and notes.json is never written
+// (charter v3.0 §6.3); a failure is returned to the caller — persist-failure
+// is not success (charter §5.2).
+func (s *noteStore) saveSnapshot(data []byte) error {
+	if data == nil {
+		return nil
+	}
+	if b := scanctx.CurrentStateFilesBackend(); b != nil {
+		if err := b.SaveStateFileSnapshot(s.contextID, scanctx.StateFileKindNotes, s.instanceID, s.writeSeq, data); err != nil {
+			return fmt.Errorf("notes durable write failed: %w", err)
+		}
+		return nil
+	}
+	return s.writeFile(data, s.persistPath)
+}
+
+// writeFile persists serialized data to the legacy file (notes.json). Safe
+// to call without holding s.mu.
 //
 // Every persistence write flows through sandbox.Default().CheckResolve so a
 // misconfigured persistPath cannot escape the Allow_List (Requirement 8.3).
@@ -231,8 +322,9 @@ func addNoteForContext(contextID string, args map[string]string) (tools.Result, 
 	s.mu.Lock()
 	prev, existed := s.store[key]
 	s.store[key] = value
-	data, path := s.marshalSnapshot()
-	writeErr := s.writeFile(data, path)
+	s.writeSeq++
+	data, _ := s.marshalSnapshot()
+	writeErr := s.saveSnapshot(data)
 	if writeErr != nil {
 		// Durable-write acknowledgement: the receipt must never claim a save
 		// that failed on disk. Roll the in-memory change back so receipt and
@@ -349,15 +441,31 @@ func ResetNotesForContext(contextID string) {
 	s.mu.Unlock()
 }
 
-// LoadFromDiskForContext loads notes from disk for a specific context.
-// LoadFromDiskForContext loads notes from disk for a specific context. The
-// returned error distinguishes a restore failure (missing file, corrupt JSON)
-// from a genuinely empty note set — a failed restore must never read as an
-// intact empty context in audit records.
+// LoadFromDiskForContext loads notes into this context's store from the
+// durable home (backend snapshot → instance continuity → legacy file, the
+// charter §6.3 read order). The returned error distinguishes a restore
+// failure (missing file, corrupt snapshot — file or backend row) from a
+// genuinely empty note set — a failed restore must never read as an intact
+// empty context in audit records.
 func LoadFromDiskForContext(contextID string) (int, error) {
 	s := getNoteStoreForContext(contextID)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if b := scanctx.CurrentStateFilesBackend(); b != nil {
+		if data, _, ok, err := b.LoadStateFileSnapshot(s.contextID, scanctx.StateFileKindNotes); err != nil {
+			log.Printf("[notes] Warning: state snapshot load failed for %s: %v", s.contextID, err)
+		} else if ok {
+			return s.mergeLocked(data, fmt.Sprintf("state snapshot %s/%s", s.contextID, scanctx.StateFileKindNotes))
+		}
+		if s.instanceID != "" {
+			if data, _, source, ok, err := b.LoadLatestStateFileSnapshotForInstance(s.instanceID, s.contextID, scanctx.StateFileKindNotes); err != nil {
+				log.Printf("[notes] Warning: continuity load failed for %s/%s: %v", s.instanceID, s.contextID, err)
+			} else if ok {
+				return s.mergeLocked(data, fmt.Sprintf("state continuity %s (from sibling %s)", s.instanceID, source))
+			}
+		}
+	}
 
 	if s.persistPath == "" {
 		return 0, nil
@@ -372,22 +480,9 @@ func LoadFromDiskForContext(contextID string) (int, error) {
 		return 0, fmt.Errorf("notes restore: %w", err)
 	}
 
-	loaded := make(map[string]string)
-	if err := json.Unmarshal(data, &loaded); err != nil {
-		log.Printf("[notes] Warning: failed to parse %s: %v", s.persistPath, err)
-		return 0, fmt.Errorf("notes restore failed: corrupt snapshot at %s: %w", s.persistPath, err)
-	}
-
-	count := 0
-	for k, v := range loaded {
-		if _, exists := s.store[k]; !exists {
-			s.store[k] = v
-			count++
-		}
-	}
-
-	if count > 0 {
-		log.Printf("[notes] Loaded %d notes from: %s (context=%s)", count, s.persistPath, contextID)
+	count, corruptErr := s.mergeLocked(data, s.persistPath)
+	if corruptErr != nil {
+		return 0, fmt.Errorf("notes restore failed: corrupt snapshot at %s: %w", s.persistPath, corruptErr)
 	}
 	return count, nil
 }

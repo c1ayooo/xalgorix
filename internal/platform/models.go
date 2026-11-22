@@ -1,11 +1,12 @@
 // Package platform implements the R1 project/task/run model (REDESIGN D6/D7):
-// Project → Task → Run with Run as a mount record over the existing hot-path
-// scan artifacts (scanctx + scan.json stay the status authority, charter §5.1).
+// Project → Task → Run with Run as a mount record over the run's scan
+// records. Since R6.1 the record status is projected from the durable runs
+// scan set (run_scan_records — REDESIGN D12, charter §5.1 v3.0); the mount
+// record itself never becomes a second status authority.
 //
 // PostgreSQL is the cold-path system of record when a DSN is configured; a
 // file snapshot under <dataDir>/_platform/platform.json keeps the API usable
-// in the no-DSN single-binary mode without reducing scan capability
-// (REDESIGN §3.3, charter §6.6).
+// in tests and drives the R6.0 migration importer (REDESIGN §3.3).
 package platform
 
 import (
@@ -504,16 +505,35 @@ type ApprovalRuleMatch struct {
 	Contains string `json:"contains,omitempty"`
 }
 
-// ApprovalRule is one operator-authored allow rule: the persistent half of
-// the "approve & remember" loop. Both gate layers consult the rules before
-// creating an approval row, so the same intent is asked at most once.
-// CreatedFromApprovalID traces the decision the rule was remembered from —
-// the approval row itself may be retention-deleted while the rule survives
-// (ON DELETE SET NULL); empty for hand-authored rules.
+// Approval rule decisions (scope observer, v4.6). "allow" is the historical
+// "approve & remember" exemption; "deny" is the inverse — the scope observer
+// auto-rejects a call matching the rule (bulk data deletion, uploads, web/OSS
+// control-plane writes on the bound project). Empty is normalized to "allow"
+// so every pre-existing rule keeps its meaning.
+const (
+	ApprovalRuleAllow = "allow"
+	ApprovalRuleDeny  = "deny"
+)
+
+// NormalizeApprovalRuleDecision maps the wire/DB value onto allow|deny.
+func NormalizeApprovalRuleDecision(raw string) string {
+	if strings.EqualFold(strings.TrimSpace(raw), ApprovalRuleDeny) {
+		return ApprovalRuleDeny
+	}
+	return ApprovalRuleAllow
+}
+
+// ApprovalRule is one operator-authored rule: the persistent half of the
+// "approve & remember" loop and the scope observer's decision table. Both gate
+// layers consult the rules before creating an approval row, so the same intent
+// is asked at most once. CreatedFromApprovalID traces the decision the rule was
+// remembered from — the approval row itself may be retention-deleted while the
+// rule survives (ON DELETE SET NULL); empty for hand-authored rules.
 type ApprovalRule struct {
 	ID                    string            `json:"id"`
 	ProjectID             string            `json:"project_id"`
-	Kind                  string            `json:"kind"` // ApprovalKindCommand / ApprovalKindHTTP
+	Kind                  string            `json:"kind"`               // ApprovalKindCommand / ApprovalKindHTTP
+	Decision              string            `json:"decision,omitempty"` // allow|deny (empty = allow)
 	Match                 ApprovalRuleMatch `json:"match"`
 	Reason                string            `json:"reason,omitempty"`
 	CreatedBy             string            `json:"created_by,omitempty"` // "operator:<user>"
@@ -527,11 +547,17 @@ type ApprovalRule struct {
 	ProjectName string `json:"project_name,omitempty"`
 }
 
+// DecisionOrAllow returns the rule's effective decision.
+func (r ApprovalRule) DecisionOrAllow() string {
+	return NormalizeApprovalRuleDecision(r.Decision)
+}
+
 // ApprovalRuleInput is the create request (REST POST /api/approval-rules and
 // the approval card's "approve & remember" path).
 type ApprovalRuleInput struct {
 	ProjectID             string
 	Kind                  string
+	Decision              string
 	Match                 ApprovalRuleMatch
 	Reason                string
 	CreatedBy             string
