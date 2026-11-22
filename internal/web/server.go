@@ -33,6 +33,7 @@ import (
 	"github.com/xalgord/xalgorix/v4/internal/agent"
 	"github.com/xalgord/xalgorix/v4/internal/auth"
 	"github.com/xalgord/xalgorix/v4/internal/config"
+	"github.com/xalgord/xalgorix/v4/internal/goalanalysis"
 	"github.com/xalgord/xalgorix/v4/internal/infoitem"
 	"github.com/xalgord/xalgorix/v4/internal/llm"
 	"github.com/xalgord/xalgorix/v4/internal/platform"
@@ -47,6 +48,7 @@ import (
 	"github.com/xalgord/xalgorix/v4/internal/storage"
 	"github.com/xalgord/xalgorix/v4/internal/tools/browser"
 	"github.com/xalgord/xalgorix/v4/internal/tools/httpclient"
+	"github.com/xalgord/xalgorix/v4/internal/tools/intelligence"
 	"github.com/xalgord/xalgorix/v4/internal/tools/notes"
 	"github.com/xalgord/xalgorix/v4/internal/tools/reporting"
 	"github.com/xalgord/xalgorix/v4/internal/tools/terminal"
@@ -187,10 +189,11 @@ func (rl *RateLimiter) Allow(ip string) bool {
 func rateLimitMiddleware(rl *RateLimiter) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Skip rate limiting for WebSocket, static files, and dashboard
-			// polling reads. Auth still wraps this middleware, so protected
-			// reads require a valid session before they reach this point.
-			if r.URL.Path == "/ws" || isStaticWebAssetPath(r.URL.Path) ||
+			// Skip rate limiting for the event stream (reconnects must never
+			// 429), static files, and dashboard polling reads. Auth still
+			// wraps this middleware, so protected reads require a valid
+			// session before they reach this point.
+			if r.URL.Path == "/api/stream" || isStaticWebAssetPath(r.URL.Path) ||
 				isDashboardReadPath(r.Method, r.URL.Path) {
 				next.ServeHTTP(w, r)
 				return
@@ -234,7 +237,7 @@ func handleRobotsTxt(w http.ResponseWriter, _ *http.Request) {
 }
 
 func isStaticWebAssetPath(path string) bool {
-	if path == "" || strings.HasPrefix(path, "/api/") || path == "/ws" {
+	if path == "" || strings.HasPrefix(path, "/api/") {
 		return false
 	}
 	if strings.HasPrefix(path, "/static/") ||
@@ -267,6 +270,7 @@ func isDashboardReadPath(method, path string) bool {
 	default:
 		return strings.HasPrefix(path, "/api/scans/") ||
 			strings.HasPrefix(path, "/api/instances/") ||
+			strings.HasPrefix(path, "/api/conversations/") ||
 			strings.HasPrefix(path, "/api/info/")
 	}
 }
@@ -435,6 +439,20 @@ type ScanRequest struct {
 	// never wire-settable; ScanContext remains the single-path compatibility
 	// field and mirrors the first entry.
 	ScanContextPaths []string `json:"-"`
+	// Objective is the operator-stated structured goal of this run (REDESIGN
+	// 3.1). It is context for the loop - never authority over finding
+	// acceptance or verification labels. Task runs inherit it from the task.
+	Objective *platform.Objective `json:"objective,omitempty"`
+	// ObjectiveProjectID / ObjectiveTaskID are the situational coordinates of
+	// the objective (used for the human-sourced InfoItem). Internal only.
+	ObjectiveProjectID string `json:"-"`
+	ObjectiveTaskID    string `json:"-"`
+	// ObjectiveGoal / ObjectiveInstruction are the task's RAW goal and
+	// execution notes — the round-0 analyzer's input when Objective is nil
+	// (R-goal, goal_analysis.go roundZeroGoalAnalysis). Internal only; set by
+	// the task run entries, never by wire requests.
+	ObjectiveGoal        string `json:"-"`
+	ObjectiveInstruction string `json:"-"`
 	// ProviderProfile is the optional "<provider>:<profileId>" key
 	// (e.g. "openai:default") that selects an Auth_Profile from
 	// Profile_Store for this scan. When set on a request from an
@@ -482,9 +500,17 @@ type ScanRequest struct {
 	allowLoopbackPorts []int              `json:"-"`
 }
 
-// WSEvent is a WebSocket message sent to clients.
+// WSEvent is the event-stream payload pushed to dashboard clients (SSE frame
+// data on /api/stream) and mirrored into REST history buffers. The WSEvent
+// name is historical (pre-SSE WebSocket hub) and kept so API consumers and
+// the frontend type share one identifier.
 type WSEvent struct {
-	EventID        string            `json:"event_id,omitempty"`
+	EventID string `json:"event_id,omitempty"`
+	// Seq is the per-process monotonic stream order stamped at fan-out time
+	// (live SSE frames only). It anchors SSE Last-Event-ID resumption; REST
+	// history entries and persisted journal records leave it unset — live
+	// ordering only, not a storage field.
+	Seq            uint64            `json:"seq,omitempty"`
 	Type           string            `json:"type"`
 	Content        string            `json:"content,omitempty"`
 	ToolName       string            `json:"tool_name,omitempty"`
@@ -519,6 +545,11 @@ type WSEvent struct {
 	// never synthesized by agents or tools (event flow is one-way).
 	Approval *platform.Approval `json:"approval,omitempty"`
 	Guidance *platform.Guidance `json:"guidance,omitempty"`
+	// Rule carries the approval-rule payload of approval_rule_hit (the
+	// "approve & remember" exemption that allowed a call without a row,
+	// API_CONTRACT §3.2). Same discipline as Approval/Guidance: web-layer
+	// emission only.
+	Rule *platform.ApprovalRule `json:"rule,omitempty"`
 }
 
 // VulnSummary is a simplified vulnerability for the UI.
@@ -574,9 +605,16 @@ type sessionUsage struct {
 
 // ScanRecord is a persisted scan result.
 type ScanRecord struct {
-	ID                 string                  `json:"id"`
-	InstanceID         string                  `json:"instance_id,omitempty"` // parent queue/instance id returned by /api/scan
-	Name               string                  `json:"name,omitempty"`        // user-defined scan name
+	ID         string `json:"id"`
+	InstanceID string `json:"instance_id,omitempty"` // parent queue/instance id returned by /api/scan
+	// RunID / TaskID are RESPONSE-ONLY linkage hints (zero on the persisted
+	// scan.json): the platform run mount pointing at this scan, resolved at
+	// read time by attachRunLinkage. Empty = unmounted (pre-platform legacy
+	// scan) — the run page's guidance composer needs task_id to reach the
+	// unified HITL channel and hides itself without it.
+	RunID              string                  `json:"run_id,omitempty"`
+	TaskID             string                  `json:"task_id,omitempty"`
+	Name               string                  `json:"name,omitempty"` // user-defined scan name
 	Target             string                  `json:"target"`
 	ParentTarget       string                  `json:"parent_target,omitempty"` // parent domain for subdomain scans (wildcard mode)
 	StartedAt          string                  `json:"started_at"`
@@ -642,13 +680,18 @@ type ScanRecord struct {
 	// engine evidence — completed plan tasks, typed dispositions, the
 	// hypothesis ledger, and the terminal lifecycle — never from LLM
 	// prose or from "the current phase number is past N".
-	PhaseStatus      map[string]string `json:"phase_status,omitempty"`
-	PhaseReasons     map[string]string `json:"phase_reasons,omitempty"`
-	SubScans         []SubScanSummary  `json:"sub_scans,omitempty"`
-	SubScanTotal     int               `json:"sub_scan_total,omitempty"`
-	SubScanCompleted int               `json:"sub_scan_completed,omitempty"`
-	SubScanRunning   int               `json:"sub_scan_running,omitempty"`
-	SubScanRemaining int               `json:"sub_scan_remaining,omitempty"`
+	PhaseStatus map[string]string `json:"phase_status,omitempty"`
+	// Objective carries the operator objective evaluation at terminal time
+	// (REDESIGN 3.1): the per-criterion states and the aggregate attainment.
+	// It is DISPLAY ONLY - it never changes the completion status, the stop
+	// reason or any finding label.
+	Objective        *objectiveSnapshot `json:"objective,omitempty"`
+	PhaseReasons     map[string]string  `json:"phase_reasons,omitempty"`
+	SubScans         []SubScanSummary   `json:"sub_scans,omitempty"`
+	SubScanTotal     int                `json:"sub_scan_total,omitempty"`
+	SubScanCompleted int                `json:"sub_scan_completed,omitempty"`
+	SubScanRunning   int                `json:"sub_scan_running,omitempty"`
+	SubScanRemaining int                `json:"sub_scan_remaining,omitempty"`
 	// Enumeration has its own outcome and plan; it is never an assessment child.
 	Discovery      *SubScanSummary `json:"discovery,omitempty"`
 	SubScanSkipped int             `json:"sub_scan_skipped,omitempty"`
@@ -810,9 +853,9 @@ type queueProgress struct {
 // on the dashboard mux"), Requirement 15.2 (existing routes
 // preserved unchanged).
 var dashboardRoutes = []string{
-	// Static + WebSocket roots (registered as catch-all and "/ws").
+	// Static root + event stream (registered as catch-all and "/api/stream").
 	"/",
-	"/ws",
+	"/api/stream",
 
 	// Existing scan / status / report / settings surface.
 	"/api/scan",
@@ -836,7 +879,6 @@ var dashboardRoutes = []string{
 	"/uploads/logos/",
 	"/api/report/",
 	"/api/settings/rate-limit",
-	"/api/settings/agentmail",
 	"/api/settings/llm",
 	"/api/settings/llm/keys",
 	"/api/settings/llm/test-route",
@@ -850,11 +892,17 @@ var dashboardRoutes = []string{
 	"/api/instances/",
 	"/api/chat",
 
-	// Dashboard auth (login/logout/status). Distinct from the new
-	// /api/auth/profiles namespace below.
+	// Dashboard auth (login/logout/status/setup/password). Distinct from
+	// the /api/auth/profiles namespace below (LLM provider credentials).
 	"/api/auth/login",
 	"/api/auth/logout",
 	"/api/auth/status",
+	"/api/auth/setup",
+	"/api/auth/password",
+
+	// RBAC account management (admin-only, auth_rbac.go).
+	"/api/users",
+	"/api/users/",
 
 	// Provider catalog (read-only) + auth profile routes.
 	"/api/providers",
@@ -872,15 +920,79 @@ var dashboardRoutes = []string{
 	// R2a HITL approval surface (REDESIGN §5, API_CONTRACT §3). Guidance
 	// lives under the existing "/api/tasks/" prefix (contract §3.1).
 	"/api/approvals",
+	"/api/approvals/summary",
 	"/api/approvals/",
+
+	// Approval rules ("approve & remember", REDESIGN §5.2, API_CONTRACT §3.2).
+	"/api/approval-rules",
+	"/api/approval-rules/",
+
+	// Integration invocation records (cross-scan retrieval projection,
+	// API_CONTRACT §integration-invocations). Exact patterns must exist so
+	// the later "/api/mcp-servers/" definition subtree cannot swallow them.
+	"/api/mcp-servers/invocations",
+	"/api/skills/invocations",
+	"/api/agent-profiles/invocations",
+
+	// User skills (operator-authored methodology, API_CONTRACT §integration-skills).
+	"/api/skills",
+	"/api/skills/",
+
+	// Agent delegation profiles (builtin rows merged read-only,
+	// API_CONTRACT §integration-agent-profiles).
+	"/api/agent-profiles",
+	"/api/agent-profiles/",
+
+	// MCP servers (credential-bearing: machine-token denied, API_CONTRACT
+	// §integration-mcp-servers). The invocations exact pattern above must
+	// exist so this subtree cannot swallow it.
+	"/api/mcp-servers",
+	"/api/mcp-servers/",
+}
+
+// registerPlatformAPIRoutes mounts the R1 platform and R2a approval surface.
+// The exact "/api/approvals/summary" pattern must exist: without it ServeMux
+// routes the request into the "/api/approvals/" subtree (handleApprovalDetail)
+// and GET returns 405. Tests mount this helper so mux dispatch is covered.
+func registerPlatformAPIRoutes(mux *http.ServeMux, s *Server) {
+	mux.HandleFunc("/api/projects", s.handleProjects)
+	mux.HandleFunc("/api/projects/", s.handleProjectDetail)
+	mux.HandleFunc("/api/tasks/", s.handleTaskDetail)
+
+	mux.HandleFunc("/api/approvals", s.handleApprovals)
+	mux.HandleFunc("/api/approvals/summary", s.handleApprovalsSummaryRoute)
+	mux.HandleFunc("/api/approvals/", s.handleApprovalDetail)
+
+	mux.HandleFunc("/api/approval-rules", s.handleApprovalRules)
+	mux.HandleFunc("/api/approval-rules/", s.handleApprovalRuleDetail)
+
+	mux.HandleFunc("/api/mcp-servers/invocations", s.handleMcpInvocations)
+	mux.HandleFunc("/api/skills/invocations", s.handleSkillInvocations)
+	mux.HandleFunc("/api/agent-profiles/invocations", s.handleAgentInvocations)
+
+	mux.HandleFunc("/api/skills", s.handleSkills)
+	mux.HandleFunc("/api/skills/", s.handleSkillDetail)
+
+	mux.HandleFunc("/api/agent-profiles", s.handleAgentProfiles)
+	mux.HandleFunc("/api/agent-profiles/", s.handleAgentProfileDetail)
+
+	mux.HandleFunc("/api/mcp-servers", s.handleMcpServers)
+	mux.HandleFunc("/api/mcp-servers/", s.handleMcpServerDetail)
 }
 
 // Server is the web UI server.
 type Server struct {
-	cfg             *config.Config
-	port            int
-	clients         map[*wsClient]bool
-	mu              sync.RWMutex
+	cfg     *config.Config
+	port    int
+	clients map[*sseClient]bool
+	mu      sync.RWMutex
+	// evtSeq/streamRing/streamMu carry the SSE stream ordering: evtSeq hands
+	// out the monotonic frame id, streamRing keeps the Last-Event-ID replay
+	// window (sse_hub.go). Deliberately separate from s.mu so fan-out's
+	// RLock never contends with ring maintenance.
+	evtSeq          atomic.Uint64
+	streamMu        sync.Mutex
+	streamRing      []sseRingEntry
 	currentAgents   map[string]*agent.Agent // scanID → agent (replaces singleton currentAgent)
 	cancelScan      context.CancelFunc      // cancels the current scan session context
 	running         atomic.Bool
@@ -910,6 +1022,7 @@ type Server struct {
 	queueResumeMu          sync.Mutex
 	queueResumeLaunching   map[string]bool
 	postScanChatFn         func(*config.Config, []llm.Message) (string, error)
+	goalAnalyzeLLM         goalanalysis.LLMFunc
 	schedulesMu            sync.RWMutex
 	schedules              map[string]*ScanSchedule
 	shutdownChan           chan struct{}
@@ -1015,6 +1128,14 @@ type Server struct {
 	// catalog + llmKeyStore. Backs /api/settings/llm/test-route. nil
 	// when llmKeyStore is nil.
 	llmRouter *llm.Router
+
+	// authJWT signs/verifies the dashboard session JWTs (auth_jwt.go) and
+	// authUsers is the local account store backing RBAC (auth_users.go).
+	// Both are initialized in NewServer via initAuthStack; nil means the
+	// auth stack failed to load — dashboard login surfaces 503, machine
+	// token auth keeps working (charter §6.6 posture).
+	authJWT   *jwtSessions
+	authUsers *userStore
 }
 
 // NewServer creates a new web server.
@@ -1032,7 +1153,7 @@ func NewServer(cfg *config.Config, port int) *Server {
 	srv := &Server{
 		cfg:                    cfg,
 		port:                   port,
-		clients:                make(map[*wsClient]bool),
+		clients:                make(map[*sseClient]bool),
 		currentAgents:          make(map[string]*agent.Agent),
 		dataDir:                dataDir,
 		discordWebhook:         cfg.DiscordWebhook,
@@ -1061,6 +1182,16 @@ func NewServer(cfg *config.Config, port int) *Server {
 		admissionWake: make(chan struct{}, 1),
 	}
 	srv.notifyScanComplete.Store(cfg.NotifyScanComplete)
+
+	// Integration invocation journals (MCP / skills / agents cross-scan
+	// records). Best-effort: an unavailable dir only disables the projection,
+	// never scanning (charter §6.6).
+	srv.initInvocationJournals()
+
+	// Dashboard auth stack (JWT secret + RBAC user store, auth_jwt.go /
+	// auth_users.go). Best-effort like the journals: a failure degrades to
+	// machine-token-only auth, never blocks the scanner.
+	srv.initAuthStack()
 
 	// R2b traffic proxy: the process-level operator-machine configuration for
 	// the upstream dial guard. Attributed traffic overrides this with its
@@ -1096,6 +1227,31 @@ func NewServer(cfg *config.Config, port int) *Server {
 		client := llm.NewClient(cfg, llm.WithResolver(resolver))
 		client.SetContext(context.Background())
 		return client.Chat(messages)
+	}
+
+	// Wire goalAnalyzeLLM (R-goal): the one-shot analyzer call behind
+	// /api/projects/{id}/analyze-goal and the round-0 auto analysis. Same
+	// resolver decision order as postScanChatFn (catalog → legacy), but the
+	// caller's context is honored so the goalAnalysisTimeout deadline applies,
+	// and temperature is pinned deterministic (one rewrite, not prose).
+	srv.goalAnalyzeLLM = func(ctx context.Context, systemPrompt, userMessage string) (string, error) {
+		cfg := srv.configSnapshot()
+		if cfg == nil {
+			return "", fmt.Errorf("goalanalysis: no configuration available")
+		}
+		opts := []llm.ResolverOption{}
+		if srv.catalog != nil && srv.profiles != nil {
+			opts = append(opts, llm.WithCatalog(srv.catalog, srv.profiles))
+		}
+		opts = append(opts, llm.WithLegacy(cfg))
+		resolver := llm.NewCompositeResolver(opts...)
+		client := llm.NewClient(cfg, llm.WithResolver(resolver))
+		client.SetContext(ctx)
+		client.SetTemperature(agent.TempScanner)
+		return client.Chat([]llm.Message{
+			{Role: "system", Content: systemPrompt},
+			{Role: "user", Content: userMessage},
+		})
 	}
 
 	// HITL approval gate service (R2a, REDESIGN §5): policy comes from
@@ -1246,10 +1402,10 @@ func (s *Server) Start() error {
 	// no-op for installs that want to keep scans forever.
 	go s.startRetentionSweeper()
 
-	// Reap expired session cookies in the background so the auth map cannot
-	// grow unbounded from abandoned logins.
-	if authConfigured(s.cfg) {
-		startSessionReaper()
+	// Reap revoked JWT jti entries in the background so the logout denylist
+	// cannot grow unbounded from abandoned sessions.
+	if s.authJWT != nil {
+		s.authJWT.startReaper()
 	}
 
 	// Auto-start Caido proxy in background if available
@@ -1300,7 +1456,7 @@ func (s *Server) Start() error {
 		r.URL.Path = "/"
 		fileServer.ServeHTTP(w, r)
 	})
-	mux.HandleFunc("/ws", s.handleWebSocket)
+	mux.HandleFunc("/api/stream", s.handleEventStream)
 	mux.HandleFunc("/api/scan", s.handleScan)
 	mux.HandleFunc("/api/stop", s.handleStop)
 	mux.HandleFunc("/api/restart", s.handleRestart)
@@ -1311,6 +1467,15 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/scans", s.handleListScans)
 	mux.HandleFunc("/api/info/", s.handleInfoRoutes)
 	mux.HandleFunc("/api/scans/", func(w http.ResponseWriter, r *http.Request) {
+		// GET /api/scans/{id}/files[/{action}] — read-only artifact/workspace
+		// browser (scan_files.go). Matched by segment so the generic detail
+		// handler below can never mistake "files" for a scan id suffix.
+		if rest := strings.TrimPrefix(r.URL.Path, "/api/scans/"); strings.Contains(rest, "/") {
+			if sub := rest[strings.Index(rest, "/")+1:]; sub == "files" || strings.HasPrefix(sub, "files/") {
+				s.handleScanFiles(w, r)
+				return
+			}
+		}
 		if strings.Contains(r.URL.Path, "/vulns/") && r.Method == http.MethodDelete {
 			s.handleDeleteVuln(w, r)
 			return
@@ -1341,6 +1506,19 @@ func (s *Server) Start() error {
 			s.handleScanColdPath(w, r)
 			return
 		}
+		// GET /api/scans/{id}/ledger — read-only hypothesis/evidence snapshot
+		// with status counts and honest presence/damage flags (scan_ledger.go).
+		if strings.HasSuffix(r.URL.Path, "/ledger") && r.Method == http.MethodGet {
+			s.handleScanLedger(w, r)
+			return
+		}
+		// GET /api/scans/{id}/traffic — read-only raw HTTP exchange archive
+		// written by the traffic proxy (endpoint/method filtered, newest
+		// window), the packets the findings UI renders (scan_traffic.go).
+		if strings.HasSuffix(r.URL.Path, "/traffic") && r.Method == http.MethodGet {
+			s.handleScanTraffic(w, r)
+			return
+		}
 		s.handleGetScan(w, r)
 	})
 	// DELETE /api/data-dirs/{name} — delete one top-level Scan_Folder under
@@ -1361,7 +1539,6 @@ func (s *Server) Start() error {
 	mux.Handle("/uploads/logos/", http.StripPrefix("/uploads/logos/", http.FileServer(http.Dir(logosDir))))
 	mux.HandleFunc("/api/report/", s.handleDownloadReport)
 	mux.HandleFunc("/api/settings/rate-limit", s.handleRateLimit)
-	mux.HandleFunc("/api/settings/agentmail", s.handleAgentMailSettings)
 	mux.HandleFunc("/api/settings/llm", s.handleLLMSettings)
 	mux.HandleFunc("/api/settings/llm/keys", s.handleProviderKeys)
 	mux.HandleFunc("/api/settings/llm/test-route", s.handleTestRoute)
@@ -1380,25 +1557,27 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/stop-notify", s.handleStopNotify)
 	mux.HandleFunc("/api/instances", s.handleInstances)
 	mux.HandleFunc("/api/instances/", s.handleInstanceAction)
+	// Chat page (docs/CHAT_PAGE_REDESIGN.md): conversation transcript and
+	// sidebar metadata. Separate prefix so instance lifecycle actions stay put.
+	mux.HandleFunc("/api/conversations/", s.handleConversationDetail)
 
-	// R1 platform routes (projects/tasks/runs). Same middleware stack as the
-	// rest of /api/* (auth + CSRF + rate limit) via the outer wrappers below.
-	mux.HandleFunc("/api/projects", s.handleProjects)
-	mux.HandleFunc("/api/projects/", s.handleProjectDetail)
-	mux.HandleFunc("/api/tasks/", s.handleTaskDetail)
-
-	// R2a HITL approval routes (REDESIGN §5, API_CONTRACT §3). Decision
-	// endpoints are state-changing and ride the same CSRF middleware as
-	// every other POST.
-	mux.HandleFunc("/api/approvals", s.handleApprovals)
-	mux.HandleFunc("/api/approvals/", s.handleApprovalDetail)
+	// R1 platform + R2a HITL approval routes (REDESIGN §5, API_CONTRACT §3).
+	// Registered through one helper so route-level tests mount exactly the
+	// same patterns the dashboard serves (see TestApprovalsSummaryRoute).
+	registerPlatformAPIRoutes(mux, s)
 
 	mux.HandleFunc("/api/chat", s.handleChat)
 
-	// Auth routes (these are public — authMiddleware skips them)
+	// Auth routes. login/status/setup are public (authMiddleware skips
+	// them); logout/password require any authenticated role; /api/users is
+	// admin-only via RBAC (auth_rbac.go).
 	mux.HandleFunc("/api/auth/login", s.handleLogin)
 	mux.HandleFunc("/api/auth/logout", s.handleLogout)
 	mux.HandleFunc("/api/auth/status", s.handleAuthStatus)
+	mux.HandleFunc("/api/auth/setup", s.handleAuthSetup)
+	mux.HandleFunc("/api/auth/password", s.handleAuthPassword)
+	mux.HandleFunc("/api/users", s.handleUsers)
+	mux.HandleFunc("/api/users/", s.handleUserDetail)
 
 	// ── Provider catalog + auth profile routes (Wave E task 5.4) ──
 	//
@@ -1490,7 +1669,7 @@ func (s *Server) Start() error {
 	})
 
 	// Wrap with auth middleware (outermost) then rate limiting
-	authMw := authMiddleware(s.cfg)
+	authMw := authMiddleware(s)
 	rlMiddleware := rateLimitMiddleware(s.rateLimiter)
 
 	// Bind to a specific interface. Default is 127.0.0.1 (loopback) so a
@@ -1504,7 +1683,7 @@ func (s *Server) Start() error {
 		bindAddr = "127.0.0.1"
 	}
 	isLoopback := bindAddr == "127.0.0.1" || bindAddr == "::1" || bindAddr == "localhost"
-	if !isLoopback && !authConfigured(s.cfg) {
+	if !isLoopback && !s.authConfigured() {
 		return fmt.Errorf(
 			"refusing to bind to non-loopback address %q without auth: set XALGORIX_USERNAME and either XALGORIX_PASSWORD_HASH (bcrypt) or XALGORIX_PASSWORD in ~/.xalgorix.env (dashboard), or XALGORIX_API_TOKEN (machine-to-machine API access), or set XALGORIX_BIND=127.0.0.1",
 			bindAddr,
@@ -1518,17 +1697,23 @@ func (s *Server) Start() error {
 	}
 	log.Printf("Scan data → %s", s.dataDir)
 	log.Printf("Rate limiting: %d requests/%ds per IP", s.cfg.RateLimitRequests, s.cfg.RateLimitWindow)
-	if authConfigured(s.cfg) {
-		authMode := "plaintext"
-		if s.cfg.PasswordHash != "" {
-			authMode = "bcrypt"
+	if s.authConfigured() {
+		users := 0
+		admins := 0
+		if s.authUsers != nil {
+			for _, u := range s.authUsers.list() {
+				users++
+				if u.Role == RoleAdmin && !u.Disabled {
+					admins++
+				}
+			}
 		}
-		log.Printf("Authentication enabled (user: %s, password: %s)", s.cfg.Username, authMode)
+		log.Printf("Authentication enabled (accounts: %d, enabled admins: %d)", users, admins)
 		if n := len(apiTokenHashes(s.cfg.APITokens)); n > 0 {
 			log.Printf("Machine API tokens: %d configured (XALGORIX_API_TOKEN(S))", n)
 		}
 	} else {
-		log.Printf("Authentication disabled — listening on loopback only. Set XALGORIX_USERNAME and XALGORIX_PASSWORD_HASH in ~/.xalgorix.env to enable.")
+		log.Printf("Authentication disabled — listening on loopback only. Create the first admin via /login or set XALGORIX_USERNAME and XALGORIX_PASSWORD_HASH in ~/.xalgorix.env to enable.")
 	}
 
 	// ── Auto-resume interrupted scan queue after short startup delay ──
@@ -3335,7 +3520,14 @@ type scanSession struct {
 	scanContext         string               // per-scan attack-surface context path (single-path compatibility)
 	scanContextPaths    []string             // task-level + request-level context paths (see ScanRequest.ScanContextPaths)
 	codeScanMode        agent.CodeScanMode   // code-first scan mode (see ScanRequest.CodeScan)
-	allowLoopbackPorts  []int                // per-scan loopback allowlist for provision scans (scope-guard exemption)
+	// objective is the operator-stated structured goal of this run
+	// (REDESIGN 3.1). It is intent for the loop: an independent prompt
+	// section plus a human-sourced InfoItem. It never changes what counts
+	// as a finding and never blocks the scan.
+	objective          *platform.Objective
+	objectiveProjectID string
+	objectiveTaskID    string
+	allowLoopbackPorts []int // per-scan loopback allowlist for provision scans (scope-guard exemption)
 
 	// llmClient, when non-nil, is a pre-built llm.Client carrying
 	// a per-scan endpoint resolver derived from the originating
@@ -3474,6 +3666,10 @@ func (sess *scanSession) cleanup() {
 			func() {
 				defer logRecover("cleanup.notes.cleanup")
 				notes.CleanupContext(sess.sctx.ID)
+			}()
+			func() {
+				defer logRecover("cleanup.intelligence.cleanup")
+				intelligence.CleanupContext(sess.sctx.ID)
 			}()
 		} else {
 			log.Printf("[wildcard] Skipping notes cleanup for discovery session %s (notes preserved for subdomain collection)", sess.sctx.ID)
@@ -3698,81 +3894,6 @@ func (s *Server) handleRateLimit(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func maskAgentMailKey(apiKey string) string {
-	if len(apiKey) > 8 {
-		return "****" + apiKey[len(apiKey)-8:]
-	}
-	if apiKey != "" {
-		return "****"
-	}
-	return ""
-}
-
-func isMaskedAgentMailKey(apiKey string) bool {
-	apiKey = strings.TrimSpace(apiKey)
-	return strings.HasPrefix(apiKey, "****") || strings.Contains(apiKey, "••••")
-}
-
-// handleAgentMailSettings handles GET and POST for AgentMail settings.
-func (s *Server) handleAgentMailSettings(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	cfg := s.configSnapshot()
-
-	switch r.Method {
-	case "GET":
-		// Return current AgentMail settings (without exposing the full API key)
-		pod, apiKey := "", ""
-		if cfg != nil {
-			pod, apiKey = cfg.AgentMailPod, cfg.AgentMailAPIKey
-		}
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"pod":       pod,
-			"apiKey":    maskAgentMailKey(apiKey),
-			"hasApiKey": apiKey != "",
-		})
-
-	case "POST":
-		// Update AgentMail settings
-		var req struct {
-			Pod    string `json:"pod"`
-			APIKey string `json:"apiKey"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "invalid request", http.StatusBadRequest)
-			return
-		}
-
-		preserveKey := strings.TrimSpace(req.APIKey) == "" || isMaskedAgentMailKey(req.APIKey)
-		effectiveAPIKey := req.APIKey
-		if preserveKey {
-			if current := s.configSnapshot(); current != nil {
-				effectiveAPIKey = current.AgentMailAPIKey
-			}
-		}
-
-		updates := map[string]string{"AGENTMAIL_POD": req.Pod}
-		if !preserveKey {
-			updates["AGENTMAIL_API_KEY"] = effectiveAPIKey
-		}
-		if _, err := s.applyEnvironmentUpdates(updates); err != nil {
-			log.Printf("Failed to save AgentMail settings: %v", err)
-			http.Error(w, "failed to save AgentMail settings", http.StatusInternalServerError)
-			return
-		}
-
-		log.Printf("AgentMail settings updated: pod=%s", req.Pod)
-
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"pod":       req.Pod,
-			"apiKey":    maskAgentMailKey(effectiveAPIKey),
-			"hasApiKey": effectiveAPIKey != "",
-		})
-
-	default:
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-	}
-}
-
 // handleVersion returns the current Xalgorix version
 func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
@@ -3935,6 +4056,7 @@ func (s *Server) handleGetScan(w http.ResponseWriter, r *http.Request) {
 		finalizeEventsMeta(rec)
 		s.markDiscordWebhookConfigured(rec)
 		s.markTelegramConfigured(rec)
+		s.attachRunLinkage(rec)
 		data, _ := json.Marshal(rec)
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(data)
@@ -4052,6 +4174,7 @@ func (s *Server) handleGetScan(w http.ResponseWriter, r *http.Request) {
 					finalizeEventsMeta(persisted)
 					s.markDiscordWebhookConfigured(persisted)
 					s.markTelegramConfigured(persisted)
+					s.attachRunLinkage(persisted)
 					data, _ := json.Marshal(persisted)
 					w.Header().Set("Content-Type", "application/json")
 					w.Write(data)
@@ -4063,6 +4186,7 @@ func (s *Server) handleGetScan(w http.ResponseWriter, r *http.Request) {
 			finalizeEventsMeta(rec)
 			s.markDiscordWebhookConfigured(rec)
 			s.markTelegramConfigured(rec)
+			s.attachRunLinkage(rec)
 			data, _ := json.Marshal(rec)
 			w.Header().Set("Content-Type", "application/json")
 			w.Write(data)
@@ -4087,6 +4211,7 @@ func (s *Server) handleGetScan(w http.ResponseWriter, r *http.Request) {
 	finalizeEventsMeta(rec)
 	s.markDiscordWebhookConfigured(rec)
 	s.markTelegramConfigured(rec)
+	s.attachRunLinkage(rec)
 	data, _ := json.Marshal(rec)
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(data)

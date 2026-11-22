@@ -223,7 +223,9 @@ func (s *Server) decideApproval(ctx context.Context, store platform.Repository, 
 	if err != nil {
 		return nil, err
 	}
-	s.broadcastToInstance(row.InstanceID, WSEvent{Type: "approval_decided", Approval: row})
+	decided := WSEvent{Type: "approval_decided", Approval: row}
+	s.broadcastToInstance(row.InstanceID, decided)
+	s.appendConversationEvent(row.InstanceID, decided)
 	return row, nil
 }
 
@@ -322,12 +324,17 @@ func (s *Server) handleTaskGuidance(w http.ResponseWriter, r *http.Request, stor
 			canInject = s.instanceCanReceiveGuidance(instanceID)
 		}
 
+		createdBy := ""
+		if claims, ok := sessionClaimsFrom(r); ok {
+			createdBy = claims.Username
+		}
 		g, created, err := store.CreateGuidance(r.Context(), platform.GuidanceInput{
 			TaskID:     taskID,
 			RunID:      runID,
 			InstanceID: instanceID,
 			Message:    req.Message,
 			RequestID:  req.RequestID,
+			CreatedBy:  createdBy,
 		})
 		if err != nil {
 			writePlatformError(w, err)
@@ -344,6 +351,10 @@ func (s *Server) handleTaskGuidance(w http.ResponseWriter, r *http.Request, stor
 			return
 		}
 
+		// First human turn names the conversation (4zreco chat semantics): the
+		// sidebar stops reading like a timestamped auto-mount.
+		s.maybeTitleFromGuidance(r.Context(), store, instanceID, g.Message)
+
 		status := platform.GuidanceQueued
 		if canInject {
 			// Path A: the stable gi:<id> marker (guidance_observer.go) makes
@@ -355,8 +366,8 @@ func (s *Server) handleTaskGuidance(w http.ResponseWriter, r *http.Request, stor
 					log.Printf("[platform] guidance %s flip to injected failed: %v", g.ID, uerr)
 					status = platform.GuidanceQueued
 				} else {
-					s.broadcastToInstance(instanceID, WSEvent{Type: "guidance_injected", Guidance: g, Content: "Operator guidance delivered to the running scan"})
 					g.Status = platform.GuidanceInjected
+					s.broadcastToInstance(instanceID, WSEvent{Type: "guidance_injected", Guidance: g, Content: "Operator guidance delivered to the running scan"})
 					s.watchGuidanceConsumption(instanceID, g.ID)
 				}
 			} else {

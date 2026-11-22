@@ -367,7 +367,43 @@ func (s *Server) launchDueSchedule(sch ScanSchedule) {
 		return
 	}
 
+	// One-shot guard (same rule as POST /api/tasks/{id}/runs): a task runs one
+	// execution at a time. If the previous run is still active, skip this
+	// cycle instead of stacking a concurrent run on the same goal — NextRun
+	// already advanced, so the schedule simply waits for the next tick.
+	if taskID != "" {
+		if store := s.currentPlatformStore(); store != nil {
+			guardCtx, guardCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if active, hasActive := s.taskActiveRun(guardCtx, store, taskID); hasActive {
+				guardCancel()
+				log.Printf("[SCHEDULER] schedule %s skipped: task %s already has an active run (%s)", sch.ID, taskID, active.InstanceID)
+				return
+			}
+			guardCancel()
+		}
+	}
+
 	req := scanRequestForSchedule(&sch)
+	// Objective coordinates (R-goal): a scheduled run rides its linked task's
+	// structured objective exactly like POST /api/tasks/{id}/runs, and carries
+	// the raw goal/instruction so round-0 analysis (goal_analysis.go) can
+	// structure an unstructured goal before the agent starts. Lookup failure
+	// only loses the objective, never the dispatch.
+	if taskID != "" {
+		if store := s.currentPlatformStore(); store != nil {
+			objCtx, objCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if task, err := store.GetTask(objCtx, taskID); err == nil {
+				req.Objective = task.Objective
+				req.ObjectiveProjectID = task.ProjectID
+				req.ObjectiveTaskID = task.ID
+				req.ObjectiveGoal = task.Goal
+				req.ObjectiveInstruction = task.Instruction
+			} else {
+				log.Printf("[SCHEDULER] schedule %s: task %s objective lookup: %v", sch.ID, taskID, err)
+			}
+			objCancel()
+		}
+	}
 	scanCfg := s.configSnapshot()
 	if scanCfg == nil {
 		log.Printf("[SCHEDULER] schedule %s skipped: config snapshot unavailable", sch.ID)
@@ -512,10 +548,18 @@ func (s *Server) dispatchScheduledScan(req ScanRequest, scanCfg *config.Config, 
 	if taskID != "" {
 		if store := s.currentPlatformStore(); store != nil {
 			mountCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			// Title the conversation after its task so the chat sidebar has
+			// something readable before the first human message arrives; a
+			// best-effort GetTask keeps the dispatch path unchanged on error.
+			title := ""
+			if task, getErr := store.GetTask(mountCtx, taskID); getErr == nil && task != nil {
+				title = conversationTitle(task.Name, time.Now())
+			}
 			_, err := store.CreateRun(mountCtx, taskID, platform.RunMount{
 				InstanceID: instanceID,
 				Mode:       sch.ScanMode,
 				Trigger:    trigger,
+				Title:      title,
 			})
 			cancel()
 			if err != nil {

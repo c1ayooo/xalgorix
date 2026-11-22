@@ -200,6 +200,28 @@ func (idx *scanSummaryIndex) activeRunCount(runs []platform.Run, isPending func(
 	return n
 }
 
+// taskActiveRun returns the task's first active run (running/pending/paused),
+// projected exactly like handleTaskRunList projects them: scan.json status via
+// the summary index, with the durable dispatch snapshot covering the window
+// before the scan.json registers. This is the one-shot guard for
+// POST /api/tasks/{id}/runs and the scheduler tick: a task with an active run
+// must not stack a second one.
+func (s *Server) taskActiveRun(ctx context.Context, store platform.Repository, taskID string) (platform.Run, bool) {
+	runs, _, err := store.ListRuns(ctx, taskID, 1, runProjectionPageSize)
+	if err != nil || len(runs) == 0 {
+		return platform.Run{}, false
+	}
+	idx := s.scanSummaryIndexFor(s.findAllScanSummaries())
+	idx.projectRuns(runs, s.pendingDispatchExists)
+	for i := range runs {
+		switch strings.ToLower(runs[i].Status) {
+		case "running", "pending", "paused":
+			return runs[i], true
+		}
+	}
+	return platform.Run{}, false
+}
+
 func (idx *scanSummaryIndex) runStatus(run *platform.Run, isPending func(instanceID string) bool) string {
 	if rec := idx.lookup(run.InstanceID, run.LegacyScanID); rec != nil {
 		return rec.Status
@@ -377,6 +399,14 @@ func (s *Server) handleProjectDetail(w http.ResponseWriter, r *http.Request) {
 		s.handleProjectTasks(w, r, store, projectID)
 		return
 	}
+	if len(parts) > 1 && parts[1] == "conversations" {
+		s.handleProjectConversations(w, r, store, projectID)
+		return
+	}
+	if len(parts) > 1 && parts[1] == "analyze-goal" {
+		s.handleAnalyzeGoal(w, r, store, projectID)
+		return
+	}
 	if len(parts) != 1 {
 		writeJSONStatus(w, http.StatusNotFound, map[string]string{"error": "not found"})
 		return
@@ -463,6 +493,7 @@ func (s *Server) handleProjectTasks(w http.ResponseWriter, r *http.Request, stor
 			PhasePolicy  *platform.PhasePolicy  `json:"phase_policy"`
 			Schedule     *platform.TaskSchedule `json:"schedule"`
 			ContextPaths []string               `json:"context_paths"`
+			Objective    *platform.Objective    `json:"objective"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 			writeJSONStatus(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
@@ -479,6 +510,7 @@ func (s *Server) handleProjectTasks(w http.ResponseWriter, r *http.Request, stor
 			PhasePolicy:  in.PhasePolicy,
 			Schedule:     in.Schedule,
 			ContextPaths: in.ContextPaths,
+			Objective:    in.Objective,
 		})
 		if err != nil {
 			writePlatformError(w, err)
@@ -498,7 +530,10 @@ type taskRequestBody struct {
 	PhasePolicy  *platform.PhasePolicy  `json:"phase_policy"`
 	Schedule     *platform.TaskSchedule `json:"schedule"`
 	ContextPaths []string               `json:"context_paths"`
-	Archived     *bool                  `json:"archived"`
+	// Objective is raw so the three states stay distinguishable: absent =
+	// leave as is, explicit null = clear, object = replace.
+	Objective json.RawMessage `json:"objective"`
+	Archived  *bool           `json:"archived"`
 }
 
 // handleTaskDetail serves /api/tasks/{id} (GET/PATCH/DELETE),
@@ -539,6 +574,23 @@ func (s *Server) handleTaskDetail(w http.ResponseWriter, r *http.Request) {
 			// into the next session briefing, or injected into a running agent.
 			s.handleTaskGuidance(w, r, store, taskID)
 			return
+		case "objective":
+			// Structured task goal + its honest evaluation (REDESIGN §3.1).
+			s.handleTaskObjective(w, r, store, taskID)
+			return
+		case "intelligence":
+			// 情报 tab: task-level intel aggregation + operator triage
+			// (handlers_task_intelligence.go).
+			if len(parts) > 2 {
+				s.handleIntelTriage(w, r, store, taskID, parts[2])
+				return
+			}
+			if r.Method != http.MethodGet {
+				writeJSONStatus(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+				return
+			}
+			s.handleTaskIntelligence(w, r, store, taskID)
+			return
 		default:
 			writeJSONStatus(w, http.StatusNotFound, map[string]string{"error": "not found"})
 			return
@@ -562,7 +614,7 @@ func (s *Server) handleTaskDetail(w http.ResponseWriter, r *http.Request) {
 			writeJSONStatus(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 			return
 		}
-		task, err := store.UpdateTask(r.Context(), taskID, platform.TaskUpdate{
+		upd := platform.TaskUpdate{
 			Name:         req.Name,
 			Goal:         req.Goal,
 			Instruction:  req.Instruction,
@@ -570,7 +622,20 @@ func (s *Server) handleTaskDetail(w http.ResponseWriter, r *http.Request) {
 			Schedule:     req.Schedule,
 			ContextPaths: req.ContextPaths,
 			Archived:     req.Archived,
-		})
+		}
+		if len(req.Objective) > 0 {
+			if strings.TrimSpace(string(req.Objective)) == "null" {
+				upd.ClearObjective = true
+			} else {
+				var obj platform.Objective
+				if err := json.Unmarshal(req.Objective, &obj); err != nil {
+					writeJSONStatus(w, http.StatusBadRequest, map[string]string{"error": "objective must be an object or null"})
+					return
+				}
+				upd.Objective = &obj
+			}
+		}
+		task, err := store.UpdateTask(r.Context(), taskID, upd)
 		if err != nil {
 			writePlatformError(w, err)
 			return
@@ -600,6 +665,10 @@ func (s *Server) handleTaskRunList(w http.ResponseWriter, r *http.Request, store
 	}
 	idx := s.scanSummaryIndexFor(s.findAllScanSummaries())
 	idx.projectRuns(runs, s.pendingDispatchExists)
+	// Backfill titles for runs mounted before conversation metadata existed
+	// (migration 0011 leaves them empty). One write per run, then the sidebar
+	// has something readable; a rename or the first human message wins later.
+	s.backfillRunTitles(r.Context(), store, taskID, runs)
 	writeJSONStatus(w, http.StatusOK, map[string]any{
 		"items": runs,
 		"total": total,
@@ -640,6 +709,20 @@ func (s *Server) handleTaskRunStart(w http.ResponseWriter, r *http.Request, stor
 	}
 	if project.ArchivedAt != nil {
 		writeJSONStatus(w, http.StatusConflict, map[string]string{"error": "project is archived"})
+		return
+	}
+
+	// One-shot guard: a task runs one execution at a time. While a run is
+	// active (pending/running/paused), refuse instead of stacking a second
+	// concurrent run on the same goal — the operator drives continuation by
+	// finishing/pausing the current run (or adding a new goal afterwards).
+	// The 409 carries the active run identity so callers can re-attach to it.
+	if active, hasActive := s.taskActiveRun(r.Context(), store, task.ID); hasActive {
+		writeJSONStatus(w, http.StatusConflict, map[string]string{
+			"error":       "task already has an active run (pending/running/paused); stop or resume it before starting another",
+			"run_id":      active.ID,
+			"instance_id": active.InstanceID,
+		})
 		return
 	}
 
@@ -691,6 +774,19 @@ func (s *Server) handleTaskRunStart(w http.ResponseWriter, r *http.Request, stor
 	req.ScanIntensity = firstNonEmptyString(override.ScanIntensity, policyIntensity(policy))
 	req.Name = firstNonEmptyString(override.Name, task.Name)
 	req.SaveOnly = false // a run always dispatches; save-only stays a /api/scan concept
+	// The structured objective of the task rides along with the run: it is
+	// operator intent for the loop (an independent prompt section, a
+	// human-sourced InfoItem, and the criteria the evaluator observes later).
+	// It never widens the authorized scope and never changes what counts as
+	// a finding.
+	req.Objective = task.Objective
+	req.ObjectiveProjectID = project.ID
+	req.ObjectiveTaskID = task.ID
+	// Round-0 raw material (R-goal): when the task carries no structured
+	// objective, the dispatch goroutine analyzes the raw goal before the
+	// agent starts (goal_analysis.go roundZeroGoalAnalysis).
+	req.ObjectiveGoal = task.Goal
+	req.ObjectiveInstruction = task.Instruction
 	// Task context_paths are the Context half of the Task model. They are
 	// additive with an explicit request scan_context and all enter the seeded
 	// attack surface (never silently reduced to the first path).
@@ -804,6 +900,7 @@ func (s *Server) handleTaskRunStart(w http.ResponseWriter, r *http.Request, stor
 		InstanceID: instanceID,
 		Mode:       req.ScanMode,
 		Trigger:    "manual",
+		Title:      conversationTitle(task.Name, time.Now()),
 	})
 	mountCancel()
 	if mountErr != nil {

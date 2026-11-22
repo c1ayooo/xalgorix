@@ -2,17 +2,17 @@ package web
 
 // approvals_gate.go — the HITL approval gate service (REDESIGN §5 / D5, R2a).
 //
-// The registry-level seam lives in internal/tools (ApprovalGate, consulted
-// as the last step of Execute — after the circuit breaker, tool lookup and
-// required-parameter validation, immediately before tool.Execute, so a
-// breaker-OPEN or malformed call never burns an approval slot); this file
-// owns everything that needs the web layer: the platform store, per-instance
-// slot accounting, WS broadcasting and the deadline/cancellation
-// bookkeeping.
+// Production scans enter through the Eino interrupt/resume broker: the tool
+// wrapper creates a pending row, returns an ADK interrupt, and Runner.Resume
+// delivers the decision. This file owns everything that needs the web layer:
+// the platform store, per-instance slot accounting, WS broadcasting and the
+// deadline/cancellation bookkeeping. The lower-level tools.Registry gate
+// remains available to direct registry consumers but is not installed by
+// scan_session.
 //
 // Lifecycle of one regulated call:
 //
-//	registry.Execute → gate.BeforeExecute (adapter bound to instance+sctx)
+//	Eino ApprovalTool → broker.RequestApproval
 //	  → Policy.Evaluate (internal/approval; mode=off short-circuits before
 //	    any classification and the gate is not even installed)
 //	  → Require → Submit: wait for a pending slot (max_pending per run,
@@ -35,8 +35,8 @@ package web
 // PostgreSQL must fail the gate open (charter §6.1 — scanning never depends
 // on the platform), not park the tool call.
 //
-// Known interaction with the agent's own tool ceilings (executeToolAsync's
-// toolWaitContext = hardTimeoutFor(tool)+30s): the configured approval
+// Known interaction with the runtime's own tool ceilings
+// (RegistryTool hardTimeoutFor(tool)+30s): the configured approval
 // timeout must stay below that ceiling or the tool hard-timeout fires first
 // and the approval verdict arrives too late to matter. newApprovalService
 // warns at startup; the row is still closed by its own deadline timer, so
@@ -54,7 +54,6 @@ import (
 	"github.com/xalgord/xalgorix/v4/internal/approval"
 	"github.com/xalgord/xalgorix/v4/internal/platform"
 	"github.com/xalgord/xalgorix/v4/internal/scanctx"
-	"github.com/xalgord/xalgorix/v4/internal/tools"
 )
 
 // maxApprovalBodyBytes caps the stored body excerpt (API_CONTRACT §3
@@ -176,19 +175,6 @@ func splitAllowlist(raw string) []string {
 	return out
 }
 
-// approvalGateFor returns the registry gate bound to one scan instance, or
-// nil when the pipeline is disabled (service absent / mode off / no store).
-// nil keeps the registry on its byte-identical legacy path. The caller binds
-// the agent's secret registry via BindSecrets after agent construction
-// (HIGH-1 by-value redaction).
-func (s *Server) approvalGateFor(instanceID string, sctx *scanctx.ScanContext) *registryGate {
-	svc := s.approvalService()
-	if svc == nil || svc.policy.Mode != approval.ModeEnforce {
-		return nil
-	}
-	return &registryGate{svc: svc, instanceID: instanceID, sctx: sctx}
-}
-
 func (s *Server) approvalService() *ApprovalService {
 	s.approvalSvcMu.RLock()
 	defer s.approvalSvcMu.RUnlock()
@@ -196,56 +182,15 @@ func (s *Server) approvalService() *ApprovalService {
 }
 
 // SetApprovalService wires the gate service (constructed by NewServer; tests
-// may replace it). nil disables the pipeline.
+// may replace it). nil disables the pipeline. The trafficproxy hook is
+// re-installed so it always wraps the CURRENT service — a mode flip between
+// enforce/off must never leave a stale adapter pointing at a retired
+// service.
 func (s *Server) SetApprovalService(svc *ApprovalService) {
 	s.approvalSvcMu.Lock()
 	s.approvalSvc = svc
 	s.approvalSvcMu.Unlock()
 	s.installProxyHighRiskGate()
-}
-
-// registryGate binds the service to one scan session (installed per registry
-// via agent.WithApprovalGate in scan_session.go; the verifier's registry is
-// deliberately NOT gated — see verifier.go). Pointer receivers: BindSecrets
-// mutates the gate stored in the registry.
-type registryGate struct {
-	svc        *ApprovalService
-	instanceID string
-	sctx       *scanctx.ScanContext
-	// secrets exposes the agent's operator-credential registry (HIGH-1);
-	// bound after agent construction, read at gate time because the values
-	// register during Run's prepareScanEnvironment.
-	secrets func() []string
-}
-
-// BindSecrets wires the agent's secret-value registry into the gate. Called
-// from scan_session.go right after agent.NewAgent.
-func (g *registryGate) BindSecrets(fn func() []string) {
-	g.secrets = fn
-}
-
-// secretValues returns the bound snapshot (nil-safe: unbound gates skip
-// by-value redaction — same posture as before HIGH-1, name masking remains).
-func (g *registryGate) secretValues() []string {
-	if g.secrets == nil {
-		return nil
-	}
-	return g.secrets()
-}
-
-// BeforeExecute implements tools.ApprovalGate. It never returns an error: a
-// verdict is an expected, operator-facing outcome (see approval_gate.go in
-// internal/tools for the contract).
-func (g *registryGate) BeforeExecute(req tools.ApprovalRequest) tools.ApprovalVerdict {
-	verdict := g.svc.policy.Evaluate(req.ToolName, req.Args)
-	if verdict.Decision == approval.Allow {
-		return tools.ApprovalVerdict{Allowed: true}
-	}
-	outcome := g.svc.submit(g.instanceID, g.sctx, verdict, g.secretValues())
-	if outcome.Approved {
-		return tools.ApprovalVerdict{Allowed: true}
-	}
-	return tools.ApprovalVerdict{Allowed: false, Output: approvalDenialMessage(outcome)}
 }
 
 // submitOutcome is the gate service's answer to one regulated call.
@@ -283,11 +228,13 @@ func (s *ApprovalService) createPendingRow(instanceID string, sctx *scanctx.Scan
 		s.releaseSlot(instanceID) // the reserved slot was never bound to a row
 		return nil, fmt.Errorf("create approval: %w", err)
 	}
-	s.srv.broadcastToInstance(instanceID, WSEvent{
+	requested := WSEvent{
 		Type:     "approval_requested",
 		Content:  fmt.Sprintf("Approval required: %s", verdict.Reason),
 		Approval: row,
-	})
+	}
+	s.srv.broadcastToInstance(instanceID, requested)
+	s.srv.appendConversationEvent(instanceID, requested)
 	return row, nil
 }
 
@@ -396,11 +343,13 @@ func (s *ApprovalService) submit(instanceID string, sctx *scanctx.ScanContext, v
 		s.mu.Unlock()
 	}()
 
-	s.srv.broadcastToInstance(instanceID, WSEvent{
+	requested := WSEvent{
 		Type:     "approval_requested",
 		Content:  fmt.Sprintf("Approval required: %s", verdict.Reason),
 		Approval: row,
-	})
+	}
+	s.srv.broadcastToInstance(instanceID, requested)
+	s.srv.appendConversationEvent(instanceID, requested)
 
 	wait := time.Until(row.DeadlineAt)
 	if wait <= 0 {
@@ -482,11 +431,13 @@ func (s *ApprovalService) finalize(row *platform.Approval, dec platform.Approval
 	}
 	s.releaseSlot(final.InstanceID)
 	s.deliverVerdict(final.ID, *final)
-	s.srv.broadcastToInstance(final.InstanceID, WSEvent{
+	decided := WSEvent{
 		Type:     "approval_decided",
 		Content:  fmt.Sprintf("Approval %s: %s", final.Status, final.Kind),
 		Approval: final,
-	})
+	}
+	s.srv.broadcastToInstance(final.InstanceID, decided)
+	s.srv.appendConversationEvent(final.InstanceID, decided)
 	return final, nil
 }
 
@@ -616,6 +567,83 @@ func (s *ApprovalService) resolveOwnership(ctx context.Context, store platform.R
 		return project.ID, taskID, runID
 	}
 	return "", taskID, runID
+}
+
+// ── operator allow rules ("approve & remember", REDESIGN §5.2, contract §3.2) ─
+
+// matchRule consults the operator-authored allow rules for a Require verdict.
+// Both gate layers call it (einoApprovalBroker for the command gate,
+// proxyHighRiskGate for the wire gate), so one remembered decision exempts
+// the same intent at either layer. Failure posture: nil store, empty project,
+// and store errors all return nil — a failed rule read must NEVER auto-allow,
+// it only falls back to the normal approval flow. Expired rules do not match
+// (expiry is match-time; the row stays listed for the operator to see).
+// A hit increments the rule's counters (best effort) and broadcasts
+// approval_rule_hit — the audit projection of "why no approval row exists
+// for this call"; the approvals table remains the state authority for rows
+// that DO pend.
+func (s *ApprovalService) matchRule(instanceID string, verdict approval.Verdict) *platform.ApprovalRule {
+	store := s.srv.currentPlatformStore()
+	if store == nil {
+		return nil
+	}
+	if verdict.Kind != approval.KindCommand && verdict.Kind != approval.KindHTTP {
+		return nil
+	}
+	ctx, cancel := storeCtx()
+	defer cancel()
+	projectID, _, _ := s.resolveOwnership(ctx, store, instanceID)
+	if projectID == "" {
+		return nil
+	}
+	rules, err := store.ListApprovalRules(ctx, platform.ApprovalRuleFilter{ProjectID: projectID, Kind: verdict.Kind})
+	if err != nil {
+		log.Printf("[approval] rule consult for run %s failed: %v — falling back to approval", instanceID, err)
+		return nil
+	}
+	now := time.Now()
+	for i := range rules {
+		r := &rules[i]
+		if r.ExpiresAt != nil && !now.Before(*r.ExpiresAt) {
+			continue
+		}
+		switch verdict.Kind {
+		case approval.KindCommand:
+			if !s.policy.MatchCommandRule(verdict.Command, r.Match.Program, r.Match.Contains) {
+				continue
+			}
+		case approval.KindHTTP:
+			if !approval.MatchHTTPRule(verdict.Method, verdict.URL, verdict.Body, r.Match.Method, r.Match.Host, r.Match.PathPrefix, r.Match.Contains) {
+				continue
+			}
+		}
+		if err := store.RecordApprovalRuleHit(ctx, r.ID); err != nil {
+			log.Printf("[approval] rule hit bookkeeping for %s: %v", r.ID, err)
+		}
+		s.srv.broadcastToInstance(instanceID, WSEvent{
+			Type:    "approval_rule_hit",
+			Content: fmt.Sprintf("Approval rule matched — %s allowed without an approval row (%s)", ruleDisplayText(r), r.ID),
+			Rule:    r,
+		})
+		return r
+	}
+	return nil
+}
+
+// ruleDisplayText renders a rule's matching coordinates for the event feed
+// (machine data stays mono in the UI).
+func ruleDisplayText(r *platform.ApprovalRule) string {
+	if r.Kind == platform.ApprovalKindHTTP {
+		path := strings.Trim(r.Match.PathPrefix, "/")
+		if path != "" {
+			path = "/" + path
+		}
+		return fmt.Sprintf("%s %s%s", strings.ToUpper(r.Match.Method), r.Match.Host, path)
+	}
+	if r.Match.Contains != "" {
+		return fmt.Sprintf("%s ~%s", r.Match.Program, r.Match.Contains)
+	}
+	return r.Match.Program
 }
 
 // ── slot accounting ──────────────────────────────────────────────────────────
