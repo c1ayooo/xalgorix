@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/xalgord/xalgorix/v4/internal/resources"
 	"github.com/xalgord/xalgorix/v4/internal/scanctx"
 )
 
@@ -429,5 +430,161 @@ func TestIsBlockedCommand_CredentialFile(t *testing.T) {
 	// Fetching a target's own /.env is a legitimate web check and must not trip.
 	if reason := isBlockedCommand("curl -s https://target.example.com/.env"); reason != "" {
 		t.Errorf("isBlockedCommand blocked a benign target .env fetch: %s", reason)
+	}
+}
+
+func withPythonMemLimit(t *testing.T, limitBytes int64) {
+	t.Helper()
+	old := resources.PythonMemLimitBytes
+	resources.PythonMemLimitBytes = limitBytes
+	t.Cleanup(func() { resources.PythonMemLimitBytes = old })
+}
+
+func TestPrepareRequestRateRuntimeAppliesPythonGuardWithoutRatePolicy(t *testing.T) {
+	withPythonMemLimit(t, 256<<20)
+
+	rt, err := prepareRequestRateRuntime(t.TempDir(), scanctx.RequestRatePolicy{})
+	if err != nil {
+		t.Fatalf("prepareRequestRateRuntime: %v", err)
+	}
+	if rt.PythonPath == "" {
+		t.Fatal("memory guard did not produce a PYTHONPATH directory")
+	}
+	if rt.DelayMS != 0 {
+		t.Fatalf("DelayMS = %d, want 0 without a rate policy", rt.DelayMS)
+	}
+	if rt.BinDir != "" {
+		t.Fatalf("BinDir = %q, want empty without a rate policy", rt.BinDir)
+	}
+
+	data, err := os.ReadFile(filepath.Join(rt.PythonPath, "sitecustomize.py"))
+	if err != nil {
+		t.Fatalf("sitecustomize.py missing: %v", err)
+	}
+	if !strings.Contains(string(data), "_XALGORIX_MEM_LIMIT_BYTES = 268435456") {
+		t.Fatalf("guard does not carry the configured ceiling:\n%s", data)
+	}
+	if !strings.Contains(string(data), "resource.setrlimit(resource.RLIMIT_AS") {
+		t.Fatalf("guard does not set RLIMIT_AS:\n%s", data)
+	}
+
+	env := commandEnv("/home/tester", "/home/tester/go", "/tmp/work", rt)
+	if !strings.Contains(strings.Join(env, "\n"), "PYTHONPATH="+rt.PythonPath) {
+		t.Fatalf("PYTHONPATH missing guard directory: %v", env)
+	}
+}
+
+func TestPrepareRequestRateRuntimeOmitsPythonGuardWhenDisabled(t *testing.T) {
+	withPythonMemLimit(t, 0)
+
+	rt, err := prepareRequestRateRuntime(t.TempDir(), scanctx.RequestRatePolicy{})
+	if err != nil {
+		t.Fatalf("prepareRequestRateRuntime: %v", err)
+	}
+	if rt != (requestRateRuntime{}) {
+		t.Fatalf("disabled guard returned runtime %+v, want zero value", rt)
+	}
+}
+
+func TestPrepareRequestRateRuntimeKeepsRateLimiterWithGuardDisabled(t *testing.T) {
+	withPythonMemLimit(t, 0)
+
+	workDir := t.TempDir()
+	rt, err := prepareRequestRateRuntime(workDir, scanctx.RequestRatePolicy{MaxRPS: 3, Source: "test"})
+	if err != nil {
+		t.Fatalf("prepareRequestRateRuntime: %v", err)
+	}
+	if rt.DelayMS != 334 || rt.BinDir == "" {
+		t.Fatalf("rate runtime regressed: %+v", rt)
+	}
+	data, err := os.ReadFile(filepath.Join(rt.PythonPath, "sitecustomize.py"))
+	if err != nil {
+		t.Fatalf("sitecustomize.py missing: %v", err)
+	}
+	if !strings.Contains(string(data), "_XALGORIX_MEM_LIMIT_BYTES = 0") {
+		t.Fatalf("disabled guard should bake 0, got:\n%s", data)
+	}
+}
+
+func TestPythonGuardEnforcesMemoryLimitAtStartup(t *testing.T) {
+	pythonBin := ""
+	for _, name := range []string{"python3", "python"} {
+		if p, err := exec.LookPath(name); err == nil {
+			pythonBin = p
+			break
+		}
+	}
+	if pythonBin == "" {
+		t.Skip("python is not installed")
+	}
+
+	withPythonMemLimit(t, 256<<20)
+	guardDir, err := PreparePythonMemoryGuard(t.TempDir())
+	if err != nil || guardDir == "" {
+		t.Fatalf("PreparePythonMemoryGuard = %q, %v", guardDir, err)
+	}
+
+	// A small script must still run under the ceiling.
+	baseEnv := make([]string, 0, len(os.Environ())+1)
+	for _, kv := range os.Environ() {
+		if !strings.HasPrefix(kv, "PYTHONPATH=") {
+			baseEnv = append(baseEnv, kv)
+		}
+	}
+	baseEnv = append(baseEnv, "PYTHONPATH="+guardDir)
+
+	okCmd := exec.Command(pythonBin, "-c", "print('guard-ok')")
+	okCmd.Env = baseEnv
+	if out, err := okCmd.CombinedOutput(); err != nil || !strings.Contains(string(out), "guard-ok") {
+		t.Fatalf("guarded small script failed: %v\n%s", err, out)
+	}
+
+	// Allocating above the ceiling must fail in the interpreter, not at the
+	// kernel OOM killer. 512 MiB > 256 MiB ceiling.
+	hogCmd := exec.Command(pythonBin, "-c", "a = bytearray(512 * 1024 * 1024); print('allocated')")
+	hogCmd.Env = baseEnv
+	out, err := hogCmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("allocation above the ceiling succeeded: %s", out)
+	}
+	if !strings.Contains(string(out), "MemoryError") {
+		t.Fatalf("expected MemoryError, got err=%v output=%s", err, out)
+	}
+}
+
+func TestRunShellAppliesPythonMemoryGuardEndToEnd(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash is not available")
+	}
+	pythonBin := ""
+	for _, name := range []string{"python3", "python"} {
+		if _, err := exec.LookPath(name); err == nil {
+			pythonBin = name
+			break
+		}
+	}
+	if pythonBin == "" {
+		t.Skip("python is not installed")
+	}
+
+	withPythonMemLimit(t, 256<<20)
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	sc := scanctx.New("term-python-guard", t.TempDir())
+	sc.Terminal.SetWorkDir(sc.ScanDir)
+	scanctx.Activate(sc)
+	defer func() {
+		CleanupContext(sc.ID)
+		scanctx.Deactivate(sc.ID)
+	}()
+
+	command := pythonBin + ` -c 'import resource; print("AS_LIMIT=%d" % resource.getrlimit(resource.RLIMIT_AS)[0])'`
+	out, code := runShellInternal(sc.ID, command)
+	if code != 0 {
+		t.Fatalf("runShellInternal exit=%d output=%q", code, out)
+	}
+	if !strings.Contains(out, "AS_LIMIT=268435456") {
+		t.Fatalf("terminal python did not inherit the 256MB guard: %q", out)
 	}
 }

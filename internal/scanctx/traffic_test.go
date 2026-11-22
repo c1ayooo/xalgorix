@@ -89,3 +89,38 @@ func TestTrafficArchiveAppendReadMatch(t *testing.T) {
 		t.Fatalf("no-match total = %d", total)
 	}
 }
+
+// TestTrafficHostBinding covers the asset join key: HostOf strips the port and
+// lowercases, and FilterTrafficExchangesWith pins traffic to one host so a
+// finding's evidence cannot pick up packets from another asset.
+func TestTrafficHostBinding(t *testing.T) {
+	all := []TrafficExchange{
+		{Seq: 1, Method: "GET", URL: "https://App.Example:8443/api/users"},
+		{Seq: 2, Method: "GET", URL: "https://api.example/login"},
+		{Seq: 3, Method: "GET", URL: "not a url"},
+	}
+	if got := HostOf(all[0]); got != "app.example" {
+		t.Fatalf("HostOf(port) = %q, want app.example", got)
+	}
+	if got := HostOf(all[2]); got != "" {
+		t.Fatalf("HostOf(unparseable) = %q, want empty", got)
+	}
+
+	matched, total := FilterTrafficExchangesWith(all, TrafficQuery{Host: "APP.example", Limit: 10})
+	if total != 1 || len(matched) != 1 || matched[0].Seq != 1 {
+		t.Fatalf("host match: total=%d got=%+v", total, matched)
+	}
+	matched, total = FilterTrafficExchangesWith(all, TrafficQuery{Host: "example", Limit: 10})
+	if total != 0 || len(matched) != 0 {
+		t.Fatalf("host match must be exact, not suffix: total=%d got=%+v", total, matched)
+	}
+	// Host + endpoint compose: same host, different path → no evidence.
+	matched, total = FilterTrafficExchangesWith(all, TrafficQuery{
+		Host:     "app.example",
+		Endpoint: "/login",
+		Limit:    10,
+	})
+	if total != 0 || len(matched) != 0 {
+		t.Fatalf("host+endpoint should not match across assets: total=%d got=%+v", total, matched)
+	}
+}

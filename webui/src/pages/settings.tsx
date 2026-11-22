@@ -151,6 +151,10 @@ export default function SettingsPage() {
     dingtalkMinSeverity: "",
     feishuWebhook: "",
     feishuSecret: "",
+    feishuAppId: "",
+    feishuAppSecret: "",
+    feishuReceiveId: "",
+    feishuReceiveIdType: "open_id",
     feishuMinSeverity: "",
     wecomWebhook: "",
     wecomMinSeverity: "",
@@ -213,6 +217,10 @@ export default function SettingsPage() {
     const dingtalkMinSeverity = envValue(environment.data, "XALGORIX_DINGTALK_MIN_SEVERITY");
     const feishuWebhook = envValue(environment.data, "XALGORIX_FEISHU_WEBHOOK");
     const feishuSecret = envValue(environment.data, "XALGORIX_FEISHU_SECRET");
+    const feishuAppId = envValue(environment.data, "XALGORIX_FEISHU_APP_ID");
+    const feishuAppSecret = envValue(environment.data, "XALGORIX_FEISHU_APP_SECRET");
+    const feishuReceiveId = envValue(environment.data, "XALGORIX_FEISHU_RECEIVE_ID");
+    const feishuReceiveIdType = envValue(environment.data, "XALGORIX_FEISHU_RECEIVE_ID_TYPE") || "open_id";
     const feishuMinSeverity = envValue(environment.data, "XALGORIX_FEISHU_MIN_SEVERITY");
     const wecomWebhook = envValue(environment.data, "XALGORIX_WECOM_WEBHOOK");
     const wecomMinSeverity = envValue(environment.data, "XALGORIX_WECOM_MIN_SEVERITY");
@@ -228,6 +236,10 @@ export default function SettingsPage() {
       dingtalkMinSeverity,
       feishuWebhook,
       feishuSecret,
+      feishuAppId,
+      feishuAppSecret,
+      feishuReceiveId,
+      feishuReceiveIdType,
       feishuMinSeverity,
       wecomWebhook,
       wecomMinSeverity,
@@ -1005,6 +1017,7 @@ export default function SettingsPage() {
         </TabsContent>
 
         <TabsContent value="engagement">
+          <div className="space-y-4">
           {rate.isLoading ? (
             <Skeleton className="h-72" />
           ) : rate.error ? (
@@ -1080,6 +1093,16 @@ export default function SettingsPage() {
               </CardContent>
             </Card>
           )}
+          <TrafficMitmCard
+            environment={environment.data}
+            updatePending={updateEnvironment.isPending}
+            onSave={(enabled) =>
+              updateEnvironment.mutateAsync({
+                XALGORIX_TRAFFICPROXY: enabled ? "true" : "false",
+              })
+            }
+          />
+          </div>
         </TabsContent>
 
         <TabsContent value="notifications">
@@ -1290,6 +1313,94 @@ export default function SettingsPage() {
                     }
                   />
                 </div>
+                <div className="space-y-3 border-t pt-4">
+                  <p className="text-xs text-muted-foreground">
+                    {t("settings.notifications.feishuAppHint")}
+                  </p>
+                  <div className="grid gap-3 lg:grid-cols-2">
+                    <div className="space-y-2">
+                      <Label htmlFor="feishu-app-id">
+                        {t("settings.notifications.feishuAppId")}
+                      </Label>
+                      <Input
+                        id="feishu-app-id"
+                        value={notificationForm.feishuAppId}
+                        onChange={(e) =>
+                          setNotificationForm({
+                            ...notificationForm,
+                            feishuAppId: e.target.value,
+                          })
+                        }
+                        placeholder="cli_..."
+                        className="font-mono"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="feishu-app-secret">
+                        {t("settings.notifications.feishuAppSecret")}
+                      </Label>
+                      <Input
+                        id="feishu-app-secret"
+                        value={notificationForm.feishuAppSecret}
+                        onChange={(e) =>
+                          setNotificationForm({
+                            ...notificationForm,
+                            feishuAppSecret: e.target.value,
+                          })
+                        }
+                        placeholder="..."
+                        className="font-mono"
+                      />
+                      <p className="text-xs text-muted-foreground">
+                        {t("settings.notifications.keepMaskedSecret")}
+                      </p>
+                    </div>
+                  </div>
+                  <div className="grid gap-3 lg:grid-cols-[1fr_220px]">
+                    <div className="space-y-2">
+                      <Label htmlFor="feishu-receive-id">
+                        {t("settings.notifications.feishuReceiveId")}
+                      </Label>
+                      <Input
+                        id="feishu-receive-id"
+                        value={notificationForm.feishuReceiveId}
+                        onChange={(e) =>
+                          setNotificationForm({
+                            ...notificationForm,
+                            feishuReceiveId: e.target.value,
+                          })
+                        }
+                        placeholder="oc_..."
+                        className="font-mono"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="feishu-receive-id-type">
+                        {t("settings.notifications.feishuReceiveIdType")}
+                      </Label>
+                      <Select
+                        value={notificationForm.feishuReceiveIdType}
+                        onValueChange={(value) =>
+                          setNotificationForm({
+                            ...notificationForm,
+                            feishuReceiveIdType: value,
+                          })
+                        }
+                      >
+                        <SelectTrigger id="feishu-receive-id-type">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {["chat_id", "open_id", "user_id", "union_id", "email"].map((kind) => (
+                            <SelectItem key={kind} value={kind}>
+                              {kind}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+                  </div>
+                </div>
               </CardContent>
             </Card>
             <Card>
@@ -1376,6 +1487,10 @@ export default function SettingsPage() {
                         XALGORIX_DINGTALK_MIN_SEVERITY: notificationForm.dingtalkMinSeverity,
                         XALGORIX_FEISHU_WEBHOOK: notificationForm.feishuWebhook,
                         XALGORIX_FEISHU_SECRET: notificationForm.feishuSecret,
+                        XALGORIX_FEISHU_APP_ID: notificationForm.feishuAppId,
+                        XALGORIX_FEISHU_APP_SECRET: notificationForm.feishuAppSecret,
+                        XALGORIX_FEISHU_RECEIVE_ID: notificationForm.feishuReceiveId,
+                        XALGORIX_FEISHU_RECEIVE_ID_TYPE: notificationForm.feishuReceiveIdType,
                         XALGORIX_FEISHU_MIN_SEVERITY: notificationForm.feishuMinSeverity,
                         XALGORIX_WECOM_WEBHOOK: notificationForm.wecomWebhook,
                         XALGORIX_WECOM_MIN_SEVERITY: notificationForm.wecomMinSeverity,
@@ -1702,6 +1817,92 @@ function normalizeReasoningEffort(value: string, ollamaMode: boolean): string {
   if (ollamaMode && value === "xhigh") return "high";
   if (!ollamaMode && value === "none") return "high";
   return value;
+}
+
+/**
+ * 流量捕获（MITM）开关：写 XALGORIX_TRAFFICPROXY（默认开启）。该 env 项同时
+ * 出现在「环境变量 → Proxy」组，这里给流量相关操作一个显式入口；缺省时按目录
+ * 声明的默认值（true）展示，与后端 config 默认一致。
+ */
+function TrafficMitmCard({
+  environment,
+  updatePending,
+  onSave,
+}: {
+  environment: EnvironmentSettings | undefined;
+  updatePending: boolean;
+  onSave: (enabled: boolean) => Promise<EnvironmentSettings>;
+}) {
+  const { t } = useI18n();
+  const [saved, setSaved] = useState(false);
+  const [restartNeeded, setRestartNeeded] = useState(false);
+
+  if (!environment) return <Skeleton className="h-32" />;
+
+  const variable = environment.variables.find(
+    (item) => item.key === "XALGORIX_TRAFFICPROXY",
+  );
+  const raw = envValue(environment, "XALGORIX_TRAFFICPROXY");
+  const enabled =
+    raw === ""
+      ? (variable?.defaultValue ?? "true") !== "false"
+      : raw === "true";
+
+  async function handleToggle(next: boolean) {
+    setSaved(false);
+    try {
+      const response = await onSave(next);
+      setRestartNeeded(
+        Boolean(response.restartRequired ?? variable?.requiresRestart),
+      );
+      setSaved(true);
+      toast.success(t("toast.saved"));
+      setTimeout(() => setSaved(false), 2500);
+    } catch (error) {
+      toast.error(
+        error instanceof Error ? error.message : t("common.somethingWrong"),
+      );
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>{t("settings.card.trafficMitm")}</CardTitle>
+        <CardDescription>{t("settings.trafficMitm.desc")}</CardDescription>
+      </CardHeader>
+      <CardContent className="flex flex-wrap items-center justify-between gap-4">
+        <div className="min-w-0 space-y-1">
+          <Label htmlFor="traffic-mitm" className="text-sm">
+            {enabled
+              ? t("settings.trafficMitm.on")
+              : t("settings.trafficMitm.off")}
+          </Label>
+          <p className="text-xs text-muted-foreground">
+            {t("settings.trafficMitm.hint")}
+          </p>
+          {restartNeeded && (
+            <p className="text-xs text-amber-600 dark:text-amber-400">
+              {t("settings.trafficMitm.restart")}
+            </p>
+          )}
+        </div>
+        <div className="flex items-center gap-2">
+          {saved && (
+            <span className="text-xs text-success">
+              {t("settings.savedIndicator")}
+            </span>
+          )}
+          <Switch
+            id="traffic-mitm"
+            checked={enabled}
+            disabled={updatePending}
+            onCheckedChange={(next) => void handleToggle(next)}
+          />
+        </div>
+      </CardContent>
+    </Card>
+  );
 }
 
 function EnvironmentRow({

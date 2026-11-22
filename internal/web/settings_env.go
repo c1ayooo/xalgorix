@@ -187,6 +187,10 @@ func allEnvSettingDefinitions() []envSettingDefinition {
 
 		{Key: "XALGORIX_FEISHU_WEBHOOK", Label: "Feishu webhook", Category: "Notifications", Description: "Feishu/Lark custom robot webhook (hook id in the path). The URL embeds the robot credential and is never returned by APIs.", Placeholder: "https://open.feishu.cn/open-apis/bot/v2/hook/...", InputType: "secret", Sensitive: true},
 		{Key: "XALGORIX_FEISHU_SECRET", Label: "Feishu sign secret", Category: "Notifications", Description: "Signing secret (加签) for the robot. Leave blank when signing is off.", Placeholder: "...", InputType: "secret", Sensitive: true},
+		{Key: "XALGORIX_FEISHU_APP_ID", Label: "Feishu app ID", Category: "Notifications", Description: "Self-built app (应用机器人) App ID, cli_... . When App ID, App Secret and receive ID are all set, notifications use the IM Open API instead of the group robot webhook.", Placeholder: "cli_...", InputType: "text"},
+		{Key: "XALGORIX_FEISHU_APP_SECRET", Label: "Feishu app secret", Category: "Notifications", Description: "Self-built app App Secret. Treated as a secret and never returned by APIs.", InputType: "secret", Sensitive: true},
+		{Key: "XALGORIX_FEISHU_RECEIVE_ID", Label: "Feishu receive ID", Category: "Notifications", Description: "App-mode delivery target: a chat_id, open_id, user_id, union_id or email, matching the receive ID type below.", Placeholder: "oc_xxxxxxxxxxxxxxxx", InputType: "text"},
+		{Key: "XALGORIX_FEISHU_RECEIVE_ID_TYPE", Label: "Feishu receive ID type", Category: "Notifications", Description: "How to interpret the receive ID. Use chat_id for a group, open_id/user_id for a person.", DefaultValue: "open_id", InputType: "select", Options: []string{"open_id", "user_id", "union_id", "email", "chat_id"}},
 		{Key: "XALGORIX_FEISHU_MIN_SEVERITY", Label: "Feishu minimum severity", Category: "Notifications", Description: "Minimum severity sent to Feishu.", InputType: "select", Options: []string{"", "info", "low", "medium", "high", "critical"}},
 
 		{Key: "XALGORIX_WECOM_WEBHOOK", Label: "WeCom webhook", Category: "Notifications", Description: "WeCom (企业微信) group robot webhook (key in the URL). The URL embeds the robot credential and is never returned by APIs.", Placeholder: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...", InputType: "secret", Sensitive: true},
@@ -239,6 +243,7 @@ func allEnvSettingDefinitions() []envSettingDefinition {
 		{Key: "XALGORIX_SCAN_MEMORY_BUDGET_MB", Label: "Scan memory budget MB", Category: "Resources", Description: "Memory budget per active scan. Empty means auto-scale from RAM and CPU cores.", Placeholder: "auto", InputType: "number", RequiresRestart: true},
 		{Key: "XALGORIX_SCAN_OVERHEAD_MB", Label: "Scan overhead MB", Category: "Resources", Description: "Reserved memory overhead per scan. Empty means auto-scale from RAM.", Placeholder: "auto", InputType: "number", RequiresRestart: true},
 		{Key: "XALGORIX_HEAVY_TOOL_MEM_LIMIT_MB", Label: "Heavy tool memory limit MB", Category: "Resources", Description: "Optional hard address-space limit for heavy terminal tools. Empty or 0 leaves hard limiting disabled; dynamic admission still uses live RAM headroom.", Placeholder: "disabled", InputType: "number", RequiresRestart: true},
+		{Key: "XALGORIX_PYTHON_MEM_LIMIT_MB", Label: "Python script memory limit MB", Category: "Resources", Description: "Address-space ceiling applied to agent-generated Python scripts (terminal python3 and python_action). Empty means auto-scale from RAM (2–4 GB); 0 disables the hard limit. An over-limit script fails with MemoryError instead of triggering the host OOM killer.", Placeholder: "auto", InputType: "number", RequiresRestart: true},
 		{Key: "XALGORIX_GO_MEM_LIMIT_MB", Label: "Go memory limit MB", Category: "Resources", Description: "Soft memory limit for the Xalgorix parent process. Empty means auto-scale from RAM.", Placeholder: "auto", InputType: "number", RequiresRestart: true},
 	}
 }
@@ -925,6 +930,18 @@ func (s *Server) applyEnvironmentToRuntimeConfig(values map[string]string) {
 		case "XALGORIX_FEISHU_SECRET":
 			s.cfg.FeishuSecret = value
 			s.feishuSecret = strings.TrimSpace(value)
+		case "XALGORIX_FEISHU_APP_ID":
+			s.cfg.FeishuAppID = value
+			s.feishuAppID = strings.TrimSpace(value)
+		case "XALGORIX_FEISHU_APP_SECRET":
+			s.cfg.FeishuAppSecret = value
+			s.feishuAppSecret = strings.TrimSpace(value)
+		case "XALGORIX_FEISHU_RECEIVE_ID":
+			s.cfg.FeishuReceiveID = value
+			s.feishuReceiveID = strings.TrimSpace(value)
+		case "XALGORIX_FEISHU_RECEIVE_ID_TYPE":
+			s.cfg.FeishuReceiveIDType = value
+			s.feishuReceiveIDType = strings.ToLower(strings.TrimSpace(value))
 		case "XALGORIX_FEISHU_MIN_SEVERITY":
 			s.cfg.FeishuMinSeverity = value
 			s.feishuMinSeverity = strings.ToLower(strings.TrimSpace(value))
@@ -1085,6 +1102,14 @@ func (s *Server) envSettingValue(key string) string {
 		return cfg.FeishuWebhook
 	case "XALGORIX_FEISHU_SECRET":
 		return cfg.FeishuSecret
+	case "XALGORIX_FEISHU_APP_ID":
+		return cfg.FeishuAppID
+	case "XALGORIX_FEISHU_APP_SECRET":
+		return cfg.FeishuAppSecret
+	case "XALGORIX_FEISHU_RECEIVE_ID":
+		return cfg.FeishuReceiveID
+	case "XALGORIX_FEISHU_RECEIVE_ID_TYPE":
+		return valueOrDefault(cfg.FeishuReceiveIDType, "open_id")
 	case "XALGORIX_FEISHU_MIN_SEVERITY":
 		return cfg.FeishuMinSeverity
 	case "XALGORIX_WECOM_WEBHOOK":

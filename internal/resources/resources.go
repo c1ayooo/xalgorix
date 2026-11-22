@@ -124,6 +124,13 @@ var (
 	// Auto-scaled in init() based on total RAM. Set to 0 to disable.
 	HeavyToolMemLimitBytes int64
 
+	// Address-space ceiling for Python subprocesses (bytes). Unlike the heavy
+	// tool limit above, this targets only agent-generated Python scripts,
+	// where RLIMIT_AS does not collide with the large virtual-memory
+	// reservations of Go/Rust/Chromium scanners. Auto-scaled in init();
+	// an explicit XALGORIX_PYTHON_MEM_LIMIT_MB=0 disables it.
+	PythonMemLimitBytes int64
+
 	// Total RAM budget per running scan instance. This is the admission-control
 	// unit used to decide how many scans can run concurrently.
 	scanMemoryBudgetMB int64
@@ -196,6 +203,14 @@ func init() {
 	}
 	HeavyToolMemLimitBytes = toolMemLimitMB * 1024 * 1024
 
+	// ── Python script address-space limit ──
+	// Python is the one subprocess class where RLIMIT_AS is safe: CPython's
+	// startup footprint is small and LLM-generated scripts are not scanners
+	// that reserve multi-GB virtual address space. A safe default is always
+	// on so an accidental exponential search fails with MemoryError instead
+	// of triggering the kernel OOM killer; operators can override or disable.
+	PythonMemLimitBytes = resolvePythonMemLimitMB(totalMB) * 1024 * 1024
+
 	configureGoRuntimeLimits(totalMB)
 
 	manualCap := "none"
@@ -203,10 +218,10 @@ func init() {
 		manualCap = strconv.Itoa(manualMaxInstances)
 	}
 	log.Printf("[RESOURCES] Auto-scaled for %d cores, %d MB RAM: manual_instance_cap=%s, "+
-		"ram_caution=%dMB, ram_critical=%dMB, tool_mem_limit=%s, scan_budget=%dMB, "+
+		"ram_caution=%dMB, ram_critical=%dMB, tool_mem_limit=%s, python_mem_limit=%s, scan_budget=%dMB, "+
 		"heavy_tool_cpu_budget=%.2f, go_mem_limit=%dMB",
 		cores, totalMB, manualCap, ramCautionMB, ramCriticalMB,
-		toolMemoryLimitLabel(), perInstanceMemoryBudgetMB(),
+		toolMemoryLimitLabel(), pythonMemoryLimitLabel(), perInstanceMemoryBudgetMB(),
 		heavyToolCPULoad, goMemoryLimitMB)
 }
 
@@ -481,6 +496,33 @@ func autoHeavyToolMemLimitMB(totalMB int64) int64 {
 	return limit
 }
 
+// autoPythonMemLimitMB returns the default address-space ceiling for
+// LLM-generated Python scripts. It scales with host RAM but stays inside a
+// band that is comfortably above CPython's startup footprint while remaining
+// far below total memory, so a runaway exponential search hits MemoryError
+// long before the kernel OOM killer (and the WSL relay) notices.
+func autoPythonMemLimitMB(totalMB int64) int64 {
+	limit := totalMB / 4
+	if limit < 2048 {
+		limit = 2048
+	}
+	if limit > 4096 {
+		limit = 4096
+	}
+	return limit
+}
+
+// resolvePythonMemLimitMB applies the operator override
+// (XALGORIX_PYTHON_MEM_LIMIT_MB) over the RAM-derived default. An explicit 0
+// disables the hard limit; leaving the variable unset keeps the safe default
+// so existing installations gain protection without configuration.
+func resolvePythonMemLimitMB(totalMB int64) int64 {
+	if override, ok := envOptionalInt64("XALGORIX_PYTHON_MEM_LIMIT_MB"); ok {
+		return override
+	}
+	return autoPythonMemLimitMB(totalMB)
+}
+
 func autoHeavyToolCPULoad(cores int) float64 {
 	if cores <= 1 {
 		return 0.85
@@ -643,6 +685,13 @@ func toolMemoryLimitLabel() string {
 		return "disabled"
 	}
 	return fmt.Sprintf("%dMB", HeavyToolMemLimitBytes/(1024*1024))
+}
+
+func pythonMemoryLimitLabel() string {
+	if PythonMemLimitBytes <= 0 {
+		return "disabled"
+	}
+	return fmt.Sprintf("%dMB", PythonMemLimitBytes/(1024*1024))
 }
 
 // AcquireToolLease reserves live CPU/RAM headroom for one subprocess. The
@@ -866,6 +915,13 @@ func (l *ToolLease) MemoryLimitBytes() int64 {
 		return CurrentToolMemoryLimitBytes(true)
 	}
 	return l.memoryLimitBytes
+}
+
+// CurrentPythonMemoryLimitBytes returns the address-space ceiling that should
+// be applied to Python subprocesses. Zero means the operator disabled it via
+// XALGORIX_PYTHON_MEM_LIMIT_MB=0.
+func CurrentPythonMemoryLimitBytes() int64 {
+	return PythonMemLimitBytes
 }
 
 // CurrentToolMemoryLimitBytes returns a best-effort memory limit for callers

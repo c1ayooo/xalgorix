@@ -20,6 +20,9 @@ import type {
   Paginated,
   Project,
   ProjectRequest,
+  ProjectScope,
+  ProjectScopeView,
+  ScopeValidateResult,
   QueueStatus,
   RateLimitSettings,
   Run,
@@ -45,6 +48,7 @@ import type {
   WSEvent,
   Guidance,
   GuidanceSendResult,
+  QuestionSendResult,
   TranscriptPage,
   ConversationPatch,
   ConversationRow,
@@ -338,11 +342,12 @@ export const api = {
   // caps at 100).
   scanTraffic: (
     id: string,
-    params?: { endpoint?: string; method?: string; limit?: number },
+    params?: { endpoint?: string; method?: string; host?: string; limit?: number },
   ) => {
     const qs = new URLSearchParams();
     if (params?.endpoint) qs.set("endpoint", params.endpoint);
     if (params?.method) qs.set("method", params.method);
+    if (params?.host) qs.set("host", params.host);
     if (params?.limit) qs.set("limit", String(params.limit));
     const suffix = qs.toString();
     return http<ScanTrafficView>(`/api/scans/${id}/traffic${suffix ? `?${suffix}` : ""}`);
@@ -688,6 +693,24 @@ export const api = {
   deleteProject: (id: string) =>
     http<{ status: string }>(`/api/projects/${id}`, { method: "DELETE" }),
 
+  // 范围/围栏配置模块（internal/web/project_scope.go）：读、写、试算都打在
+  // 同一对象上——dispatch 目标与 HITL 运行时围栏是同一个 platform.Scope。
+  getProjectScope: (id: string) =>
+    http<ProjectScopeView>(`/api/projects/${id}/scope`),
+  updateProjectScope: (id: string, scope: ProjectScope) =>
+    http<ProjectScopeView>(`/api/projects/${id}/scope`, {
+      method: "PUT",
+      json: scope,
+    }),
+  validateProjectScope: (
+    id: string,
+    req: { scope?: ProjectScope; targets?: string[] },
+  ) =>
+    http<ScopeValidateResult>(`/api/projects/${id}/scope/validate`, {
+      method: "POST",
+      json: req,
+    }),
+
   listTasks: (projectId: string) =>
     http<{ tasks: Task[] }>(`/api/projects/${projectId}/tasks`),
   getTask: (id: string) => http<Task>(`/api/tasks/${id}`),
@@ -759,6 +782,17 @@ export const api = {
         ...(instanceId ? { instance_id: instanceId } : {}),
       },
     }),
+  // 旁路提问（chat_questions.go）：对运行中的 Run 提一个不经扫描主循环的
+  // 问题，回答以 chat_reply 事件回流转录；忙时 409（同一 Run 一条在途）。
+  sendTaskQuestion: (id: string, message: string, requestId: string, instanceId?: string) =>
+    http<QuestionSendResult>(`/api/tasks/${id}/questions`, {
+      method: "POST",
+      json: {
+        message,
+        request_id: requestId,
+        ...(instanceId ? { instance_id: instanceId } : {}),
+      },
+    }),
 
   listApprovals: (
     opts: { status?: "pending" | "decided" | "all"; projectId?: string; taskId?: string; page?: number; size?: number } = {},
@@ -812,6 +846,7 @@ export const api = {
     if (params.nature) sp.set("nature", params.nature);
     if (params.after) sp.set("after", params.after);
     if (params.before) sp.set("before", params.before);
+    if (params.cursor) sp.set("cursor", params.cursor);
     if (params.limit) sp.set("limit", String(params.limit));
     return http<InfoRegionResult>(`/api/info/region?${sp.toString()}`).then((r) => ({
       ...r,

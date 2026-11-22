@@ -1,7 +1,7 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { toast } from "sonner";
-import { Bot, ListTodo, MessageSquare, Pause, Pencil, Play, ShieldAlert, Square, Eye } from "lucide-react";
+import { Bot, ListTodo, MessageSquare, Pause, Pencil, Play, ShieldAlert, Square, Terminal, Eye } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
@@ -23,8 +23,16 @@ import { useLiveSessionKeys } from "@/components/session-item";
 import { ScanStatusPill } from "@/components/scan-status-pill";
 import { fmtTokens } from "@/components/chat/format";
 import { useI18n } from "@/i18n";
-import { usePauseInstance, useResumeInstance, useSendTaskGuidance, useStopInstance } from "@/api/queries";
+import {
+  usePauseInstance,
+  useResumeInstance,
+  useSendTaskGuidance,
+  useSendTaskQuestion,
+  useStopInstance,
+} from "@/api/queries";
 import { newRequestId } from "@/lib/guidance";
+import { useEventsStore } from "@/store/events";
+import { cn } from "@/lib/utils";
 import type { ConversationRow } from "@/types/api";
 
 type ViewMode = "full" | "human";
@@ -53,6 +61,7 @@ export function ChatPanel({
   const paused = status === "paused";
 
   const send = useSendTaskGuidance();
+  const ask = useSendTaskQuestion();
   const pause = usePauseInstance();
   const resume = useResumeInstance();
   const stop = useStopInstance();
@@ -61,6 +70,31 @@ export function ChatPanel({
   const [stopReason, setStopReason] = useState("");
   const [renaming, setRenaming] = useState(false);
   const [title, setTitle] = useState(run.title ?? "");
+  // 转录为空时 composer 垂直居中（ChatGPT 新会话式）；有内容即钉底。
+  const [empty, setEmpty] = useState(false);
+  // 运行中的发送语义（4zreco 对话页）：默认「提问」走旁路应答（保证有回应、
+  // 不消耗扫描轮次），「指令」才注入主循环（HITL guidance）。空闲/终态只有
+  // guidance 一条路，切换器不出现。
+  const [sendMode, setSendMode] = useState<"question" | "directive">("question");
+  // 提问在途标记：202 后等 chat_reply 事件回流（SSE→refetch 渲染答案），
+  // 期间禁用发送避免 409。切换会话即复位。
+  const [questionPending, setQuestionPending] = useState(false);
+  const questionSinceRef = useRef(0);
+  const events = useEventsStore((s) => s.events);
+  useEffect(() => {
+    if (!questionPending) return;
+    for (const e of events) {
+      const owner = e.instance_id || e.agent_id;
+      if (owner === instanceId && e.type === "chat_reply" && (e._receivedAt || 0) > questionSinceRef.current) {
+        setQuestionPending(false);
+        return;
+      }
+    }
+  }, [events, questionPending, instanceId]);
+  useEffect(() => {
+    setQuestionPending(false);
+    setSendMode("question");
+  }, [instanceId]);
 
   useEffect(() => {
     setTitle(run.title ?? "");
@@ -77,7 +111,9 @@ export function ChatPanel({
   if (!instanceId) return null;
 
   return (
-    <div className="flex min-h-0 min-w-0 flex-col overflow-hidden rounded-lg border border-border bg-card">
+    // 外框由 pages/chat.tsx 的容器提供，这里只负责纵向填充：flex-1 占满定高父级，
+    // 否则面板塌缩成内容高、composer 悬在半空。
+    <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
       {/* 头部：标题 + 状态 + 实时 + meta（参照 px-4 py-2.5 语法）。 */}
       <div className="flex min-w-0 flex-wrap items-center gap-2 border-b border-border px-4 py-2.5">
         <Bot className="size-4 shrink-0 text-muted-foreground" aria-hidden />
@@ -201,9 +237,13 @@ export function ChatPanel({
         <Transcript
           instanceId={instanceId}
           running={running}
+          onEmptyChange={setEmpty}
           empty={
-            <div className="py-10 text-center text-muted-foreground text-sm">
-              {t("chat.draftGreeting").replace("{name}", run.task_name || t("chat.untitled"))}
+            // 空态时贴在居中 composer 上方，两者读作一组（提示文案本身说「在下方发送」）。
+            <div className="flex h-full flex-col items-center justify-end px-4 pb-3 text-center">
+              <p className="max-w-md text-muted-foreground text-sm">
+                {t("chat.draftGreeting").replace("{name}", run.task_name || t("chat.untitled"))}
+              </p>
             </div>
           }
         />
@@ -213,6 +253,7 @@ export function ChatPanel({
             taskId={run.task_id}
             instanceId={instanceId}
             runId={run.id}
+            onEmptyChange={setEmpty}
             className="h-full bg-muted/10"
           />
         </div>
@@ -220,8 +261,73 @@ export function ChatPanel({
 
       <Composer
         instanceId={instanceId}
-        running={running}
+        // 提问模式下发送键保持发送（停止控制在次行头部已有）；指令模式沿用
+        // 「运行中发送键变停止键」的参照语义。
+        running={running && sendMode === "directive"}
+        disabled={running && sendMode === "question" && questionPending}
+        placeholder={
+          running && sendMode === "question"
+            ? t("chat.questionPlaceholder")
+            : undefined
+        }
+        className={empty ? "mx-auto w-full max-w-3xl rounded-lg border border-border" : undefined}
+        leftSlot={
+          running ? (
+            <div className="inline-flex rounded-md border border-border p-0.5" role="group" aria-label={t("chat.sendModeLabel")}>
+              <button
+                type="button"
+                aria-pressed={sendMode === "question"}
+                onClick={() => setSendMode("question")}
+                className={cn(
+                  "inline-flex items-center gap-1 rounded-sm px-2 py-1 text-[11px] transition-colors",
+                  sendMode === "question"
+                    ? "bg-accent text-accent-foreground"
+                    : "text-muted-foreground hover:text-foreground",
+                )}
+              >
+                <MessageSquare className="size-3" aria-hidden />
+                {t("chat.sendModeQuestion")}
+              </button>
+              <button
+                type="button"
+                aria-pressed={sendMode === "directive"}
+                onClick={() => setSendMode("directive")}
+                className={cn(
+                  "inline-flex items-center gap-1 rounded-sm px-2 py-1 text-[11px] transition-colors",
+                  sendMode === "directive"
+                    ? "bg-accent text-accent-foreground"
+                    : "text-muted-foreground hover:text-foreground",
+                )}
+              >
+                <Terminal className="size-3" aria-hidden />
+                {t("chat.sendModeDirective")}
+              </button>
+            </div>
+          ) : undefined
+        }
         onSend={async (message) => {
+          if (running && sendMode === "question") {
+            await new Promise<void>((resolve, reject) => {
+              ask.mutate(
+                { id: run.task_id, message, requestId: newRequestId(), instanceId },
+                {
+                  onSuccess: (result) => {
+                    if (result.accepted) {
+                      questionSinceRef.current = Date.now();
+                      setQuestionPending(true);
+                      toast.success(t("chat.questionAccepted"));
+                    }
+                    resolve();
+                  },
+                  onError: (error: Error) => {
+                    toast.error(`${t("chat.sendFailed")}: ${error.message}`);
+                    reject(error);
+                  },
+                },
+              );
+            });
+            return;
+          }
           await new Promise<void>((resolve, reject) => {
             send.mutate(
               { id: run.task_id, message, requestId, instanceId },
@@ -243,6 +349,9 @@ export function ChatPanel({
         }}
         onStop={() => setStopOpen(true)}
       />
+
+      {/* 空态：composer 之后的等高占位把它推到面板垂直正中；有内容时不渲染 → 钉底。 */}
+      {empty && <div aria-hidden className="flex-1" />}
 
       <AlertDialog open={stopOpen} onOpenChange={setStopOpen}>
         <AlertDialogContent>

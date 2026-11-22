@@ -104,6 +104,32 @@ func TestScanTrafficEndpoint_ProjectionAndFilters(t *testing.T) {
 	if !view.Present || view.TotalMatched != 0 || len(view.Exchanges) != 0 {
 		t.Fatalf("empty match = %+v", view)
 	}
+
+	// Every exchange carries its derived asset host; host is an exact,
+	// case-insensitive join key (asset ↔ traffic evidence binding).
+	rr = trafficGet(t, s, "/api/scans/"+id+"/traffic")
+	if err := json.Unmarshal(rr.Body.Bytes(), &view); err != nil {
+		t.Fatal(err)
+	}
+	if view.Exchanges[0].Host != "target.example" || view.Exchanges[2].Host != "other.example" {
+		t.Fatalf("derived host missing: %q %q", view.Exchanges[0].Host, view.Exchanges[2].Host)
+	}
+	rr = trafficGet(t, s, "/api/scans/"+id+"/traffic?host=TARGET.example")
+	if err := json.Unmarshal(rr.Body.Bytes(), &view); err != nil {
+		t.Fatal(err)
+	}
+	if view.TotalMatched != 2 || len(view.Exchanges) != 2 {
+		t.Fatalf("host filter = total:%d n:%d", view.TotalMatched, len(view.Exchanges))
+	}
+	// Host + endpoint compose, so one asset's packet never masquerades as
+	// another asset's evidence.
+	rr = trafficGet(t, s, "/api/scans/"+id+"/traffic?host=other.example&endpoint=/api/user")
+	if err := json.Unmarshal(rr.Body.Bytes(), &view); err != nil {
+		t.Fatal(err)
+	}
+	if view.TotalMatched != 0 {
+		t.Fatalf("cross-asset match must be empty: %+v", view)
+	}
 }
 
 // A scan whose traffic archive never existed (pre-R2b layout, proxy off) must

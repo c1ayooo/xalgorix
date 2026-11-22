@@ -209,6 +209,18 @@ func (s *ApprovalService) createPendingRow(instanceID string, sctx *scanctx.Scan
 	if store == nil {
 		return nil, nil // fail-open: scanning never depends on the platform
 	}
+	// Project fence (scope_fence.go): the operator's authorization boundary
+	// outranks a per-call decision, so an out-of-fence call is closed as
+	// rejected instead of being offered for approval. The terminal row still
+	// travels the normal interrupt/resume path — WaitApproval returns the
+	// rejection immediately and the model gets the ⛔ denial text.
+	if row, denied := s.fenceDenial(instanceID, sctx, verdict, secrets); denied {
+		if row == nil {
+			return nil, fmt.Errorf("fence denied the %s call and no audit row could be persisted", verdict.Kind)
+		}
+		return row, nil
+	}
+
 	ctx, cancel := storeCtx()
 	defer cancel()
 	if err := s.waitForSlot(instanceID, sctx); err != nil {
@@ -302,6 +314,17 @@ func (s *ApprovalService) submit(instanceID string, sctx *scanctx.ScanContext, v
 		// would break the no-DSN degradation red line.
 		log.Printf("[approval] store unavailable — failing open for %s call in run %s", verdict.Kind, instanceID)
 		return submitOutcome{Approved: true, Status: "store_unavailable"}
+	}
+
+	// Project fence (scope_fence.go) — applies to the registry gate and the
+	// traffic-proxy gate alike: a call outside the operator's boundary is
+	// recorded as rejected (decided_by="fence") and never becomes actionable.
+	if row, denied := s.fenceDenial(instanceID, sctx, verdict, secrets); denied {
+		if row == nil {
+			log.Printf("[approval] fence denied a %s call in run %s and the audit row could not be persisted — blocking the call anyway", verdict.Kind, instanceID)
+			return submitOutcome{Approved: false, Status: platform.ApprovalRejected}
+		}
+		return outcomeFromRow(*row)
 	}
 
 	// Slot accounting (max_pending per run, REDESIGN §5.3): overflow queues
@@ -885,6 +908,12 @@ func approvalDenialMessage(outcome submitOutcome) string {
 	detail := ""
 	if outcome.Row != nil && outcome.Row.Reason != "" {
 		detail = "\nReason: " + outcome.Row.Reason
+	}
+	// Fence denials are not operator decisions: no amount of retrying or
+	// rephrasing will turn one into an approval. Say so, so the model stops.
+	if outcome.Row != nil && outcome.Row.DecidedBy == "fence" {
+		return fmt.Sprintf("⛔ FENCE DENIAL — this %s leaves the project's authorized scope, so it was NOT executed and was never sent to the operator (approval %s).%s\nDo NOT retry or rephrase the same destination: the project scope/deny rules outrank any approval. Work only inside the registered targets, and record the blocked lane as a typed disposition for the operator to widen the scope if it is legitimate.",
+			kind, approvalRef(outcome), detail)
 	}
 	switch status {
 	case platform.ApprovalTimeout:

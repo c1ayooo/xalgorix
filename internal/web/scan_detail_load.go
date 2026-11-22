@@ -362,3 +362,51 @@ func loadScanEventsWindow(dir string, offset, limit int) ([]WSEvent, int, bool) 
 	}
 	return decodeEvents(window), total, true
 }
+
+// loadRunEventsWindow is loadScanEventsWindow across a run's sibling session
+// directories (D11 re-dispatch / multi-target): the journals concatenate in
+// the given chronological order and the offset/limit window indexes into the
+// union. A damaged sibling journal must not blank the whole run's history, so
+// its unreadable tail — including any events parsed before the damage — is
+// skipped while the sessions that still parse are kept.
+func loadRunEventsWindow(dirs []string, offset, limit int) ([]WSEvent, int, bool) {
+	if len(dirs) == 0 || limit <= 0 {
+		return nil, 0, false
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	if limit > maxEventsWindow {
+		limit = maxEventsWindow
+	}
+	end := offset + limit
+	type windowed struct {
+		globalIdx int
+		event     WSEvent
+	}
+	var win []windowed
+	total := 0
+	anySession := false
+	for _, dir := range dirs {
+		base := total
+		count, _, err := walkEventJournal(dir, func(idx int, event WSEvent) {
+			if g := base + idx; g >= offset && g < end {
+				win = append(win, windowed{globalIdx: g, event: event})
+			}
+		})
+		if err != nil {
+			// Skip the whole damaged session; the union keeps the rest.
+			continue
+		}
+		anySession = true
+		total += count
+	}
+	if !anySession {
+		return nil, 0, false
+	}
+	window := make([]WSEvent, 0, len(win))
+	for _, w := range win {
+		window = append(window, w.event)
+	}
+	return window, total, true
+}

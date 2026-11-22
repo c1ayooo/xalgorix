@@ -37,6 +37,13 @@ const (
 	heavyCmdTimeout   = 60 * time.Minute // nmap, nuclei, ffuf, gobuster, sqlmap, masscan
 	hardMaxTimeout    = 2 * time.Hour    // absolute ceiling — nothing runs longer
 	dirbusterGrace    = 15 * time.Second // allow scanners to flush results after their own deadline
+
+	// Bounded waits for the post-kill / post-exit pipe drain. A process-group
+	// escapee (setsid daemon) can hold the stdout/stderr write ends long after
+	// the group SIGKILL; these caps keep the tool call — and therefore the
+	// whole scan loop — live instead of wedged until the engine hard ceiling.
+	pipeDrainGrace = 5 * time.Second  // grace for readers to unwind after reap/deadline
+	cmdReapGrace   = 10 * time.Second // grace for cmd.Wait after the group kill
 )
 
 // ── Per-instance terminal stores ──
@@ -588,37 +595,71 @@ type requestRateRuntime struct {
 
 func prepareRequestRateRuntime(workDir string, policy scanctx.RequestRatePolicy) (requestRateRuntime, error) {
 	policy = scanctx.NormalizeRequestRatePolicy(policy)
-	if !policy.Enabled() {
-		return requestRateRuntime{}, nil
+	delayMS := 0
+	if policy.Enabled() {
+		delayMS = int(policy.Delay() / time.Millisecond)
 	}
-	delayMS := int(policy.Delay() / time.Millisecond)
-	if delayMS <= 0 {
+	// The Python guard is independent of the request-rate policy: an
+	// exponential LLM-generated script can exhaust memory even when rate
+	// limiting is off (the default). Keep preparing the sitecustomize hook
+	// whenever either feature is active.
+	memLimitBytes := resources.CurrentPythonMemoryLimitBytes()
+	if delayMS <= 0 && memLimitBytes <= 0 {
 		return requestRateRuntime{}, nil
 	}
 
 	root := filepath.Join(workDir, ".xalgorix-rate")
 	rt := requestRateRuntime{
-		BinDir:     filepath.Join(root, "bin"),
 		PythonPath: filepath.Join(root, "python"),
 		LockDir:    filepath.Join(root, "locks"),
 		DelayMS:    delayMS,
 	}
-	for _, dir := range []string{rt.BinDir, rt.PythonPath, rt.LockDir} {
+	if delayMS > 0 {
+		// Only the rate limiter needs a PATH shim; a guard-only runtime must
+		// not inject a non-existent wrapper directory into PATH.
+		rt.BinDir = filepath.Join(root, "bin")
+	}
+	for _, dir := range []string{rt.PythonPath, rt.LockDir} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return requestRateRuntime{}, err
 		}
 	}
-
-	if err := writeRateLimitedBinaryWrapper(rt.BinDir, "curl"); err != nil {
-		return requestRateRuntime{}, err
+	if rt.BinDir != "" {
+		if err := os.MkdirAll(rt.BinDir, 0o700); err != nil {
+			return requestRateRuntime{}, err
+		}
+		if err := writeRateLimitedBinaryWrapper(rt.BinDir, "curl"); err != nil {
+			return requestRateRuntime{}, err
+		}
+		if err := writeRateLimitedBinaryWrapper(rt.BinDir, "wget"); err != nil {
+			return requestRateRuntime{}, err
+		}
 	}
-	if err := writeRateLimitedBinaryWrapper(rt.BinDir, "wget"); err != nil {
-		return requestRateRuntime{}, err
-	}
-	if err := writePythonRateLimiter(rt.PythonPath); err != nil {
+	if err := writePythonRateLimiter(rt.PythonPath, memLimitBytes); err != nil {
 		return requestRateRuntime{}, err
 	}
 	return rt, nil
+}
+
+// PreparePythonMemoryGuard writes the Python startup guard (sitecustomize.py)
+// that enforces the configured address-space ceiling for workDir and returns
+// the directory to prepend to PYTHONPATH. It is the python_action counterpart
+// of the terminal path: applying the limit from sitecustomize runs before any
+// user code, so no post-start prlimit race exists. An empty string means the
+// limit is disabled (XALGORIX_PYTHON_MEM_LIMIT_MB=0).
+func PreparePythonMemoryGuard(workDir string) (string, error) {
+	memLimitBytes := resources.CurrentPythonMemoryLimitBytes()
+	if memLimitBytes <= 0 {
+		return "", nil
+	}
+	dir := filepath.Join(workDir, ".xalgorix-rate", "python")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	if err := writePythonRateLimiter(dir, memLimitBytes); err != nil {
+		return "", err
+	}
+	return dir, nil
 }
 
 func writeRateLimitedBinaryWrapper(binDir, name string) error {
@@ -740,11 +781,49 @@ func prepareTrafficProxyClientConfig(workDir, scanCtxID string) error {
 	return nil
 }
 
-func writePythonRateLimiter(pythonPath string) error {
+func writePythonRateLimiter(pythonPath string, memLimitBytes int64) error {
 	siteCustomize := filepath.Join(pythonPath, "sitecustomize.py")
 	source := `import functools
 import os
 import time
+
+# Xalgorix Python guard. This runs at interpreter startup, before any
+# agent-generated code, so a runaway exponential search fails with
+# MemoryError instead of exhausting the host before a post-launch prlimit
+# could fire. 0 means the operator disabled the ceiling.
+_XALGORIX_MEM_LIMIT_BYTES = ` + strconv.FormatInt(memLimitBytes, 10) + `
+
+
+def _apply_memory_limit():
+    limit = _XALGORIX_MEM_LIMIT_BYTES
+    if limit <= 0:
+        return
+    try:
+        import resource
+    except Exception:
+        return
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+    except Exception:
+        return
+    if soft != resource.RLIM_INFINITY:
+        limit = min(limit, soft)
+    if hard != resource.RLIM_INFINITY:
+        limit = min(limit, hard)
+    if limit <= 0:
+        return
+    try:
+        resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+    except Exception:
+        # Never make tool execution fail because the ceiling could not be
+        # tightened; a post-start RLIMIT_AS remains as defense in depth.
+        try:
+            resource.setrlimit(resource.RLIMIT_AS, (limit, hard))
+        except Exception:
+            pass
+
+
+_apply_memory_limit()
 
 try:
     import fcntl
@@ -837,7 +916,10 @@ try:
 except Exception:
     pass
 `
-	return os.WriteFile(siteCustomize, []byte(source), 0o600)
+	// Atomic rewrite: every terminal command refreshes this file, and a
+	// concurrently starting interpreter must never import a half-written
+	// sitecustomize (which would silently drop the memory guard).
+	return storage.WriteAtomic(siteCustomize, []byte(source))
 }
 
 // setProcessLimits applies resource constraints to a child process:
@@ -1816,17 +1898,68 @@ func runShellInternalContext(parent context.Context, contextID string, command s
 		}
 	}()
 
-	// Wait for output readers to finish, then the process.
-	// IMPORTANT: wg.Wait() MUST run before cmd.Wait(). The Go docs say
-	// "it is incorrect to call Wait before all reads from the pipe have
-	// completed" when using StdoutPipe — calling cmd.Wait() first would
-	// close the pipes and lose buffered data.
+	// Reap the process concurrently and bound the pipe-drain wait.
 	//
-	// On timeout: cmd.Cancel kills the entire process group (SIGKILL to
-	// -PGID), which closes all pipe write ends, causing the goroutines
-	// to get EOF → wg.Wait() returns → cmd.Wait() runs.
-	wg.Wait()
-	err = cmd.Wait()
+	// The old ordering — inline wg.Wait() strictly before cmd.Wait() — could
+	// deadlock: os/exec's Wait is what closes our pipe read ends after the
+	// command exits, so when a process-group escapee (setsid/double-fork
+	// daemon) kept the write ends open past the group SIGKILL, the readers
+	// never saw EOF, wg.Wait() never returned, and the code could never reach
+	// the one call that would have unblocked it. The scan loop then sat in
+	// this tool call until the engine's hard ceiling.
+	//
+	// cmd.Wait() is safe to run alongside the readers (call it exactly once;
+	// it only closes the pipes at reap time). Normal path is unchanged:
+	// readers hit EOF, the drain completes, and the already-reaped Wait
+	// result is read immediately. Pathological paths — bash reaped while an
+	// orphan holds the write end, or the deadline firing — are bounded: after
+	// a short grace we force-close the read ends (Read returns ErrClosed →
+	// reader goroutines unwind) and proceed with whatever was captured. Two
+	// leaked reader goroutines beat a wedged scan loop; the buffers are
+	// mutex-guarded, so a straggler write races nothing.
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- cmd.Wait() }()
+	drainDone := make(chan struct{})
+	go func() { wg.Wait(); close(drainDone) }()
+
+	forceCloseReaders := func() {
+		_ = stdoutPipe.Close() // double-close after Wait is an ignored no-op
+		_ = stderrPipe.Close()
+	}
+	awaitDrain := func() {
+		timer := time.NewTimer(pipeDrainGrace)
+		defer timer.Stop()
+		select {
+		case <-drainDone:
+		case <-timer.C:
+			forceCloseReaders()
+			select {
+			case <-drainDone:
+			case <-time.After(2 * time.Second):
+			}
+		}
+	}
+
+	select {
+	case <-drainDone:
+		err = <-waitDone
+	case waitErr := <-waitDone:
+		awaitDrain()
+		err = waitErr
+	case <-ctx.Done():
+		// The deadline fired: cmd.Cancel already SIGKILLed the process group.
+		// Readers usually reach EOF within microseconds (bash's own write
+		// ends closed), so give the drain the grace first — that preserves
+		// the trailing buffered output a force-close would drop. Only when
+		// an escapee still holds the write ends does awaitDrain force-close.
+		awaitDrain()
+		select {
+		case waitErr := <-waitDone:
+			err = waitErr
+		case <-time.After(cmdReapGrace):
+			err = fmt.Errorf("command process did not exit within %s of the group kill", cmdReapGrace)
+		}
+	}
 	// Note: process unregistration is handled by defer UntrackProcess(cmd) above
 
 	stdoutStr := stdout.String()

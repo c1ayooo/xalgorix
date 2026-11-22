@@ -245,9 +245,24 @@ func main() {
 	cfg := config.Get()
 	resources.ProtectCurrentProcess()
 
-	// Optional PostgreSQL InfoItem cold path. An empty DSN leaves the scanner
-	// in pure-file mode; any startup failure is non-fatal and never gates a
-	// scan or the dashboard.
+	// -------------------------------------------------------------------------
+	// PG primary storage (REDESIGN D12, charter v3.0): PostgreSQL is the
+	// required deployment dependency — state and panel data have no durable
+	// file home since R6. A missing DSN is a fail-fast configuration error,
+	// not a degraded mode; see deploy/docker-compose.yml for the one-command
+	// local stack.
+	// -------------------------------------------------------------------------
+	if strings.TrimSpace(cfg.DatabaseURL) == "" {
+		fmt.Fprintln(os.Stderr, "❌ PostgreSQL is required (charter v3.0 / REDESIGN D12):")
+		fmt.Fprintln(os.Stderr, "   state and panel data are stored in PostgreSQL; there is no file fallback.")
+		fmt.Fprintln(os.Stderr, "   Set XALGORIX_DATABASE_URL (e.g. postgres://user:pass@localhost:5432/xalgorix)")
+		fmt.Fprintln(os.Stderr, "   or start the bundled stack:  docker compose -f deploy/docker-compose.yml up -d")
+		os.Exit(1)
+	}
+
+	// Optional PostgreSQL InfoItem cold path. With the required DSN present,
+	// a startup failure is fatal: running unpersisted scans would silently
+	// lose state (platform.Open below enforces the same rule for the store).
 	var coldSvc *coldpath.Service
 	if strings.TrimSpace(cfg.DatabaseURL) != "" {
 		svc, err := coldpath.New(context.Background(), coldpath.Config{
@@ -282,27 +297,22 @@ func main() {
 	// R1 platform store (projects/tasks/runs, REDESIGN D6/D7). Same degradation
 	// posture as the cold path: with a DSN it owns its own clamped pgxpool and
 	// any startup failure logs to stderr and leaves the platform endpoints at
-	// 503; without a DSN the JSON snapshot file store keeps the API usable.
-	// Assembly must never block or gate a scan (charter §6.6).
 	// -------------------------------------------------------------------------
-	var platformStore platform.Repository
-	if strings.TrimSpace(cfg.DatabaseURL) != "" {
-		store, err := platform.Open(context.Background(), platform.Config{
-			DSN:     cfg.DatabaseURL,
-			DataDir: cfg.DataDir,
-		})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "[platform] disabled after startup error: %v\n", err)
-		} else {
-			platformStore = store
-		}
-	} else {
-		store, err := platform.Open(context.Background(), platform.Config{DataDir: cfg.DataDir})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "[platform] file store disabled: %v\n", err)
-		} else {
-			platformStore = store
-		}
+	// R1 platform store (projects/tasks/runs, REDESIGN D6/D7). v3.0/D12: the
+	// DSN gate above guarantees a non-empty DSN here; a store that cannot
+	// start (pool, ping, migrations) is a fatal configuration error, not a
+	// degraded mode — running unpersisted would silently lose state. The
+	// platform.json file store stays in the codebase only as the migration
+	// importer's read-only source (R6.0).
+	// -------------------------------------------------------------------------
+	platformStore, err := platform.Open(context.Background(), platform.Config{
+		DSN:     cfg.DatabaseURL,
+		DataDir: cfg.DataDir,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "❌ PostgreSQL store failed to start (REDESIGN D12): %v\n", err)
+		fmt.Fprintln(os.Stderr, "   Fix the DSN / database, then start again — the engine will not run unpersisted.")
+		os.Exit(1)
 	}
 
 	// -------------------------------------------------------------------------

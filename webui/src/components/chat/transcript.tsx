@@ -5,6 +5,8 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { ErrorState } from "@/components/states";
 import { TranscriptView } from "@/components/transcript/transcript-view";
 import { cn } from "@/lib/utils";
+import { useInstanceActivity } from "@/lib/use-instance-activity";
+import { fmtDuration } from "@/components/chat/format";
 import { useTranscript } from "@/api/queries";
 import { useEventsStore } from "@/store/events";
 import { useI18n } from "@/i18n";
@@ -23,6 +25,8 @@ const TRANSCRIPT_EVENT_TYPES = new Set([
   "guidance_injected",
   "guidance_queued",
   "guidance_consumed",
+  "chat_question",
+  "chat_reply",
   "finished",
 ]);
 
@@ -47,6 +51,7 @@ export function Transcript({
   filter,
   className,
   empty,
+  onEmptyChange,
 }: {
   instanceId?: string;
   running?: boolean;
@@ -55,6 +60,8 @@ export function Transcript({
   filter?: (item: TranscriptItem) => boolean;
   className?: string;
   empty?: React.ReactNode;
+  /** 空态上报（对话页据此把 composer 居中）；缺省不报告。 */
+  onEmptyChange?: (empty: boolean) => void;
 }) {
   const { t } = useI18n();
   const [beforeSeq, setBeforeSeq] = useState<number | undefined>(undefined);
@@ -170,8 +177,24 @@ export function Transcript({
     () => (filter ? pages.filter(filter) : pages),
     [pages, filter],
   );
-  const live = !!(running || data?.running);
+  // 诚实流式三态（use-instance-activity）：running 投影只说明 run 未结束，
+  // 不说明有数据在流动——指示器跟随真实事件年龄，而不是状态投影。
+  const runInFlight = !!(running || data?.running);
+  const lastActivityAt = useInstanceActivity(instanceId);
+  const activityAgeMs = lastActivityAt !== null ? Date.now() - lastActivityAt : null;
+  const streaming = runInFlight && activityAgeMs !== null && activityAgeMs <= 5000;
+  const staleFor =
+    runInFlight && activityAgeMs !== null && activityAgeMs > 5000
+      ? fmtDuration(activityAgeMs)
+      : null;
+  const unobserved = runInFlight && activityAgeMs === null;
   const hasMore = data?.has_more ?? false;
+
+  // 空态上报须在早退 return（skeleton/error）之前声明，保证各分支都在报告。
+  const isEmpty = !isLoading && !error && filtered.length === 0;
+  useEffect(() => {
+    onEmptyChange?.(isEmpty);
+  }, [isEmpty, onEmptyChange]);
 
   if (!instanceId) return null;
   if (isLoading && pages.length === 0) {
@@ -209,7 +232,13 @@ export function Transcript({
         {!loadingMore && hasMore && (
           <div className="pb-2 text-center text-muted-foreground/70 text-xs">{t("chat.scrollForEarlier")}</div>
         )}
-        <TranscriptView items={filtered} live={live} empty={empty} />
+        <TranscriptView
+          items={filtered}
+          live={streaming}
+          staleFor={staleFor}
+          unobserved={unobserved}
+          empty={empty}
+        />
       </div>
       {jumpPill && (
         <div className="pointer-events-none absolute inset-x-0 bottom-2 flex justify-center">

@@ -8,7 +8,6 @@ import ScanDetailPage from "@/pages/scan-detail"
 // import NewScanPage from "@/pages/new-scan"
 import FindingsPage from "@/pages/findings"
 import ReportsPage from "@/pages/reports"
-import IntegrationsPage from "@/pages/integrations"
 import LivePage from "@/pages/live"
 import InstancesPage from "@/pages/instances"
 import SettingsPage from "@/pages/settings"
@@ -63,7 +62,6 @@ const routes: RouteObject[] = [
       { path: "schedules", element: <SchedulesPage /> },
       { path: "findings", element: <FindingsPage /> },
       { path: "reports", element: <ReportsPage /> },
-      { path: "integrations", element: <IntegrationsPage /> },
       { path: "mcp", element: <McpServersPage /> },
       { path: "skills", element: <SkillsPage /> },
       { path: "agents", element: <AgentProfilesPage /> },

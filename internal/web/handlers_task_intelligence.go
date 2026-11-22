@@ -43,26 +43,17 @@ func (s *Server) handleTaskIntelligence(w http.ResponseWriter, r *http.Request, 
 	ctx := r.Context()
 
 	entries := s.findAllScanSummaries()
-	// run identity → scan dir: id→dir pairs from the same walk (scan files'
-	// dir source of truth), plus a record index for canonical scan ids.
+	// run identity → sibling scan dirs: id→dir pairs from the same walk (scan
+	// files' dir source of truth), plus a record index for canonical ids.
 	idx := s.scanSummaryIndexFor(entries)
-	dirByScan := make(map[string]string, len(entries)*2)
-	for i := range entries {
-		if id := entries[i].rec.ID; id != "" {
-			if _, ok := dirByScan[id]; !ok {
-				dirByScan[id] = entries[i].dir
-			}
-		}
-		if iid := entries[i].rec.InstanceID; iid != "" {
-			if _, ok := dirByScan[iid]; !ok {
-				dirByScan[iid] = entries[i].dir
-			}
-		}
-	}
 
 	// Walk the task's runs newest first (ListRuns order): the newest run's
 	// record of a fingerprint wins, older runs only extend ScanIDs — a
-	// re-observation never overwrites the original record.
+	// re-observation never overwrites the original record. Within a run,
+	// every sibling session's snapshot merges too (D11 re-dispatch): a
+	// re-dispatched run keeps its previous session's intel instead of
+	// dropping it when the first-wins directory pick lands on the fresh
+	// session (the lookupAll discipline the finding projections use).
 	const pageSize = 500
 	var ordered []*taskIntelItem
 	deduped := make(map[string]*taskIntelItem)
@@ -77,39 +68,39 @@ func (s *Server) handleTaskIntelligence(w http.ResponseWriter, r *http.Request, 
 			break
 		}
 		for _, run := range runs {
-			rec := idx.lookup(run.InstanceID, run.LegacyScanID)
-			dir := dirByScan[run.InstanceID]
-			if dir == "" {
-				dir = dirByScan[run.LegacyScanID]
-			}
-			if dir == "" {
-				continue // missing run (purged history): nothing to read
-			}
-			items, err := intelligence.LoadSnapshot(filepath.Join(dir, "intelligence.json"))
-			if err != nil {
-				// One damaged run snapshot must not fabricate a clean task
-				// view: count it and say so in the response.
-				damagedRuns++
-				log.Printf("[intel] task %s run %s: %v", taskID, run.ID, err)
-				continue
-			}
-			scanKey := run.InstanceID
-			if rec != nil && rec.ID != "" {
-				scanKey = rec.ID
-			}
-			for _, item := range items {
-				if item.Fingerprint == "" {
+			recs := idx.lookupAll(run.InstanceID, run.LegacyScanID)
+			sort.SliceStable(recs, func(i, j int) bool { return recs[i].StartedAt > recs[j].StartedAt })
+			for _, rec := range recs {
+				dir := idx.dirByScanID[rec.ID]
+				if dir == "" {
+					continue // missing session (purged history): nothing to read
+				}
+				items, err := intelligence.LoadSnapshot(filepath.Join(dir, "intelligence.json"))
+				if err != nil {
+					// One damaged run snapshot must not fabricate a clean task
+					// view: count it and say so in the response.
+					damagedRuns++
+					log.Printf("[intel] task %s run %s session %s: %v", taskID, run.ID, rec.ID, err)
 					continue
 				}
-				if existing, ok := deduped[item.Fingerprint]; ok {
-					if !scanIDKnown(existing.ScanIDs, scanKey) {
-						existing.ScanIDs = append(existing.ScanIDs, scanKey)
+				scanKey := run.InstanceID
+				if rec.ID != "" {
+					scanKey = rec.ID
+				}
+				for _, item := range items {
+					if item.Fingerprint == "" {
+						continue
 					}
-					continue
+					if existing, ok := deduped[item.Fingerprint]; ok {
+						if !scanIDKnown(existing.ScanIDs, scanKey) {
+							existing.ScanIDs = append(existing.ScanIDs, scanKey)
+						}
+						continue
+					}
+					ti := &taskIntelItem{Item: item, ScanIDs: []string{scanKey}}
+					deduped[item.Fingerprint] = ti
+					ordered = append(ordered, ti)
 				}
-				ti := &taskIntelItem{Item: item, ScanIDs: []string{scanKey}}
-				deduped[item.Fingerprint] = ti
-				ordered = append(ordered, ti)
 			}
 		}
 		if page*pageSize >= total {

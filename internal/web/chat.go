@@ -185,40 +185,50 @@ func buildPostScanChatPrompt(inst *ScanInstance, language string) string {
 		b.WriteString("You are Xalgorix in post-scan chat mode. The scan has already finished, so answer follow-up questions using only the completed scan context below. Do not claim that you are still scanning or that you can run tools in this chat. If the user asks for new testing, first summarize what the completed scan already found for that topic, then explain that additional live testing requires resuming, restarting, or starting a new scan.\n\n")
 	}
 
+	writeScanChatSnapshot(&b, inst)
+	return b.String()
+}
+
+// writeScanChatSnapshot renders the shared scan-context body used by both
+// chat channels (post-scan chat and running side-questions): instance facts,
+// bounded vulnerability list and the recent event tail. Callers own the
+// framing preamble; this body is identical so both channels answer from the
+// same context discipline.
+func writeScanChatSnapshot(b *strings.Builder, inst *ScanInstance) {
 	b.WriteString("## Scan\n")
-	fmt.Fprintf(&b, "Instance ID: %s\n", inst.ID)
-	fmt.Fprintf(&b, "Targets: %s\n", inst.Targets)
-	fmt.Fprintf(&b, "Status: %s\n", inst.Status)
+	fmt.Fprintf(b, "Instance ID: %s\n", inst.ID)
+	fmt.Fprintf(b, "Targets: %s\n", inst.Targets)
+	fmt.Fprintf(b, "Status: %s\n", inst.Status)
 	if inst.ScanMode != "" {
-		fmt.Fprintf(&b, "Mode: %s\n", inst.ScanMode)
+		fmt.Fprintf(b, "Mode: %s\n", inst.ScanMode)
 	}
 	if inst.StartedAt != "" {
-		fmt.Fprintf(&b, "Started: %s\n", inst.StartedAt)
+		fmt.Fprintf(b, "Started: %s\n", inst.StartedAt)
 	}
 	if inst.FinishedAt != "" {
-		fmt.Fprintf(&b, "Finished: %s\n", inst.FinishedAt)
+		fmt.Fprintf(b, "Finished: %s\n", inst.FinishedAt)
 	}
-	fmt.Fprintf(&b, "Iterations: %d\nTool calls: %d\nVulnerabilities: %d\nTotal tokens: %d\n", inst.Iterations, inst.ToolCalls, inst.VulnCount, inst.TotalTokens)
+	fmt.Fprintf(b, "Iterations: %d\nTool calls: %d\nVulnerabilities: %d\nTotal tokens: %d\n", inst.Iterations, inst.ToolCalls, inst.VulnCount, inst.TotalTokens)
 	if strings.TrimSpace(inst.Instruction) != "" {
-		fmt.Fprintf(&b, "User instructions: %s\n", truncStr(inst.Instruction, 1200))
+		fmt.Fprintf(b, "User instructions: %s\n", truncStr(inst.Instruction, 1200))
 	}
 
 	if len(inst.Vulns) > 0 {
 		b.WriteString("\n## Vulnerabilities\n")
 		for i, v := range inst.Vulns {
 			if i >= 40 {
-				fmt.Fprintf(&b, "- ... %d additional vulnerabilities omitted from prompt context\n", len(inst.Vulns)-i)
+				fmt.Fprintf(b, "- ... %d additional vulnerabilities omitted from prompt context\n", len(inst.Vulns)-i)
 				break
 			}
-			fmt.Fprintf(&b, "- [%s] %s", strings.ToUpper(v.Severity), v.Title)
+			fmt.Fprintf(b, "- [%s] %s", strings.ToUpper(v.Severity), v.Title)
 			if v.Endpoint != "" {
-				fmt.Fprintf(&b, " at %s", v.Endpoint)
+				fmt.Fprintf(b, " at %s", v.Endpoint)
 			}
 			if v.CVSS > 0 {
-				fmt.Fprintf(&b, " (CVSS %.1f)", v.CVSS)
+				fmt.Fprintf(b, " (CVSS %.1f)", v.CVSS)
 			}
 			if v.Description != "" {
-				fmt.Fprintf(&b, " - %s", truncStr(v.Description, 500))
+				fmt.Fprintf(b, " - %s", truncStr(v.Description, 500))
 			}
 			b.WriteByte('\n')
 		}
@@ -239,8 +249,6 @@ func buildPostScanChatPrompt(inst *ScanInstance, language string) string {
 			}
 		}
 	}
-
-	return b.String()
 }
 
 func summarizeChatEvent(evt WSEvent) string {

@@ -40,6 +40,7 @@ import {
 } from "@/api/queries";
 import { activePhaseNames, phaseCountSummary } from "@/components/phase-progress";
 import { useActiveProjectId } from "@/lib/use-active-project";
+import { scopeEventsToProject } from "@/lib/events-scope";
 import {
   normalizeSeverity,
   severityRank,
@@ -78,6 +79,12 @@ export default function OverviewPage() {
         .slice(0, 5),
     [allInstances],
   );
+  // SSE store 是全局的：按当前项目的实例集裁剪，避免别的项目的运行事件漏进
+  // 本页动态流（与 /live 同一口径，见 lib/events-scope）。
+  const projectInstanceIds = useMemo(
+    () => new Set(allInstances.map((i) => i.id)),
+    [allInstances],
+  );
   const eventHistoryQueries = useQueries({
     queries: activeEventInstanceIds.map((id) => ({
       queryKey: qk.instanceEvents(id),
@@ -96,8 +103,11 @@ export default function OverviewPage() {
         ),
       ),
     );
-    return mergeFeedEvents(persisted, events).slice(-80);
-  }, [activeEventInstanceIds, eventHistoryQueries, events]);
+    return mergeFeedEvents(
+      persisted,
+      scopeEventsToProject(events, projectInstanceIds),
+    ).slice(-80);
+  }, [activeEventInstanceIds, eventHistoryQueries, events, projectInstanceIds]);
 
   // 项目作用域发现投影（契约 §3.2）：单一数据源，替代原 getScan N+1 fan-out
   //（UI_DESIGN K-3）——同时消除全局扫描发现漏进当前项目视图的隔离破口。

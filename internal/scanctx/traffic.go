@@ -3,6 +3,7 @@ package scanctx
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -181,6 +182,17 @@ func ReadTrafficExchanges(scanDir string) ([]TrafficExchange, error) {
 	return exchanges, nil
 }
 
+// TrafficQuery narrows an archive listing. Empty fields mean "any"; Limit <= 0
+// means "all matches". Host is matched case-insensitively against the exchange
+// URL's hostname (port ignored), which is the join key between captured traffic
+// and a discovered asset.
+type TrafficQuery struct {
+	Endpoint string
+	Method   string
+	Host     string
+	Limit    int
+}
+
 // MatchTrafficExchanges filters archived exchanges for a finding's endpoint.
 // The endpoint is matched as a case-insensitive substring of the exchange URL
 // (findings carry paths or URLs; the archive stores absolute URLs); method,
@@ -201,8 +213,17 @@ func MatchTrafficExchanges(scanDir, endpoint, method string, limit int) ([]Traff
 // web-layer projection, which also distinguishes an empty archive from an
 // empty match).
 func FilterTrafficExchanges(all []TrafficExchange, endpoint, method string, limit int) ([]TrafficExchange, int) {
-	ep := strings.ToLower(strings.TrimSpace(endpoint))
-	m := strings.ToUpper(strings.TrimSpace(method))
+	return FilterTrafficExchangesWith(all, TrafficQuery{Endpoint: endpoint, Method: method, Limit: limit})
+}
+
+// FilterTrafficExchangesWith applies the full query (endpoint substring,
+// method, asset host, newest-window limit) to an already-loaded exchange list.
+// Host matching uses the exchange URL's hostname so a traffic record can be
+// pinned to the discovered asset it was observed against.
+func FilterTrafficExchangesWith(all []TrafficExchange, q TrafficQuery) ([]TrafficExchange, int) {
+	ep := strings.ToLower(strings.TrimSpace(q.Endpoint))
+	m := strings.ToUpper(strings.TrimSpace(q.Method))
+	host := strings.ToLower(strings.TrimSpace(q.Host))
 	matched := make([]TrafficExchange, 0)
 	for _, ex := range all {
 		if m != "" && strings.ToUpper(ex.Method) != m {
@@ -211,11 +232,24 @@ func FilterTrafficExchanges(all []TrafficExchange, endpoint, method string, limi
 		if ep != "" && !strings.Contains(strings.ToLower(ex.URL), ep) {
 			continue
 		}
+		if host != "" && HostOf(ex) != host {
+			continue
+		}
 		matched = append(matched, ex)
 	}
 	total := len(matched)
-	if limit > 0 && len(matched) > limit {
-		matched = matched[len(matched)-limit:] // newest window, ascending order
+	if q.Limit > 0 && len(matched) > q.Limit {
+		matched = matched[len(matched)-q.Limit:] // newest window, ascending order
 	}
 	return matched, total
+}
+
+// HostOf returns the lowercased hostname of an exchange URL (port stripped).
+// Unparseable URLs yield "" — callers treat that as "no asset binding".
+func HostOf(ex TrafficExchange) string {
+	u, err := url.Parse(strings.TrimSpace(ex.URL))
+	if err != nil || u.Hostname() == "" {
+		return ""
+	}
+	return strings.ToLower(u.Hostname())
 }

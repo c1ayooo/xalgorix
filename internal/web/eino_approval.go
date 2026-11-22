@@ -6,6 +6,7 @@ package web
 
 import (
 	"context"
+	"errors"
 	"strings"
 
 	"github.com/xalgord/xalgorix/v4/internal/approval"
@@ -102,6 +103,16 @@ func (b *einoApprovalBroker) RequestApproval(_ context.Context, req engine.Appro
 	verdict := b.svc.policy.Evaluate(req.ToolName, req.Args)
 	if verdict.Decision == approval.Allow {
 		return "", nil
+	}
+	// Project fence first (scope_fence.go): a remembered rule may only exempt
+	// calls that already sit inside the authorization boundary. The denial
+	// row is terminal, so WaitApproval resolves it without waiting for the
+	// operator and the model receives the ⛔ FENCE DENIAL text.
+	if row, denied := b.svc.fenceDenial(b.instanceID, b.sctx, verdict, b.secretValues()); denied {
+		if row == nil {
+			return "", errors.New("project fence denied the call (audit row unavailable)")
+		}
+		return row.ID, nil
 	}
 	// Operator rule exemption ("approve & remember", contract §3.2): a
 	// remembered rule allows the call without an interrupt and without a row

@@ -239,6 +239,9 @@ let state = {
       consumed_at: nowIso(),
     },
   ],
+  // 旁路提问（chat_questions.go mock）：phase=running 时同 run 再问 → 409；
+  // status=answered/failed 后回流转录（chat_question / chat_reply 行）。
+  sideQuestions: [],
   // 任务情报（契约 §3.7 mock）：按 task_id 聚合的观测项 + 操作者分诊覆盖层。
   intelTriages: new Map(), // taskId -> Map(fingerprint -> triage)
   convMeta: new Map(), // instance_id -> { title?, pinned?, archived? }（会话元数据覆盖层）
@@ -502,6 +505,37 @@ const providerCatalog = [
   { id: "google", displayName: "Google Gemini", baseURL: "https://generativelanguage.googleapis.com/v1beta", headerStyle: "gemini", authMethods: ["api_key"], models: ["gemini-3.5-flash", "gemini-3.6-flash"] },
 ];
 
+// 环境变量设置的 mock 落点：只维护与前端设置页开关相关的键（MITM 流量代理）。
+const envSettings = {
+  XALGORIX_TRAFFICPROXY: "true",
+};
+
+const envVariableCatalog = [
+  {
+    key: "XALGORIX_TRAFFICPROXY",
+    label: "Traffic proxy (MITM)",
+    category: "Proxy",
+    description:
+      "Route all scan HTTP through a local loopback MITM proxy (default on). Takes effect after restart.",
+    defaultValue: "true",
+    inputType: "boolean",
+    sensitive: false,
+    requiresRestart: true,
+  },
+];
+
+function envSettingsPayload(restartRequired) {
+  return {
+    envFile: "~/.xalgorix.env",
+    variables: envVariableCatalog.map((def) => ({
+      ...def,
+      value: envSettings[def.key] ?? "",
+      hasValue: (envSettings[def.key] ?? "") !== "",
+    })),
+    restartRequired,
+  };
+}
+
 const llmSettings = {
   model: "",
   apiBase: "",
@@ -740,6 +774,18 @@ function buildMockTranscript(instanceId, run) {
     if (g.instance_id !== instanceId && (!run || g.run_id !== run.id)) continue;
     if (!g.message?.trim()) continue;
     rows.push({ kind: "human", role: "human", text: g.message, status: g.status, at: g.created_at });
+  }
+
+  // 旁路提问 + 应答（chat_transcript.go 的 chat_question/chat_reply 映射同款）。
+  for (const q of state.sideQuestions) {
+    if (q.instance_id !== instanceId && (!run || q.run_id !== run.id)) continue;
+    if (!q.message?.trim()) continue;
+    rows.push({ kind: "human", role: "human", text: q.message, at: q.created_at });
+    if (q.status === "answered") {
+      rows.push({ kind: "assistant", role: "chat", text: q.answer, agent_id: "operator_chat", at: q.answered_at });
+    } else if (q.status === "failed") {
+      rows.push({ kind: "assistant", role: "chat", status: "failed", text: q.error, agent_id: "operator_chat", at: q.answered_at });
+    }
   }
 
   // 事件 fixture（与 /api/instances/:id/events 同源，时间轴对齐）。
@@ -1011,6 +1057,67 @@ const server = http.createServer(async (req, res) => {
         ["scopeguard","target_scope","phase","auth","activity","goal","ledger","report","benchmark","other"].map((k) => [k, 0]),
       ),
       truncated: false,
+    });
+  }
+
+  // GET /api/scans/{id}/traffic — MITM 代理 raw 流量归档（契约同
+  // scan_traffic.go：endpoint 子串 / method 精确 / host 精确 + limit 最新窗口）。
+  // mock 固定返回两条挂在实例资产上的 exchange，供实时动态 HTTP 视图与
+  // finding 证据面板联调。
+  const trafficMatch = url.match(/^\/api\/scans\/([^/]+)\/traffic$/);
+  if (trafficMatch && method === "GET") {
+    const scanId = decodeURIComponent(trafficMatch[1]);
+    const known =
+      state.instances.some((inst) => inst.id === scanId) ||
+      state.scans.some((sc) => sc.id === scanId);
+    if (!known) return send(res, { error: "scan not found" }, 404);
+    const tqs = new URLSearchParams(req.url.split("?")[1] || "");
+    const endpoint = (tqs.get("endpoint") || "").toLowerCase();
+    const host = (tqs.get("host") || "").toLowerCase();
+    const methodFilter = (tqs.get("method") || "").toUpperCase();
+    const limit = Math.min(Number(tqs.get("limit")) || 20, 100);
+    const ago = (min) => new Date(Date.now() - min * 60_000).toISOString();
+    const all = [
+      {
+        seq: 3, at: ago(2), method: "POST",
+        url: "https://api.acme.com/api/v1/orders", host: "api.acme.com",
+        status: 200, channel: "bearer",
+        request_raw:
+          "POST /api/v1/orders HTTP/1.1\r\nHost: api.acme.com\r\nAuthorization: Bearer eyJhbGciOi...\r\nContent-Type: application/json\r\n\r\n{\"item\":\"sku-1\",\"qty\":1}",
+        response_raw:
+          "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"order_id\":1001,\"owner\":\"other-user\"}",
+      },
+      {
+        seq: 2, at: ago(3), method: "GET",
+        url: "https://api.acme.com/api/v1/orders/1001", host: "api.acme.com",
+        status: 401, channel: "subprocess",
+        request_raw:
+          "GET /api/v1/orders/1001 HTTP/1.1\r\nHost: api.acme.com\r\n\r\n",
+        response_raw:
+          "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer\r\n\r\n",
+      },
+      {
+        seq: 1, at: ago(5), method: "GET",
+        url: "https://acme.com/login", host: "acme.com",
+        status: 200, channel: "bearer",
+        request_raw: "GET /login HTTP/1.1\r\nHost: acme.com\r\n\r\n",
+        response_raw:
+          "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<form action=\"/session\" method=\"post\"></form>",
+      },
+    ];
+    const matched = all.filter(
+      (ex) =>
+        (!methodFilter || ex.method === methodFilter) &&
+        (!endpoint || ex.url.toLowerCase().includes(endpoint)) &&
+        (!host || ex.host === host),
+    );
+    const windowed = matched.slice(-limit);
+    return send(res, {
+      scan_id: scanId,
+      exchanges: windowed,
+      total_matched: matched.length,
+      truncated: matched.length > windowed.length,
+      present: true,
     });
   }
   // -------- Scans (records) -------------------------------------------------
@@ -1427,7 +1534,14 @@ const server = http.createServer(async (req, res) => {
     return send(res, llmSettings);
   }
   if (method === "GET" && url === "/api/settings/environment") {
-    return send(res, { envFile: "~/.xalgorix.env", variables: [], restartRequired: false });
+    return send(res, envSettingsPayload(false));
+  }
+  if (method === "POST" && url === "/api/settings/environment") {
+    const body = await readBody(req);
+    for (const [key, value] of Object.entries(body.values || {})) {
+      envSettings[key] = String(value ?? "");
+    }
+    return send(res, envSettingsPayload(true));
   }
   if (method === "GET" && url === "/api/legacy-import/status") {
     return send(res, { count: 0, dismissed: true });
@@ -1457,6 +1571,113 @@ const server = http.createServer(async (req, res) => {
     state.projects.push(proj);
     return send(res, proj, 201);
   }
+  // -------- R3: project scope & fence (project page module) ------------------
+  // Mirrors internal/web/project_scope.go closely enough for UI work: shape
+  // validation, per-target dispatch+fence verdicts, and the effective view.
+  const projScopeOne = url.match(/^\/api\/projects\/([^/]+)\/scope$/);
+  const projScopeValidate = url.match(/^\/api\/projects\/([^/]+)\/scope\/validate$/);
+  if (projScopeOne || projScopeValidate) {
+    const id = (projScopeOne || projScopeValidate)[1];
+    const proj = state.projects.find((p) => p.id === id);
+    if (!proj) return send(res, { error: "not found" }, 404);
+    const approvalMode = "enforce";
+    const fenceOf = (scope) => (scope && scope.fence) || { enforce: false };
+    const hostOf = (value) => {
+      let t = String(value || "").trim();
+      if (t.includes("://")) {
+        try {
+          const u = new URL(t);
+          return { host: u.hostname.toLowerCase(), port: u.port || (u.protocol === "https:" ? "443" : "80") };
+        } catch {
+          return { host: "", port: "" };
+        }
+      }
+      const slash = t.search(/[/?#]/);
+      if (slash >= 0) t = t.slice(0, slash);
+      const m = t.match(/^\[([^\]]+)\](?::(\d+))?$/) || t.match(/^([^:]+)(?::(\d+))?$/);
+      if (!m) return { host: "", port: "" };
+      return { host: m[1].toLowerCase(), port: m[2] || "" };
+    };
+    const hostInScope = (host, entry) => {
+      const e = String(entry || "").trim().toLowerCase().replace(/\.$/, "");
+      const h = host.replace(/\.$/, "");
+      if (!e || !h) return false;
+      if (h === e) return true;
+      if (e.startsWith("*.")) return h.endsWith(`.${e.slice(2)}`);
+      return h.endsWith(`.${e}`);
+    };
+    const problemsOf = (scope) => {
+      const out = [];
+      if (!Array.isArray(scope?.targets)) out.push("targets must be an array");
+      for (const entry of scope?.targets || []) {
+        if (/^[^:[\]]+:\d+$/.test(String(entry).trim())) {
+          out.push(`scope target ${entry} carries a port; list hosts only and control ports via allow_ports`);
+        }
+      }
+      if (fenceOf(scope).enforce && (scope?.targets || []).length === 0) {
+        out.push("fence cannot be enforced while the scope has no targets");
+      }
+      return out;
+    };
+    const viewOf = (scope, problems = [], warning = "") => ({
+      project_id: proj.id,
+      scope,
+      fence: fenceOf(scope),
+      problems,
+      active_runs: proj.active_runs || 0,
+      approval_mode: approvalMode,
+      fence_bound: !!fenceOf(scope).enforce && approvalMode === "enforce",
+      ...(warning ? { warning } : {}),
+    });
+    if (projScopeOne && method === "GET") {
+      return send(res, viewOf(proj.scope || { targets: [] }, problemsOf(proj.scope)));
+    }
+    if (projScopeOne && method === "PUT") {
+      const body = await readBody(req);
+      const problems = problemsOf(body);
+      if (problems.length > 0) return send(res, { error: problems[0], problems }, 400);
+      proj.scope = body;
+      return send(res, viewOf(proj.scope, [], ""));
+    }
+    if (projScopeValidate && method === "POST") {
+      const body = await readBody(req);
+      const scope = body.scope || proj.scope || { targets: [] };
+      const problems = problemsOf(scope);
+      const hostPorts = (scope.targets || []).map((e) => hostOf(e).host).filter(Boolean);
+      const allowPorts = scope.allow_ports || [];
+      const deny = fenceOf(scope).deny_targets || [];
+      const entries = (body.targets || []).map((raw) => {
+        const target = String(raw).trim();
+        const { host, port } = hostOf(target);
+        const reasons = [];
+        if (!host) reasons.push(`target ${JSON.stringify(target)} is not a valid host`);
+        else if (!hostPorts.some((e) => hostInScope(host, e))) {
+          reasons.push(`target ${JSON.stringify(target)} is outside the project scope`);
+        }
+        if (host) {
+          if (deny.some((e) => hostInScope(host, e))) {
+            reasons.push(`fence: host ${JSON.stringify(host)} is excluded by the project fence`);
+          }
+          if (port && allowPorts.length > 0 && !allowPorts.includes(Number(port))) {
+            reasons.push(`target ${JSON.stringify(target)} can use port ${port} which is not in the project allow_ports`);
+          }
+        }
+        return reasons.length === 0
+          ? { target, in_scope: true }
+          : { target, in_scope: false, reason: reasons.join("; ") };
+      });
+      return send(res, {
+        ok: problems.length === 0,
+        problems,
+        entries,
+        scope,
+        fence: fenceOf(scope),
+        fence_bound: !!fenceOf(scope).enforce && approvalMode === "enforce",
+        approval_mode: approvalMode,
+      });
+    }
+  }
+
   const projOne = url.match(/^\/api\/projects\/([^/]+)$/);
   if (projOne) {
     const proj = state.projects.find((p) => p.id === projOne[1]);
@@ -2072,12 +2293,89 @@ const server = http.createServer(async (req, res) => {
       instance_id: g.instance_id,
       guidance: g,
     });
+    // guidance consumed 闭环模拟（guidance_observer.go 同语义）：注入后数秒
+    // 引擎在 ledger 记录里引用 gi:<id>，观察者翻转 consumed 并广播。
+    if (g.status === "injected") {
+      setTimeout(() => {
+        g.status = "consumed";
+        g.consumed_at = nowIso();
+        broadcastEvent({
+          type: "guidance_consumed",
+          content: message,
+          timestamp: g.consumed_at,
+          agent_id: g.instance_id,
+          instance_id: g.instance_id,
+          guidance: g,
+        });
+      }, 4000);
+    }
     return send(res, {
       status: g.status,
       guidance_id: g.id,
       run_id: g.run_id,
       accepted: true,
     });
+  }
+
+  // -------- 旁路提问（chat_questions.go mock）--------------------------------
+  // 运行中的对话页提问：独立 LLM 从快照回答，不进扫描主循环。mock 用延迟
+  // 广播模拟应答延迟；phase=running 期间同 run 再问 → 409（chatBusy 语义）。
+  const taskQuestions = url.match(/^\/api\/tasks\/([^/]+)\/questions$/);
+  if (taskQuestions && method === "POST") {
+    const task = state.tasks.find((t) => t.id === taskQuestions[1]);
+    if (!task) return send(res, { error: "not found" }, 404);
+    const body = await readBody(req);
+    const message = typeof body.message === "string" ? body.message.trim() : "";
+    if (!message || Array.from(message).length > 4000) {
+      return send(res, { error: "message must be 1..4000 code points" }, 400);
+    }
+    const run =
+      state.runs.find((r) => r.task_id === task.id && r.status === "running") ||
+      state.runs.find((r) => r.task_id === task.id);
+    if (!run?.instance_id) return send(res, { error: "no run mounted on this task" }, 400);
+    if (state.sideQuestions.some((q) => q.instance_id === run.instance_id && q.phase === "running")) {
+      return send(res, { error: "a question for this run is already being answered" }, 409);
+    }
+    const q = {
+      id: `sq_${String(state.sideQuestions.length + 1).padStart(2, "0")}`,
+      task_id: task.id,
+      run_id: run.id,
+      instance_id: run.instance_id,
+      message,
+      request_id: typeof body.request_id === "string" ? body.request_id : "",
+      status: "pending",
+      phase: "running",
+      created_at: nowIso(),
+    };
+    state.sideQuestions.unshift(q);
+    broadcastEvent({
+      type: "chat_question",
+      content: message,
+      timestamp: q.created_at,
+      agent_id: q.instance_id,
+      instance_id: q.instance_id,
+    });
+    setTimeout(() => {
+      q.phase = "done";
+      q.status = "answered";
+      q.answered_at = nowIso();
+      q.answer = `（mock 旁路回答）关于「${message.slice(0, 24)}」：当前快照显示本次运行仍在推进，最近事件以 recon 与已验证发现为主；详细结论以转录与发现页为准。`;
+      broadcastEvent({
+        type: "chat_reply",
+        content: q.answer,
+        timestamp: q.answered_at,
+        agent_id: "operator_chat",
+        instance_id: q.instance_id,
+        result_meta: { request_id: q.request_id, status: "answered" },
+      });
+    }, 1200);
+    return send(res, {
+      status: "pending",
+      accepted: true,
+      run_id: run.id,
+      instance_id: run.instance_id,
+      request_id: q.request_id,
+    }, 202);
   }
   if (taskGuidance && method === "GET") {
     const items = state.guidances

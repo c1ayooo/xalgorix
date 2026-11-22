@@ -399,6 +399,14 @@ type Config struct {
 	FeishuWebhook       string // XALGORIX_FEISHU_WEBHOOK - Feishu/Lark custom robot webhook URL (hook id in path)
 	FeishuSecret        string // XALGORIX_FEISHU_SECRET - Feishu sign secret (加签); empty when signing is off
 	FeishuMinSeverity   string // XALGORIX_FEISHU_MIN_SEVERITY - minimum severity to notify
+	// Feishu self-built app (应用机器人) mode: when AppID, AppSecret and
+	// ReceiveID are all set, notifications go through the IM Open API with a
+	// cached tenant_access_token instead of the group robot webhook. Ported
+	// from the 4zreco notify channel implementation.
+	FeishuAppID         string // XALGORIX_FEISHU_APP_ID - self-built app App ID (cli_...)
+	FeishuAppSecret     string // XALGORIX_FEISHU_APP_SECRET - self-built app App Secret (secret)
+	FeishuReceiveID     string // XALGORIX_FEISHU_RECEIVE_ID - chat/user the app sends to
+	FeishuReceiveIDType string // XALGORIX_FEISHU_RECEIVE_ID_TYPE - open_id/user_id/union_id/email/chat_id
 	WeComWebhook        string // XALGORIX_WECOM_WEBHOOK - WeCom group robot webhook URL (key in query)
 	WeComMinSeverity    string // XALGORIX_WECOM_MIN_SEVERITY - minimum severity to notify
 
@@ -661,6 +669,10 @@ func load() *Config {
 		FeishuWebhook:       envOr("XALGORIX_FEISHU_WEBHOOK", ""),
 		FeishuSecret:        envOr("XALGORIX_FEISHU_SECRET", ""),
 		FeishuMinSeverity:   envOr("XALGORIX_FEISHU_MIN_SEVERITY", ""),
+		FeishuAppID:         envOr("XALGORIX_FEISHU_APP_ID", ""),
+		FeishuAppSecret:     envOr("XALGORIX_FEISHU_APP_SECRET", ""),
+		FeishuReceiveID:     envOr("XALGORIX_FEISHU_RECEIVE_ID", ""),
+		FeishuReceiveIDType: envOr("XALGORIX_FEISHU_RECEIVE_ID_TYPE", "open_id"),
 		WeComWebhook:        envOr("XALGORIX_WECOM_WEBHOOK", ""),
 		WeComMinSeverity:    envOr("XALGORIX_WECOM_MIN_SEVERITY", ""),
 

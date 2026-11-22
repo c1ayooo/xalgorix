@@ -21,8 +21,8 @@ import (
 // projectedRunFindings converts the saved ScanRecords behind one run into the
 // platform projection shape. Records are the run's sibling sessions (REDESIGN
 // D11 re-dispatch shares one instance id across several scan.json records), so
-// the corpus merges newest-wins over the same (target, endpoint, title,
-// severity) key the findings list uses — one record alone is a blind spot, not
+// the corpus merges newest-wins over the same findingContentKey (title, target,
+// endpoint, method, cve) the findings list uses — one record alone is a blind spot, not
 // the truth. Callers build this before handing work to a goroutine so cleanup
 // never races with further record mutation.
 func projectedRunFindings(recs []*ScanRecord) []platform.RunFinding {

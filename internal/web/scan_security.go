@@ -45,7 +45,7 @@ type scanSecurityView struct {
 // securityBlockCategories maps journal marker prefixes to a stable category
 // key the frontend localizes. Order matters: first match wins.
 var securityBlockCategories = []struct {
-	prefix  string
+	prefix   string
 	category string
 }{
 	{"OUT-OF-SCOPE TARGET BLOCKED", "scopeguard"},
@@ -68,64 +68,73 @@ var securityCategories = []string{
 	"goal", "ledger", "report", "benchmark", "other",
 }
 
-const securityBlockCap = 200        // newest blocks returned
+const securityBlockCap = 200             // newest blocks returned
 const securityJournalMaxBytes = 32 << 20 // read cap for oversized journals
 
 // handleScanSecurity serves GET /api/scans/{id}/security.
+//
+// Instance-form requests (the task-detail run view) merge every sibling
+// session's journal, newest session first — a D11 re-dispatch continues the
+// same guarded investigation, so its previous sessions' refusals stay visible
+// instead of vanishing into the fresh session's empty journal.
 func (s *Server) handleScanSecurity(w http.ResponseWriter, r *http.Request) {
 	scanID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/scans/"), "/security")
 	if scanID == "" {
 		http.Error(w, `{"error":"scan id is required"}`, http.StatusBadRequest)
 		return
 	}
-	dir, ok := s.resolveScanDirByID(scanID)
+	entries := s.findAllScanSummaries()
+	res, ok := s.resolveScanRecordByIDFrom(scanID, func() []scanEntry { return entries })
 	if !ok {
 		http.Error(w, `{"error":"scan not found"}`, http.StatusNotFound)
 		return
 	}
+	dirs := s.sessionDirsForProjection(res, entries)
 
 	view := scanSecurityView{
-		ScanID: filepath.Base(scanID),
-		Blocks: []securityBlock{},
+		ScanID:   filepath.Base(scanID),
+		Blocks:   []securityBlock{},
 		Counters: map[string]int{},
 	}
 	for _, c := range securityCategories {
 		view.Counters[c] = 0
 	}
 
-	data, err := readJournalTail(filepath.Join(dir, scanEventJournalFile), securityJournalMaxBytes)
-	if err != nil || len(data) == 0 {
-		writeJSONStatus(w, http.StatusOK, view)
-		return
-	}
-	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-	// Newest first; the cap keeps the tail when a scan racks up refusals.
+	// Newest session first; the cap keeps the newest refusals across the
+	// whole run when it racks them up.
 	var blocks []securityBlock
 	truncated := false
-	for i := len(lines) - 1; i >= 0; i-- {
-		line := strings.TrimSpace(lines[i])
-		if line == "" {
+	for i := len(dirs) - 1; i >= 0 && !truncated; i-- {
+		data, err := readJournalTail(filepath.Join(dirs[i], scanEventJournalFile), securityJournalMaxBytes)
+		if err != nil || len(data) == 0 {
 			continue
 		}
-		var ev WSEvent
-		if json.Unmarshal([]byte(line), &ev) != nil {
-			continue
+		lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+		for j := len(lines) - 1; j >= 0; j-- {
+			line := strings.TrimSpace(lines[j])
+			if line == "" {
+				continue
+			}
+			var ev WSEvent
+			if json.Unmarshal([]byte(line), &ev) != nil {
+				continue
+			}
+			category, reason := classifySecurityBlock(&ev)
+			if category == "" {
+				continue
+			}
+			if len(blocks) >= securityBlockCap {
+				truncated = true
+				break
+			}
+			view.Counters[category]++
+			blocks = append(blocks, securityBlock{
+				TS:       ev.Timestamp,
+				Category: category,
+				Tool:     ev.ToolName,
+				Reason:   firstLine(reason),
+			})
 		}
-		category, reason := classifySecurityBlock(&ev)
-		if category == "" {
-			continue
-		}
-		if len(blocks) >= securityBlockCap {
-			truncated = true
-			break
-		}
-		view.Counters[category]++
-		blocks = append(blocks, securityBlock{
-			TS:       ev.Timestamp,
-			Category: category,
-			Tool:     ev.ToolName,
-			Reason:   firstLine(reason),
-		})
 	}
 	// Chronological order for display (oldest → newest within the cap).
 	sort.Slice(blocks, func(i, j int) bool { return blocks[i].TS < blocks[j].TS })

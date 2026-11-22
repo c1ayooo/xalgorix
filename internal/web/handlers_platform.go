@@ -36,6 +36,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -123,14 +124,18 @@ type scanSummaryIndex struct {
 	// projections and task views.
 	byInstance map[string][]*ScanRecord
 	byScanID   map[string]*ScanRecord
+	// dirByScanID maps each record id to its on-disk directory so the merge
+	// primitives below can hand journal readers real paths.
+	dirByScanID map[string]string
 }
 
 // scanSummaryIndexFor builds the index from one shared findAllScanSummaries
 // walk. Records are shallow cached copies — read-only use only.
 func (s *Server) scanSummaryIndexFor(entries []scanEntry) *scanSummaryIndex {
 	idx := &scanSummaryIndex{
-		byInstance: make(map[string][]*ScanRecord, len(entries)),
-		byScanID:   make(map[string]*ScanRecord, len(entries)),
+		byInstance:  make(map[string][]*ScanRecord, len(entries)),
+		byScanID:    make(map[string]*ScanRecord, len(entries)),
+		dirByScanID: make(map[string]string, len(entries)),
 	}
 	for i := range entries {
 		rec := &entries[i].rec
@@ -144,6 +149,9 @@ func (s *Server) scanSummaryIndexFor(entries []scanEntry) *scanSummaryIndex {
 		if rec.ID != "" {
 			if _, ok := idx.byScanID[rec.ID]; !ok {
 				idx.byScanID[rec.ID] = rec
+			}
+			if _, ok := idx.dirByScanID[rec.ID]; !ok {
+				idx.dirByScanID[rec.ID] = entries[i].dir
 			}
 		}
 	}
@@ -202,6 +210,23 @@ func (idx *scanSummaryIndex) lookupAll(instanceID, scanID string) []*ScanRecord 
 		add(idx.byScanID[scanID])
 	}
 	return out
+}
+
+// siblingDirs returns the on-disk directories behind a run — every sibling
+// session claiming the instance plus the legacy scan id record — newest
+// session first. Journal projections merge across them: a re-dispatched run's
+// history lives in several session directories, and reading any single one is
+// the blind spot, not the truth (D11, same discipline as lookupAll).
+func (idx *scanSummaryIndex) siblingDirs(instanceID, scanID string) []string {
+	recs := idx.lookupAll(instanceID, scanID)
+	sort.SliceStable(recs, func(i, j int) bool { return recs[i].StartedAt > recs[j].StartedAt })
+	dirs := make([]string, 0, len(recs))
+	for _, rec := range recs {
+		if d := idx.dirByScanID[rec.ID]; d != "" {
+			dirs = append(dirs, d)
+		}
+	}
+	return dirs
 }
 
 // RunMissingStatus marks a mount whose scan.json no longer exists and which
@@ -509,6 +534,13 @@ func (s *Server) handleProjectDetail(w http.ResponseWriter, r *http.Request) {
 		s.handleAnalyzeGoal(w, r, store, projectID)
 		return
 	}
+	if len(parts) > 1 && parts[1] == "scope" {
+		// Scope/fence configuration module (project_scope.go): read, save and
+		// dry-run the same authorization boundary Quick-create dispatches
+		// against.
+		s.handleProjectScope(w, r, store, projectID, parts[2:])
+		return
+	}
 	if len(parts) != 1 {
 		writeJSONStatus(w, http.StatusNotFound, map[string]string{"error": "not found"})
 		return
@@ -675,6 +707,11 @@ func (s *Server) handleTaskDetail(w http.ResponseWriter, r *http.Request) {
 			// R2a HITL-intent (API_CONTRACT §3.1): queued human turns merged
 			// into the next session briefing, or injected into a running agent.
 			s.handleTaskGuidance(w, r, store, taskID)
+			return
+		case "questions":
+			// Side-question responder (chat_questions.go): tool-less LLM
+			// answer over a scan snapshot; never enters the scan loop.
+			s.handleTaskQuestions(w, r, store, taskID)
 			return
 		case "objective":
 			// Structured task goal + its honest evaluation (REDESIGN §3.1).

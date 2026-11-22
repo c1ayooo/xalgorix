@@ -35,7 +35,7 @@ import { useI18n } from "@/i18n";
 import { useRunSelection } from "@/hooks/use-run-selection";
 import { RunTraffic } from "@/components/run-traffic";
 import type { Approval, Run } from "@/types/api";
-import type { FlatFinding } from "@/lib/findings";
+import { dedupFindings, type FlatFinding } from "@/lib/findings";
 
 /** 本页的 tab 词汇（4zreco 交互骨架 × REDESIGN §7.2 内容处方：会话默认 + 消耗）。 */
 type TaskDetailTab =
@@ -88,7 +88,13 @@ export default function TaskDetailPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const { data: task, isLoading, error, refetch } = useTask(taskId);
   const { data: runsData, isLoading: runsLoading } = useTaskRuns(taskId);
-  const { data: findings } = useTaskFindings(taskId);
+  const { data: taskFindings } = useTaskFindings(taskId);
+  // 服务端已按同一身份键去重；这里再走一次客户端去重，兜住 PostgreSQL 投影里
+  // 尚未重投影的旧 dedup_key 行（否则同一发现会出现两行，与头部计数不符）。
+  const findings = useMemo(
+    () => dedupFindings(taskFindings ?? []),
+    [taskFindings],
+  );
   const { data: projectsData } = useProjects();
   // 运行 tab 行内展开的流量面板（run id 集合；懒加载在 RunTraffic 内部）。
   const [trafficRuns, setTrafficRuns] = useState<Set<string>>(() => new Set());
@@ -138,7 +144,9 @@ export default function TaskDetailPage() {
   const latestInstanceId = runs.find((r) => r.instance_id)?.instance_id;
   const scopedInstanceId = selectedInstanceId ?? latestInstanceId;
   const scopedRun = runs.find((r) => r.instance_id === scopedInstanceId);
-  const scopedRunning = scopedRun?.status === "running";
+  // pending（续跑排队待准入）也算活跃：看板按运行节奏轮询，避免排队期间
+  // 一次抓取后停在空态直到下次状态翻转。
+  const scopedRunning = scopedRun?.status === "running" || scopedRun?.status === "pending";
 
   const project = useMemo(
     () => projectsData?.projects.find((p) => p.id === task?.project_id),

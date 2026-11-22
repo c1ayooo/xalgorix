@@ -8,7 +8,6 @@ import {
   MessagesSquare,
   FileText,
   LayoutGrid,
-  Plug,
   Plus,
   Radio,
   Server,
@@ -64,7 +63,6 @@ const NAV_GROUPS: {
     items: [
       { to: "/schedules", labelKey: "nav.schedules", icon: Clock },
       { to: "/reports", labelKey: "nav.reports", icon: FileText },
-      { to: "/integrations", labelKey: "nav.integrations", icon: Plug },
       { to: "/mcp", labelKey: "nav.mcp", icon: Cable },
       { to: "/skills", labelKey: "nav.skills", icon: Sparkles },
       { to: "/agents", labelKey: "nav.agents", icon: Bot },

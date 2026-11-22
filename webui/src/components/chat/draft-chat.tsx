@@ -53,8 +53,10 @@ export function DraftChat({
   );
 
   return (
+    // 草稿恒为空态：composer 垂直居中（ChatGPT 新会话式），引导文案贴在其上方。
+    // 前后两块等高 flex-1 夹住 composer，保证严格居中。
     <>
-      <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 px-4 text-center">
+      <div className="flex min-h-0 flex-1 flex-col items-center justify-end gap-2 px-4 pb-3 text-center">
         <div className="flex size-12 items-center justify-center rounded-full bg-primary/10">
           <Bot className="size-6 text-primary" aria-hidden />
         </div>
@@ -70,11 +72,13 @@ export function DraftChat({
         disabled={tasks.length === 0 || starting || !value}
         placeholder={t("chat.draftPlaceholder")}
         leftSlot={picker}
+        className="mx-auto w-full max-w-3xl rounded-lg border border-border"
         onSend={async (message) => {
           if (!value) return;
           await onSend(value, message);
         }}
       />
+      <div aria-hidden className="flex-1" />
     </>
   );
 }

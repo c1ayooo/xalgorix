@@ -205,9 +205,9 @@ func (s *Server) effectiveVulnCount(inst *ScanInstance, sess *scanSession) int {
 
 // totalPersistedVulnCount returns the total number of persisted (on-disk)
 // vulnerabilities across every scan record under cfg.DataDir, deduplicated
-// by (target, endpoint, title, severity). This is the stable on-disk
-// corpus used by both /api/findings/summary and the vulns_persisted field
-// on /api/status. The dedup matches the WebUI's dedupFindings helper so
+// by findingContentKey (title|target|endpoint|method|cve). This is the stable
+// on-disk corpus used by both /api/findings/summary and the vulns_persisted
+// field on /api/status. The dedup matches the WebUI's dedupFindings helper so
 // the totals strip and the row count never disagree. See Property 2
 // (counter monotonicity) — the on-disk total is monotonic-non-decreasing
 // across teardown because reporting.CleanupContext does not touch
@@ -226,18 +226,38 @@ func (s *Server) totalPersistedVulnCount() int {
 	return len(seen)
 }
 
-// dedupFindingKey computes the same lowercase (target, endpoint, title,
-// severity) key the WebUI's dedupFindings helper uses, so the server
-// counter sources and the WebUI row list are always in agreement.
+// findingContentKey is the single content-identity key for a finding. It is
+// shared by three consumers that used to disagree:
 //
-// Severity is bucketed via normalizeSeverityBucket so "Informational",
-// "info", and "" all collapse to "info" (mirrors the WebUI's
-// normalizeSeverity).
+//   - record de-dup (appendVulnSummaryUnique via vulnSummaryKey),
+//   - the live broadcast "seen" set and the instance vuln buffer,
+//   - every aggregation projection (/api/findings, /api/tasks/{id}/findings,
+//     task finding_count, /api/findings/summary, PG run_findings.dedup_key).
+//
+// Dimensions = title|target|endpoint|method|cve (lowercased, whitespace
+// collapsed). Severity is deliberately NOT part of identity: the report gate may
+// recompute it (CVSS recalc / severity cap), so keying on it made the live feed
+// broadcast two events for one finding while the findings list merged them into
+// one row — and the reverse for differing method/cve.
+func findingContentKey(target, title, endpoint, method, cve string) string {
+	return strings.Join([]string{
+		normalizeSummaryPart(title),
+		normalizeSummaryPart(target),
+		normalizeSummaryPart(endpoint),
+		normalizeSummaryPart(method),
+		normalizeSummaryPart(cve),
+	}, "|")
+}
+
+// dedupFindingKey keys a persisted finding for cross-scan aggregation. The
+// finding's own Target wins when present, so the key does not depend on which
+// caller produced it (record target vs. instance target) — otherwise the same
+// finding could aggregate differently depending on the endpoint that read it.
 func dedupFindingKey(target string, v VulnSummary) string {
-	return strings.ToLower(strings.TrimSpace(target)) + "|" +
-		strings.ToLower(strings.TrimSpace(v.Endpoint)) + "|" +
-		strings.ToLower(strings.TrimSpace(v.Title)) + "|" +
-		normalizeSeverityBucket(v.Severity)
+	if own := strings.TrimSpace(v.Target); own != "" {
+		target = own
+	}
+	return findingContentKey(target, v.Title, v.Endpoint, v.Method, v.CVE)
 }
 
 // normalizeSeverityBucket folds free-form severity strings into one of

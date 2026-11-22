@@ -664,3 +664,39 @@ func TestLeaseReleaseUpdatesActiveCounters(t *testing.T) {
 		t.Fatalf("double release changed counters = %d/%d, want 0/0", gotTotal, gotHeavy)
 	}
 }
+
+func TestAutoPythonMemLimitScalesWithHostRAM(t *testing.T) {
+	for _, tc := range []struct {
+		totalMB, want int64
+	}{
+		{0, 2048},
+		{1024, 2048},
+		{4096, 2048},
+		{8192, 2048},
+		{12288, 3072},
+		{16384, 4096},
+		{32768, 4096},
+		{98304, 4096},
+	} {
+		if got := autoPythonMemLimitMB(tc.totalMB); got != tc.want {
+			t.Errorf("autoPythonMemLimitMB(%d) = %d, want %d", tc.totalMB, got, tc.want)
+		}
+	}
+}
+
+func TestResolvePythonMemLimitHonorsOverride(t *testing.T) {
+	setOrUnsetEnv(t, "XALGORIX_PYTHON_MEM_LIMIT_MB", "", true)
+	if got := resolvePythonMemLimitMB(16384); got != 4096 {
+		t.Fatalf("unset override = %d, want auto 4096", got)
+	}
+
+	t.Setenv("XALGORIX_PYTHON_MEM_LIMIT_MB", "1024")
+	if got := resolvePythonMemLimitMB(16384); got != 1024 {
+		t.Fatalf("explicit override = %d, want 1024", got)
+	}
+
+	t.Setenv("XALGORIX_PYTHON_MEM_LIMIT_MB", "0")
+	if got := resolvePythonMemLimitMB(16384); got != 0 {
+		t.Fatalf("zero override = %d, want 0 (disabled)", got)
+	}
+}

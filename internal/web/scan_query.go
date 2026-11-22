@@ -113,14 +113,11 @@ func appendVulnSummaryUnique(vulns *[]VulnSummary, vuln VulnSummary) bool {
 	return true
 }
 
+// vulnSummaryKey is the VulnSummary view of findingContentKey: record de-dup,
+// live broadcast de-dup and every aggregation projection must share one
+// identity, so this delegates instead of keeping a second dimension set.
 func vulnSummaryKey(v VulnSummary) string {
-	return strings.Join([]string{
-		normalizeSummaryPart(v.Title),
-		normalizeSummaryPart(v.Target),
-		normalizeSummaryPart(v.Endpoint),
-		normalizeSummaryPart(v.Method),
-		normalizeSummaryPart(v.CVE),
-	}, "|")
+	return findingContentKey(v.Target, v.Title, v.Endpoint, v.Method, v.CVE)
 }
 
 func normalizeSummaryPart(value string) string {
@@ -440,10 +437,34 @@ func (s *Server) resolveScanDirByID(scanID string) (string, bool) {
 // caller, so a request that needs the summaries again can reuse one walk.
 // summaries is not called for an invalid id.
 func (s *Server) resolveScanDirByIDFrom(scanID string, summaries func() []scanEntry) (string, bool) {
+	res, ok := s.resolveScanRecordByIDFrom(scanID, summaries)
+	if !ok {
+		return "", false
+	}
+	return res.dir, true
+}
+
+// scanResolution is one scan-identity resolution: the bound directory, the
+// record behind it (nil for the legacy flat-path fallback), and whether the
+// instance-id fallback made the binding. The record is a shallow cached copy —
+// read-only use only.
+type scanResolution struct {
+	dir string
+	rec *ScanRecord
+	// instanceForm marks bindings made through the instance-id fallback
+	// (D11): the request addressed the RUN, which can own several sibling
+	// session directories.
+	instanceForm bool
+}
+
+// resolveScanRecordByIDFrom resolves a scan record id, a directory basename,
+// or an instance id against the cached summaries, returning the bound
+// directory plus the record that made the binding.
+func (s *Server) resolveScanRecordByIDFrom(scanID string, summaries func() []scanEntry) (scanResolution, bool) {
 	// Sanitize: prevent path traversal via ../
 	scanID = filepath.Base(scanID)
 	if scanID == "" || scanID == "." || scanID == ".." {
-		return "", false
+		return scanResolution{}, false
 	}
 
 	entries := summaries()
@@ -453,10 +474,11 @@ func (s *Server) resolveScanDirByIDFrom(scanID string, summaries func() []scanEn
 	// dispatches, D11 re-dispatches), so treating it as an exact match made
 	// every run-scoped endpoint 404 the moment a dispatch owned two scans.
 	// Instance identity resolves through the newest-session fallback below.
-	resolveUniqueDir := func(topLevelOnly bool) (string, bool, bool) {
-		var matchedDir string
+	resolveUniqueDir := func(topLevelOnly bool) (scanResolution, bool, bool) {
+		var matched scanResolution
 		found := false
-		for _, entry := range entries {
+		for i := range entries {
+			entry := entries[i]
 			if topLevelOnly && entry.rec.ParentTarget != "" {
 				continue
 			}
@@ -465,28 +487,28 @@ func (s *Server) resolveScanDirByIDFrom(scanID string, summaries func() []scanEn
 			}
 			if found {
 				log.Printf("[scan] refusing ambiguous scan id %q: multiple records match", scanID)
-				return "", false, true // ambiguous → resolved, no match
+				return scanResolution{}, false, true // ambiguous → resolved, no match
 			}
-			matchedDir = entry.dir
+			matched = scanResolution{dir: entry.dir, rec: &entries[i].rec}
 			found = true
 		}
-		return matchedDir, found, false
+		return matched, found, false
 	}
-	if dir, found, ambiguous := resolveUniqueDir(true); ambiguous {
-		return "", false
+	if res, found, ambiguous := resolveUniqueDir(true); ambiguous {
+		return scanResolution{}, false
 	} else if found {
-		return dir, true
+		return res, true
 	}
-	if dir, found, ambiguous := resolveUniqueDir(false); ambiguous {
-		return "", false
+	if res, found, ambiguous := resolveUniqueDir(false); ambiguous {
+		return scanResolution{}, false
 	} else if found {
-		return dir, true
+		return res, true
 	}
 
 	// Legacy flat path fallback (dataDir/scanID/scan.json).
 	direct := filepath.Join(s.dataDir, scanID, "scan.json")
 	if _, err := os.Stat(direct); err == nil {
-		return filepath.Join(s.dataDir, scanID), true
+		return scanResolution{dir: filepath.Join(s.dataDir, scanID)}, true
 	}
 
 	// Instance-id form (D11): an instance is a run identity, and one run can
@@ -498,8 +520,10 @@ func (s *Server) resolveScanDirByIDFrom(scanID string, summaries func() []scanEn
 	// (scanDirRecordForRun, REDESIGN D11).
 	var bestDir string
 	var bestStarted string
+	var bestRec *ScanRecord
 	claims := 0
-	for _, entry := range entries {
+	for i := range entries {
+		entry := entries[i]
 		if entry.rec.ParentTarget != "" || entry.rec.InstanceID != scanID {
 			continue
 		}
@@ -507,15 +531,39 @@ func (s *Server) resolveScanDirByIDFrom(scanID string, summaries func() []scanEn
 		if bestDir == "" || entry.rec.StartedAt > bestStarted {
 			bestDir = entry.dir
 			bestStarted = entry.rec.StartedAt
+			bestRec = &entries[i].rec
 		}
 	}
 	if claims > 0 {
 		if claims > 1 {
 			log.Printf("[scan] instance id %q spans %d scans; binding run-scoped reads to the newest session", scanID, claims)
 		}
-		return bestDir, true
+		return scanResolution{dir: bestDir, rec: bestRec, instanceForm: true}, true
 	}
-	return "", false
+	return scanResolution{}, false
+}
+
+// sessionDirsForProjection expands one resolution into the per-session
+// directories a run-scoped JOURNAL projection must cover, oldest session
+// first. Instance-form requests address the run (the task-detail view), and a
+// 1:1 re-dispatch continues the same investigation in a fresh session
+// directory — so the run's history is the union of its sibling sessions, the
+// same discipline 09d06a3e applied to finding projections via lookupAll.
+// Record-id requests stay scoped to that one session.
+func (s *Server) sessionDirsForProjection(res scanResolution, entries []scanEntry) []string {
+	if !res.instanceForm || res.rec == nil || res.rec.InstanceID == "" {
+		return []string{res.dir}
+	}
+	idx := s.scanSummaryIndexFor(entries)
+	dirs := idx.siblingDirs(res.rec.InstanceID, res.rec.ID)
+	if len(dirs) == 0 {
+		return []string{res.dir}
+	}
+	// siblingDirs is newest-first; journal merges walk chronologically.
+	for i, j := 0, len(dirs)-1; i < j; i, j = i+1, j-1 {
+		dirs[i], dirs[j] = dirs[j], dirs[i]
+	}
+	return dirs
 }
 
 // findScanByID searches for a scan by its AgentID (the slug dir name) and

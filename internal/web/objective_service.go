@@ -217,15 +217,44 @@ func (s *Server) evaluateTaskObjective(ctx context.Context, store platform.Repos
 		return nil, err
 	}
 	entries := s.findAllScanSummaries()
-	dirByInstance := make(map[string]string, len(entries))
-	recByInstance := make(map[string]*ScanRecord, len(entries))
-	for i := range entries {
-		key := strings.TrimSpace(entries[i].rec.InstanceID)
-		if key == "" {
-			continue
+	idx := s.scanSummaryIndexFor(entries)
+
+	// mergeSignal folds one session's signals into an accumulator. Runs and
+	// their sibling sessions are consumed newest first, so the first sight of
+	// a finding/hypothesis id keeps the newest state; later (older) sessions
+	// only add ids the newest session does not carry. Coverage counters take
+	// the max across sessions: each session re-plans from zero, and completed
+	// coverage is monotone within a session, so the max is the honest union
+	// lower bound (REDESIGN D11 re-dispatch: the fresh session must not make
+	// the objective look unstarted).
+	mergeSignal := func(dst *objective.Signal, sig objective.Signal) {
+		dst.Findings = append(dst.Findings, sig.Findings...)
+		for _, h := range sig.Hypotheses {
+			dup := false
+			for _, existing := range dst.Hypotheses {
+				if existing.ID == h.ID {
+					dup = true
+					break
+				}
+			}
+			if !dup {
+				dst.Hypotheses = append(dst.Hypotheses, h)
+			}
 		}
-		dirByInstance[key] = entries[i].dir
-		recByInstance[key] = &entries[i].rec
+		if sig.CoveragePlanned > dst.CoveragePlanned {
+			dst.CoveragePlanned = sig.CoveragePlanned
+		}
+		if sig.CoverageCompleted > dst.CoverageCompleted {
+			dst.CoverageCompleted = sig.CoverageCompleted
+		}
+	}
+	seenFinding := func(sig objective.Signal, id string) bool {
+		for _, f := range sig.Findings {
+			if f.ID == id {
+				return true
+			}
+		}
+		return false
 	}
 
 	merged := objective.Signal{}
@@ -233,15 +262,37 @@ func (s *Server) evaluateTaskObjective(ctx context.Context, store platform.Repos
 	var latestLedger *scanctx.LedgerStore
 	for i := range runs {
 		run := runs[i]
-		dir := ""
-		if d, ok := dirByInstance[strings.TrimSpace(run.InstanceID)]; ok {
-			dir = d
+		recs := idx.lookupAll(strings.TrimSpace(run.InstanceID), run.LegacyScanID)
+		sort.SliceStable(recs, func(i, j int) bool { return recs[i].StartedAt > recs[j].StartedAt })
+		sig := objective.Signal{}
+		var newestDir string
+		for _, rec := range recs {
+			dir := idx.dirByScanID[rec.ID]
+			if dir == "" {
+				continue // missing session (purged history): nothing to read
+			}
+			if newestDir == "" {
+				newestDir = dir
+				latest = rec
+			}
+			sessionSig := collectObjectiveSignals(dir)
+			var freshFindings []objective.FindingSignal
+			for _, f := range sessionSig.Findings {
+				if !seenFinding(sig, f.ID) {
+					freshFindings = append(freshFindings, f)
+				}
+			}
+			sessionSig.Findings = freshFindings
+			mergeSignal(&sig, sessionSig)
 		}
-		sig := collectObjectiveSignals(dir)
 		merged.Findings = append(merged.Findings, sig.Findings...)
 		merged.Hypotheses = append(merged.Hypotheses, sig.Hypotheses...)
-		merged.CoveragePlanned = sig.CoveragePlanned
-		merged.CoverageCompleted = sig.CoverageCompleted
+		if sig.CoveragePlanned > merged.CoveragePlanned {
+			merged.CoveragePlanned = sig.CoveragePlanned
+		}
+		if sig.CoverageCompleted > merged.CoverageCompleted {
+			merged.CoverageCompleted = sig.CoverageCompleted
+		}
 		runReport := objective.Evaluate(spec, sig)
 		report.Runs = append(report.Runs, taskObjectiveRun{
 			RunID:  run.ID,
@@ -249,12 +300,9 @@ func (s *Server) evaluateTaskObjective(ctx context.Context, store platform.Repos
 			Status: run.Status,
 			Report: runReport,
 		})
-		if dir != "" {
-			if rec, ok := recByInstance[strings.TrimSpace(run.InstanceID)]; ok {
-				latest = rec
-			}
+		if newestDir != "" {
 			ledger := scanctx.NewLedgerStore()
-			ledger.SetPersistPath(dir)
+			ledger.SetPersistPath(newestDir)
 			ledger.LoadFromDisk()
 			latestLedger = ledger
 		}

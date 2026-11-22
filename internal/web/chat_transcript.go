@@ -54,6 +54,10 @@ type transcriptItem struct {
 	Status  string          `json:"status,omitempty"`
 	AgentID string          `json:"agent_id,omitempty"`
 	At      time.Time       `json:"at"`
+	// Phase carries the inferred methodology phase of tool events (Track C
+	// round segmentation): the transcript view inserts a divider when it
+	// changes. Zero = event carried no phase.
+	Phase int `json:"phase,omitempty"`
 	// Truncated marks an output cut for transport; the full text stays in the
 	// scan directory and the event archive.
 	Truncated bool `json:"truncated,omitempty"`
@@ -345,33 +349,52 @@ func (s *Server) buildTranscript(ctx context.Context, store platform.Repository,
 	return items
 }
 
-// transcriptEvents reads the scan journal for this run. scanID resolution
+// transcriptEvents reads the scan journals behind this run. The conversation
+// surface is per-instance: a D11 re-dispatch continues the same conversation
+// in a fresh session directory (the old journal is replayed into the prompt
+// only), and multi-target dispatches add further sessions — so the transcript
+// merges every sibling session's journal, oldest session first. Resolution
 // follows the same path as the scan detail page so a wildcard child or an
-// imported run lands on the same directory.
+// imported run lands on the same directories.
 func (s *Server) transcriptEvents(instanceID string, run *platform.Run) []transcriptItem {
-	scanID := instanceID
-	if run != nil && strings.TrimSpace(run.LegacyScanID) != "" {
-		scanID = run.LegacyScanID
-	}
 	entries := s.findAllScanSummaries()
-	dir, ok := s.resolveScanDirByIDFrom(scanID, func() []scanEntry { return entries })
-	if !ok || dir == "" {
+	// Resolve the INSTANCE first so the D11 sibling expansion applies; the
+	// legacy scan id is only a fallback for runs whose records lost the
+	// instance stamp (imported history). Preferring the legacy id would pin
+	// the transcript to the first session and hide the resumed one.
+	res, ok := s.resolveScanRecordByIDFrom(instanceID, func() []scanEntry { return entries })
+	if !ok && run != nil && strings.TrimSpace(run.LegacyScanID) != "" {
+		res, ok = s.resolveScanRecordByIDFrom(run.LegacyScanID, func() []scanEntry { return entries })
+	}
+	if !ok || res.dir == "" {
 		return nil
 	}
-	f, err := os.Open(filepath.Join(dir, "events.jsonl"))
-	if err != nil {
-		return nil
-	}
-	defer f.Close()
+	dirs := s.sessionDirsForProjection(res, entries)
 
 	out := make([]transcriptItem, 0, 128)
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	// The engine emits some terminal events more than once (finished per
 	// phase, and a message mirror of every tool result). Rendering them all
 	// would show duplicated bubbles, so identical (type,tool,body,timestamp)
-	// rows collapse to the first occurrence.
+	// rows collapse to the first occurrence. The dedup spans sessions so a
+	// turn mirrored across a continuity boundary still renders once.
 	seen := make(map[string]struct{}, 256)
+	for _, dir := range dirs {
+		s.appendSessionTranscript(dir, seen, &out)
+	}
+	return out
+}
+
+// appendSessionTranscript folds one session directory's events.jsonl into the
+// run transcript timeline.
+func (s *Server) appendSessionTranscript(dir string, seen map[string]struct{}, out *[]transcriptItem) {
+	f, err := os.Open(filepath.Join(dir, "events.jsonl"))
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	lines := 0
 	for scanner.Scan() {
 		lines++
@@ -384,8 +407,10 @@ func (s *Server) transcriptEvents(instanceID string, run *platform.Run) []transc
 			Tool    string          `json:"tool_name"`
 			Args    json.RawMessage `json:"tool_args"`
 			Output  string          `json:"output"`
+			Error   string          `json:"error"`
 			AgentID string          `json:"agent_id"`
 			At      time.Time       `json:"timestamp"`
+			Phase   int             `json:"current_phase"`
 			Vulns   []struct {
 				ID       string `json:"id"`
 				Title    string `json:"title"`
@@ -415,17 +440,42 @@ func (s *Server) transcriptEvents(instanceID string, run *platform.Run) []transc
 			if strings.TrimSpace(ev.Content) == "" || isToolEcho(ev.Content) {
 				continue
 			}
-			out = append(out, transcriptItem{Kind: "assistant", Role: "agent", Text: ev.Content, AgentID: ev.AgentID, At: at})
+			*out = append(*out, transcriptItem{Kind: "assistant", Role: "agent", Text: ev.Content, AgentID: ev.AgentID, At: at})
+		case "chat_question":
+			// Operator side-question (chat_questions.go): renders like a
+			// human turn; no guidance lifecycle status behind it.
+			if strings.TrimSpace(ev.Content) == "" {
+				continue
+			}
+			*out = append(*out, transcriptItem{Kind: "human", Role: "human", Text: ev.Content, At: at})
+		case "chat_reply":
+			// The side-question responder's answer (or its honest failure).
+			// Role "chat" lets the UI badge it apart from main-loop agent
+			// narration; a failed call keeps its row so the operator sees
+			// the error instead of silence.
+			item := transcriptItem{Kind: "assistant", Role: "chat", AgentID: ev.AgentID, At: at}
+			if strings.TrimSpace(ev.Error) != "" {
+				// Text stays the raw error; the UI renders the localized
+				// "answer failed" framing from Status.
+				item.Status = "failed"
+				item.Text = ev.Error
+			} else {
+				item.Text = ev.Content
+			}
+			if strings.TrimSpace(item.Text) == "" {
+				continue
+			}
+			*out = append(*out, item)
 		case "tool_call":
-			out = append(out, transcriptItem{Kind: "tool_use", Tool: ev.Tool, Args: ev.Args, Text: ev.Content, AgentID: ev.AgentID, At: at})
+			*out = append(*out, transcriptItem{Kind: "tool_use", Tool: ev.Tool, Args: ev.Args, Text: ev.Content, AgentID: ev.AgentID, Phase: ev.Phase, At: at})
 		case "tool_result":
 			text, cut := truncateTranscript(ev.Output)
-			out = append(out, transcriptItem{Kind: "tool_result", Tool: ev.Tool, Output: text, Truncated: cut, AgentID: ev.AgentID, At: at})
+			*out = append(*out, transcriptItem{Kind: "tool_result", Tool: ev.Tool, Output: text, Truncated: cut, AgentID: ev.AgentID, Phase: ev.Phase, At: at})
 		case "approval_requested", "approval_decided":
 			if ev.Approval == nil {
 				continue
 			}
-			out = append(out, transcriptItem{
+			*out = append(*out, transcriptItem{
 				Kind:   "approval",
 				Text:   approvalTranscriptLine(ev.Type, ev.Approval),
 				Status: ev.Approval.Status,
@@ -446,7 +496,7 @@ func (s *Server) transcriptEvents(instanceID string, run *platform.Run) []transc
 					status += ": " + reason
 				}
 			}
-			out = append(out, transcriptItem{Kind: "system", Text: status, At: at})
+			*out = append(*out, transcriptItem{Kind: "system", Text: status, At: at})
 			for _, v := range ev.Vulns {
 				line := strings.TrimSpace(v.Title)
 				if v.Severity != "" {
@@ -455,11 +505,10 @@ func (s *Server) transcriptEvents(instanceID string, run *platform.Run) []transc
 				if v.Endpoint != "" {
 					line += " @ " + v.Endpoint
 				}
-				out = append(out, transcriptItem{Kind: "finding", Text: line, Status: v.ID, At: at})
+				*out = append(*out, transcriptItem{Kind: "finding", Text: line, Status: v.ID, At: at})
 			}
 		}
 	}
-	return out
 }
 
 // transcriptGuidance folds the operator's own turns in. Guidance rows carry

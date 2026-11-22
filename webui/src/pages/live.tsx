@@ -8,10 +8,13 @@ import {
   useEventsStore,
 } from "@/store/events"
 import { LiveFeed, type FeedFilter } from "@/components/live-feed"
+import { LiveTraffic } from "@/components/live-traffic"
+import { LiveFindings } from "@/components/live-findings"
 import { ConnectionStatus } from "@/components/connection-status"
 import { api } from "@/api/client"
 import { qk, useInstances } from "@/api/queries"
 import { useActiveProjectId } from "@/lib/use-active-project"
+import { scopeEventsToProject } from "@/lib/events-scope"
 
 export default function LivePage() {
   const { t } = useI18n()
@@ -21,12 +24,21 @@ export default function LivePage() {
   const { data: instances } = useInstances(projectId ?? undefined)
   const [filter, setFilter] = useState<FeedFilter>("all")
   const [clearedAt, setClearedAt] = useState<number | null>(null)
-  const activeInstanceIds = useMemo(
+  const activeInstances = useMemo(
     () =>
       (instances?.instances ?? [])
         .filter((i) => isActiveStatus(i.status))
-        .map((i) => i.id)
         .slice(0, 8),
+    [instances],
+  )
+  const activeInstanceIds = useMemo(
+    () => activeInstances.map((i) => i.id),
+    [activeInstances],
+  )
+  // SSE store 是全局的（/api/stream 只支持 instance 过滤）：按当前项目的实例集
+  // 裁剪，否则别的项目的事件会混进来，与本页项目级的「发现」面板口径打架。
+  const projectInstanceIds = useMemo(
+    () => new Set((instances?.instances ?? []).map((i) => i.id)),
     [instances],
   )
   const historyQueries = useQueries({
@@ -47,10 +59,13 @@ export default function LivePage() {
         ),
       ),
     )
-    const merged = mergeFeedEvents(persisted, events)
+    const merged = mergeFeedEvents(
+      persisted,
+      scopeEventsToProject(events, projectInstanceIds),
+    )
     if (!clearedAt) return merged
     return merged.filter((event) => eventOrderMs(event) > clearedAt)
-  }, [activeInstanceIds, clearedAt, events, historyQueries])
+  }, [activeInstanceIds, clearedAt, events, historyQueries, projectInstanceIds])
 
   return (
     <div className="space-y-6">
@@ -75,6 +90,8 @@ export default function LivePage() {
         }}
         emptyTitle={t("live.empty.title")}
         emptyDescription={t("live.empty.description")}
+        httpPanel={<LiveTraffic instances={activeInstances} />}
+        findingsPanel={<LiveFindings projectId={projectId} />}
       />
     </div>
   )

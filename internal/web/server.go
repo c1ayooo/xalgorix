@@ -1033,6 +1033,10 @@ type Server struct {
 	feishuWebhook          string      // XALGORIX_FEISHU_WEBHOOK - Feishu robot webhook (credential in path, never exposed via API)
 	feishuSecret           string      // XALGORIX_FEISHU_SECRET - Feishu sign secret (加签)
 	feishuMinSeverity      string      // minimum severity to send to Feishu ("info", "low", "medium", "high", "critical")
+	feishuAppID            string      // XALGORIX_FEISHU_APP_ID - self-built app App ID (app mode)
+	feishuAppSecret        string      // XALGORIX_FEISHU_APP_SECRET - self-built app App Secret (secret, never exposed via API)
+	feishuReceiveID        string      // XALGORIX_FEISHU_RECEIVE_ID - app-mode receive target (chat/user)
+	feishuReceiveIDType    string      // XALGORIX_FEISHU_RECEIVE_ID_TYPE - open_id/user_id/union_id/email/chat_id
 	weComWebhook           string      // XALGORIX_WECOM_WEBHOOK - WeCom robot webhook (credential in query, never exposed via API)
 	weComMinSeverity       string      // minimum severity to send to WeCom ("info", "low", "medium", "high", "critical")
 	notifyScanComplete     atomic.Bool // XALGORIX_NOTIFY_SCAN_COMPLETE - send the "Scan Finished" summary after every scan (default false)
@@ -1047,9 +1051,18 @@ type Server struct {
 	queueResumeLaunching   map[string]bool
 	postScanChatFn         func(*config.Config, []llm.Message) (string, error)
 	goalAnalyzeLLM         goalanalysis.LLMFunc
-	schedulesMu            sync.RWMutex
-	schedules              map[string]*ScanSchedule
-	shutdownChan           chan struct{}
+	// scanQuestionFn is the side-question responder behind
+	// POST /api/tasks/{id}/questions (chat_questions.go): one tool-less LLM
+	// call over a point-in-time scan snapshot. Same resolver decision order
+	// as postScanChatFn; the caller's context carries the answer deadline.
+	scanQuestionFn func(ctx context.Context, systemPrompt, userMessage string) (string, error)
+	// questionsMu/questionsInFlight gate one in-flight side-question per run
+	// (4zreco chatBusy semantics — 409 on double-submit, no queueing).
+	questionsMu       sync.Mutex
+	questionsInFlight map[string]struct{}
+	schedulesMu       sync.RWMutex
+	schedules         map[string]*ScanSchedule
+	shutdownChan      chan struct{}
 	// scanListCache memoizes the built GET /api/scans list for a few seconds
 	// so paging/filtering/polling don't each re-walk the whole data dir.
 	scanListCacheMu sync.Mutex
@@ -1191,6 +1204,10 @@ func NewServer(cfg *config.Config, port int) *Server {
 		feishuWebhook:          strings.TrimSpace(cfg.FeishuWebhook),
 		feishuSecret:           strings.TrimSpace(cfg.FeishuSecret),
 		feishuMinSeverity:      strings.ToLower(strings.TrimSpace(cfg.FeishuMinSeverity)),
+		feishuAppID:            strings.TrimSpace(cfg.FeishuAppID),
+		feishuAppSecret:        strings.TrimSpace(cfg.FeishuAppSecret),
+		feishuReceiveID:        strings.TrimSpace(cfg.FeishuReceiveID),
+		feishuReceiveIDType:    strings.ToLower(strings.TrimSpace(cfg.FeishuReceiveIDType)),
 		weComWebhook:           strings.TrimSpace(cfg.WeComWebhook),
 		weComMinSeverity:       strings.ToLower(strings.TrimSpace(cfg.WeComMinSeverity)),
 		rateLimiter:            rl,
@@ -1280,6 +1297,29 @@ func NewServer(cfg *config.Config, port int) *Server {
 		client := llm.NewClient(cfg, llm.WithResolver(resolver))
 		client.SetContext(ctx)
 		client.SetTemperature(agent.TempScanner)
+		return client.Chat([]llm.Message{
+			{Role: "system", Content: systemPrompt},
+			{Role: "user", Content: userMessage},
+		})
+	}
+
+	// Wire scanQuestionFn (chat_questions.go): same resolver decision order
+	// as the other web-layer LLM closures; the ctx carries the
+	// questionAnswerTimeout deadline. No temperature pin — this is a
+	// conversational answer, not a deterministic rewrite.
+	srv.scanQuestionFn = func(ctx context.Context, systemPrompt, userMessage string) (string, error) {
+		cfg := srv.configSnapshot()
+		if cfg == nil {
+			return "", fmt.Errorf("chat: no configuration available")
+		}
+		opts := []llm.ResolverOption{}
+		if srv.catalog != nil && srv.profiles != nil {
+			opts = append(opts, llm.WithCatalog(srv.catalog, srv.profiles))
+		}
+		opts = append(opts, llm.WithLegacy(cfg))
+		resolver := llm.NewCompositeResolver(opts...)
+		client := llm.NewClient(cfg, llm.WithResolver(resolver))
+		client.SetContext(ctx)
 		return client.Chat([]llm.Message{
 			{Role: "system", Content: systemPrompt},
 			{Role: "user", Content: userMessage},
@@ -2600,8 +2640,10 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 // Overview totals widgets to surface a counter that does NOT collapse
 // when reporting.CleanupContext wipes in-memory stores during teardown.
 //
-// Counts are deduplicated by (target, endpoint, title, severity) — the
-// same key the WebUI's dedupFindings helper uses. Without this, a
+// Counts are deduplicated by findingContentKey (title, target, endpoint,
+// method, cve) — the same key the WebUI's dedupFindings helper uses. Severity is
+// an attribute (the report gate may recompute it), not part of identity, so a
+// finding re-rated across rescans counts once. Without this, a
 // vulnerability that recurs across N rescans of the same target would
 // inflate the totals strip relative to the deduped row count rendered
 // below it on /findings.
@@ -2714,8 +2756,8 @@ func severityRankValue(severity string) int {
 }
 
 // handleFindingsList returns every finding flattened across all scans, deduped
-// by (target, endpoint, title, severity) and sorted by severity desc then
-// scan_started_at desc. This replaces the previous WebUI behavior of fetching
+// by findingContentKey (title, target, endpoint, method, cve) and sorted by
+// severity desc then scan_started_at desc. This replaces the previous WebUI behavior of fetching
 // every scan record individually (an N+1 of full-record requests, each
 // carrying the scan's entire event log) just to build the findings table.
 // One server-side walk returns only the vuln fields the table needs.
@@ -4313,9 +4355,15 @@ func finalizeEventsMeta(rec *ScanRecord) {
 
 // handleScanEvents serves a page of a scan's event log:
 // GET /api/scans/{id}/events?offset=&limit=  →  {events, total, offset, limit}
+//
+// Instance-form requests (the task-detail run view) project the run's WHOLE
+// history: a D11 re-dispatch continues the same investigation in a fresh
+// session directory, so the sibling sessions' journals concatenate
+// chronologically (same discipline as the finding projections' lookupAll).
 func (s *Server) handleScanEvents(w http.ResponseWriter, r *http.Request) {
 	scanID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/scans/"), "/events")
-	dir, ok := s.resolveScanDirByID(scanID)
+	entries := s.findAllScanSummaries()
+	res, ok := s.resolveScanRecordByIDFrom(scanID, func() []scanEntry { return entries })
 	if !ok {
 		http.Error(w, "scan not found", http.StatusNotFound)
 		return
@@ -4332,7 +4380,13 @@ func (s *Server) handleScanEvents(w http.ResponseWriter, r *http.Request) {
 			limit = n
 		}
 	}
-	events, total, ok := loadScanEventsWindow(dir, offset, limit)
+	var events []WSEvent
+	var total int
+	if dirs := s.sessionDirsForProjection(res, entries); len(dirs) > 1 {
+		events, total, ok = loadRunEventsWindow(dirs, offset, limit)
+	} else {
+		events, total, ok = loadScanEventsWindow(res.dir, offset, limit)
+	}
 	if !ok {
 		http.Error(w, "scan not found", http.StatusNotFound)
 		return

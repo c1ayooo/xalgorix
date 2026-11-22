@@ -31,9 +31,24 @@ export function severityRank(sev: string): number {
 }
 
 /**
- * Dedup findings across all scans by (scan_target, endpoint, title, severity).
- * The surviving row preserves the most recent owning scan id (so delete and
- * navigation point at the latest scan that produced the finding).
+ * Collapse a value the same way the server's `normalizeSummaryPart` does
+ * (lowercase, trim, collapse inner whitespace) so client and server dedup keys
+ * agree on real payloads — not just on well-formed ones.
+ */
+function normalizeKeyPart(value?: string): string {
+  return (value ?? "").toLowerCase().trim().split(/\s+/).filter(Boolean).join(" ");
+}
+
+/**
+ * Deduplicate findings across all scans by the finding's content identity:
+ * (title, target, endpoint, method, cve) — mirroring the server's
+ * `findingContentKey`.
+ *
+ * Severity is deliberately excluded: the report gate may recompute it (CVSS
+ * recalc / severity cap), so keying on it used to keep one row per rating for
+ * the same finding while the scan record held a single entry. The surviving row
+ * is the most recent one (so delete and navigation point at the latest scan that
+ * produced the finding).
  *
  * Output is sorted by severity rank desc, then `scan_started_at` desc.
  */
@@ -41,10 +56,11 @@ export function dedupFindings(findings: FlatFinding[]): FlatFinding[] {
   const map = new Map<string, FlatFinding>();
   for (const f of findings) {
     const key =
-      `${(f.scan_target ?? "").toLowerCase()}|` +
-      `${(f.endpoint ?? "").toLowerCase()}|` +
-      `${(f.title ?? "").toLowerCase()}|` +
-      `${normalizeSeverity(f.severity)}`;
+      `${normalizeKeyPart(f.title)}|` +
+      `${normalizeKeyPart(f.target || f.scan_target)}|` +
+      `${normalizeKeyPart(f.endpoint)}|` +
+      `${normalizeKeyPart(f.method)}|` +
+      `${normalizeKeyPart(f.cve)}`;
     const existing = map.get(key);
     if (!existing || (f.scan_started_at ?? "") > (existing.scan_started_at ?? "")) {
       map.set(key, f);

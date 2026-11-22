@@ -12,6 +12,7 @@ import type {
   InfoRegionParams,
   ListParams,
   ProjectRequest,
+  ProjectScope,
   Role,
   ScanRequest,
   ScanSchedule,
@@ -62,6 +63,7 @@ export const qk = {
   // R3: projects / tasks / runs / approvals. Tasks/runs/findings carry the
   // projectId so switching projects re-keys every cache entry.
   projects: ["projects"] as const,
+  projectScope: (projectId: string) => ["projects", projectId, "scope"] as const,
   tasks: (projectId: string) => ["projects", projectId, "tasks"] as const,
   task: (id: string) => ["task", id] as const,
   taskRuns: (id: string) => ["task", id, "runs"] as const,
@@ -132,12 +134,14 @@ export function useScansList() {
 // in a single server-side walk. Replaces the per-scan getScan() fan-out the
 // findings page used to do (an N+1 that shipped every scan's full event log
 // to the browser just to render the findings table).
-export function useFindingsList(projectId?: string) {
+export function useFindingsList(projectId?: string, enabled = true) {
   return useQuery({
     queryKey: ["findings", "list", projectId ?? "all"],
     queryFn: () => api.listFindings(projectId),
     refetchInterval: 15000,
     placeholderData: (prev) => prev,
+    // 未选项目时缺省参数会扫全量记录（跨项目最坏情况），调用方可显式关掉。
+    enabled,
   });
 }
 
@@ -176,22 +180,59 @@ export function useTokenUsage(id?: string, running?: boolean) {
   });
 }
 
-// 流量代理 raw 交换（finding 详情渲染 HTTP 请求/响应包）。按 finding 的
-// endpoint/method 过滤，懒加载：只在调用方 enabled 时请求。归档是扫描结束
-// 后仍在的文件，缓存 30s 足够新鲜。
+export interface ScanTrafficOptions {
+  endpoint?: string;
+  method?: string;
+  /** Hostname join key — pins traffic to one discovered asset. */
+  host?: string;
+  limit?: number;
+  enabled?: boolean;
+  /** Live views poll; archive-only consumers leave it off. */
+  refetchInterval?: number | false;
+  staleTime?: number;
+}
+
+// 流量代理 raw 交换（finding 证据 / 实时动态 HTTP 视图）。归档是扫描结束后
+// 仍在的文件；实时视图传 refetchInterval 轮询增量，详情弹窗懒加载即可。
+export function useScanTrafficQuery(
+  scanId: string | undefined,
+  options: ScanTrafficOptions = {},
+) {
+  const {
+    endpoint,
+    method,
+    host,
+    limit = 20,
+    enabled = true,
+    refetchInterval = false,
+    staleTime = 30_000,
+  } = options;
+  return useQuery({
+    queryKey: [
+      "scan",
+      scanId ?? "none",
+      "traffic",
+      endpoint ?? "",
+      method ?? "",
+      host ?? "",
+      limit,
+    ],
+    queryFn: () => api.scanTraffic(scanId!, { endpoint, method, host, limit }),
+    enabled: enabled && !!scanId,
+    staleTime,
+    refetchInterval,
+    retry: false,
+  });
+}
+
+// 兼容旧调用面：finding 详情按 endpoint/method 过滤的单次读取。
 export function useScanTraffic(
   scanId: string | undefined,
   endpoint?: string,
   method?: string,
   enabled = true,
 ) {
-  return useQuery({
-    queryKey: ["scan", scanId ?? "none", "traffic", endpoint ?? "", method ?? ""],
-    queryFn: () => api.scanTraffic(scanId!, { endpoint, method, limit: 20 }),
-    enabled: enabled && !!scanId,
-    staleTime: 30_000,
-    retry: false,
-  });
+  return useScanTrafficQuery(scanId, { endpoint, method, enabled });
 }
 
 // Run 文件浏览器：单层目录列表。扫描运行中每 5s 轮询当前目录，让新产物
@@ -673,6 +714,88 @@ export function useDeleteProject() {
   });
 }
 
+/**
+ * 项目范围/围栏视图：项目页的配置模块读它，快速创建任务写它。
+ * 20s 轻轮询只为了让 active_runs / fence_bound 在改围栏后自己收敛，
+ * 保存与试算都由 mutation 显式失效。
+ */
+export function useProjectScope(projectId?: string) {
+  return useQuery({
+    queryKey: projectId ? qk.projectScope(projectId) : ["projects", "none", "scope"],
+    queryFn: () => api.getProjectScope(projectId!),
+    enabled: !!projectId,
+    retry: false,
+    refetchInterval: 20000,
+  });
+}
+
+/** 保存范围（含围栏）：成功后项目列表与围栏视图同时刷新。 */
+export function useUpdateProjectScope() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, scope }: { id: string; scope: ProjectScope }) =>
+      api.updateProjectScope(id, scope),
+    onSuccess: (view) => {
+      qc.invalidateQueries({ queryKey: qk.projectScope(view.project_id) });
+      qc.invalidateQueries({ queryKey: qk.projects });
+    },
+  });
+}
+
+/** 试算（不落库）：项目页「校验」按钮与快速创建前的目标预检共用。 */
+export function useValidateProjectScope() {
+  return useMutation({
+    mutationFn: ({
+      id,
+      req,
+    }: {
+      id: string;
+      req: { scope?: ProjectScope; targets?: string[] };
+    }) => api.validateProjectScope(id, req),
+  });
+}
+
+/**
+ * 快速创建任务：一次交互 = 建任务 + 立即发起运行。
+ *
+ * 两步不是原子的（后端 createTask 与 POST runs 是两个契约端点），失败语义
+ * 因此必须显式：任务已创建但启动失败时返回 launchError，调用方提示「任务已
+ * 保存，可在任务页重试启动」而不是把已建的任务当成失败丢掉。
+ */
+export function useQuickCreateTask() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async ({
+      projectId,
+      req,
+      launch,
+    }: {
+      projectId: string;
+      req: TaskRequest;
+      launch?: Partial<ScanRequest>;
+    }) => {
+      const task = await api.createTask(projectId, req);
+      if (!launch) return { task, run: null, launchError: null };
+      try {
+        const run = await api.startTaskRun(task.id, launch);
+        return { task, run, launchError: null };
+      } catch (err) {
+        return {
+          task,
+          run: null,
+          launchError: err instanceof Error ? err.message : String(err),
+        };
+      }
+    },
+    onSuccess: (_data, vars) => {
+      qc.invalidateQueries({ queryKey: qk.tasks(vars.projectId) });
+      qc.invalidateQueries({ queryKey: qk.projects });
+      qc.invalidateQueries({ queryKey: qk.instances });
+      qc.invalidateQueries({ queryKey: qk.status });
+    },
+  });
+}
+
 export function useTasks(projectId?: string) {
   return useQuery({
     queryKey: projectId ? qk.tasks(projectId) : ["projects", "none", "tasks"],
@@ -1019,6 +1142,20 @@ export function useSendTaskGuidance() {
       instanceId,
     }: { id: string; message: string; requestId: string; instanceId?: string }) =>
       api.sendTaskGuidance(id, message, requestId, instanceId),
+  });
+}
+
+// 旁路提问（chat_questions.go）：受理即返回，回答经 chat_reply SSE 回流转录
+// ——转录的 SSE 桥已监听该事件类型触发 refetch，这里不做任何缓存失效。
+export function useSendTaskQuestion() {
+  return useMutation({
+    mutationFn: ({
+      id,
+      message,
+      requestId,
+      instanceId,
+    }: { id: string; message: string; requestId: string; instanceId?: string }) =>
+      api.sendTaskQuestion(id, message, requestId, instanceId),
   });
 }
 

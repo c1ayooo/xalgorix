@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState, useEffect, useId } from "react";
+import { useMemo, useRef, useState, useEffect, useId, type ReactNode } from "react";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { ChevronRight, Download, FileText, Pause, Play, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -266,6 +266,13 @@ export function LiveFeed({
   // 而非默认的 max-h-[60vh] 自适应。
   fillHeight = false,
   streaming = [],
+  // HTTP 视图的数据源不是事件流，而是各 run 的 MITM 流量归档：调用方传入
+  // 面板后，选中 HTTP 筛选即整块替换为它（导出/暂停/清空对归档无意义，隐藏）。
+  httpPanel,
+  // 发现视图的数据源同样是投影而非事件流（项目级 /api/findings）：传入后面板
+  // 整块替换内容。事件流里的 vulns 快照受广播门/活跃状态/缓冲窗口三重裁剪，
+  // 拿它当发现列表必然与任务详情对不上。
+  findingsPanel,
 }: {
   events: FeedEvent[];
   filter: FeedFilter;
@@ -280,6 +287,8 @@ export function LiveFeed({
   exportScope?: string;
   fillHeight?: boolean;
   streaming?: StreamingMessage[];
+  httpPanel?: ReactNode;
+  findingsPanel?: ReactNode;
 }) {
   const { t } = useI18n();
   const paused = useEventsStore((s) => s.paused);
@@ -293,6 +302,12 @@ export function LiveFeed({
     () => events.filter((e) => matchFilter(e, filter)),
     [events, filter],
   );
+
+  // 面板视图（http / findings）的数据源不是事件流：整块替换内容，并隐藏只对
+  // 事件有意义的控件（导出/暂停/清空）。未传面板时回退到事件行，保持其他页
+  // 复用本组件时的既有行为。
+  const activePanel =
+    filter === "http" ? httpPanel : filter === "findings" ? findingsPanel : undefined;
 
   function handleExport(format: FeedExportFormat) {
     exportFeedEvents({
@@ -341,37 +356,39 @@ export function LiveFeed({
               {f.labelKey ? t(f.labelKey) : f.label}
             </button>
           ))}
-          <div className="ml-auto flex items-center gap-1">
-            <FeedExportMenu
-              disabled={visible.length === 0}
-              visibleCount={visible.length}
-              onExport={handleExport}
-            />
-            <Button
-              size="sm"
-              variant="ghost"
-              onClick={() => setPaused(!paused)}
-              className="h-7 px-2"
-            >
-              {paused ? (
-                <>
-                  <Play className="h-3.5 w-3.5" /> {t("console.resume")}
-                </>
-              ) : (
-                <>
-                  <Pause className="h-3.5 w-3.5" /> {t("console.pause")}
-                </>
-              )}
-            </Button>
-            <Button
-              size="sm"
-              variant="ghost"
-              onClick={onClearEvents ?? clearEvents}
-              className="h-7 px-2"
-            >
-              <Trash2 className="h-3.5 w-3.5" /> {t("feed.clear")}
-            </Button>
-          </div>
+          {!activePanel && (
+            <div className="ml-auto flex items-center gap-1">
+              <FeedExportMenu
+                disabled={visible.length === 0}
+                visibleCount={visible.length}
+                onExport={handleExport}
+              />
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => setPaused(!paused)}
+                className="h-7 px-2"
+              >
+                {paused ? (
+                  <>
+                    <Play className="h-3.5 w-3.5" /> {t("console.resume")}
+                  </>
+                ) : (
+                  <>
+                    <Pause className="h-3.5 w-3.5" /> {t("console.pause")}
+                  </>
+                )}
+              </Button>
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={onClearEvents ?? clearEvents}
+                className="h-7 px-2"
+              >
+                <Trash2 className="h-3.5 w-3.5" /> {t("feed.clear")}
+              </Button>
+            </div>
+          )}
         </div>
       )}
       <div
@@ -386,7 +403,9 @@ export function LiveFeed({
           fillHeight ? "min-h-0 flex-1" : "max-h-[60vh] min-h-64",
         )}
       >
-        {visible.length === 0 ? (
+        {activePanel ? (
+          activePanel
+        ) : visible.length === 0 ? (
           <EmptyState
             title={resolvedEmptyTitle}
             description={resolvedEmptyDescription}

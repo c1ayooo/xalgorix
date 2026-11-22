@@ -4,6 +4,7 @@ import {
   AlertTriangle,
   Check,
   ChevronRight,
+  MessageSquare,
   ShieldAlert,
   Terminal,
   User,
@@ -68,7 +69,33 @@ function ActivityTime({ at }: { at?: string }) {
   );
 }
 
-/** 人工回合：右对齐品牌色气泡 + 头像（参照 UserRow）。 */
+/** guidance 生命周期章（injected/queued=violet、consumed=emerald，对齐
+ * live-feed TYPE_COLOR 先例；UI_DESIGN §3.3 胶囊形态：10% 底 + 30% 边）。 */
+function GuidanceStatusChip({ status }: { status: string }) {
+  const { t } = useI18n();
+  const consumed = status === "consumed";
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-[10px] leading-none",
+        consumed
+          ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
+          : "border-violet-500/30 bg-violet-500/10 text-violet-600 dark:text-violet-400",
+      )}
+    >
+      <span
+        className={cn(
+          "size-1 rounded-full",
+          consumed ? "bg-emerald-500" : "bg-violet-500",
+        )}
+        aria-hidden
+      />
+      {t(`guidance.status.${status}`)}
+    </span>
+  );
+}
+
+/** 人工回合：右对齐品牌色气泡 + 头像（参照 UserRow）。guidance 行带状态章。 */
 function HumanRow({ item }: { item: TranscriptItem }) {
   return (
     <div className="mt-3 mb-2 flex min-w-0 justify-end gap-2">
@@ -76,9 +103,7 @@ function HumanRow({ item }: { item: TranscriptItem }) {
         <div className="min-w-0 max-w-full whitespace-pre-wrap rounded-lg rounded-tr-sm bg-primary px-3 py-1.5 text-primary-foreground text-sm [overflow-wrap:anywhere]">
           {item.text}
         </div>
-        {item.status && item.status !== "injected" && (
-          <p className="font-mono text-[10px] text-muted-foreground">{item.status}</p>
-        )}
+        {item.status && <GuidanceStatusChip status={item.status} />}
         <ActivityTime at={item.at} />
       </div>
       <div className="mt-0.5 flex size-6 shrink-0 items-center justify-center rounded-full bg-primary/10">
@@ -88,11 +113,30 @@ function HumanRow({ item }: { item: TranscriptItem }) {
   );
 }
 
-/** agent 结论块（参照 AnswerBlock）：通栏 muted 卡片，Markdown 全文展开不折叠。 */
+/**
+ * assistant 结论块（参照 AnswerBlock）：通栏 muted 卡片，Markdown 全文展开。
+ * role="chat" 是旁路提问的应答（不经扫描主循环）：加来源章区分主循环叙述；
+ * status="failed" 是诚实失败行，destructive 呈现。
+ */
 function AssistantRow({ item }: { item: TranscriptItem }) {
+  const { t } = useI18n();
+  const failed = item.status === "failed";
   return (
     <div className="mt-1 mb-2 flex min-w-0 flex-col gap-1">
-      <div className="min-w-0 break-words rounded-lg bg-muted px-3 py-2 text-sm">
+      {item.role === "chat" && (
+        <div className="flex items-center gap-1 pl-1 text-muted-foreground text-[11px]">
+          <MessageSquare className="size-3" aria-hidden />
+          {failed ? t("chat.answerFailed") : t("chat.sideAnswer")}
+        </div>
+      )}
+      <div
+        className={cn(
+          "min-w-0 break-words rounded-lg px-3 py-2 text-sm",
+          failed
+            ? "border border-red-500/40 bg-red-500/5 text-red-600 dark:text-red-400"
+            : "bg-muted",
+        )}
+      >
         <Markdown source={item.text ?? ""} />
       </div>
       <ActivityTime at={item.at} />
@@ -223,49 +267,96 @@ function FindingCard({ item }: { item: TranscriptItem }) {
 export function TranscriptView({
   items,
   live,
+  staleFor,
+  unobserved,
   empty,
 }: {
   items: TranscriptItem[];
+  /** 流式中：5s 内有真实事件到达（use-instance-activity）。 */
   live?: boolean;
+  /** 运行中但事件停滞：预格式化的停滞时长（"2 分钟"）。 */
+  staleFor?: string | null;
+  /** 运行中但本页会话尚未观测到任何事件：中性等待行，不冒充流式。 */
+  unobserved?: boolean;
   empty?: ReactNode;
 }) {
   const { t } = useI18n();
   if (items.length === 0) {
     return <>{empty ?? <p className="py-10 text-center text-muted-foreground text-sm">{t("chat.noMessages")}</p>}</>;
   }
+  let lastPhase = 0;
   return (
     <div className="flex flex-col gap-1">
       {groupToolRows(items).map((entry, index) => {
-        if ("kind" in entry) {
-          switch (entry.kind) {
-            case "human":
-              return <HumanRow key={entry.seq} item={entry} />;
-            case "assistant":
-              return <AssistantRow key={entry.seq} item={entry} />;
-            case "approval":
-              return <ApprovalCard key={entry.seq} item={entry} />;
-            case "finding":
-              return <FindingCard key={entry.seq} item={entry} />;
-            case "system":
-              return (
-                <p key={entry.seq} className="my-1 text-center text-[11px] text-muted-foreground">
-                  {entry.text}
-                </p>
-              );
-            default:
-              return <Fragment key={entry.seq} />;
-          }
-        }
-        return <ToolCard key={`${entry.use?.seq ?? entry.result?.seq ?? index}`} group={entry} />;
+        // 阶段分段：工具卡的 inferred phase 变化处插一条分隔线（Track C），
+        // 让上一轮的终态与新一轮工作在视觉上分开。
+        const phase =
+          "use" in entry
+            ? entry.use?.phase ?? 0
+            : "result" in entry
+              ? entry.result?.phase ?? 0
+              : 0;
+        const phaseChanged = phase > 0 && phase !== lastPhase;
+        if (phaseChanged) lastPhase = phase;
+        return (
+          <Fragment key={`row-${index}`}>
+            {phaseChanged && (
+              <div className="my-2 flex items-center gap-2 font-medium text-muted-foreground text-[11px]">
+                <span className="h-px flex-1 bg-border" />
+                {t("chat.phaseDivider").replace("{n}", String(phase))}
+                <span className="h-px flex-1 bg-border" />
+              </div>
+            )}
+            {renderEntry(entry, index)}
+          </Fragment>
+        );
       })}
-      {live && (
+      {(live || staleFor || unobserved) && (
         <div className="flex items-center gap-2 pt-1 pl-2 text-xs text-muted-foreground">
-          <span className="size-1.5 animate-pulse rounded-full bg-emerald-500" aria-hidden />
-          {t("chat.agentWorking")}
+          <span
+            className={cn(
+              "size-1.5 rounded-full",
+              live
+                ? "animate-pulse bg-emerald-500"
+                : staleFor
+                  ? "animate-pulse bg-amber-500"
+                  : "bg-muted-foreground/40",
+            )}
+            aria-hidden
+          />
+          {live
+            ? t("chat.agentWorking")
+            : staleFor
+              ? t("chat.staleNoOutput").replace("{duration}", staleFor)
+              : t("chat.noLiveEvents")}
         </div>
       )}
     </div>
   );
+}
+
+function renderEntry(entry: TranscriptItem | ToolGroup, index: number): ReactNode {
+  if ("kind" in entry) {
+    switch (entry.kind) {
+      case "human":
+        return <HumanRow key={entry.seq} item={entry} />;
+      case "assistant":
+        return <AssistantRow key={entry.seq} item={entry} />;
+      case "approval":
+        return <ApprovalCard key={entry.seq} item={entry} />;
+      case "finding":
+        return <FindingCard key={entry.seq} item={entry} />;
+      case "system":
+        return (
+          <p key={entry.seq} className="my-1 text-center text-[11px] text-muted-foreground">
+            {entry.text}
+          </p>
+        );
+      default:
+        return <Fragment key={entry.seq} />;
+    }
+  }
+  return <ToolCard key={`${entry.use?.seq ?? entry.result?.seq ?? index}`} group={entry} />;
 }
 
 function stringifyArgs(args: unknown): string {

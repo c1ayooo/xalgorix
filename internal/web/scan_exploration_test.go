@@ -357,13 +357,13 @@ func TestScanExplorationEndpoint_ZeroEdgesMarshallAsEmptyArray(t *testing.T) {
 	}
 }
 
-// D11: an instance is a run identity — a multi-target dispatch owns several
-// top-level scan records. Instance-form requests bind to the NEWEST session
-// (matching scanDirRecordForRun) and disclose the fan-out in the note;
-// exact record-id requests still resolve their own scan.
-func TestScanExplorationEndpoint_InstanceFormBindsToNewestSession(t *testing.T) {
+// D11: an instance is a run identity. Same-target sibling sessions (1:1
+// re-dispatch 续跑) merge in the instance-form projection — the resumed run
+// keeps its previous chain — with the merge disclosed in the note; exact
+// record-id requests still resolve their own session only.
+func TestScanExplorationEndpoint_InstanceFormMergesSameTargetSessions(t *testing.T) {
 	s := newTestServer(t, nil)
-	inst := "inst-multi-1"
+	inst := "inst-redispatch-1"
 
 	newest := "10.0.100.58_new"
 	oldest := "10.0.100.58_old"
@@ -384,17 +384,32 @@ func TestScanExplorationEndpoint_InstanceFormBindsToNewestSession(t *testing.T) 
 	oldDir := mkScan(oldest, "2026-11-21T10:00:00Z")
 	newDir := mkScan(newest, "2026-11-22T10:00:00Z")
 
-	// 每个会话一份 ledger,标题可区分。
-	writeLedgerHyp := func(dir, title string) {
-		store := scanctx.NewLedgerStore()
-		store.SetPersistPath(dir)
-		now := time.Now().UTC()
-		store.Upsert(scanctx.Hypothesis{Title: title, Status: scanctx.HypothesisQueued, CreatedAt: now, UpdatedAt: now})
+	// 每个会话一份 ledger,标题可区分。真实续跑的 ledger 是整体拷贝(同一 id
+	// 序列),这里用显式 id/dedup_key 写文件以模拟该形状——独立 store 的自增
+	// 序列会彼此碰撞,不能用作跨会话 fixture。
+	writeLedgerHyp := func(dir, id, dedup, title string) {
+		snap := map[string]any{
+			"seq":   1,
+			"order": []string{id},
+			"hypotheses": []map[string]any{{
+				"id":        id,
+				"dedup_key": dedup,
+				"title":     title,
+				"status":    "queued",
+			}},
+		}
+		data, err := json.Marshal(snap)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "ledger.json"), data, 0o600); err != nil {
+			t.Fatal(err)
+		}
 	}
-	writeLedgerHyp(oldDir, "old session hypothesis")
-	writeLedgerHyp(newDir, "newest session hypothesis")
+	writeLedgerHyp(oldDir, "H-1", "k-old", "old session hypothesis")
+	writeLedgerHyp(newDir, "H-2", "k-new", "newest session hypothesis")
 
-	// Instance 形态 → 绑定最新会话 + 披露。
+	// Instance 形态 → 合并同 target 的全部 sibling 会话 + 合并披露。
 	rr := explorationGet(t, s, inst)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("instance form code=%d body=%s", rr.Code, rr.Body.String())
@@ -412,17 +427,17 @@ func TestScanExplorationEndpoint_InstanceFormBindsToNewestSession(t *testing.T) 
 			foundOld = true
 		}
 	}
-	if !foundNewest || foundOld {
-		t.Fatalf("instance form did not bind to newest session (newest=%v old=%v)", foundNewest, foundOld)
+	if !foundNewest || !foundOld {
+		t.Fatalf("instance form lost a sibling session's chain (newest=%v old=%v)", foundNewest, foundOld)
 	}
-	if view.Note == "" || !strings.Contains(view.Note, "newest session") {
-		t.Fatalf("multi-target disclosure missing: %q", view.Note)
+	if view.Note == "" || !strings.Contains(view.Note, "sibling sessions") {
+		t.Fatalf("merge disclosure missing: %q", view.Note)
 	}
 
-	// 记录 id 形态仍精确解析各自的 scan。
-	for _, tc := range []struct{ id, wantTitle string }{
-		{oldest, "old session hypothesis"},
-		{newest, "newest session hypothesis"},
+	// 记录 id 形态仍精确解析各自的会话。
+	for _, tc := range []struct{ id, wantTitle, absentTitle string }{
+		{oldest, "old session hypothesis", "newest session hypothesis"},
+		{newest, "newest session hypothesis", "old session hypothesis"},
 	} {
 		rr := explorationGet(t, s, tc.id)
 		if rr.Code != http.StatusOK {
@@ -432,16 +447,91 @@ func TestScanExplorationEndpoint_InstanceFormBindsToNewestSession(t *testing.T) 
 		if err := json.Unmarshal(rr.Body.Bytes(), &v); err != nil {
 			t.Fatal(err)
 		}
-		ok := false
+		foundWant, foundAbsent := false, false
 		for _, n := range v.Nodes {
 			if n.Title == tc.wantTitle {
-				ok = true
+				foundWant = true
+			}
+			if n.Title == tc.absentTitle {
+				foundAbsent = true
 			}
 		}
-		if !ok {
-			t.Fatalf("record form %s lost its own ledger (%s)", tc.id, tc.wantTitle)
+		if !foundWant || foundAbsent {
+			t.Fatalf("record form %s scoped wrong (want %v, absent %v)", tc.id, foundWant, foundAbsent)
 		}
 	}
 	_ = oldDir
 	_ = newDir
+}
+
+// D11 multi-target fan-out: sibling records claiming one instance with
+// DIFFERENT targets are separate chains. The instance-form projection binds
+// to the newest target's chain and discloses the fan-out instead of mixing
+// targets into one graph (对象映射不得反向: 一条链属于一个 target).
+func TestScanExplorationEndpoint_InstanceFormDisclosesMultiTargetFanOut(t *testing.T) {
+	s := newTestServer(t, nil)
+	inst := "inst-multi-1"
+
+	mkScan := func(id, target, startedAt string) string {
+		dir := filepath.Join(s.dataDir, id)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		s.saveScanRecordTo(&ScanRecord{
+			ID:         id,
+			Target:     target,
+			InstanceID: inst,
+			Status:     "finished",
+			StartedAt:  startedAt,
+		}, dir)
+		return dir
+	}
+	otherDir := mkScan("10.0.0.1_old", "https://other.example", "2026-11-21T10:00:00Z")
+	newDir := mkScan("10.0.100.58_new", "https://example.com", "2026-11-22T10:00:00Z")
+
+	writeLedgerHyp := func(dir, id, dedup, title string) {
+		snap := map[string]any{
+			"seq":   1,
+			"order": []string{id},
+			"hypotheses": []map[string]any{{
+				"id":        id,
+				"dedup_key": dedup,
+				"title":     title,
+				"status":    "queued",
+			}},
+		}
+		data, err := json.Marshal(snap)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "ledger.json"), data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeLedgerHyp(otherDir, "H-1", "k-other", "other target hypothesis")
+	writeLedgerHyp(newDir, "H-1", "k-newest", "newest target hypothesis")
+
+	rr := explorationGet(t, s, inst)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("instance form code=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var view explorationView
+	if err := json.Unmarshal(rr.Body.Bytes(), &view); err != nil {
+		t.Fatal(err)
+	}
+	foundNewest, foundOther := false, false
+	for _, n := range view.Nodes {
+		if n.Title == "newest target hypothesis" {
+			foundNewest = true
+		}
+		if n.Title == "other target hypothesis" {
+			foundOther = true
+		}
+	}
+	if !foundNewest || foundOther {
+		t.Fatalf("multi-target instance form must bind the newest target's chain only (newest=%v other=%v)", foundNewest, foundOther)
+	}
+	if view.Note == "" || !strings.Contains(view.Note, "further target scans") {
+		t.Fatalf("multi-target disclosure missing: %q", view.Note)
+	}
 }

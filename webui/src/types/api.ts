@@ -38,6 +38,10 @@ export interface HttpExchange {
   at: string;
   method: string;
   url: string;
+  // Derived by the server from the exchange URL (lowercased hostname, port
+  // stripped). It is the join key against discovered assets (run target +
+  // sub-scan targets) and lets the UI group raw packets per asset.
+  host?: string;
   status?: number;
   channel?: string; // bearer / subprocess
   high_risk?: string; // AssessHTTP reason when the request pended the proxy gate
@@ -729,9 +733,62 @@ export interface SettingsImportResult {
 // 形状以 docs/API_CONTRACT.md 为唯一权威；后端实现见 internal/platform（R1/R2）。
 // ---------------------------------------------------------------------------
 
+/**
+ * 项目围栏（HITL 运行时约束，REDESIGN §5 × D7）。
+ *
+ * targets/allow_ports 管的是「运行启动时可以点名哪些目标」（dispatch 校验）；
+ * fence 管的是「运行期间受审批管辖的调用可以真的碰到什么」——命令字面量、
+ * 高危 HTTP、代理侧子进程流量。越界的调用不会出现在待审队列里，而是直接
+ * 以 rejected/decided_by="fence" 落审计行并回给模型 ⛔ 拒绝文本。
+ */
+export interface ProjectFence {
+  enforce: boolean;
+  /** 显式排除（覆盖 targets）：第三方 SaaS / 共享基础设施 / 禁止触碰的子域。 */
+  deny_targets?: string[];
+  /** 允许的写方法（大写）；空 = 不限制方法。 */
+  allow_http_methods?: string[];
+  /** 命中即硬拦截的命令子串（大小写不敏感）。 */
+  deny_command_patterns?: string[];
+}
+
 export interface ProjectScope {
   targets: string[];
   allow_ports?: number[];
+  fence?: ProjectFence;
+}
+
+/** GET/PUT /api/projects/{id}/scope 的响应。 */
+export interface ProjectScopeView {
+  project_id: string;
+  scope: ProjectScope;
+  fence: ProjectFence;
+  /** 写入校验问题（非空 = 该范围不可保存/不可启用）。 */
+  problems: string[];
+  /** 该项目执行中的 run 数：>0 时改围栏会立即影响后续审批。 */
+  active_runs: number;
+  /** HITL 模式（enforce/off）。off 时围栏只是配置，不是生效的控制。 */
+  approval_mode: string;
+  /** 围栏是否真的在拦（enforce 且有 HITL enforce）。 */
+  fence_bound: boolean;
+  warning?: string;
+}
+
+/** 单个候选目标的试算结果。 */
+export interface ScopeTargetCheck {
+  target: string;
+  in_scope: boolean;
+  reason?: string;
+}
+
+/** POST /api/projects/{id}/scope/validate 的响应（试算，不落库）。 */
+export interface ScopeValidateResult {
+  ok: boolean;
+  problems: string[];
+  entries: ScopeTargetCheck[];
+  scope: ProjectScope;
+  fence: ProjectFence;
+  fence_bound: boolean;
+  approval_mode: string;
 }
 
 export interface Project {
@@ -1034,6 +1091,15 @@ export interface GuidanceSendResult {
   guidance_id: string;
   run_id?: string;
   accepted?: boolean; // false = 重复 request_id（幂等命中）
+}
+
+/** 旁路提问受理回执（chat_questions.go）：回答经 chat_reply 事件回流转录。 */
+export interface QuestionSendResult {
+  status: "pending";
+  accepted: boolean;
+  run_id?: string;
+  instance_id?: string;
+  request_id?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -1592,6 +1658,8 @@ export interface TranscriptItem {
   agent_id?: string;
   at: string;
   truncated?: boolean;
+  /** Inferred methodology phase of tool events (absent = none); drives round dividers. */
+  phase?: number;
   /** Structured approval payload; present on approval rows so the UI can localize them. */
   approval?: {
     kind: string;

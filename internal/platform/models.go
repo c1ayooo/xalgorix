@@ -49,6 +49,56 @@ const DefaultProjectSlug = "default"
 type Scope struct {
 	Targets    []string `json:"targets"`
 	AllowPorts []int    `json:"allow_ports,omitempty"`
+	// Fence is the runtime (HITL) enforcement layer of the same boundary:
+	// Targets/AllowPorts decide which destinations a run may NAME at dispatch
+	// time, Fence decides what an approval-gated call may TOUCH while the run
+	// is live (REDESIGN §5 × D7). nil / enforce=false leaves the approval gate
+	// exactly as it was before the fence existed.
+	Fence *Fence `json:"fence,omitempty"`
+}
+
+// Fence is the operator-configured constraint the HITL approval gate applies
+// to every regulated call (command + high-risk HTTP + proxy-attributed wire
+// traffic) before the operator is even asked:
+//
+//	command — the call's literal destinations (URL host / host:port / IPv4 /
+//	          dotted hostname, minus common file suffixes) must fall inside
+//	          Targets, outside DenyTargets, and match DenyCommandPatterns none.
+//	http    — the request method must be listed in AllowHTTPMethods (empty =
+//	          all write methods) and the URL host:port must fall inside the
+//	          same host/port boundary.
+//
+// A call that violates the fence is never offered to the operator for a
+// decision: it is closed as rejected with decided_by="fence" so the audit row
+// still exists while the authorization boundary holds (charter §3.5 field
+// authority: the project fence outranks an operator's per-call approval).
+type Fence struct {
+	// Enforce turns the runtime check on. Requires a non-empty Targets list —
+	// an enforced fence with nothing inside it would block every call.
+	Enforce bool `json:"enforce"`
+	// DenyTargets are explicit exclusions that override Targets (third-party
+	// SaaS, shared infrastructure, subdomains that must never be touched).
+	// Entries are hosts or "*.domain" wildcards, never port-carrying.
+	DenyTargets []string `json:"deny_targets,omitempty"`
+	// AllowHTTPMethods limits which write methods an approval may carry
+	// (upper-case, from the standard HTTP set). Empty = all methods.
+	AllowHTTPMethods []string `json:"allow_http_methods,omitempty"`
+	// DenyCommandPatterns are case-insensitive substrings that hard-stop a
+	// command-class call (e.g. "msfconsole", "sudo", "--os-shell").
+	DenyCommandPatterns []string `json:"deny_command_patterns,omitempty"`
+}
+
+// Fence limits. They bound the prompt/UI surface and the per-call scanning
+// cost, not the repository's ability to store what it is given.
+const (
+	MaxFenceDenyTargets         = 64
+	MaxFenceDenyCommandPatterns = 32
+	MaxFencePatternLength       = 200
+)
+
+// FenceHTTPMethods is the closed vocabulary AllowHTTPMethods draws from.
+var FenceHTTPMethods = []string{
+	"GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE",
 }
 
 // Project is the top-level authorization/ownership entity.
@@ -627,7 +677,52 @@ func normalizeScope(s Scope) Scope {
 	if s.Targets == nil {
 		s.Targets = []string{}
 	}
+	if f := s.Fence; f != nil {
+		normalized := Fence{
+			Enforce:             f.Enforce,
+			DenyTargets:         normalizeStringList(f.DenyTargets, false),
+			AllowHTTPMethods:    normalizeStringList(f.AllowHTTPMethods, true),
+			DenyCommandPatterns: normalizeStringList(f.DenyCommandPatterns, false),
+		}
+		s.Fence = &normalized
+	}
 	return s
+}
+
+// normalizeStringList trims, drops empties and de-duplicates while keeping the
+// caller's order (case-insensitive dedupe; upper=true folds the value). Empty
+// results stay nil so the JSON shape does not grow a horde of empty arrays.
+func normalizeStringList(values []string, upper bool) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, raw := range values {
+		v := strings.TrimSpace(raw)
+		if v == "" {
+			continue
+		}
+		if upper {
+			v = strings.ToUpper(v)
+		}
+		key := strings.ToLower(v)
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, v)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// ValidateScope exposes scope validation to the web layer so a candidate scope
+// can be checked (project page "校验" action) without persisting it.
+func ValidateScope(s Scope) error {
+	return validateScope(normalizeScope(s))
 }
 
 // validateScope rejects scope entries that carry their own port ("host:port",
@@ -641,6 +736,61 @@ func validateScope(s Scope) error {
 	for _, entry := range s.Targets {
 		if scopeEntryHasExplicitPort(entry) {
 			return fmt.Errorf("%w: scope target %q carries a port; list hosts only and control ports via allow_ports", ErrValidation, entry)
+		}
+	}
+	return validateFence(s)
+}
+
+// validateFence rejects fence shapes the runtime check cannot honour. Every
+// rule here is a fail-closed write-time 400 (same posture as the scope entry
+// port rule): a fence the engine would have to interpret loosely is worse than
+// no fence, because the operator would believe the boundary holds.
+func validateFence(s Scope) error {
+	f := s.Fence
+	if f == nil {
+		return nil
+	}
+	if f.Enforce && len(s.Targets) == 0 {
+		return fmt.Errorf("%w: fence cannot be enforced while the scope has no targets", ErrValidation)
+	}
+	if len(f.DenyTargets) > MaxFenceDenyTargets {
+		return fmt.Errorf("%w: at most %d fence deny_targets", ErrValidation, MaxFenceDenyTargets)
+	}
+	for _, entry := range f.DenyTargets {
+		trimmed := strings.TrimSpace(entry)
+		if trimmed == "" {
+			return fmt.Errorf("%w: fence deny_targets contains an empty entry", ErrValidation)
+		}
+		if scopeEntryHasExplicitPort(trimmed) {
+			return fmt.Errorf("%w: fence deny target %q carries a port; list hosts only and control ports via allow_ports", ErrValidation, trimmed)
+		}
+		if strings.ContainsAny(trimmed, " /?#") {
+			return fmt.Errorf("%w: fence deny target %q is not a host or *.domain wildcard", ErrValidation, trimmed)
+		}
+	}
+	allowed := make(map[string]struct{}, len(FenceHTTPMethods))
+	for _, m := range FenceHTTPMethods {
+		allowed[m] = struct{}{}
+	}
+	for _, raw := range f.AllowHTTPMethods {
+		m := strings.ToUpper(strings.TrimSpace(raw))
+		if m == "" {
+			return fmt.Errorf("%w: fence allow_http_methods contains an empty entry", ErrValidation)
+		}
+		if _, ok := allowed[m]; !ok {
+			return fmt.Errorf("%w: fence allow_http_methods entry %q is not a standard HTTP method", ErrValidation, raw)
+		}
+	}
+	if len(f.DenyCommandPatterns) > MaxFenceDenyCommandPatterns {
+		return fmt.Errorf("%w: at most %d fence deny_command_patterns", ErrValidation, MaxFenceDenyCommandPatterns)
+	}
+	for _, pattern := range f.DenyCommandPatterns {
+		p := strings.TrimSpace(pattern)
+		if p == "" {
+			return fmt.Errorf("%w: fence deny_command_patterns contains an empty entry", ErrValidation)
+		}
+		if len(p) > MaxFencePatternLength {
+			return fmt.Errorf("%w: fence deny pattern %q exceeds %d bytes", ErrValidation, p, MaxFencePatternLength)
 		}
 	}
 	return nil

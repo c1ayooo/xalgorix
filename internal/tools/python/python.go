@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -167,6 +168,16 @@ func executePythonForContextCtx(parent context.Context, contextID string, args m
 		return tools.Result{}, err
 	}
 	cmdEnv = append(cmdEnv, egress.EnvForChild(contextID)...)
+	// Apply the address-space ceiling at interpreter startup, before the
+	// generated code runs. This closes the post-start prlimit race where an
+	// exponential script could allocate gigabytes in the first milliseconds.
+	// The guard is best-effort: a write failure must not block the tool, and
+	// the post-start RLIMIT_AS below still covers this process.
+	if guardDir, guardErr := terminal.PreparePythonMemoryGuard(cmd.Dir); guardErr != nil {
+		log.Printf("[python] memory guard unavailable: %v", guardErr)
+	} else if guardDir != "" {
+		cmdEnv = prependPythonPath(cmdEnv, guardDir)
+	}
 	cmd.Env = cmdEnv
 	configureProcessGroupKill(cmd)
 	if err := egress.PrepareChildAccess(contextID, cmd.Dir); err != nil {
@@ -184,7 +195,7 @@ func executePythonForContextCtx(parent context.Context, contextID string, args m
 	if err := cmd.Start(); err != nil {
 		return tools.Result{Error: fmt.Sprintf("Failed to start python process: %v", err)}, nil
 	}
-	terminal.ApplyProcessLimitsWithLimit(cmd, true, lease.MemoryLimitBytes())
+	terminal.ApplyProcessLimitsWithLimit(cmd, true, pythonProcessMemoryLimit(lease.MemoryLimitBytes()))
 
 	// Register with terminal so watchdog knows we are active
 	cleanCode := code
@@ -305,6 +316,44 @@ func pythonWorkspaceEnv(workDir string) []string {
 		"XALGORIX_WORKSPACE="+workDir,
 		"PYTHONDONTWRITEBYTECODE=1",
 	)
+}
+
+// prependPythonPath puts dir first on PYTHONPATH so the generated
+// sitecustomize guard is imported at interpreter startup. Any inherited
+// PYTHONPATH entry is preserved after the guard directory; a duplicate
+// PYTHONPATH key is removed first because execve/libc only honors one.
+func prependPythonPath(env []string, dir string) []string {
+	if dir == "" {
+		return env
+	}
+	joined := dir
+	for i, kv := range env {
+		if !strings.HasPrefix(kv, "PYTHONPATH=") {
+			continue
+		}
+		if existing := strings.TrimPrefix(kv, "PYTHONPATH="); existing != "" && existing != dir {
+			joined += ":" + existing
+		}
+		env = append(env[:i], env[i+1:]...)
+		break
+	}
+	return append(env, "PYTHONPATH="+joined)
+}
+
+// pythonProcessMemoryLimit picks the tighter of the lease ceiling and the
+// Python-specific ceiling for the post-start RLIMIT_AS defense in depth. The
+// authoritative pre-exec cap is applied by sitecustomize; this value only
+// covers builds invoked with -S/-I (which skip site) and the milliseconds
+// before sitecustomize runs.
+func pythonProcessMemoryLimit(leaseLimitBytes int64) int64 {
+	pythonLimit := resources.CurrentPythonMemoryLimitBytes()
+	if pythonLimit <= 0 {
+		return leaseLimitBytes
+	}
+	if leaseLimitBytes <= 0 || pythonLimit < leaseLimitBytes {
+		return pythonLimit
+	}
+	return leaseLimitBytes
 }
 
 // trafficProxyTLSBundleEnv appends the TLS trust environment for the

@@ -71,7 +71,7 @@ import {
   useDeleteScan,
   useDeleteVuln,
   useSendTaskGuidance,
-  useScanTraffic,
+  useScanTrafficQuery,
 } from "@/api/queries";
 import { api } from "@/api/client";
 import { MAX_GUIDANCE_CHARS, newRequestId } from "@/lib/guidance";
@@ -899,6 +899,20 @@ function findingSourceScanId(scanId: string, finding: VulnSummary): string {
   return finding.source_scan_id || scanId;
 }
 
+/** finding 所属资产的 host（用于把 raw 流量钉在同一资产上）；解析不出返回空。 */
+function hostFromAsset(raw?: string): string {
+  const trimmed = (raw ?? "").trim();
+  if (!trimmed) return "";
+  try {
+    const parsed = new URL(
+      trimmed.includes("://") ? trimmed : `https://${trimmed}`,
+    );
+    return parsed.hostname.toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
 function FindingsTab({
   vulns,
   scanId,
@@ -1400,6 +1414,10 @@ function DetailSection({
 // 流量代理为该 finding 记录的原始 HTTP 交互（wire 包，未脱敏）。懒加载：
 // 打开详情弹窗才拉取；扫描没有流量归档（代理关闭或旧扫描）或无匹配时整段
 // 不渲染——不堆空态文案。
+//
+// 证据绑定：endpoint 子串 + 资产 host 双条件。只按路径匹配会让 A 资产上的
+// 同名路径流量冒充 B 资产的证据；host 来自 finding.target（发现项所属资产），
+// 解析不出 host 时退回纯 endpoint 匹配。
 function FindingHttpExchanges({
   scanId,
   finding,
@@ -1408,11 +1426,12 @@ function FindingHttpExchanges({
   finding: VulnSummary;
 }) {
   const { t } = useI18n();
-  const { data } = useScanTraffic(
-    findingSourceScanId(scanId, finding),
-    finding.endpoint,
-    finding.method,
-  );
+  const assetHost = hostFromAsset(finding.target ?? finding.endpoint);
+  const { data } = useScanTrafficQuery(findingSourceScanId(scanId, finding), {
+    endpoint: finding.endpoint,
+    method: finding.method,
+    host: assetHost || undefined,
+  });
   const exchanges = data?.exchanges ?? [];
   if (exchanges.length === 0) return null;
   return (

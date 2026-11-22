@@ -179,9 +179,13 @@ func TestLeadVerificationWindowOpensOnceAndIsBounded(t *testing.T) {
 	if start == 0 {
 		t.Fatal("verification window did not open")
 	}
-	last := a.messages[len(a.messages)-1]
-	if last.Role != "user" || !strings.Contains(last.Content, "VERIFICATION WINDOW") || !strings.Contains(last.Content, lead.ID) {
-		t.Fatalf("window directive not delivered to the model: %+v", last)
+	// The directive rides the pending-injection queue (BeforeTurn drains it
+	// into the next ADK turn nudge). The old assertion read a.messages, which
+	// after the Eino migration was a dead letter no model call ever read —
+	// the test was green precisely because it asserted the broken channel.
+	delivered := a.drainPendingInjects()
+	if !strings.Contains(delivered, "VERIFICATION WINDOW") || !strings.Contains(delivered, lead.ID) {
+		t.Fatalf("window directive not delivered to the model turn: %q", delivered)
 	}
 
 	got := runUntilFinal(a, 50)

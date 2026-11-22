@@ -97,17 +97,41 @@ type explorationView struct {
 	Edges          []explorationEdge `json:"edges"`
 }
 
-// instanceScanClaimCount reports how many top-level scan records claim the
-// given instance id — the multi-target/re-dispatch disclosure for the
-// exploration projection (D11: an instance is a run identity, 1:N scans).
-func (s *Server) instanceScanClaimCount(instanceID string) int {
-	claims := 0
-	for _, entry := range s.findAllScanSummaries() {
-		if entry.rec.ParentTarget == "" && entry.rec.InstanceID == instanceID {
-			claims++
-		}
+// explorationSessionDirs expands the resolved scan identity into the sibling
+// session directories whose journals/ledgers compose THIS target's chain,
+// oldest session first. Instance form: same-target siblings concatenate — a
+// 1:1 re-dispatch continues the same investigation in a fresh session
+// directory (REDESIGN D11), so the run view must span its sessions.
+// Distinct-target siblings of a multi-target dispatch stay out of the graph
+// (a chain is per target) and are disclosed in the note instead. Record-id
+// form stays scoped to that one session (the scan-detail view).
+func (s *Server) explorationSessionDirs(res scanResolution, entries []scanEntry) (dirs []string, otherTargets int) {
+	if !res.instanceForm || res.rec == nil || res.rec.InstanceID == "" {
+		return []string{res.dir}, 0
 	}
-	return claims
+	idx := s.scanSummaryIndexFor(entries)
+	recs := idx.lookupAll(res.rec.InstanceID, res.rec.ID)
+	sort.SliceStable(recs, func(i, j int) bool { return recs[i].StartedAt > recs[j].StartedAt })
+	target := res.rec.Target
+	for _, rec := range recs {
+		d := idx.dirByScanID[rec.ID]
+		if d == "" {
+			continue
+		}
+		if target != "" && rec.Target == target {
+			dirs = append(dirs, d)
+			continue
+		}
+		otherTargets++
+	}
+	// newest-first → chronological
+	for i, j := 0, len(dirs)-1; i < j; i, j = i+1, j-1 {
+		dirs[i], dirs[j] = dirs[j], dirs[i]
+	}
+	if len(dirs) == 0 {
+		dirs = []string{res.dir}
+	}
+	return dirs, otherTargets
 }
 
 func joinNotes(base, extra string) string {
@@ -118,27 +142,41 @@ func joinNotes(base, extra string) string {
 }
 
 // handleScanExploration serves GET /api/scans/{id}/exploration.
+//
+// Instance-form requests project the run's chain across its same-target
+// sibling sessions (D11 re-dispatch): journals concatenate chronologically
+// and the newest session's ledger wins per hypothesis id, so a resumed run
+// keeps its previous chain instead of surfacing an empty graph.
 func (s *Server) handleScanExploration(w http.ResponseWriter, r *http.Request) {
 	scanID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/scans/"), "/exploration")
 	if scanID == "" {
 		http.Error(w, `{"error":"scan id is required"}`, http.StatusBadRequest)
 		return
 	}
-	dir, ok := s.resolveScanDirByID(scanID)
+	entries := s.findAllScanSummaries()
+	res, ok := s.resolveScanRecordByIDFrom(scanID, func() []scanEntry { return entries })
 	if !ok {
 		http.Error(w, `{"error":"scan not found"}`, http.StatusNotFound)
 		return
 	}
-	// D11 披露:instance 是 run 身份,多目标派发/重派发会让一个 instance 名下
-	// 有多个 scan 记录——解析绑定最新会话(resolveScanDirByID 的 instance 形态
-	// 回退),这里如实注明,不冒充完整历史。
-	instanceClaims := s.instanceScanClaimCount(scanID)
+	dirs, otherTargets := s.explorationSessionDirs(res, entries)
+	sessions := len(dirs)
+
+	// D11 披露:instance 是 run 身份——重派发让同一 target 名下有多个会话目录
+	// (合并投影),多目标派发让一个 instance 名下有多个 target 的记录(如实注明
+	// 只画本 target 的链,不冒充完整历史)。
 	disclosure := ""
-	if instanceClaims > 1 {
+	if sessions > 1 {
 		disclosure = fmt.Sprintf(
-			"this run dispatched %d target scans sharing the instance; the projection binds to the newest session",
-			instanceClaims,
+			"this run re-dispatched the same target %d times; the projection merges all sibling sessions (oldest → newest)",
+			sessions,
 		)
+	}
+	if otherTargets > 0 {
+		disclosure = joinNotes(disclosure, fmt.Sprintf(
+			"the run dispatched %d further target scans sharing the instance; the graph covers this target's sessions only",
+			otherTargets,
+		))
 	}
 
 	view := explorationView{
@@ -151,28 +189,53 @@ func (s *Server) handleScanExploration(w http.ResponseWriter, r *http.Request) {
 	// Hypothesis titles/states and the structural finding_ref links live
 	// here; the journal supplies history the snapshot may have capped away
 	// (evidence cap) or never recorded as state (observations, delegates).
-	ledgerPath := filepath.Join(dir, ledgerFileName)
-	_, ledgerStatErr := os.Stat(ledgerPath)
-	ledgerMissing := ledgerStatErr != nil && errors.Is(ledgerStatErr, os.ErrNotExist)
+	// Across sessions the walk is oldest → newest, so the newest session's
+	// state wins per hypothesis id — the continuity continuation of the
+	// chain, never a silent overwrite of a distinct hypothesis.
 	var ledger map[string]scanctx.Hypothesis
-	if !ledgerMissing {
+	for _, dir := range dirs {
+		if _, err := os.Stat(filepath.Join(dir, ledgerFileName)); err != nil {
+			continue
+		}
 		store := scanctx.NewLedgerStore()
 		store.SetPersistPath(dir)
 		store.LoadFromDisk()
 		hyps := store.All()
-		ledger = make(map[string]scanctx.Hypothesis, len(hyps))
+		if ledger == nil {
+			ledger = make(map[string]scanctx.Hypothesis, len(hyps))
+		}
 		for _, h := range hyps {
 			ledger[h.ID] = h
 		}
 		view.LedgerPresent = true
 	}
+	ledgerMissing := !view.LedgerPresent
 
 	// ── journal: append-only history ─────────────────────────────────────
-	journalPath := filepath.Join(dir, domainjournal.FileName)
-	if _, err := os.Stat(journalPath); errors.Is(err, os.ErrNotExist) {
+	var records []domainjournal.Record
+	journalDamaged := false
+	for _, dir := range dirs {
+		journalPath := filepath.Join(dir, domainjournal.FileName)
+		if _, err := os.Stat(journalPath); errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		sessionRecords, damaged, err := domainjournal.ReadRecords(journalPath)
+		if err != nil {
+			http.Error(w, `{"error":"failed to read domain journal"}`, http.StatusInternalServerError)
+			return
+		}
+		view.JournalPresent = true
+		journalDamaged = journalDamaged || damaged
+		records = append(records, sessionRecords...)
+	}
+	if !view.JournalPresent {
 		if ledgerMissing {
 			view.Incomplete = true
-			view.Note = joinNotes("no domain journal and no ledger snapshot exist for this scan", disclosure)
+			if sessions > 1 {
+				view.Note = joinNotes("no domain journal and no ledger snapshot exist in any of this run's sessions", disclosure)
+			} else {
+				view.Note = joinNotes("no domain journal and no ledger snapshot exist for this scan", disclosure)
+			}
 			writeJSONStatus(w, http.StatusOK, view)
 			return
 		}
@@ -180,29 +243,27 @@ func (s *Server) handleScanExploration(w http.ResponseWriter, r *http.Request) {
 		// state only — stated honestly instead of a fabricated history.
 		buildExploration(&view, ledger, nil)
 		view.Incomplete = true
-		view.Note = joinNotes("no domain journal exists for this scan; the graph is the ledger's current state only (no claim history, delegates or observations)", disclosure)
+		if sessions > 1 {
+			view.Note = joinNotes("no domain journal exists in any of this run's sessions; the graph is the ledger's current state only (no claim history, delegates or observations)", disclosure)
+		} else {
+			view.Note = joinNotes("no domain journal exists for this scan; the graph is the ledger's current state only (no claim history, delegates or observations)", disclosure)
+		}
 		sortAndCountExploration(&view)
 		writeJSONStatus(w, http.StatusOK, view)
 		return
 	}
-	records, damaged, err := domainjournal.ReadRecords(journalPath)
-	if err != nil {
-		http.Error(w, `{"error":"failed to read domain journal"}`, http.StatusInternalServerError)
-		return
-	}
-	view.JournalPresent = true
-	view.JournalDamaged = damaged
+	view.JournalDamaged = journalDamaged
 
 	buildExploration(&view, ledger, records)
 
-	notes := make([]string, 0, 2)
-	if damaged {
+	notes := make([]string, 0, 3)
+	if journalDamaged {
 		notes = append(notes, "journal has a damaged trailing entry; nodes below the damage are authoritative, the tail is incomplete")
 	}
 	if !view.LedgerPresent {
 		notes = append(notes, "no ledger snapshot exists; hypothesis states reflect journal records only")
 	}
-	view.Incomplete = damaged || !view.LedgerPresent
+	view.Incomplete = journalDamaged || !view.LedgerPresent
 	if disclosure != "" {
 		notes = append(notes, disclosure)
 	}

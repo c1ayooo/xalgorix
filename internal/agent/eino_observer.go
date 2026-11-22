@@ -82,6 +82,18 @@ func (o *einoObserver) BeforeTurn(_ context.Context, turn int) engine.TurnDecisi
 	if result.EmitMessage != "" {
 		a.emit(Event{Type: "message", Content: result.EmitMessage, TotalTokens: a.syncBudgetTokens()})
 	}
+	// Mid-run injections (operator messages via SendMessage, hook nudges from
+	// the tool/stuck guards) ride the pending queue and land at the tail of
+	// the conversation right before this model call. The stop-path returns
+	// above skip the drain on purpose: queued content must survive a stop
+	// check and deliver on the next live turn.
+	if injected := a.drainPendingInjects(); injected != "" {
+		if result.Nudge != "" {
+			result.Nudge += "\n\n" + injected
+		} else {
+			result.Nudge = injected
+		}
+	}
 	return engine.TurnDecision{Nudge: result.Nudge, EmitMessage: result.EmitMessage}
 }
 

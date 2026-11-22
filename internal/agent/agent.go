@@ -223,8 +223,9 @@ type Agent struct {
 	userProfiles               []specialistProfile                // operator-authored delegation profiles injected for THIS scan only
 	mcpServers                 []mcptool.ServerSpec               // operator-registered MCP servers for THIS scan only
 	mcpManager                 *mcptool.Manager                   // per-scan MCP session owner (nil until Run)
-	messages                   []llm.Message
-	msgMu                      sync.Mutex
+	messages                   []llm.Message                      // Run-start conversation seed; the only reader is einoMessages() before rt.Run
+	msgMu                      sync.Mutex                         // guards messages AND pendingInjects
+	pendingInjects             []string                           // mid-run injections (operator messages via SendMessage, hook nudges); drained by BeforeTurn into the ADK turn nudge
 	events                     chan Event
 	maxIter                    int
 	stopped                    atomic.Bool
@@ -1322,19 +1323,46 @@ func scannerTemperatureFor(state *ScanState) float64 {
 	return t
 }
 
-// appendUserNudge appends a user-role recovery nudge unless the previous
-// message is byte-identical. A deterministic model that re-emits the same
-// malformed output between attempts would otherwise stack duplicate
-// recovery instructions, burning context without changing what the model
-// sees; one copy of each distinct nudge is enough.
+// appendUserNudge queues a user-role recovery nudge for delivery on the next
+// model turn (BeforeTurn drains the pending-injection queue into the ADK
+// turn nudge). A nudge identical to the last queued one is dropped: a
+// deterministic model that re-emits the same malformed output between
+// attempts would otherwise stack duplicate recovery instructions, burning
+// context without changing what the model sees; one copy of each distinct
+// nudge is enough. Before the Eino migration this appended directly to
+// a.messages, which the old loop re-read every iteration — the ADK runtime
+// reads the conversation state itself, so anything that must reach the model
+// mid-run has to ride the turn nudge seam.
 func (a *Agent) appendUserNudge(content string) {
 	a.msgMu.Lock()
 	defer a.msgMu.Unlock()
-	if n := len(a.messages); n > 0 &&
-		a.messages[n-1].Role == "user" && a.messages[n-1].Content == content {
+	if n := len(a.pendingInjects); n > 0 && a.pendingInjects[n-1] == content {
 		return
 	}
-	a.messages = append(a.messages, llm.Message{Role: "user", Content: content})
+	a.pendingInjects = append(a.pendingInjects, content)
+}
+
+// queueUserMessage queues an operator message for delivery on the next model
+// turn. Same seam as appendUserNudge; kept separate so the operator channel
+// and hook nudges can evolve independently.
+func (a *Agent) queueUserMessage(content string) {
+	a.msgMu.Lock()
+	defer a.msgMu.Unlock()
+	a.pendingInjects = append(a.pendingInjects, content)
+}
+
+// drainPendingInjects returns all queued injections joined as one turn-nudge
+// block and empties the queue. Callers that are about to stop the loop must
+// NOT drain — queued content has to survive for the next turn.
+func (a *Agent) drainPendingInjects() string {
+	a.msgMu.Lock()
+	defer a.msgMu.Unlock()
+	if len(a.pendingInjects) == 0 {
+		return ""
+	}
+	joined := strings.Join(a.pendingInjects, "\n\n")
+	a.pendingInjects = nil
+	return joined
 }
 
 // delegationEnabled reports whether ANY specialist delegation is possible
@@ -1989,10 +2017,13 @@ func (a *Agent) WaitForDelegatedAgents(timeout time.Duration) bool {
 	return a.agentGraph.WaitStopped(timeout)
 }
 
-// SendMessage injects an operator message into the running scan's
-// conversation history so the agent picks it up on its next iteration.
-// Routing it through the message buffer (instead of issuing a separate
-// LLM call) avoids concurrent Chat() calls that would corrupt history.
+// SendMessage injects an operator message into the running scan so the agent
+// sees it on its next model turn. It rides the pending-injection queue that
+// BeforeTurn drains into the ADK turn nudge — the ADK owns the conversation
+// state, so appending to a.messages (the Run-start seed) would be a dead
+// letter that no model call ever reads. Routing through the queue (instead
+// of issuing a separate LLM call) also avoids concurrent Chat() calls that
+// would corrupt history.
 //
 // This is fire-and-forget: the returned string is an acknowledgement
 // that the message was queued, NOT the agent's reply. The agent's
@@ -2003,12 +2034,7 @@ func (a *Agent) SendMessage(message string) (string, error) {
 		return "", fmt.Errorf("agent is not running")
 	}
 
-	a.msgMu.Lock()
-	a.messages = append(a.messages, llm.Message{
-		Role:    "user",
-		Content: "[USER MESSAGE DURING SCAN]: " + message,
-	})
-	a.msgMu.Unlock()
+	a.queueUserMessage("[USER MESSAGE DURING SCAN]: " + message)
 
 	// Emit as a visible event so it appears in the feed
 	a.emit(Event{Type: "message", Content: a.opf("📨 User message received: %s", "📨 已收到用户消息：%s", message)})

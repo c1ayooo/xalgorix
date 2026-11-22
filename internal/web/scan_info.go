@@ -136,7 +136,31 @@ func (s *Server) infoProject(w http.ResponseWriter, r *http.Request) (platform.R
 		writeJSONStatus(w, http.StatusInternalServerError, map[string]string{"error": "project scan lookup failed"})
 		return nil, "", nil, false
 	}
-	return store, projectID, scanIDs, true
+	return store, projectID, s.expandSiblingScanIDs(scanIDs), true
+}
+
+// expandSiblingScanIDs unions the platform whitelist with the on-disk sibling
+// record ids behind each whitelisted run instance (REDESIGN D11). A re-started
+// run journals and cold-path-syncs under its own session scan id, which the
+// fill-once legacy linkage never learns — without this expansion /api/info/*
+// silently drops every item a resumed session produces (the same blind spot
+// 09d06a3e fixed for finding projections). Expansion can only add records
+// claiming already-whitelisted instances, so project isolation never widens.
+func (s *Server) expandSiblingScanIDs(scanIDs []string) []string {
+	if len(scanIDs) == 0 {
+		return scanIDs
+	}
+	idx := s.scanSummaryIndexFor(s.findAllScanSummaries())
+	out := append([]string(nil), scanIDs...)
+	for _, id := range scanIDs {
+		for _, rec := range idx.byInstance[id] {
+			if rec.ID == "" || containsString(out, rec.ID) {
+				continue
+			}
+			out = append(out, rec.ID)
+		}
+	}
+	return out
 }
 
 func infoQueryLimit(r *http.Request) (int, error) {
@@ -209,6 +233,10 @@ func (s *Server) narrowInfoScans(w http.ResponseWriter, r *http.Request, store p
 		writePlatformError(w, err)
 		return nil, false
 	}
+	// The task whitelist needs the same sibling expansion as the project one:
+	// intersecting an un-expanded task set with the expanded project set
+	// would silently narrow the resumed session's id back out.
+	taskScans = s.expandSiblingScanIDs(taskScans)
 	out := make([]string, 0, len(taskScans))
 	for _, id := range taskScans {
 		if containsString(scanIDs, id) {

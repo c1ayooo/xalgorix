@@ -5,7 +5,6 @@ import { create } from "zustand";
 import {
   FileText,
   LayoutGrid,
-  Plug,
   Plus,
   Radio,
   Settings,
@@ -35,7 +34,6 @@ const NAV_ITEMS = [
   { labelKey: "nav.findings", to: "/findings", icon: ShieldAlert },
   { labelKey: "nav.live", to: "/live", icon: Radio },
   { labelKey: "nav.reports", to: "/reports", icon: FileText },
-  { labelKey: "nav.integrations", to: "/integrations", icon: Plug },
   { labelKey: "nav.settings", to: "/settings", icon: Settings },
 ];
 

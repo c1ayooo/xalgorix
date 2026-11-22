@@ -25,11 +25,27 @@ interface Project {
   id: string;            // uuid
   name: string;
   slug: string;          // URL/切换器用，唯一
-  scope: { targets: string[]; allow_ports?: number[] };
+  scope: ProjectScope;
   created_at: string;
   archived_at?: string;  // 存在即归档（列表默认不含归档）
   task_count?: number;   // 列表响应附带
   active_runs?: number;  // 列表响应附带
+}
+
+// 一个授权边界，两层判定（2026-11-22 增补）：
+//   targets/allow_ports → dispatch 层：运行启动时可以点名哪些目标（只写主机名）
+//   fence               → 运行时层：受审批管辖的调用（命令 / 高危 HTTP / 代理侧
+//                          子进程流量）可以真的碰到什么。越界调用不进入待审队列，
+//                          直接以 rejected + decided_by="fence" 落审计行。
+interface ProjectScope {
+  targets: string[];
+  allow_ports?: number[];
+  fence?: {
+    enforce: boolean;                 // 启用后至少需要一个 targets 条目
+    deny_targets?: string[];          // 覆盖 targets 的排除主机（主机或 *.domain，不带端口）
+    allow_http_methods?: string[];    // 允许的写方法（大写标准方法）；空 = 不限制
+    deny_command_patterns?: string[]; // 命中即硬拦截的命令子串（大小写不敏感）
+  };
 }
 ```
 
@@ -40,6 +56,9 @@ interface Project {
 | GET `/api/projects/{id}` | — | `Project` |
 | PATCH `/api/projects/{id}` | `{ name?, scope?, archived? }` | `Project` |
 | DELETE `/api/projects/{id}` | — | `{ status: "deleted" }`（仅允许无活跃 Run 的项目；否则 409） |
+| GET `/api/projects/{id}/scope` | — | `{ project_id, scope, fence, problems: string[], active_runs, approval_mode: "enforce"\|"off", fence_bound, warning? }`（`fence_bound = fence.enforce && approval_mode=="enforce"`——围栏是配置还是真的在拦，由它回答） |
+| PUT `/api/projects/{id}/scope` | `ProjectScope`（原样替换） | 同上视图；写入校验失败 400 `{ error, problems: string[] }`（围栏启用却无 targets、deny_targets 带端口/协议、方法不在标准集合、命令片段超限）；围栏在 `active_runs > 0` 时也允许改，响应带 `warning`（对后续审批立即生效，已在待审的行保持原判） |
+| POST `/api/projects/{id}/scope/validate` | `{ scope?: ProjectScope, targets?: string[] }`（scope 缺省取已存值） | `{ ok, problems, entries: [{ target, in_scope, reason? }], scope, fence, fence_bound, approval_mode }`——不落库；`entries` 同时回答 dispatch 判定与围栏判定（任一不通过即 `in_scope=false`） |
 
 ## 2. Tasks
 
@@ -179,7 +198,7 @@ interface Approval {
   created_at: string;
   deadline_at: string;       // created_at + XALGORIX_APPROVAL_TIMEOUT；前端倒计时，归零显示 timeout
   decided_at?: string;
-  decided_by?: string;       // "operator:<user>" | "timeout" | "system"
+  decided_by?: string;       // "operator:<user>" | "timeout" | "system" | "fence"
   reason?: string;           // 拒绝/批准附言
 }
 ```
@@ -198,6 +217,8 @@ interface Approval {
 前端在 LiveFeed 的 `TYPE_COLOR` 中已为 `approval_requested`/`approval_decided` 留色；事件流内嵌紧凑审批卡（行内决策 + 深链 `/approvals?focus=<id>`）。
 
 **后端行为要点**（与 REDESIGN §5 对齐）：超时由服务端判定写 `timeout`；Run 停止时未决单批量 `cancelled`；同一 Run 未决上限默认 1。
+
+**项目围栏（2026-11-22 增补，`decided_by="fence"`）**：项目 scope 的 `fence.enforce=true` 且 HITL 模式为 `enforce` 时，每一张审批请求在**进入待审队列之前**先过围栏：命令类按字面量抽取目的地（URL / host:port / IPv4 / 点号主机名，常见文件名后缀除外），HTTP 类按 method + URL 的 host:port 判定；`deny_targets` 覆盖 `targets`，`allow_ports` 非空时端口必须命中，回环地址不参与判定。越界调用不会等待人工决策——引擎立即以 `status=rejected, decided_by="fence"` 关闭该行（审计保留），并把 ⛔ FENCE DENIAL 交回模型；代理侧同一判定直接 403。**"approve & remember" 规则不能扩大边界**：围栏判定先于规则匹配。
 
 **停止带 reason（2026-11-21 增补，4zreco 软取消语义）**：`POST /api/instances/{id}/stop` 请求体接受可选 `{ "reason": string }`（向后兼容空体）。reason 落 `stop_reason` 供引擎在下一 Run 的 briefing 中参考（人工转向的结构化反馈，对应 4zreco"软取消 → 规划者据此重规划"）。前端停止按钮已带 reason 输入弹窗。
 

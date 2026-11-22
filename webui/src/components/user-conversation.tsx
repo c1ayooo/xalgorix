@@ -27,11 +27,14 @@ export function UserConversation({
   instanceId,
   runId,
   className,
+  onEmptyChange,
 }: {
   taskId: string;
   instanceId: string;
   runId?: string;
   className?: string;
+  /** 空态上报（对话页据此把 composer 居中）；缺省不报告。 */
+  onEmptyChange?: (empty: boolean) => void;
 }) {
   const { t } = useI18n();
   const { data, isLoading, error, refetch } = useTaskGuidance(taskId);
@@ -80,6 +83,12 @@ export function UserConversation({
     return () => cancelAnimationFrame(frame);
   }, [messages]);
 
+  // 空态上报须在早退 return（skeleton/error）之前声明，保证各分支都在报告。
+  const isEmpty = !isLoading && authStatus !== "loading" && !error && messages.length === 0;
+  useEffect(() => {
+    onEmptyChange?.(isEmpty);
+  }, [isEmpty, onEmptyChange]);
+
   if (isLoading || authStatus === "loading") {
     return (
       <div className={cn("space-y-3 p-4", className)} aria-label={t("common.loading")}>
@@ -117,7 +126,8 @@ export function UserConversation({
       }}
     >
       {messages.length === 0 ? (
-        <div className="grid min-h-full place-items-center p-4">
+        // 提示贴滚动区底部，正好落在居中 composer 上方（文案本身说「在下方发送」）。
+        <div className="flex min-h-full flex-col items-center justify-end p-4 pb-3">
           <EmptyState
             className="w-full max-w-lg"
             icon={<User className="size-5" aria-hidden />}

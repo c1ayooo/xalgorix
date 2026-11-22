@@ -155,6 +155,8 @@ const NAMED_STREAM_EVENT_TYPES = [
   "guidance_injected",
   "guidance_queued",
   "guidance_consumed",
+  "chat_question",
+  "chat_reply",
   "goal_analyzed",
   "skills_changed",
   "agent_profiles_changed",

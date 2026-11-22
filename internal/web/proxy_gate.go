@@ -66,6 +66,12 @@ func (g *proxyHighRiskGate) Adjudicate(attr trafficproxy.Attribution, verdict ap
 		log.Printf("[approval] proxy gate: scan context %s gone — failing open", attr.ScanCtxID)
 		return true, "", nil
 	}
+	// Project fence first (scope_fence.go): the wire layer is part of the same
+	// authorization boundary, and a remembered rule never widens it. Denial
+	// here is a 403 with the fence reason — no operator decision is possible.
+	if row, denied := g.svc.fenceDenial(attr.InstanceID, sctx, verdict, g.svc.srv.secretValuesForInstance(attr.InstanceID)); denied {
+		return false, fenceDenialMessage(row), nil
+	}
 	// Operator rule exemption (contract §3.2): the same remembered rules the
 	// command gate consults cover the wire layer — one operator decision
 	// stops asking about this intent at either granularity. This also lets a
