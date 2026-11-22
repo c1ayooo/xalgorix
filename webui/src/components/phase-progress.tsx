@@ -1,4 +1,5 @@
 import { cn } from "@/lib/utils";
+import { useI18n } from "@/i18n";
 // Canonical 22-phase methodology list, GENERATED from the Go registry
 // (internal/methodology) via `go run ./tools/gen-webui-phases`. A Go test
 // (internal/methodology TestWebuiPhaseListInSync) fails the build when this
@@ -44,6 +45,11 @@ export const PHASE_STATUS_LABEL: Record<PhaseStatus, string> = {
   not_applicable: "Not applicable",
   not_selected: "Not selected",
 };
+
+// Localized label for a phase disposition; falls back to the English label.
+export function phaseStatusLabel(status: PhaseStatus, t: (k: string) => string): string {
+  return t(`phase.status.${status}`);
+}
 
 type PhaseVisual = {
   className: string;
@@ -109,6 +115,7 @@ export function PhaseProgress({
   worked?: number[];
   className?: string;
 }) {
+  const { t } = useI18n();
   const isRunning = (status || "").toLowerCase() === "running";
   const selectedSet = new Set(
     selected && selected.length ? selected : PHASES.map((p) => p.id),
@@ -120,7 +127,7 @@ export function PhaseProgress({
       aria-valuemin={1}
       aria-valuemax={PHASES.length}
       aria-valuenow={current ?? undefined}
-      aria-label="Scan phase progress"
+      aria-label={t("phase.progressAria")}
     >
       {PHASES.map((p) => {
         const isSelected = selectedSet.has(p.id);
@@ -136,12 +143,12 @@ export function PhaseProgress({
             key={p.id}
             role="img"
             tabIndex={0}
-            aria-label={`${p.id}. ${p.name} — ${PHASE_STATUS_LABEL[visual.status]}${
-              isSelected || excludedByStatus ? "" : " (not selected)"
+            aria-label={`${p.id}. ${p.name} — ${phaseStatusLabel(visual.status, t)}${
+              isSelected || excludedByStatus ? "" : t("phase.notSelectedSuffix")
             }`}
             title={`${p.id}. ${p.name}${
-              isSelected || excludedByStatus ? "" : " (not selected)"
-            } — ${PHASE_STATUS_LABEL[visual.status]}`}
+              isSelected || excludedByStatus ? "" : t("phase.notSelectedSuffix")
+            } — ${phaseStatusLabel(visual.status, t)}`}
             className={cn(
               "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
               "h-1.5 flex-1 rounded-sm transition-colors",

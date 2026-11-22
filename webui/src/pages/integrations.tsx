@@ -3,18 +3,17 @@ import { useI18n } from "@/i18n";
 import {
   CheckCircle2,
   ExternalLink,
-  Mail,
   MessageSquare,
   Plug,
   Send,
   ShieldCheck,
   Sparkles,
+  Bot,
 } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
-  useAgentMail,
   useEnvironmentSettings,
   useRateLimit,
   useVersion,
@@ -25,7 +24,7 @@ type Integration = {
   key: string;
   name: string;
   description: string;
-  category: "AI" | "Email" | "Notifications" | "Engagement";
+  category: "AI" | "Notifications" | "Engagement";
   icon: typeof Plug;
   configurePath?: string;
   configureLabel?: string;
@@ -36,7 +35,6 @@ type Integration = {
 
 export default function IntegrationsPage() {
   const { t } = useI18n();
-  const mail = useAgentMail();
   const rate = useRateLimit();
   const version = useVersion();
   const environment = useEnvironmentSettings();
@@ -52,76 +50,91 @@ export default function IntegrationsPage() {
   const integrations: Integration[] = [
     {
       key: "llm-provider",
-      name: usesVercelGateway ? "Vercel AI Gateway" : "LLM Provider",
+      name: usesVercelGateway ? "Vercel AI Gateway" : t("settings.card.llmProvider"),
       description: usesVercelGateway
-        ? "Multi-provider LLM access for the security agent through Vercel AI Gateway."
-        : "Direct model provider used by the security agent for planning, testing, and reporting.",
+        ? t("integrations.card.llmGatewayDesc")
+        : t("integrations.card.llmDesc"),
       category: "AI",
       icon: Sparkles,
       configurePath: "/settings?tab=llm",
-      configureLabel: "Open settings",
+      configureLabel: t("integrations.card.openSettings"),
       external: usesVercelGateway ? "https://vercel.com/docs/ai-gateway" : undefined,
       isConfigured: Boolean(ai?.configured),
       detail: ai
         ? `${ai.provider}${ai.model ? ` · ${ai.model}` : ""}`
-        : "Loading provider status...",
-    },
-    {
-      key: "agentmail",
-      name: "AgentMail",
-      description:
-        "Inbound email triage: forward security inboxes and let the agent classify, prioritize, and respond.",
-      category: "Email",
-      icon: Mail,
-      configurePath: "/settings?tab=email",
-      configureLabel: "Configure",
-      external: "https://agentmail.to",
-      isConfigured: Boolean(mail.data?.hasApiKey && mail.data?.pod),
-      detail: mail.data?.pod ? `Pod: ${mail.data.pod}` : "Not connected",
+        : t("integrations.card.loadingProvider"),
     },
     {
       key: "discord",
-      name: "Discord webhook",
-      description:
-        "Stream critical findings and scan summaries to a Discord channel as they happen.",
+      name: t("settings.notifications.webhookLabel"),
+      description: t("integrations.card.discordDesc"),
       category: "Notifications",
       icon: MessageSquare,
       configurePath: "/settings?tab=notifications",
-      configureLabel: "Configure",
+      configureLabel: t("integrations.card.configure"),
       external: "https://discord.com/developers/docs/resources/webhook",
       isConfigured: Boolean(discordWebhook?.hasValue),
       detail: discordWebhook?.hasValue
-        ? "Global webhook configured"
-        : "Global default, with per-scan overrides available.",
+        ? t("integrations.card.discordDetailOn")
+        : t("integrations.card.discordDetailOff"),
     },
     {
       key: "telegram",
-      name: "Telegram bot",
-      description:
-        "Receive scan events, severity-gated findings, and the finished PDF report in a Telegram chat or channel.",
+      name: t("integrations.card.telegramName"),
+      description: t("integrations.card.telegramDesc"),
       category: "Notifications",
       icon: Send,
       configurePath: "/settings?tab=notifications",
-      configureLabel: "Configure",
+      configureLabel: t("integrations.card.configure"),
       external: "https://core.telegram.org/bots/api",
       isConfigured: Boolean(telegramToken?.hasValue),
       detail: telegramToken?.hasValue
-        ? "Bot token configured"
-        : "Set a bot token and chat ID to enable Telegram alerts.",
+        ? t("integrations.card.telegramDetailOn")
+        : t("integrations.card.telegramDetailOff"),
     },
     {
       key: "rate-limit",
-      name: "Outbound rate limiter",
-      description:
-        "Throttle the agent so it stays within target SLAs and bug bounty engagement rules.",
+      name: t("integrations.card.rateName"),
+      description: t("integrations.card.rateDesc"),
       category: "Engagement",
       icon: ShieldCheck,
       configurePath: "/settings?tab=engagement",
-      configureLabel: "Adjust",
+      configureLabel: t("integrations.card.rateAdjust"),
       isConfigured: Boolean(rate.data?.requests),
       detail: rate.data
-        ? `${rate.data.requests} req / ${rate.data.window}s window`
-        : "Loading…",
+        ? `${rate.data.requests} ${t("integrations.card.reqUnit")} / ${rate.data.window} ${t("integrations.card.windowUnit")}`
+        : t("common.loading"),
+    },
+    // 集成模块：MCP / Skills / Agents——独立管理页（各含配置 + 调用记录两 tab）。
+    {
+      key: "mcp",
+      name: t("nav.mcp"),
+      description: t("mcp.subtitle"),
+      category: "Engagement",
+      icon: Plug,
+      configurePath: "/mcp",
+      configureLabel: t("integrations.card.manage"),
+      isConfigured: true,
+    },
+    {
+      key: "skills",
+      name: t("nav.skills"),
+      description: t("skills.subtitle"),
+      category: "Engagement",
+      icon: Sparkles,
+      configurePath: "/skills",
+      configureLabel: t("integrations.card.manage"),
+      isConfigured: true,
+    },
+    {
+      key: "agents",
+      name: t("nav.agents"),
+      description: t("agents.subtitle"),
+      category: "Engagement",
+      icon: Bot,
+      configurePath: "/agents",
+      configureLabel: t("integrations.card.manage"),
+      isConfigured: true,
     },
   ];
 
@@ -132,12 +145,11 @@ export default function IntegrationsPage() {
       <div>
         <h1 className="text-2xl font-semibold tracking-tight">{t("integrations.title")}</h1>
         <p className="mt-1 text-sm text-muted-foreground">
-          Services the agent can talk to. Configure once, reuse across every
-          scan.
+          {t("integrations.subtitle")}
         </p>
       </div>
 
-      {(["AI", "Email", "Notifications", "Engagement"] as const).map((cat) => {
+      {(["AI", "Notifications", "Engagement"] as const).map((cat) => {
         const items = byCategory[cat] ?? [];
         if (!items.length) return null;
         return (
@@ -203,14 +215,14 @@ function IntegrationCard({ integration }: { integration: Integration }) {
           {integration.external && (
             <Button asChild size="sm" variant="ghost">
               <a href={integration.external} target="_blank" rel="noreferrer">
-                Docs <ExternalLink className="h-3 w-3" />
+                {t("integrations.card.docs")} <ExternalLink className="h-3 w-3" />
               </a>
             </Button>
           )}
           {integration.configurePath && (
             <Button asChild size="sm" variant="outline">
               <Link to={integration.configurePath}>
-                {integration.configureLabel || "Configure"}
+                {integration.configureLabel || t("integrations.card.configure")}
               </Link>
             </Button>
           )}

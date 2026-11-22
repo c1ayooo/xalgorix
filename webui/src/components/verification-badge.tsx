@@ -1,4 +1,5 @@
 import { ShieldCheck, ShieldAlert } from "lucide-react";
+import { useI18n } from "@/i18n";
 import { cn } from "@/lib/utils";
 
 export const TAG_VERIFIED = "verified";
@@ -17,6 +18,7 @@ export function VerificationBadge({
   tags?: string[];
   className?: string;
 }) {
+  const { t } = useI18n();
   // When tags are present they are authoritative (the backend sets exactly one
   // verification tag). Only fall back to the boolean `verified` for legacy
   // records that predate tags — otherwise a first-party-proof finding
@@ -37,10 +39,10 @@ export function VerificationBadge({
           "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-500/30",
           className,
         )}
-        title="Independently reproduced by the Verifier"
+        title={t("badge.verifiedTitle")}
       >
         <ShieldCheck className="h-3 w-3" aria-hidden />
-        Verified
+        {t("badge.verified")}
       </span>
     );
   }
@@ -52,10 +54,10 @@ export function VerificationBadge({
           "bg-amber-500/10 text-amber-700 dark:text-amber-400 border-amber-500/30",
           className,
         )}
-        title="Preserved but not independently confirmed — verify manually before relying on it"
+        title={t("badge.manualReviewTitle")}
       >
         <ShieldAlert className="h-3 w-3" aria-hidden />
-        Manual verification needed
+        {t("badge.manualReview")}
       </span>
     );
   }

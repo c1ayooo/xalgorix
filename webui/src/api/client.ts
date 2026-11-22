@@ -2,12 +2,17 @@ import type {
   Approval,
   ApprovalsResponse,
   ApprovalsSummary,
+  ApprovalRule,
+  ApprovalRuleRequest,
   AuthProfile,
   AuthStatus,
-  AgentMailSettings,
+  AuthUser,
+  ManagedUser,
+  Role,
   CatalogEntry,
   EnvironmentSettings,
   InstancesResponse,
+  IntelTriageStatus,
   LLMSettings,
   LLMSettingsRequest,
   ListParams,
@@ -19,20 +24,31 @@ import type {
   RateLimitSettings,
   Run,
   ScanEventsPage,
+  ScanFileContent,
+  ScanFileListing,
   ScanInstance,
   ScanListItem,
   ScanRecord,
+  ScanLedgerView,
   ScanRequest,
   ScanSchedule,
+  ScanTrafficView,
   SettingsBackup,
   SettingsImportResult,
   StatusResponse,
   Task,
+  TaskIntelResponse,
+  TaskObjectiveView,
   TaskRequest,
+  GoalProposal,
   VersionInfo,
   WSEvent,
   Guidance,
   GuidanceSendResult,
+  TranscriptPage,
+  ConversationPatch,
+  ConversationRow,
+  ChatAttachment,
   InfoAssociationParams,
   InfoAssociationResult,
   ColdPathSyncState,
@@ -40,9 +56,21 @@ import type {
   InfoContextResult,
   InfoRegionParams,
   InfoRegionResult,
+  AgentProfile,
+  AgentProfilePatch,
+  AgentProfileRequest,
+  InvocationList,
+  InvocationListParams,
+  McpServer,
+  McpServerPatch,
+  McpServerRequest,
+  UserSkill,
+  UserSkillPatch,
+  UserSkillRequest,
 } from "@/types/api";
 import type { FlatFinding } from "@/lib/findings";
 import type { TokenUsageResponse } from "@/types/token-usage";
+import { getLanguage, translate } from "@/i18n";
 
 /**
  * Status of a single provider's API key as reported by
@@ -164,9 +192,11 @@ async function http<T>(
     const aborted = controller?.signal.aborted;
     throw new HttpError({
       status: 0,
-      statusText: aborted ? "Request timed out" : "Network error",
+      statusText: aborted
+        ? translate(getLanguage(), "http.timeout")
+        : translate(getLanguage(), "http.networkError"),
       body: aborted
-        ? `The server did not respond within ${Math.round((timeoutMs ?? 0) / 1000)}s. It may be overloaded or unreachable.`
+        ? `${translate(getLanguage(), "http.timeoutBodyBefore")}${Math.round((timeoutMs ?? 0) / 1000)}${translate(getLanguage(), "http.timeoutBodyAfter")}`
         : err instanceof Error
           ? err.message
           : String(err),
@@ -229,16 +259,48 @@ function listQuery(params: ListParams): string {
   return qs ? `?${qs}` : "";
 }
 
+/** 调用记录端点按模块路由（handlers_invocations.go）。 */
+type InvocationListModule = "mcp" | "skills" | "agents";
+const INVOCATION_PATHS: Record<InvocationListModule, string> = {
+  mcp: "/api/mcp-servers/invocations",
+  skills: "/api/skills/invocations",
+  agents: "/api/agent-profiles/invocations",
+};
+
 export const api = {
   authStatus: () =>
     http<AuthStatus>("/api/auth/status", { timeoutMs: 10_000 }),
   login: (username: string, password: string) =>
-    http<{ status: string }>("/api/auth/login", {
+    http<{ status: string; user?: AuthUser }>("/api/auth/login", {
       method: "POST",
       json: { username, password },
     }),
+  // First-run bootstrap: create the initial admin account. Only works while
+  // /api/auth/status reports needs_setup.
+  setupAuth: (username: string, password: string) =>
+    http<{ status: string; user?: AuthUser }>("/api/auth/setup", {
+      method: "POST",
+      json: { username, password },
+    }),
+  // Self-service password change (any role; current password required).
+  changePassword: (currentPassword: string, newPassword: string) =>
+    http<{ status: string }>("/api/auth/password", {
+      method: "POST",
+      json: { current_password: currentPassword, new_password: newPassword },
+    }),
   logout: () =>
     http<{ status: string }>("/api/auth/logout", { method: "POST" }),
+
+  // RBAC account management (admin-only; the server 403s other roles).
+  listUsers: () => http<ManagedUser[]>("/api/users"),
+  createUser: (input: { username: string; password: string; role: Role }) =>
+    http<ManagedUser>("/api/users", { method: "POST", json: input }),
+  updateUser: (
+    id: string,
+    patch: { role?: Role; disabled?: boolean; password?: string },
+  ) => http<ManagedUser>(`/api/users/${id}`, { method: "PATCH", json: patch }),
+  deleteUser: (id: string) =>
+    http<{ status: string }>(`/api/users/${id}`, { method: "DELETE" }),
 
   status: () => http<StatusResponse>("/api/status"),
   version: () => http<VersionInfo>("/api/version"),
@@ -257,6 +319,21 @@ export const api = {
   listScansPage: (params: ListParams) =>
     http<Paginated<ScanListItem>>(`/api/scans${listQuery(params)}`),
   getScan: (id: string) => http<ScanRecord | null>(`/api/scans/${id}`),
+  // Raw HTTP exchange archive written by the traffic proxy (finding detail
+  // renders these packets). endpoint: case-insensitive URL substring (a
+  // finding's endpoint); method: exact method; limit: newest window (server
+  // caps at 100).
+  scanTraffic: (
+    id: string,
+    params?: { endpoint?: string; method?: string; limit?: number },
+  ) => {
+    const qs = new URLSearchParams();
+    if (params?.endpoint) qs.set("endpoint", params.endpoint);
+    if (params?.method) qs.set("method", params.method);
+    if (params?.limit) qs.set("limit", String(params.limit));
+    const suffix = qs.toString();
+    return http<ScanTrafficView>(`/api/scans/${id}/traffic${suffix ? `?${suffix}` : ""}`);
+  },
   // Lazily page older events for a scan whose detail response only tailed the
   // most recent ones (see ScanRecord.events_truncated).
   scanEvents: (id: string, offset: number, limit: number) =>
@@ -374,13 +451,6 @@ export const api = {
       json: req,
     }),
 
-  agentMail: () => http<AgentMailSettings>("/api/settings/agentmail"),
-  updateAgentMail: (req: { pod: string; apiKey: string }) =>
-    http<AgentMailSettings>("/api/settings/agentmail", {
-      method: "POST",
-      json: req,
-    }),
-
   llmSettings: () => http<LLMSettings>("/api/settings/llm"),
   updateLLMSettings: (req: LLMSettingsRequest) =>
     http<LLMSettings>("/api/settings/llm", {
@@ -420,6 +490,43 @@ export const api = {
 
   reportUrl: (scanId: string) => `/api/report/${scanId}`,
 
+  // Run 文件浏览器（只读，后端 scan_files.go）。列表/文本读取走 http()；
+  // 图片预览、单文件下载、目录 ZIP 走原生 <a href>/img src —— cookie 会话
+  // 鉴权（与 reportUrl 同款），不经过 http() 的 JSON 解析。
+  scanFiles: (scanId: string, path: string) =>
+    http<ScanFileListing>(
+      `/api/scans/${scanId}/files?path=${encodeURIComponent(path)}`,
+    ),
+  scanFileContent: (scanId: string, path: string) =>
+    http<ScanFileContent>(
+      `/api/scans/${scanId}/files/content?path=${encodeURIComponent(path)}`,
+    ),
+  scanFilePreviewUrl: (scanId: string, path: string) =>
+    `/api/scans/${scanId}/files/preview?path=${encodeURIComponent(path)}`,
+  scanFileDownloadUrl: (scanId: string, path: string) =>
+    `/api/scans/${scanId}/files/download?path=${encodeURIComponent(path)}`,
+  scanFilesArchiveUrl: (scanId: string, path: string) =>
+    `/api/scans/${scanId}/files/archive?path=${encodeURIComponent(path)}`,
+
+  // Run 账本投影（只读，后端 scan_ledger.go，契约 §3.6）。
+  scanLedger: (scanId: string) =>
+    http<ScanLedgerView>(`/api/scans/${scanId}/ledger`),
+
+  // 任务情报（后端 handlers_task_intelligence.go，契约 §3.7）。
+  taskIntelligence: (taskId: string) =>
+    http<TaskIntelResponse>(
+      `/api/tasks/${taskId}/intelligence`,
+    ),
+  triageIntelligence: (
+    taskId: string,
+    fingerprint: string,
+    status: IntelTriageStatus,
+  ) =>
+    http<{ fingerprint: string; status: IntelTriageStatus }>(
+      `/api/tasks/${taskId}/intelligence/${encodeURIComponent(fingerprint)}`,
+      { method: "PATCH", json: { status } },
+    ),
+
   legacyImportStatus: () =>
     http<{ count: number; dismissed: boolean }>("/api/legacy-import/status"),
   dismissLegacyImport: () =>
@@ -427,13 +534,6 @@ export const api = {
       "/api/legacy-import/status",
       { method: "POST" },
     ),
-
-  // 旁路提问（in-scan chat 通道，永不进 loop）。真实后端回 response，mock 回 reply。
-  chat: (message: string, instanceId?: string) =>
-    http<{ response?: string; reply?: string }>("/api/chat", {
-      method: "POST",
-      json: { message, instance_id: instanceId },
-    }),
 
   listSchedules: () => http<ScanSchedule[]>("/api/schedules"),
   createSchedule: (schedule: Omit<ScanSchedule, "id" | "next_run">) =>
@@ -589,12 +689,51 @@ export const api = {
       `/api/tasks/${id}/runs`,
       { method: "POST", json: overrides ?? {} },
     ),
+  projectConversations: (projectId: string, includeArchived = false) =>
+    http<{ items: ConversationRow[] }>(
+      `/api/projects/${projectId}/conversations${includeArchived ? "?include_archived=true" : ""}`,
+    ),
+  conversationTranscript: (instanceId: string, beforeSeq?: number, limit = 80) => {
+    const qs = new URLSearchParams({ limit: String(limit) });
+    if (beforeSeq && beforeSeq > 0) qs.set("before_seq", String(beforeSeq));
+    return http<TranscriptPage>(`/api/conversations/${instanceId}/transcript?${qs.toString()}`);
+  },
+  updateConversation: (instanceId: string, patch: ConversationPatch) =>
+    http<Run>(`/api/conversations/${instanceId}`, { method: "PATCH", json: patch }),
+  uploadChatAttachment: async (instanceId: string, file: File) => {
+    const form = new FormData();
+    form.append("file", file);
+    const res = await fetch(`/api/conversations/${instanceId}/attachments?instance_id=${encodeURIComponent(instanceId)}`, {
+      method: "POST",
+      body: form,
+    });
+    if (!res.ok) {
+      let message = `HTTP ${res.status}`;
+      try {
+        const body = (await res.json()) as { error?: string };
+        if (body?.error) message = body.error;
+      } catch {
+        /* non-JSON body keeps the status text */
+      }
+      throw new Error(message);
+    }
+    return (await res.json()) as ChatAttachment;
+  },
   taskRuns: (id: string, page = 1, size = 50) =>
     http<Paginated<Run>>(
       `/api/tasks/${id}/runs?page=${page}&size=${size}`,
     ),
   taskFindings: (id: string) =>
     http<FlatFinding[]>(`/api/tasks/${id}/findings`),
+
+  taskObjective: (id: string) => http<TaskObjectiveView>(`/api/tasks/${id}/objective`),
+
+  // R-goal 意图分析预览：模糊 goal → 可判定判据草案；纯预览不落盘。
+  analyzeGoal: (projectId: string, body: { goal: string; instruction?: string }) =>
+    http<{ proposal: GoalProposal }>(`/api/projects/${projectId}/analyze-goal`, {
+      method: "POST",
+      json: body,
+    }),
 
   taskGuidance: (id: string, limit = 50) =>
     http<{ items: Guidance[] }>(`/api/tasks/${id}/guidance?limit=${limit}`),
@@ -635,6 +774,19 @@ export const api = {
       "/api/approvals/batch-decision",
       { method: "POST", json: { ids, decision, reason } },
     ),
+
+  // 审批豁免规则（approve & remember，契约 §3.4）。
+  listApprovalRules: (opts: { projectId?: string; kind?: "command" | "http" } = {}) => {
+    const sp = new URLSearchParams();
+    if (opts.projectId) sp.set("project_id", opts.projectId);
+    if (opts.kind) sp.set("kind", opts.kind);
+    const qs = sp.toString();
+    return http<{ rules: ApprovalRule[] }>(`/api/approval-rules${qs ? `?${qs}` : ""}`);
+  },
+  createApprovalRule: (req: ApprovalRuleRequest) =>
+    http<ApprovalRule>("/api/approval-rules", { method: "POST", json: req }),
+  deleteApprovalRule: (id: string) =>
+    http<{ ok: boolean }>(`/api/approval-rules/${id}`, { method: "DELETE" }),
 
   // R5 信息空间（只读；契约 §5）。项目隔离由后端 project_id 强制。
   infoRegion: (params: InfoRegionParams) => {
@@ -677,4 +829,43 @@ export const api = {
   // 正常态，不是 failed。
   coldPathSync: (scanId: string) =>
     http<ColdPathSyncState>(`/api/scans/${encodeURIComponent(scanId)}/coldpath`),
+
+  // ── 集成模块：MCP 服务器 / 用户技能 / Agent 档案（契约 §integration-*）──
+  listMcpServers: () => http<{ servers: McpServer[] }>("/api/mcp-servers"),
+  createMcpServer: (req: McpServerRequest) =>
+    http<McpServer>("/api/mcp-servers", { method: "POST", json: req }),
+  updateMcpServer: (id: string, patch: McpServerPatch) =>
+    http<McpServer>(`/api/mcp-servers/${encodeURIComponent(id)}`, { method: "PATCH", json: patch }),
+  deleteMcpServer: (id: string) =>
+    http<{ ok: boolean }>(`/api/mcp-servers/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  refreshMcpServer: (id: string) =>
+    http<McpServer>(`/api/mcp-servers/${encodeURIComponent(id)}/refresh`, { method: "POST" }),
+
+  listSkills: () => http<{ skills: UserSkill[] }>("/api/skills"),
+  createSkill: (req: UserSkillRequest) =>
+    http<UserSkill>("/api/skills", { method: "POST", json: req }),
+  updateSkill: (id: string, patch: UserSkillPatch) =>
+    http<UserSkill>(`/api/skills/${encodeURIComponent(id)}`, { method: "PATCH", json: patch }),
+  deleteSkill: (id: string) =>
+    http<{ ok: boolean }>(`/api/skills/${encodeURIComponent(id)}`, { method: "DELETE" }),
+
+  listAgentProfiles: () => http<{ profiles: AgentProfile[] }>("/api/agent-profiles"),
+  createAgentProfile: (req: AgentProfileRequest) =>
+    http<AgentProfile>("/api/agent-profiles", { method: "POST", json: req }),
+  updateAgentProfile: (id: string, patch: AgentProfilePatch) =>
+    http<AgentProfile>(`/api/agent-profiles/${encodeURIComponent(id)}`, { method: "PATCH", json: patch }),
+  deleteAgentProfile: (id: string) =>
+    http<{ ok: boolean }>(`/api/agent-profiles/${encodeURIComponent(id)}`, { method: "DELETE" }),
+
+  // 调用记录（跨扫描检索投影，只读）。
+  listInvocations: (module: InvocationListModule, params: InvocationListParams = {}) => {
+    const sp = new URLSearchParams();
+    if (params.page) sp.set("page", String(params.page));
+    if (params.size) sp.set("size", String(params.size));
+    if (params.instanceId) sp.set("instance_id", params.instanceId);
+    if (params.name) sp.set("name", params.name);
+    if (params.status) sp.set("status", params.status);
+    const qs = sp.toString();
+    return http<InvocationList>(`${INVOCATION_PATHS[module]}${qs ? `?${qs}` : ""}`);
+  },
 };

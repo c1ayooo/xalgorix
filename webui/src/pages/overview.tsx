@@ -28,7 +28,7 @@ import { ScanStatusPill } from "@/components/scan-status-pill";
 import { EmptyState, ErrorState } from "@/components/states";
 import { Skeleton } from "@/components/ui/skeleton";
 import { LiveFeed } from "@/components/live-feed";
-import { mergeFeedEvents, toFeedEvent, useWSStore } from "@/store/ws";
+import { mergeFeedEvents, toFeedEvent, useEventsStore } from "@/store/events";
 import { api } from "@/api/client";
 import {
   qk,
@@ -55,7 +55,7 @@ export default function OverviewPage() {
     useInstances(projectId ?? undefined);
   const { data: scanList } = useScansList();
   const { data: queue } = useQueueStatus();
-  const events = useWSStore((s) => s.events);
+  const events = useEventsStore((s) => s.events);
   const allInstances = instances?.instances ?? [];
   const runningInstances = allInstances.filter((i) => i.status === "running");
   const activeInstance = runningInstances[0];
@@ -175,7 +175,7 @@ export default function OverviewPage() {
   if (instancesError) {
     return (
       <ErrorState
-        title="Failed to load dashboard"
+        title={t("overview.loadFailed")}
         description={(instancesError as Error).message}
       />
     );
@@ -187,69 +187,69 @@ export default function OverviewPage() {
         <div>
           <h1 className="text-xl font-semibold tracking-tight">{t("overview.title")}</h1>
           <p className="mt-1 text-sm text-muted-foreground">
-            Command center for scans, findings, and live activity.
+            {t("overview.subtitle")}
           </p>
         </div>
       </div>
 
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
         <MetricCard
-          label="Active"
+          label={t("overview.metric.active")}
           value={runningInstances.length}
           hint={
             activeInstance
               ? `${activeInstance.name || activeInstance.targets.split(",")[0]}`
-              : "No active scans"
+              : t("overview.metric.activeHintNone")
           }
           to={activeInstance ? `/scans/${activeInstance.id}` : "/scans"}
           icon={<Activity className="h-3.5 w-3.5" />}
           accent={runningInstances.length > 0 ? "success" : "default"}
         />
         <MetricCard
-          label="Findings"
+          label={t("overview.metric.findings")}
           value={totalFindings}
-          hint={`${scanList?.length || 0} scans on disk`}
+          hint={`${scanList?.length || 0} ${t("overview.metric.runsOnDisk")}`}
           to="/findings"
           icon={<ShieldAlert className="h-3.5 w-3.5" />}
         />
         <MetricCard
-          label="Crit / High"
+          label={t("overview.metric.critHigh")}
           value={severityLoading ? "..." : criticalHigh}
           hint={
             severityLoading
-              ? "Checking severity"
+              ? t("overview.metric.checkingSeverity")
               : criticalHigh > 0
-                ? "Needs review"
-                : "All clear"
+                ? t("overview.metric.needsReview")
+                : t("overview.metric.allClear")
           }
           to="/findings"
           icon={<AlertOctagon className="h-3.5 w-3.5" />}
           accent={criticalHigh > 0 ? "critical" : "default"}
         />
         <MetricCard
-          label="Targets"
+          label={t("overview.metric.targets")}
           value={targetsScanned}
-          hint={targetsScanned === 1 ? "1 host" : `${targetsScanned} hosts`}
+          hint={`${targetsScanned} ${t("overview.metric.hosts")}`}
           to="/scans"
           icon={<Target className="h-3.5 w-3.5" />}
         />
         <MetricCard
-          label="Phase"
+          label={t("overview.metric.phase")}
           value={status?.current_phase ?? "—"}
           hint={
             status?.current_phase
-              ? `Methodology phase ${status.current_phase}`
-              : "Idle"
+              ? `${t("overview.metric.phaseHint")}${status.current_phase}`
+              : t("overview.metric.idle")
           }
           icon={<Layers className="h-3.5 w-3.5" />}
         />
         <MetricCard
-          label="Queue"
+          label={t("overview.metric.queue")}
           value={queueCount}
           hint={
             queue?.available
-              ? `${queue.queue_count ?? 1} queue${(queue.queue_count ?? 1) === 1 ? "" : "s"} · ${queue.paused ? "paused" : "resumable"}`
-              : "Empty"
+              ? `${queue.queue_count ?? 1} ${t("overview.metric.queues")} · ${queue.paused ? t("status.paused") : t("overview.metric.resumable")}`
+              : t("overview.metric.empty")
           }
           to={queue?.available ? "/scans" : undefined}
           icon={<Radio className="h-3.5 w-3.5" />}
@@ -264,7 +264,7 @@ export default function OverviewPage() {
               <CardTitle>{t("overview.recentScans")}</CardTitle>
               <Button asChild size="sm" variant="ghost">
                 <Link to="/scans">
-                  View all <ArrowRight className="h-3.5 w-3.5" />
+                  {t("overview.viewAll")} <ArrowRight className="h-3.5 w-3.5" />
                 </Link>
               </Button>
             </CardHeader>
@@ -277,12 +277,12 @@ export default function OverviewPage() {
                 </div>
               ) : recentScans.length === 0 ? (
                 <EmptyState
-                  title="No scans yet"
-                  description="Launch your first scan to start collecting findings."
+                  title={t("overview.empty.title")}
+                  description={t("overview.empty.description")}
                   action={
                     <Button asChild size="sm">
-                      <Link to="/scans/new">
-                        <Plus className="h-3.5 w-3.5" /> New Scan
+                      <Link to="/tasks?create=1">
+                        <Plus className="h-3.5 w-3.5" /> {t("tasks.create")}
                       </Link>
                     </Button>
                   }
@@ -299,14 +299,14 @@ export default function OverviewPage() {
                       <ScanStatusPill status={s.status} />
                       <div className="min-w-0 flex-1">
                         <p className="text-sm font-medium truncate">
-                          {s.name || s.targets.split(",")[0] || "Untitled scan"}
+                          {s.name || s.targets.split(",")[0] || t("overview.untitled")}
                         </p>
                         <p className="text-xs text-muted-foreground mono truncate">
                           {s.targets}
                         </p>
                       </div>
                       <div className="hidden md:block text-right text-xs text-muted-foreground mono">
-                        <div>{s.vuln_count} findings</div>
+                        <div>{s.vuln_count} {t("common.findings")}</div>
                         <div>{timeAgo(s.started_at)}</div>
                       </div>
                     </Link>
@@ -321,7 +321,7 @@ export default function OverviewPage() {
               <CardTitle>{t("overview.liveActivity")}</CardTitle>
               <Button asChild size="sm" variant="ghost">
                 <Link to="/live">
-                  Open feed <ArrowRight className="h-3.5 w-3.5" />
+                  {t("overview.openFeed")} <ArrowRight className="h-3.5 w-3.5" />
                 </Link>
               </Button>
             </CardHeader>
@@ -332,8 +332,8 @@ export default function OverviewPage() {
                 onFilterChange={() => {}}
                 showControls={false}
                 className="border-0"
-                emptyTitle="Waiting for events"
-                emptyDescription="When a scan is running, its live events appear here."
+                emptyTitle={t("overview.emptyEvents.title")}
+                emptyDescription={t("overview.emptyEvents.description")}
               />
             </CardContent>
           </Card>
@@ -347,16 +347,16 @@ export default function OverviewPage() {
             <CardContent className="space-y-3 text-xs">
               <Row
                 icon={<Cpu className="h-3.5 w-3.5" />}
-                label="CPU load (1m)"
+                label={t("overview.health.cpu")}
                 value={
                   resources
-                    ? `${resources.cpu_load_1m?.toFixed(2)} · ${resources.cpu_cores} cores`
+                    ? `${resources.cpu_load_1m?.toFixed(2)} · ${resources.cpu_cores} ${t("overview.health.cores")}`
                     : "—"
                 }
               />
               <Row
                 icon={<HardDrive className="h-3.5 w-3.5" />}
-                label="RAM available"
+                label={t("overview.health.ram")}
                 value={
                   resources
                     ? `${(resources.ram_available_mb / 1024).toFixed(1)} GB / ${(resources.ram_total_mb / 1024).toFixed(1)} GB`
@@ -365,7 +365,7 @@ export default function OverviewPage() {
               />
               <Row
                 icon={<HardDrive className="h-3.5 w-3.5" />}
-                label="Disk free"
+                label={t("overview.health.disk")}
                 value={
                   resources
                     ? `${(resources.disk_free_mb / 1024).toFixed(1)} GB`
@@ -374,11 +374,11 @@ export default function OverviewPage() {
               />
               <Row
                 icon={<Layers className="h-3.5 w-3.5" />}
-                label="Resource level"
+                label={t("overview.health.resourceLevel")}
                 value={
                   resources ? (
                     <span className="capitalize">
-                      {resources.level} · capacity {resources.effective_max_instances}
+                      {resources.level} · {t("overview.health.capacity")} {resources.effective_max_instances}
                     </span>
                   ) : (
                     "—"
@@ -398,15 +398,15 @@ export default function OverviewPage() {
               <CardTitle>{t("overview.criticalFindings")}</CardTitle>
               <Button asChild size="sm" variant="ghost">
                 <Link to="/findings">
-                  All findings <ArrowRight className="h-3.5 w-3.5" />
+                  {t("overview.allFindings")} <ArrowRight className="h-3.5 w-3.5" />
                 </Link>
               </Button>
             </CardHeader>
             <CardContent className="p-0">
               {recentCritical.length === 0 ? (
                 <EmptyState
-                  title="No critical findings"
-                  description="Critical and high severity findings appear here as they are discovered."
+                  title={t("overview.noCritical.title")}
+                  description={t("overview.noCritical.description")}
                   className="m-4"
                 />
               ) : (
@@ -454,10 +454,10 @@ export default function OverviewPage() {
               )}
               <p className="text-[11px] text-muted-foreground">
                 {aggregateVulns.length > 0
-                  ? `${aggregateVulns.length.toLocaleString()} findings with loaded severity detail`
+                  ? `${aggregateVulns.length.toLocaleString()} ${t("overview.mix.severityDetailLoaded")}`
                   : severityLoading
-                    ? "Severity detail is still loading"
-                    : "No severity detail loaded yet"}
+                    ? t("overview.mix.loading")
+                    : t("overview.mix.noneLoaded")}
               </p>
             </CardContent>
           </Card>
@@ -469,28 +469,28 @@ export default function OverviewPage() {
             <CardContent className="space-y-3 text-xs">
               <Row
                 icon={<Activity className="h-3.5 w-3.5" />}
-                label="Running"
-                value={`${runningInstances.length} active`}
+                label={t("status.running")}
+                value={`${runningInstances.length} ${t("overview.ops.active")}`}
               />
               <Row
                 icon={<Radio className="h-3.5 w-3.5" />}
-                label="Queue"
-	                value={
-	                  queue?.available
-	                    ? queue.paused
-	                      ? `${queueCount} paused`
-	                      : `${queueCount} remaining`
-	                    : "empty"
-	                }
+                label={t("overview.metric.queue")}
+                value={
+                  queue?.available
+                    ? queue.paused
+                      ? `${queueCount} ${t("overview.ops.pausedCount")}`
+                      : `${queueCount} ${t("overview.ops.remaining")}`
+                    : t("overview.ops.empty")
+                }
               />
               <Row
                 icon={<Layers className="h-3.5 w-3.5" />}
-                label="Current phase"
-                value={status?.current_phase ? `phase ${status.current_phase}` : "idle"}
+                label={t("overview.ops.currentPhase")}
+                value={status?.current_phase ? `${t("overview.ops.phaseWord")}${status.current_phase}` : t("overview.metric.idle")}
               />
               <Row
                 icon={<ShieldAlert className="h-3.5 w-3.5" />}
-                label="Completed / stopped"
+                label={t("overview.ops.completedStopped")}
                 value={`${completedCount} / ${stoppedCount}`}
               />
               <SeparatorLine />
@@ -500,13 +500,13 @@ export default function OverviewPage() {
                   <p className="mt-0.5 truncate text-sm text-foreground">
                     {latestScan?.name ||
                       latestScan?.targets.split(",")[0] ||
-                      "No scans yet"}
+                      t("overview.empty.title")}
                   </p>
                 </div>
                 {latestScan && (
                   <Button asChild size="sm" variant="outline" className="h-8 shrink-0">
                     <Link to={`/scans/${latestScan.id}`}>
-                      Open <ArrowRight className="h-3.5 w-3.5" />
+                      {t("common.open")} <ArrowRight className="h-3.5 w-3.5" />
                     </Link>
                   </Button>
                 )}

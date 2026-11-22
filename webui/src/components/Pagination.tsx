@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import { useSearchParams } from "react-router-dom";
 import { ChevronLeft, ChevronRight } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { useI18n } from "@/i18n";
 import {
   Select,
   SelectContent,
@@ -74,6 +75,7 @@ export function Pagination({
   onPageSizeChange,
   className,
 }: PaginationProps) {
+  const { t } = useI18n();
   const [searchParams, setSearchParams] = useSearchParams();
 
   // Hydrate from URL once on mount + whenever the URL changes externally.
@@ -140,7 +142,7 @@ export function Pagination({
       )}
     >
       <div className="flex items-center gap-2 text-xs text-muted-foreground">
-        <span>Rows per page</span>
+        <span>{t("pagination.rowsPerPage")}</span>
         <Select value={String(pageSize)} onValueChange={changeSize}>
           <SelectTrigger className="h-8 w-20 text-xs">
             <SelectValue />
@@ -154,7 +156,7 @@ export function Pagination({
           </SelectContent>
         </Select>
         <span className="ml-2 mono">
-          Page {safePage} of {totalPages} · {totalItems} items
+          {t("pagination.pageBefore")}{safePage}{t("pagination.pageMiddle")}{totalPages} · {totalItems} {t("pagination.items")}
         </span>
       </div>
 
@@ -167,10 +169,10 @@ export function Pagination({
               variant="outline"
               disabled={safePage <= 1}
               onClick={() => go(safePage - 1)}
-              aria-label="Previous page"
+              aria-label={t("pagination.prevAria")}
             >
               <ChevronLeft className="h-3.5 w-3.5" />
-              Prev
+              {t("pagination.prev")}
             </Button>
             {items.map((item, i) =>
               item === "ellipsis" ? (
@@ -189,7 +191,7 @@ export function Pagination({
                   variant={item === safePage ? "default" : "outline"}
                   onClick={() => go(item)}
                   aria-current={item === safePage ? "page" : undefined}
-                  aria-label={`Page ${item}`}
+                  aria-label={`${t("pagination.pageWord")}${item}`}
                 >
                   {item}
                 </Button>
@@ -201,9 +203,9 @@ export function Pagination({
               variant="outline"
               disabled={safePage >= totalPages}
               onClick={() => go(safePage + 1)}
-              aria-label="Next page"
+              aria-label={t("pagination.nextAria")}
             >
-              Next
+              {t("pagination.next")}
               <ChevronRight className="h-3.5 w-3.5" />
             </Button>
           </>

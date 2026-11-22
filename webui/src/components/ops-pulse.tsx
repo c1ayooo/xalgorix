@@ -1,5 +1,5 @@
 import { Link } from "react-router-dom";
-import { FolderKanban, Hourglass, Radio } from "lucide-react";
+import { Coins, FolderKanban, Hourglass, Radio } from "lucide-react";
 import { useApprovalsSummary, useInstances, useProjects } from "@/api/queries";
 import { useActiveProjectId } from "@/lib/use-active-project";
 import { useI18n } from "@/i18n";
@@ -28,14 +28,22 @@ export function OpsPulse() {
 
   const pendingTotal = summary?.pending_total ?? 0;
   const nearest = summary?.nearest_deadline;
-  const running =
-    instances?.instances?.filter((i) => i.status === "running").length ?? 0;
+  const runningInstances =
+    instances?.instances?.filter((i) => i.status === "running") ?? [];
+  const running = runningInstances.length;
+  // Token consumption of the active runs; the strip is about "what is
+  // happening now", so finished runs are deliberately excluded.
+  const tokens = runningInstances.reduce(
+    (sum, i) => sum + (i.total_tokens || 0),
+    0,
+  );
 
   return <PulseLine
     projectName={active?.name}
     pendingTotal={pendingTotal}
     nearestDeadline={nearest}
     running={running}
+    tokens={tokens}
   />;
 }
 
@@ -44,11 +52,13 @@ function PulseLine({
   pendingTotal,
   nearestDeadline,
   running,
+  tokens,
 }: {
   projectName?: string;
   pendingTotal: number;
   nearestDeadline?: string;
   running: number;
+  tokens: number;
 }) {
   const { t } = useI18n();
   const { remainingMs, expired } = useCountdown(nearestDeadline);
@@ -100,6 +110,15 @@ function PulseLine({
         <Radio className="h-3 w-3 shrink-0" aria-hidden />
         <span className="tabular-nums mono">
           {t("pulse.running")} {running}
+        </span>
+      </span>
+
+      <span className="h-3 w-px shrink-0 bg-border" aria-hidden />
+
+      <span className="flex shrink-0 items-center gap-1.5 text-muted-foreground">
+        <Coins className="h-3 w-3 shrink-0" aria-hidden />
+        <span className="tabular-nums mono">
+          {t("pulse.tokens")} {tokens.toLocaleString()}
         </span>
       </span>
     </div>

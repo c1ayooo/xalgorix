@@ -54,7 +54,7 @@ export default function ProviderKeysManager({ className }: ProviderKeysManagerPr
       setConfiguredCount(data.configured_count);
       setRouterEnabled(data.router_enabled);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load provider keys");
+      setError(err instanceof Error ? err.message : t("providerKeys.loadFailed"));
     } finally {
       setLoading(false);
     }
@@ -86,7 +86,7 @@ export default function ProviderKeysManager({ className }: ProviderKeysManagerPr
       await fetchKeys(); // refresh
       setTimeout(() => setSaved(false), 2500);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to save keys");
+      setError(err instanceof Error ? err.message : t("providerKeys.saveFailed"));
     } finally {
       setSaving(false);
     }
@@ -97,7 +97,7 @@ export default function ProviderKeysManager({ className }: ProviderKeysManagerPr
       await api.deleteProviderKey(providerId);
       await fetchKeys();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to delete key");
+      setError(err instanceof Error ? err.message : t("providerKeys.deleteFailed"));
     }
   }
 
@@ -111,7 +111,7 @@ export default function ProviderKeysManager({ className }: ProviderKeysManagerPr
     } catch (err) {
       setTestResult({
         resolved: false,
-        error: err instanceof Error ? err.message : "Test failed",
+        error: err instanceof Error ? err.message : t("providerKeys.testFailed"),
       });
     } finally {
       setTesting(false);
@@ -124,7 +124,7 @@ export default function ProviderKeysManager({ className }: ProviderKeysManagerPr
         <CardContent className="p-6">
           <div className="flex items-center gap-2 text-muted-foreground">
             <div className="h-4 w-4 animate-spin rounded-full border-2 border-primary border-t-transparent" />
-            Loading provider keys...
+            {t("providerKeys.loading")}
           </div>
         </CardContent>
       </Card>
@@ -137,7 +137,7 @@ export default function ProviderKeysManager({ className }: ProviderKeysManagerPr
         <CardContent className="p-6">
           <div className="text-sm text-destructive">{error}</div>
           <Button size="sm" variant="outline" onClick={fetchKeys} className="mt-2">
-            Retry
+            {t("common.retry")}
           </Button>
         </CardContent>
       </Card>
@@ -153,13 +153,15 @@ export default function ProviderKeysManager({ className }: ProviderKeysManagerPr
       <CardHeader>
         <CardTitle className="flex items-center gap-2">
           <Zap className="h-5 w-5 text-amber-500" />
-          Multi-Provider Model Router
+          {t("providerKeys.title")}
         </CardTitle>
         <CardDescription>
-          Configure API keys for multiple providers — xalgorix automatically routes
-          models like <code className="text-xs">gpt-5.6</code>,{" "}
-          <code className="text-xs">claude-fable-5</code>, or{" "}
-          <code className="text-xs">gemini-3.5-flash</code> to the correct provider.
+          {t("providerKeys.descBefore")}
+          <code className="text-xs">gpt-5.6</code>,{" "}
+          <code className="text-xs">claude-fable-5</code>,{" "}
+          {t("providerKeys.descOr")}{" "}
+          <code className="text-xs">gemini-3.5-flash</code>
+          {t("providerKeys.descAfter")}
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-5">
@@ -174,10 +176,10 @@ export default function ProviderKeysManager({ className }: ProviderKeysManagerPr
             ) : (
               <XCircle className="h-3 w-3" />
             )}
-            {routerEnabled ? "Router active" : "Router inactive"}
+            {routerEnabled ? t("providerKeys.routerActive") : t("providerKeys.routerInactive")}
           </Badge>
           <span className="text-xs text-muted-foreground">
-            {configuredCount} provider{configuredCount !== 1 ? "s" : ""} configured
+            {configuredCount} {t("providerKeys.providersConfigured")}
           </span>
         </div>
 
@@ -185,7 +187,7 @@ export default function ProviderKeysManager({ className }: ProviderKeysManagerPr
         {configured.length > 0 && (
           <div className="space-y-2">
             <Label className="text-xs uppercase tracking-wider text-muted-foreground">
-              Configured
+              {t("providerKeys.configuredLabel")}
             </Label>
             <div className="divide-y divide-border rounded-md border border-border">
               {configured.map((provider) => (
@@ -216,7 +218,7 @@ export default function ProviderKeysManager({ className }: ProviderKeysManagerPr
                     className="text-destructive"
                     onClick={() => deleteKey(provider.provider_id)}
                   >
-                    Remove
+                    {t("providerKeys.remove")}
                   </Button>
                 </div>
               ))}
@@ -228,7 +230,7 @@ export default function ProviderKeysManager({ className }: ProviderKeysManagerPr
         {unconfigured.length > 0 && (
           <div className="space-y-2">
             <Label className="text-xs uppercase tracking-wider text-muted-foreground">
-              Add provider keys
+              {t("providerKeys.addLabel")}
             </Label>
             <div className="divide-y divide-border rounded-md border border-border">
               {unconfigured.map((provider) => (
@@ -242,7 +244,7 @@ export default function ProviderKeysManager({ className }: ProviderKeysManagerPr
                   </div>
                   <Input
                     className="max-w-64 font-mono text-xs"
-                    placeholder={`API key for ${provider.display_name}...`}
+                    placeholder={`${provider.display_name}${t("providerKeys.apiKeyForAfter")}`}
                     value={keyInputs[provider.provider_id] || ""}
                     onChange={(e) =>
                       updateKeyInput(provider.provider_id, e.target.value)
@@ -256,7 +258,7 @@ export default function ProviderKeysManager({ className }: ProviderKeysManagerPr
 
         {/* Save button */}
         <div className="flex items-center justify-end gap-3">
-          {saved && <span className="text-xs text-success">Saved</span>}
+          {saved && <span className="text-xs text-success">{t("settings.savedIndicator")}</span>}
           {error && <span className="text-xs text-destructive">{error}</span>}
           <Button
             onClick={saveKeys}
@@ -265,7 +267,7 @@ export default function ProviderKeysManager({ className }: ProviderKeysManagerPr
               Object.values(keyInputs).every((v) => !v.trim())
             }
           >
-            {saving ? "Saving..." : "Save provider keys"}
+            {saving ? t("settings.saving") : t("providerKeys.save")}
           </Button>
         </div>
 
@@ -274,7 +276,7 @@ export default function ProviderKeysManager({ className }: ProviderKeysManagerPr
         {/* Model route tester */}
         <div className="space-y-3">
           <Label className="text-xs uppercase tracking-wider text-muted-foreground">
-            Test model routing
+            {t("providerKeys.testLabel")}
           </Label>
           <div className="flex gap-2">
             <Input
@@ -291,7 +293,7 @@ export default function ProviderKeysManager({ className }: ProviderKeysManagerPr
               disabled={testing || !testModel.trim()}
             >
               <Search className="mr-1 h-3.5 w-3.5" />
-              {testing ? "Testing..." : "Resolve"}
+              {testing ? t("providerKeys.testing") : t("providerKeys.resolve")}
             </Button>
           </div>
 
@@ -312,9 +314,9 @@ export default function ProviderKeysManager({ className }: ProviderKeysManagerPr
                     </span>
                   </div>
                   <div className="text-xs text-muted-foreground">
-                    Model: <code>{testResult.bare_model}</code> •{" "}
-                    Provider: <code>{testResult.provider_id}</code> •{" "}
-                    Key: {testResult.has_key ? "✅ configured" : "❌ missing"}
+                    {t("settings.llm.model")}: <code>{testResult.bare_model}</code> •{" "}
+                    {t("settings.llm.provider")}: <code>{testResult.provider_id}</code> •{" "}
+                    {t("providerKeys.keyWord")}: {testResult.has_key ? t("providerKeys.configured") : t("providerKeys.missing")}
                   </div>
                 </div>
               ) : (

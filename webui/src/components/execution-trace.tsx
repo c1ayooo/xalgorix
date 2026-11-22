@@ -22,7 +22,7 @@ import {
   toolSummary,
   type TraceItem,
 } from "@/lib/execution-trace";
-import type { FeedEvent, StreamingMessage } from "@/store/ws";
+import type { FeedEvent, StreamingMessage } from "@/store/events";
 
 function formatTime(ms: number): string {
   const d = new Date(ms);

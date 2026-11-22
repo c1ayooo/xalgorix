@@ -44,5 +44,8 @@
     "typescript": "^7.0.2",
     "vite": "^8.1.5",
     "ws": "^8.21.1"
+  },
+  "overrides": {
+    "@radix-ui/react-dismissable-layer": "1.2.1"
   }
 }

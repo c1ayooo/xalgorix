@@ -91,9 +91,9 @@ export function Topbar({
           </Button>
         )}
         <Button asChild size="sm" className="shrink-0">
-          <Link to="/scans/new">
+          <Link to="/tasks?create=1">
             <Plus className="h-3.5 w-3.5" />{" "}
-            <span className="hidden md:inline">{t("topbar.newScan")}</span>
+            <span className="hidden md:inline">{t("topbar.newTask")}</span>
           </Link>
         </Button>
       </div>

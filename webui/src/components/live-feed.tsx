@@ -3,10 +3,10 @@ import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { ChevronRight, Download, FileText, Pause, Play, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn, menuContentClass, menuItemClass as menuItemBase } from "@/lib/utils";
-import { useWSStore, type FeedEvent } from "@/store/ws";
+import { useEventsStore, type FeedEvent } from "@/store/events";
 import { exportFeedEvents, type FeedExportFormat } from "@/lib/feed-export";
 import { EmptyState } from "./states";
-import type { StreamingMessage } from "@/store/ws";
+import type { StreamingMessage } from "@/store/events";
 import { useI18n } from "@/i18n";
 import { ApprovalInlineBar } from "@/components/approval-inline-bar";
 
@@ -19,11 +19,11 @@ export type FeedFilter =
   | "http"
   | "llm";
 
-const FILTERS: { key: FeedFilter; label: string }[] = [
-  { key: "all", label: "All" },
-  { key: "tools", label: "Tools" },
-  { key: "findings", label: "Findings" },
-  { key: "errors", label: "Errors" },
+const FILTERS: { key: FeedFilter; labelKey?: string; label: string }[] = [
+  { key: "all", labelKey: "feed.filter.all", label: "All" },
+  { key: "tools", labelKey: "feed.filter.tools", label: "Tools" },
+  { key: "findings", labelKey: "feed.filter.findings", label: "Findings" },
+  { key: "errors", labelKey: "feed.filter.errors", label: "Errors" },
   { key: "agent", label: "Agent" },
   { key: "http", label: "HTTP" },
   { key: "llm", label: "LLM" },
@@ -118,9 +118,10 @@ const TYPE_COLOR: Record<string, string> = {
   resumed: "text-emerald-600 dark:text-emerald-300",
   instance_started: "text-emerald-600 dark:text-emerald-300",
   instance_updated: "text-neutral-600 dark:text-neutral-400",
-  // HITL（契约 §3/§3.1）
+  // HITL（契约 §3/§3.1/§3.4）
   approval_requested: "text-amber-700 dark:text-amber-300",
   approval_decided: "text-emerald-600 dark:text-emerald-400",
+  approval_rule_hit: "text-violet-600 dark:text-violet-300",
   assistant: "text-foreground",
   guidance_injected: "text-violet-600 dark:text-violet-300",
   guidance_queued: "text-violet-600 dark:text-violet-300",
@@ -253,8 +254,8 @@ export function LiveFeed({
   events,
   filter,
   onFilterChange,
-  emptyTitle = "No events yet",
-  emptyDescription = "Events will appear here as soon as a scan produces output.",
+  emptyTitle,
+  emptyDescription,
   autoScroll = true,
   showControls = true,
   className,
@@ -280,10 +281,13 @@ export function LiveFeed({
   fillHeight?: boolean;
   streaming?: StreamingMessage[];
 }) {
-  const paused = useWSStore((s) => s.paused);
-  const setPaused = useWSStore((s) => s.setPaused);
-  const clearEvents = useWSStore((s) => s.clearEvents);
+  const { t } = useI18n();
+  const paused = useEventsStore((s) => s.paused);
+  const setPaused = useEventsStore((s) => s.setPaused);
+  const clearEvents = useEventsStore((s) => s.clearEvents);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const resolvedEmptyTitle = emptyTitle ?? t("feed.empty.title");
+  const resolvedEmptyDescription = emptyDescription ?? t("feed.empty.description");
 
   const visible = useMemo(
     () => events.filter((e) => matchFilter(e, filter)),
@@ -334,7 +338,7 @@ export function LiveFeed({
                   : "text-muted-foreground hover:text-foreground hover:bg-accent/40",
               )}
             >
-              {f.label}
+              {f.labelKey ? t(f.labelKey) : f.label}
             </button>
           ))}
           <div className="ml-auto flex items-center gap-1">
@@ -351,11 +355,11 @@ export function LiveFeed({
             >
               {paused ? (
                 <>
-                  <Play className="h-3.5 w-3.5" /> Resume
+                  <Play className="h-3.5 w-3.5" /> {t("console.resume")}
                 </>
               ) : (
                 <>
-                  <Pause className="h-3.5 w-3.5" /> Pause
+                  <Pause className="h-3.5 w-3.5" /> {t("console.pause")}
                 </>
               )}
             </Button>
@@ -365,7 +369,7 @@ export function LiveFeed({
               onClick={onClearEvents ?? clearEvents}
               className="h-7 px-2"
             >
-              <Trash2 className="h-3.5 w-3.5" /> Clear
+              <Trash2 className="h-3.5 w-3.5" /> {t("feed.clear")}
             </Button>
           </div>
         </div>
@@ -384,8 +388,8 @@ export function LiveFeed({
       >
         {visible.length === 0 ? (
           <EmptyState
-            title={emptyTitle}
-            description={emptyDescription}
+            title={resolvedEmptyTitle}
+            description={resolvedEmptyDescription}
             className="m-3"
           />
         ) : (
@@ -398,7 +402,7 @@ export function LiveFeed({
                 <div className="max-w-[80%] rounded-lg rounded-tl-sm border border-ring/40 bg-card px-3 py-2 text-sm [overflow-wrap:anywhere]">
                   <div className="mb-1 flex items-center gap-2 text-[10px] uppercase tracking-wider text-muted-foreground">
                     {m.agent_id && <span className="mono">{m.agent_id}</span>}
-                    <span className="text-emerald-600 dark:text-emerald-400">typing…</span>
+                    <span className="text-emerald-600 dark:text-emerald-400">{t("feed.typing")}</span>
                   </div>
                   <div className="whitespace-pre-wrap text-foreground">
                     {m.text}
@@ -426,6 +430,7 @@ function FeedExportMenu({
   visibleCount: number;
   onExport: (format: FeedExportFormat) => void;
 }) {
+  const { t } = useI18n();
   return (
     <DropdownMenu.Root>
       <DropdownMenu.Trigger asChild>
@@ -434,15 +439,15 @@ function FeedExportMenu({
           variant="ghost"
           disabled={disabled}
           className="h-7 px-2"
-          aria-label={`Export ${visibleCount} live feed events`}
+          aria-label={`${t("feed.exportAriaPrefix")} ${visibleCount} ${t("feed.eventsWord")}`}
         >
-          <Download className="h-3.5 w-3.5" /> Export
+          <Download className="h-3.5 w-3.5" /> {t("feed.export")}
         </Button>
       </DropdownMenu.Trigger>
       <DropdownMenu.Portal>
         <DropdownMenu.Content align="end" className={menuContentClass}>
           <DropdownMenu.Label className="px-2 py-1.5 text-xs text-muted-foreground">
-            {visibleCount} visible events
+            {visibleCount} {t("feed.visibleEvents")}
           </DropdownMenu.Label>
           <DropdownMenu.Separator className="-mx-1 my-1 h-px bg-border" />
           <DropdownMenu.Item
@@ -464,7 +469,7 @@ function FeedExportMenu({
             onSelect={() => onExport("txt")}
           >
             <FileText className="h-3.5 w-3.5" />
-            Transcript
+            {t("feed.transcript")}
           </DropdownMenu.Item>
         </DropdownMenu.Content>
       </DropdownMenu.Portal>

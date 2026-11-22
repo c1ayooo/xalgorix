@@ -33,6 +33,16 @@ import { VerificationBadge } from "@/components/verification-badge";
 import { EmptyState } from "@/components/states";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import {
   DEFAULT_PAGE_SIZE,
   PAGE_SIZE_OPTIONS,
   Pagination,
@@ -67,6 +77,7 @@ export default function FindingsPage() {
   const qc = useQueryClient();
   const { data: scans } = useScansList();
   const del = useDeleteVuln();
+  const [pendingDelete, setPendingDelete] = useState<string[] | null>(null);
   // Scan ids are kept only for the "across N scans" header label and as the
   // refresh-target count. The findings themselves no longer fan out one
   // getScan() request per scan; they come from a single server-side walk.
@@ -168,11 +179,6 @@ export default function FindingsPage() {
   async function deleteFindings(keys: string[]) {
     const unique = [...new Set(keys)].filter(Boolean);
     if (!unique.length) return;
-    const label =
-      unique.length === 1
-        ? "Permanently delete this finding?"
-        : `Permanently delete ${unique.length} selected findings?`;
-    if (!window.confirm(label)) return;
     const validKeys = unique.filter((key) => key.split(":").length === 2);
     const settled = await Promise.allSettled(
       validKeys.map((key) => {
@@ -310,15 +316,15 @@ export default function FindingsPage() {
               variant="outline"
               onClick={allVisibleSelected ? clearSelection : selectAllVisible}
             >
-              {allVisibleSelected ? "Clear selection" : "Select all"}
+              {allVisibleSelected ? t("common.clearSelection") : t("scans.selectAll")}
             </Button>
             <span className="text-xs text-muted-foreground">
-              {selectedIds.size} selected
+              {selectedIds.size} {t("scans.selectedCount")}
             </span>
             <BulkActionMenu
               disabled={selectedIds.size === 0 || del.isPending}
               selectedCount={selectedIds.size}
-              onDelete={() => void deleteFindings([...selectedIds])}
+              onDelete={() => setPendingDelete([...selectedIds])}
             />
           </div>
         )}
@@ -394,7 +400,7 @@ export default function FindingsPage() {
                     <RowActionMenu
                       finding={f}
                       deleting={del.isPending}
-                      onDelete={() => void deleteFindings([key])}
+                      onDelete={() => setPendingDelete([key])}
                     />
                   </li>
                 );
@@ -414,6 +420,36 @@ export default function FindingsPage() {
           </>
         )}
       </Card>
+
+      <AlertDialog
+        open={!!pendingDelete}
+        onOpenChange={(v) => !v && setPendingDelete(null)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t("findings.deleteTitle")}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {pendingDelete
+                ? pendingDelete.length === 1
+                  ? t("findings.confirmDeleteOne")
+                  : `${t("findings.confirmDeleteManyBefore")}${pendingDelete.length}${t("findings.confirmDeleteManyAfter")}`
+                : ""}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
+            <AlertDialogAction
+              variant="destructive"
+              onClick={() => {
+                void deleteFindings(pendingDelete ?? []);
+                setPendingDelete(null);
+              }}
+            >
+              {t("common.delete")}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }
@@ -443,10 +479,12 @@ function BulkActionMenu({
           <DropdownMenu.Separator className="-mx-1 my-1 h-px bg-border" />
           <DropdownMenu.Item
             className={cn(menuItemClass, "text-red-600 focus:text-red-700 dark:text-red-400 dark:focus:text-red-300")}
-            onSelect={(event) => {
-              event.preventDefault();
-              onDelete();
-            }}
+            // Do NOT preventDefault: the menu must unmount before the confirm
+            // AlertDialog mounts. Two stacked Radix modal layers capture
+            // mismatched body pointer-events originals and the last unmount
+            // leaves body { pointer-events: none } — the whole page dead
+            // until reload (DismissableLayer last-restorer-wins).
+            onSelect={() => onDelete()}
           >
             <Trash2 className="h-3.5 w-3.5" />
             Delete selected
@@ -493,10 +531,9 @@ function RowActionMenu({
               menuItemClass,
               "text-red-600 focus:text-red-700 dark:text-red-400 dark:focus:text-red-300 data-[disabled]:pointer-events-none data-[disabled]:opacity-50",
             )}
-            onSelect={(event) => {
-              event.preventDefault();
-              onDelete();
-            }}
+            // Same layer-ordering constraint as the bulk delete above: the
+            // menu must close before the confirm dialog opens.
+            onSelect={() => onDelete()}
           >
             <Trash2 className="h-3.5 w-3.5" />
             Delete finding

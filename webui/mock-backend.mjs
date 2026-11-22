@@ -1,5 +1,4 @@
 import http from "node:http";
-import { WebSocketServer } from "ws";
 
 // ---------------------------------------------------------------------------
 // Mock backend for the SPA dev environment.
@@ -21,6 +20,52 @@ const send = (res, body, status = 200, headers = {}) => {
   res.end(typeof body === "string" ? body : JSON.stringify(body));
 };
 const ok = (res, body = { status: "ok" }) => send(res, body);
+
+// Run 文件浏览器 fixture：形状与真实 scanDir 一致（scan.json / events.jsonl /
+// ledger.json / tool-outputs/ / tmp/<agentID>/ …）。不在 MOCK_SCAN_TEXT 里的
+// 文件按二进制处理（content 接口只标记、不落内容）。
+const MOCK_MTIME = Date.parse("2026-11-22T10:00:00Z");
+const dirEntry = (name, type, size = 0) => ({ name, type, size, mtime: MOCK_MTIME });
+const MOCK_SCAN_TREE = {
+  ".": [
+    dirEntry("scan.json", "file", 1_240),
+    dirEntry("scan.meta.json", "file", 512),
+    dirEntry("events.jsonl", "file", 88_210),
+    dirEntry("ledger.json", "file", 6_430),
+    dirEntry("domain_journal.jsonl", "file", 21_002),
+    dirEntry("coverage.json", "file", 1_204),
+    dirEntry("token-usage.jsonl", "file", 30_112),
+    dirEntry("tool-outputs", "dir"),
+    dirEntry("tmp", "dir"),
+    dirEntry("xalgorix_report_inst_01.pdf", "file", 482_112),
+  ],
+  "tool-outputs": [
+    dirEntry("to_000001", "file", 12_004),
+    dirEntry("to_000002", "file", 512),
+  ],
+  tmp: [dirEntry("agent-recon", "dir")],
+  "tmp/agent-recon": [
+    dirEntry("nmap-result.txt", "file", 2_240),
+    dirEntry("probe.js", "file", 340),
+  ],
+};
+const MOCK_SCAN_FILE_INDEX = new Map();
+for (const [dir, entries] of Object.entries(MOCK_SCAN_TREE)) {
+  for (const e of entries) {
+    if (e.type === "file") {
+      MOCK_SCAN_FILE_INDEX.set(dir === "." ? e.name : `${dir}/${e.name}`, e.size);
+    }
+  }
+}
+const MOCK_SCAN_TEXT = {
+  "scan.json": '{"id":"scan_01","target":"acme.com","status":"finished"}',
+  "events.jsonl":
+    '{"seq":1,"type":"phase","msg":"phase 1 start"}\n{"seq":2,"type":"tool","tool":"http_probe","msg":"GET /login"}',
+  "tool-outputs/to_000001":
+    "tool: http_probe\nstatus: 200\nnote: oversized output archived verbatim",
+  "tmp/agent-recon/nmap-result.txt":
+    "PORT     STATE  SERVICE\n443/tcp  open   https\n8080/tcp open   http-alt",
+};
 
 const nowIso = () => new Date().toISOString();
 
@@ -74,6 +119,7 @@ let state = {
   scans: [
     {
       id: "scan_01",
+      instance_id: "inst_01",
       name: "Acme nightly",
       target: "acme.com",
       parent_target: "acme.com",
@@ -125,8 +171,37 @@ let state = {
     effective_max_instances: 4,
   },
   rateLimit: { requests: 60, window: 60 },
-  agentMail: { pod: "ops-pod-1", apiKey: "", hasApiKey: true },
-  schedules: [],
+  schedules: [
+    {
+      id: "sched_01",
+      name: "Acme nightly audit",
+      targets: ["acme.com"],
+      interval: "daily",
+      run_at: "02:00",
+      run_day: 1,
+      timezone: "Asia/Shanghai",
+      enabled: true,
+      next_run: new Date(Date.now() + 3600e3).toISOString(),
+      scan_mode: "single",
+      scan_intensity: "active",
+      recon_mode: "active",
+      severity_filter: [],
+      created_at: nowIso(),
+    },
+    {
+      id: "sched_02",
+      name: "Globex weekly recon",
+      targets: ["globex.io"],
+      interval: "weekly",
+      run_day: 1,
+      run_at: "03:30",
+      timezone: "Asia/Shanghai",
+      enabled: false,
+      scan_mode: "single",
+      severity_filter: [],
+      created_at: nowIso(),
+    },
+  ],
   authProfiles: [],
   reqCounter: 0,
   // R3: projects / tasks / runs / approvals seed（docs/API_CONTRACT.md）。
@@ -162,6 +237,8 @@ let state = {
       consumed_at: nowIso(),
     },
   ],
+  // 任务情报（契约 §3.7 mock）：按 task_id 聚合的观测项 + 操作者分诊覆盖层。
+  intelTriages: new Map(), // taskId -> Map(fingerprint -> triage)
   tasks: [
     {
       id: "task_acme_nightly",
@@ -312,6 +389,109 @@ let state = {
       decided_by: "operator:admin",
     },
   ],
+  // 集成模块（契约 §integration-*）：MCP 服务器 / 用户技能 / Agent 档案。
+  mcpServers: [
+    {
+      id: "mcp_01",
+      name: "recon",
+      transport: "stdio",
+      command: "npx",
+      args: ["-y", "@example/recon-mcp"],
+      env: { API_TOKEN: "****d1234" },
+      url: "",
+      headers: {},
+      enabled: true,
+      require_approval: true,
+      timeout_seconds: 120,
+      tool_count: 6,
+      last_healthy_at: nowIso(),
+      last_error: "",
+      created_by: "operator:admin",
+      created_at: nowIso(),
+    },
+    {
+      id: "mcp_02",
+      name: "ticketing",
+      transport: "http",
+      url: "https://mcp.corp.example.com/sse",
+      env: {},
+      headers: { Authorization: "****9f876" },
+      enabled: false,
+      require_approval: true,
+      timeout_seconds: 120,
+      tool_count: 0,
+      last_healthy_at: undefined,
+      last_error: "connect: x509: certificate signed by unknown authority",
+      created_by: "operator:admin",
+      created_at: nowIso(),
+    },
+  ],
+  skills: [
+    {
+      id: "skill_01",
+      name: "testing-payment-price-tampering",
+      category: "user",
+      description: "Prove a server accepts a manipulated price (checkout/coupon/transfer).",
+      tags: ["payment", "business-logic"],
+      intent: "offensive",
+      body: "# Testing Payment Price Tampering\n\n1. Replay the checkout request with a negative quantity.",
+      enabled: true,
+      created_by: "operator:admin",
+      created_at: nowIso(),
+    },
+    {
+      id: "skill_02",
+      name: "hardening-csp-rollout",
+      category: "user",
+      description: "Roll out a strict CSP without breaking the legacy bundle.",
+      tags: ["csp", "hardening"],
+      intent: "defensive",
+      body: "# CSP rollout\n\n- Start with report-only.",
+      enabled: false,
+      created_by: "operator:admin",
+      created_at: nowIso(),
+    },
+  ],
+  agentProfiles: [
+    { id: "ap_01", role: "api-fuzzing", focus: "REST/GraphQL surface fuzzing", vuln_classes: ["api-auth", "mass-assignment"], evidence_contract: "a proven differential or a rejected hypothesis with its control", stopping_rule: "stop when the assigned endpoint × class matrix is exhausted", tool_scope_hidden: ["browser_action"], enabled: true, builtin: false, created_by: "operator:admin", created_at: nowIso() },
+  ],
+  invocations: [
+    { id: "inv_01", module: "mcp", ts: nowIso(), instance_id: "inst_01", scan_id: "sess_01", agent_id: "", name: "mcp_recon_lookup", server: "recon", status: "ok", args: '{"query":"acme.com"}', outcome: '{"subdomains":["api.acme.com"]}' },
+    { id: "inv_02", module: "mcp", ts: nowIso(), instance_id: "inst_01", scan_id: "sess_01", agent_id: "", name: "mcp_ticketing_create_ticket", server: "ticketing", status: "error", args: '{"title":"x"}', error: "server not connected" },
+    { id: "inv_03", module: "skills", ts: nowIso(), instance_id: "inst_01", scan_id: "sess_01", agent_id: "", name: "testing-payment-price-tampering", status: "ok", outcome: "loaded (model-requested)" },
+    { id: "inv_04", module: "skills", ts: nowIso(), instance_id: "inst_01", scan_id: "sess_01", agent_id: "", name: "no-such-skill", status: "error", error: "skill not found: no-such-skill" },
+    { id: "inv_05", module: "agents", ts: nowIso(), instance_id: "inst_01", scan_id: "sess_01", agent_id: "sub_1_1", name: "api-fuzzing", status: "ok", args: '{"task":"own the api-auth lane"}', outcome: "spawned" },
+    { id: "inv_06", module: "agents", ts: nowIso(), instance_id: "inst_01", scan_id: "sess_01", agent_id: "sub_1_1", name: "delegate_result", status: "ok", outcome: "completed: 2 findings" },
+  ],
+  // 审批豁免规则（approve & remember，契约 §3.4）。
+  approvalRules: [
+    {
+      id: "arule_01",
+      project_id: "proj_acme",
+      project_name: "Acme Corp",
+      kind: "command",
+      match: { program: "curl", contains: "api.acme.com" },
+      reason: "curl write flags approved once against the acme api",
+      created_by: "operator:admin",
+      created_from_approval_id: "appr_04",
+      created_at: nowIso(),
+      expires_at: new Date(Date.now() + 30 * 86_400_000).toISOString(),
+      hit_count: 12,
+      last_hit_at: nowIso(),
+    },
+    {
+      id: "arule_02",
+      project_id: "proj_acme",
+      project_name: "Acme Corp",
+      kind: "http",
+      match: { method: "POST", host: "api.acme.com", path_prefix: "api/auth/login" },
+      reason: "auth-probe lane remembered from the login fuzzing approval",
+      created_by: "operator:admin",
+      created_at: nowIso(),
+      hit_count: 4,
+      last_hit_at: nowIso(),
+    },
+  ],
 };
 
 const providerCatalog = [
@@ -410,6 +590,41 @@ async function readBody(req) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// SSE 事件流（/api/stream，替代原 /ws WebSocket）。
+// ---------------------------------------------------------------------------
+// 连接注册表：POST 产生的服务端事件（guidance_injected 等）向全部客户端广播，
+// 与契约 §3.1 的事件流约定一致；?instance= 过滤语义与 internal/web/sse_hub.go
+// 对齐（带过滤的客户端只收该实例的事件帧）。
+const sseClients = new Set();
+let sseSeq = 0;
+
+function broadcastEvent(evt) {
+  const seq = ++sseSeq;
+  const frame = `id: ${seq}\nevent: ${evt.type}\ndata: ${JSON.stringify(evt)}\n\n`;
+  for (const client of sseClients) {
+    if (client.filter && evt.instance_id && client.filter !== evt.instance_id) {
+      continue;
+    }
+    try {
+      client.res.write(frame);
+    } catch {
+      sseClients.delete(client);
+    }
+  }
+}
+
+// 保活注释帧：代理/浏览器空闲超时的最低要求（后端 30s，mock 用 15s）。
+setInterval(() => {
+  for (const client of sseClients) {
+    try {
+      client.res.write(": ping\n\n");
+    } catch {
+      sseClients.delete(client);
+    }
+  }
+}, 15000);
+
 const server = http.createServer(async (req, res) => {
   const method = req.method || "GET";
   const url = req.url.split("?")[0];
@@ -420,22 +635,99 @@ const server = http.createServer(async (req, res) => {
   if (method === "OPTIONS") {
     res.writeHead(204, {
       "access-control-allow-origin": "*",
-      "access-control-allow-methods": "GET,POST,DELETE,OPTIONS",
+      "access-control-allow-methods": "GET,POST,PATCH,DELETE,OPTIONS",
       "access-control-allow-headers": "content-type",
     });
     return res.end();
   }
 
   // -------- Auth (auth disabled in the mock so login is bypassed) ----------
+  // The mock signs nobody in: it answers as an open deployment that has
+  // already completed setup, so the SPA takes the auth-disabled fast path.
   if (method === "GET" && url === "/api/auth/status") {
-    return send(res, { auth_enabled: false, authenticated: true });
+    return send(res, {
+      auth_enabled: false,
+      authenticated: true,
+      needs_setup: false,
+      user: null,
+    });
   }
   if (method === "POST" && url === "/api/auth/login") {
     await readBody(req);
     return send(res, { status: "ok" });
   }
+  if (method === "POST" && url === "/api/auth/setup") {
+    await readBody(req);
+    return send(res, { status: "ok" });
+  }
+  if (method === "POST" && url === "/api/auth/password") {
+    await readBody(req);
+    return send(res, { status: "ok" });
+  }
   if (method === "POST" && url === "/api/auth/logout") {
     return send(res, { status: "logged_out" });
+  }
+
+  // -------- RBAC account management (admin-only; mock returns a fixed set) --
+  if (method === "GET" && url === "/api/users") {
+    return send(res, [
+      {
+        id: "u_mockadmin0000000",
+        username: "admin",
+        role: "admin",
+        disabled: false,
+        created_at: new Date(Date.now() - 86400_000).toISOString(),
+        updated_at: new Date().toISOString(),
+      },
+      {
+        id: "u_mockviewer000000",
+        username: "audit",
+        role: "viewer",
+        disabled: false,
+        created_at: new Date(Date.now() - 3600_000).toISOString(),
+        updated_at: new Date().toISOString(),
+      },
+    ]);
+  }
+  if (method === "POST" && url === "/api/users") {
+    const body = await readBody(req);
+    return send(res, {
+      id: "u_mock" + Math.random().toString(16).slice(2, 10),
+      username: body.username || "new-user",
+      role: body.role || "viewer",
+      disabled: false,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    }, 201);
+  }
+  if (method === "PATCH" && url.startsWith("/api/users/")) {
+    const body = await readBody(req);
+    return send(res, {
+      id: url.split("/")[3],
+      username: "admin",
+      role: body.role || "admin",
+      disabled: body.disabled ?? false,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+  }
+  if (method === "DELETE" && url.startsWith("/api/users/")) {
+    return send(res, { status: "deleted" });
+  }
+
+  // -------- SSE event stream（/api/stream，替代原 /ws）----------------------
+  if (method === "GET" && url === "/api/stream") {
+    res.writeHead(200, {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache",
+      connection: "keep-alive",
+    });
+    const filter =
+      new URLSearchParams(req.url.split("?")[1] || "").get("instance") || "";
+    const client = { res, filter };
+    sseClients.add(client);
+    req.on("close", () => sseClients.delete(client));
+    return; // 连接保持打开，合成事件由 broadcastEvent 定时推流
   }
 
   // -------- Version / status ------------------------------------------------
@@ -462,22 +754,45 @@ const server = http.createServer(async (req, res) => {
     const list = projectId
       ? state.instances.filter((i) => i.project_id === projectId)
       : state.instances;
-    return send(res, { instances: list, resources: state.resources });
+    return send(res, { instances: list, total: list.length, resources: state.resources });
   }
   const instOne = url.match(/^\/api\/instances\/([^/]+)$/);
   if (instOne && method === "GET") {
     const inst = state.instances.find((i) => i.id === instOne[1]);
     return inst ? send(res, inst) : send(res, { error: "not found" }, 404);
   }
+  // 实例状态翻转辅助：同步 instance / run 投影 / 任务 last_run_status，
+  // 并广播 instance_updated（WS→查询桥依赖；真实后端 server.go 同语义）。
+  const setInstanceStatus = (instanceId, status) => {
+    const inst = state.instances.find((i) => i.id === instanceId);
+    if (inst) inst.status = status;
+    for (const r of state.runs) {
+      if (r.instance_id === instanceId) r.status = status;
+    }
+    for (const tk of state.tasks) {
+      if (state.runs.some((r) => r.task_id === tk.id && r.instance_id === instanceId)) {
+        tk.last_run_status = status;
+      }
+    }
+    const wire = {
+      type: "instance_updated",
+      content: instanceId,
+      instance_id: instanceId,
+      timestamp: nowIso(),
+    };
+    broadcastEvent(wire);
+  };
   const instStop = url.match(/^\/api\/instances\/([^/]+)\/stop$/);
   if (instStop && method === "POST") {
     const inst = state.instances.find((i) => i.id === instStop[1]);
     if (!inst) return send(res, { error: "not found" }, 404);
     const body = await readBody(req);
-    inst.status = "finished";
+    inst.status = "stopped";
     inst.finished_at = nowIso();
     // 软取消语义：reason 供引擎下一 Run briefing 参考。
     inst.stop_reason = body.reason ? `manual: ${body.reason}` : "manual";
+    // run/任务投影同步翻转为终态（真实后端：stopped；一次性守卫随之解除）。
+    setInstanceStatus(inst.id, "stopped");
     return ok(res, { status: "stopped" });
   }
   const instRestart = url.match(/^\/api\/instances\/([^/]+)\/restart$/);
@@ -497,9 +812,44 @@ const server = http.createServer(async (req, res) => {
     inst.started_at = nowIso();
     return ok(res, { status: "started" });
   }
+  // 暂停/恢复（真实后端 server.go 语义：仅 running 可暂停 / 仅 paused 可恢复，
+  // run 投影同步翻转并广播 instance_updated——WS→查询桥的测试依赖）。
+  const instPause = url.match(/^\/api\/instances\/([^/]+)\/pause$/);
+  if (instPause && method === "POST") {
+    const inst = state.instances.find((i) => i.id === instPause[1]);
+    if (!inst) return send(res, { error: "not found" }, 404);
+    if (inst.status !== "running") {
+      return send(res, { error: "only a running instance can be paused" }, 409);
+    }
+    inst.stop_reason = "user_paused";
+    setInstanceStatus(inst.id, "paused");
+    return ok(res, { status: "paused" });
+  }
+  const instResume = url.match(/^\/api\/instances\/([^/]+)\/resume$/);
+  if (instResume && method === "POST") {
+    const inst = state.instances.find((i) => i.id === instResume[1]);
+    if (!inst) return send(res, { error: "not found" }, 404);
+    if (inst.status !== "paused") {
+      return send(res, { error: "only a paused instance can be resumed" }, 409);
+    }
+    inst.stop_reason = undefined;
+    setInstanceStatus(inst.id, "running");
+    return ok(res, { status: "resumed" });
+  }
 
   // -------- Scans (records) -------------------------------------------------
   if (method === "GET" && url === "/api/scans") {
+    // listScansPage (paginated table) expects { items, total }; bare-list
+    // consumers (useScansList → overview/reports) expect the plain array.
+    const qs = new URLSearchParams(req.url.split("?")[1] || "");
+    if (qs.get("page") != null) {
+      const size = Math.max(1, Number(qs.get("size") ?? 50) || 50);
+      const pg = Math.max(1, Number(qs.get("page")) || 1);
+      return send(res, {
+        items: state.scans.slice((pg - 1) * size, pg * size),
+        total: state.scans.length,
+      });
+    }
     return send(res, state.scans);
   }
   const scanOne = url.match(/^\/api\/scans\/([^/]+)$/);
@@ -524,6 +874,12 @@ const server = http.createServer(async (req, res) => {
       // Merge phases/vulns from the matching instance when available so the
       // scan-detail "Findings" tab is populated.
       if (!inst) inst = state.instances.find((i) => i.name === scan.name);
+      // Run/task linkage hints (mirrors the backend's attachRunLinkage): the
+      // run-page guidance composer needs task_id for the unified HITL channel.
+      const mount =
+        state.runs.find((r) => r.instance_id && r.instance_id === (inst?.id ?? scan.instance_id)) ??
+        state.runs.find((r) => r.legacy_scan_id === scan.id);
+      const linkage = mount ? { run_id: mount.id, task_id: mount.task_id } : {};
       const vulns =
         inst?.vulns ??
         (id === "scan_01"
@@ -538,7 +894,7 @@ const server = http.createServer(async (req, res) => {
               { id: "v6", title: "S3 bucket misconfiguration", severity: "high", endpoint: "https://cdn.globex.io", cvss: 7.1 },
               { id: "v7", title: "Outdated jQuery 1.4.2", severity: "low", endpoint: "https://globex.io/static/jquery.js", cvss: 3.1 },
             ]);
-      return send(res, { ...scan, events: [], vulns });
+      return send(res, { ...scan, ...linkage, events: [], vulns });
     }
   }
 
@@ -620,26 +976,6 @@ const server = http.createServer(async (req, res) => {
     };
     return send(res, state.rateLimit);
   }
-  if (method === "GET" && url === "/api/settings/agentmail") {
-    return send(res, {
-      pod: state.agentMail.pod,
-      apiKey: "",
-      hasApiKey: state.agentMail.hasApiKey,
-    });
-  }
-  if (method === "POST" && url === "/api/settings/agentmail") {
-    const body = await readBody(req);
-    state.agentMail = {
-      pod: typeof body.pod === "string" ? body.pod : state.agentMail.pod,
-      apiKey: body.apiKey || state.agentMail.apiKey,
-      hasApiKey: !!body.apiKey || state.agentMail.hasApiKey,
-    };
-    return send(res, {
-      pod: state.agentMail.pod,
-      apiKey: "",
-      hasApiKey: state.agentMail.hasApiKey,
-    });
-  }
 
   // -------- Report download (anchor href in Reports page) -------------------
   const reportMatch = url.match(/^\/api\/report\/([^/]+)$/);
@@ -650,15 +986,6 @@ const server = http.createServer(async (req, res) => {
 <p>Report for scan <code>${id}</code> (mock build).</p>
 </body></html>`;
     return send(res, html, 200, { "content-type": "text/html; charset=utf-8" });
-  }
-
-  // -------- Chat (palette → ask) -------------------------------------------
-  if (method === "POST" && url === "/api/chat") {
-    await readBody(req);
-    return send(res, {
-      reply:
-        "I am a mock assistant. The real backend would answer questions about the active scan here.",
-    });
   }
 
   // -------- Findings list + on-disk summary --------------------------------
@@ -835,6 +1162,60 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
+  // -------- Run files browser (read-only artifact/workspace view) ----------
+  // Mirrors scan_files.go: single-level listing, bounded text read, binary
+  // flagged without content. preview/archive are native <a> routes in real
+  // deployment — the mock serves download inline and 501s the archive.
+  const filesMatch = url.match(/^\/api\/scans\/([^/]+)\/files(\/[a-z]+)?$/);
+  if (filesMatch && method === "GET") {
+    const scanId = decodeURIComponent(filesMatch[1]);
+    const action = filesMatch[2] || "";
+    const known =
+      state.instances.some((inst) => inst.id === scanId) ||
+      state.scans.some((sc) => sc.id === scanId);
+    if (!known) return send(res, { error: "not found" }, 404);
+    const qs = new URLSearchParams(req.url.split("?")[1] || "");
+    const rel = qs.get("path") || ".";
+    if (action === "") {
+      const entries = MOCK_SCAN_TREE[rel];
+      if (!entries) return send(res, { error: "not found" }, 404);
+      return send(res, { path: rel, entries, truncated: false });
+    }
+    if (action === "/content" || action === "/download") {
+      if (!MOCK_SCAN_FILE_INDEX.has(rel)) {
+        return send(res, { error: "not found" }, 404);
+      }
+      const text = MOCK_SCAN_TEXT[rel];
+      if (action === "/content") {
+        if (text == null) {
+          return send(res, {
+            path: rel,
+            size: MOCK_SCAN_FILE_INDEX.get(rel),
+            mtime: MOCK_MTIME,
+            truncated: false,
+            binary: true,
+          });
+        }
+        return send(res, {
+          path: rel,
+          size: text.length,
+          mtime: MOCK_MTIME,
+          truncated: false,
+          binary: false,
+          content: text,
+        });
+      }
+      res.writeHead(200, {
+        "content-type": text == null
+          ? "application/octet-stream"
+          : "text/plain; charset=utf-8",
+        "content-disposition": `attachment; filename="${rel.split("/").pop()}"`,
+      });
+      return res.end(text == null ? "mock binary content" : text);
+    }
+    return send(res, { error: "not supported by the mock backend" }, 501);
+  }
+
   // -------- Schedules ------------------------------------------------------
   if (method === "GET" && url === "/api/schedules") {
     return send(res, state.schedules);
@@ -914,6 +1295,31 @@ const server = http.createServer(async (req, res) => {
       ),
     });
   }
+  // R-goal 目标意图分析预览（确定性 mock：不假装智能，给可编辑的草案形状）。
+  const projAnalyzeGoal = url.match(/^\/api\/projects\/([^/]+)\/analyze-goal$/);
+  if (projAnalyzeGoal && method === "POST") {
+    const body = await readBody(req);
+    const goal = String(body.goal || "").trim();
+    if (!goal) return send(res, { error: "goal is required" }, 400);
+    const project = state.projects.find((p) => p.id === projAnalyzeGoal[1]);
+    if (!project) return send(res, { error: "not found" }, 404);
+    return send(res, {
+      proposal: {
+        statement: `Deliver verified findings proving: ${goal}`,
+        criteria: [
+          {
+            kind: "finding_class",
+            vuln_class: "sql injection",
+            verify_by: "verifier",
+            required: true,
+            rationale: "mock draft — edit freely before saving",
+          },
+        ],
+        constraints: [],
+        notes: "Mock analysis: rewrite the draft statement and criteria to match the real objective.",
+      },
+    });
+  }
   if (projTasks && method === "POST") {
     const body = await readBody(req);
     const id = `task_${state.tasks.length + 1}`;
@@ -925,6 +1331,7 @@ const server = http.createServer(async (req, res) => {
       instruction: body.instruction || undefined,
       phase_policy: body.phase_policy || undefined,
       schedule: body.schedule || undefined,
+      objective: body.objective || undefined,
       created_at: nowIso(),
       run_count: 0,
       finding_count: 0,
@@ -937,7 +1344,57 @@ const server = http.createServer(async (req, res) => {
     const task = state.tasks.find((t) => t.id === taskRunsPost[1]);
     if (!task) return send(res, { error: "not found" }, 404);
     await readBody(req);
+    // 一次性守卫（与真实后端 handleTaskRunStart 的 409 一致）：
+    // 活跃 run（pending/running/paused）存在时拒绝重复发起。
+    const activeRun = state.runs.find(
+      (r) =>
+        r.task_id === task.id &&
+        ["running", "pending", "paused"].includes(r.status),
+    );
+    if (activeRun) {
+      return send(
+        res,
+        {
+          error:
+            "task already has an active run (pending/running/paused); stop or resume it before starting another",
+          run_id: activeRun.id,
+          instance_id: activeRun.instance_id,
+        },
+        409,
+      );
+    }
     const project = state.projects.find((p) => p.id === task.project_id);
+    // R-goal 第 0 轮目标分析模拟：任务有 goal 但 objective 未结构化时，
+    // 派发后延迟落盘 + goal_analyzed 广播（真实后端在 runMultiScan 里做）。
+    if (!task.objective && (task.goal || "").trim()) {
+      setTimeout(() => {
+        task.objective = {
+          kind: "engagement",
+          statement: `Deliver verified findings proving: ${task.goal.trim()}`,
+          criteria: [
+            {
+              id: "C1",
+              kind: "finding_class",
+              vuln_class: "sql injection",
+              verify_by: "verifier",
+              required: true,
+            },
+          ],
+        };
+        broadcastEvent({
+          type: "goal_analyzed",
+          content: `Goal analysis (analyzed) for task ${task.name}`,
+          result_meta: {
+            task_id: task.id,
+            project_id: task.project_id,
+            status: "analyzed",
+            statement: task.objective.statement,
+            criteria: task.objective.criteria.length,
+          },
+          timestamp: nowIso(),
+        });
+      }, 1500);
+    }
     const instId = `inst_${String(state.instances.length + 1).padStart(2, "0")}`;
     state.instances.unshift({
       id: instId,
@@ -997,6 +1454,63 @@ const server = http.createServer(async (req, res) => {
     }
     return send(res, out);
   }
+  // GET /api/tasks/{id}/objective — 只读达成度投影（mock 级近似：finding_class
+  // 判据在该任务已有发现时判 met，其余 undetermined；达成度不阻断任何东西）。
+  const taskObjectiveGet = url.match(/^\/api\/tasks\/([^/]+)\/objective$/);
+  if (taskObjectiveGet && method === "GET") {
+    const task = state.tasks.find((t) => t.id === taskObjectiveGet[1]);
+    if (!task) return send(res, { error: "not found" }, 404);
+    const objective = task.objective ?? null;
+    const structured = !!objective;
+    const findings = state.instances
+      .filter((i) =>
+        state.runs.some(
+          (r) => r.task_id === task.id && r.instance_id === i.id,
+        ),
+      )
+      .flatMap((i) => i.vulns || []);
+    const criteria = (objective?.criteria ?? []).map((c, idx) => {
+      const hit = c.kind === "finding_class" && findings.length > 0;
+      return {
+        ...c,
+        id: c.id ?? `C${idx + 1}`,
+        state: hit ? "met" : "undetermined",
+        reason: hit ? "该任务已有同类发现（mock 投影）" : undefined,
+      };
+    });
+    const met = criteria.filter((c) => c.state === "met").length;
+    const undetermined = criteria.length - met;
+    const attainment = criteria.length ? met / criteria.length : 0;
+    const report = {
+      structured,
+      criteria,
+      met,
+      unmet: 0,
+      undetermined,
+      manual_pending: 0,
+      attainment,
+    };
+    const latestRun = state.runs.find((r) => r.task_id === task.id);
+    return send(res, {
+      objective,
+      structured,
+      report,
+      runs: latestRun
+        ? [
+            {
+              run_id: latestRun.id,
+              scan_id: latestRun.instance_id ?? latestRun.id,
+              status: latestRun.status,
+              report,
+            },
+          ]
+        : [],
+      ring: latestRun ? "act" : "observe",
+      ring_basis: latestRun ? "最新 run transcript（mock）" : "尚无运行",
+      gaps: [],
+      schedulable: [],
+    });
+  }
   const taskOne = url.match(/^\/api\/tasks\/([^/]+)$/);
   if (taskOne) {
     const task = state.tasks.find((t) => t.id === taskOne[1]);
@@ -1007,6 +1521,8 @@ const server = http.createServer(async (req, res) => {
       for (const key of ["name", "goal", "instruction", "phase_policy", "schedule"]) {
         if (body[key] !== undefined) task[key] = body[key];
       }
+      // 三态语义与真实后端一致：缺席=不动、null=清除、对象=替换。
+      if (body.objective !== undefined) task.objective = body.objective || undefined;
       task.updated_at = nowIso();
       return send(res, task);
     }
@@ -1072,6 +1588,233 @@ const server = http.createServer(async (req, res) => {
     return send(res, { approved, rejected, skipped });
   }
 
+  // -------- 审批豁免规则（approve & remember，契约 §3.4）--------------------
+  // -------- 集成模块：MCP 服务器 / 用户技能 / Agent 档案（契约 §integration-*）
+
+  const invocationMatch = url.match(/^\/api\/(mcp-servers|skills|agent-profiles)\/invocations$/);
+  if (invocationMatch && method === "GET") {
+    const module = invocationMatch[1] === "mcp-servers" ? "mcp" : invocationMatch[1] === "skills" ? "skills" : "agents";
+    const q = new URLSearchParams(req.url.split("?")[1] || "");
+    const page = Math.max(1, Number.parseInt(q.get("page") || "1", 10) || 1);
+    const size = Math.max(1, Number.parseInt(q.get("size") || "50", 10) || 50);
+    let list = state.invocations.filter((r) => r.module === module);
+    const instanceId = q.get("instance_id");
+    const name = (q.get("name") || "").toLowerCase();
+    const status = q.get("status");
+    if (instanceId) list = list.filter((r) => r.instance_id === instanceId);
+    if (name) list = list.filter((r) => r.name.toLowerCase().includes(name));
+    if (status) list = list.filter((r) => r.status === status);
+    list = [...list].reverse(); // newest first
+    const start = (page - 1) * size;
+    return send(res, { items: list.slice(start, start + size), total: list.length, page, size });
+  }
+
+  if (method === "GET" && url === "/api/mcp-servers") {
+    return send(res, { servers: state.mcpServers });
+  }
+  if (url === "/api/mcp-servers" && method === "POST") {
+    const body = await readBody(req);
+    if (!body.name || !body.transport) {
+      return send(res, { error: "name and transport are required" }, 400);
+    }
+    if (state.mcpServers.some((m) => m.name === body.name)) {
+      return send(res, { error: "duplicate name" }, 409);
+    }
+    const server = {
+      id: `mcp_${state.mcpServers.length + 1}_${Date.now().toString(36)}`,
+      command: "", args: [], env: {}, url: "", headers: {},
+      timeout_seconds: 120, tool_count: 0, last_error: "",
+      created_by: "operator:admin", created_at: nowIso(),
+      ...body,
+    };
+    state.mcpServers.unshift(server);
+    broadcastEvent({ type: "mcp_servers_changed", content: "MCP server created", timestamp: nowIso() });
+    return send(res, server, 201);
+  }
+  const mcpDetail = url.match(/^\/api\/mcp-servers\/([^/]+)$/);
+  if (mcpDetail) {
+    const idx = state.mcpServers.findIndex((m) => m.id === mcpDetail[1]);
+    if (idx < 0) return send(res, { error: "not found" }, 404);
+    if (method === "GET") return send(res, state.mcpServers[idx]);
+    if (method === "PATCH") {
+      const body = await readBody(req);
+      // 打码回显语义：**** 前缀 = 未修改。
+      for (const field of ["env", "headers"]) {
+        if (body[field]) {
+          for (const [k, v] of Object.entries(body[field])) {
+            if (typeof v === "string" && v.startsWith("****")) body[field][k] = state.mcpServers[idx][field]?.[k] ?? "";
+          }
+        }
+      }
+      state.mcpServers[idx] = { ...state.mcpServers[idx], ...body, updated_at: nowIso() };
+      broadcastEvent({ type: "mcp_servers_changed", content: "MCP server updated", timestamp: nowIso() });
+      return send(res, state.mcpServers[idx]);
+    }
+    if (method === "DELETE") {
+      const [removed] = state.mcpServers.splice(idx, 1);
+      broadcastEvent({ type: "mcp_servers_changed", content: "MCP server deleted", timestamp: nowIso() });
+      return send(res, { ok: true, removed: removed.id });
+    }
+  }
+  const mcpRefresh = url.match(/^\/api\/mcp-servers\/([^/]+)\/refresh$/);
+  if (mcpRefresh && method === "POST") {
+    const server = state.mcpServers.find((m) => m.id === mcpRefresh[1]);
+    if (!server) return send(res, { error: "not found" }, 404);
+    if (server.transport === "http" && /127\.|localhost/.test(server.url || "")) {
+      return send(res, { error: "endpoint resolves to the operator machine" }, 400);
+    }
+    server.tool_count = server.enabled ? 6 : 0;
+    server.last_healthy_at = nowIso();
+    server.last_error = server.enabled ? "" : "disabled";
+    broadcastEvent({ type: "mcp_servers_changed", content: "MCP server refreshed", timestamp: nowIso() });
+    return send(res, server);
+  }
+
+  if (method === "GET" && url === "/api/skills") {
+    return send(res, { skills: state.skills });
+  }
+  if (url === "/api/skills" && method === "POST") {
+    const body = await readBody(req);
+    if (!/^[a-z0-9]+(-[a-z0-9]+)*$/.test(body.name || "")) {
+      return send(res, { error: "name must be kebab-case" }, 400);
+    }
+    if (state.skills.some((k) => k.name === (body.name || "").toLowerCase())) {
+      return send(res, { error: "duplicate name" }, 409);
+    }
+    const skill = {
+      id: `skill_${state.skills.length + 1}_${Date.now().toString(36)}`,
+      category: "user", tags: [], intent: "", created_by: "operator:admin", created_at: nowIso(),
+      ...body,
+      name: (body.name || "").toLowerCase(),
+    };
+    state.skills.unshift(skill);
+    broadcastEvent({ type: "skills_changed", content: "Skill created", timestamp: nowIso() });
+    return send(res, skill, 201);
+  }
+  const skillDetail = url.match(/^\/api\/skills\/([^/]+)$/);
+  if (skillDetail) {
+    const idx = state.skills.findIndex((k) => k.id === skillDetail[1]);
+    if (idx < 0) return send(res, { error: "not found" }, 404);
+    if (method === "GET") return send(res, state.skills[idx]);
+    if (method === "PATCH") {
+      const body = await readBody(req);
+      state.skills[idx] = { ...state.skills[idx], ...body, updated_at: nowIso() };
+      broadcastEvent({ type: "skills_changed", content: "Skill updated", timestamp: nowIso() });
+      return send(res, state.skills[idx]);
+    }
+    if (method === "DELETE") {
+      const [removed] = state.skills.splice(idx, 1);
+      broadcastEvent({ type: "skills_changed", content: "Skill deleted", timestamp: nowIso() });
+      return send(res, { ok: true, removed: removed.id });
+    }
+  }
+
+  if (method === "GET" && url === "/api/agent-profiles") {
+    const builtin = ["recon-discovery", "authz-logic", "business-logic", "injection-serverside", "client-source"].map((role, i) => ({
+      id: `builtin:${role}`, role, builtin: true, enabled: true, focus: "", vuln_classes: [], evidence_contract: "", stopping_rule: "", created_at: nowIso(),
+    }));
+    return send(res, { profiles: [...builtin, ...state.agentProfiles] });
+  }
+  if (url === "/api/agent-profiles" && method === "POST") {
+    const body = await readBody(req);
+    const RESERVED = ["recon-discovery", "authz-logic", "business-logic", "injection-serverside", "client-source"];
+    if (RESERVED.includes(body.role)) {
+      return send(res, { error: "role is reserved by a built-in specialist profile" }, 409);
+    }
+    if (!/^[a-z0-9]+(-[a-z0-9]+)*$/.test(body.role || "")) {
+      return send(res, { error: "role must be kebab-case" }, 400);
+    }
+    if (state.agentProfiles.some((p) => p.role === body.role)) {
+      return send(res, { error: "duplicate role" }, 409);
+    }
+    const profile = {
+      id: `ap_${state.agentProfiles.length + 1}_${Date.now().toString(36)}`,
+      vuln_classes: [], tool_scope_hidden: [], builtin: false,
+      created_by: "operator:admin", created_at: nowIso(),
+      ...body,
+    };
+    state.agentProfiles.unshift(profile);
+    broadcastEvent({ type: "agent_profiles_changed", content: "Agent profile created", timestamp: nowIso() });
+    return send(res, profile, 201);
+  }
+  const profileDetail = url.match(/^\/api\/agent-profiles\/([^/]+)$/);
+  if (profileDetail) {
+    if (profileDetail[1].startsWith("builtin:")) {
+      return send(res, { error: "built-in profiles are read-only" }, 404);
+    }
+    const idx = state.agentProfiles.findIndex((p) => p.id === profileDetail[1]);
+    if (idx < 0) return send(res, { error: "not found" }, 404);
+    if (method === "GET") return send(res, state.agentProfiles[idx]);
+    if (method === "PATCH") {
+      const body = await readBody(req);
+      state.agentProfiles[idx] = { ...state.agentProfiles[idx], ...body, updated_at: nowIso() };
+      broadcastEvent({ type: "agent_profiles_changed", content: "Agent profile updated", timestamp: nowIso() });
+      return send(res, state.agentProfiles[idx]);
+    }
+    if (method === "DELETE") {
+      const [removed] = state.agentProfiles.splice(idx, 1);
+      broadcastEvent({ type: "agent_profiles_changed", content: "Agent profile deleted", timestamp: nowIso() });
+      return send(res, { ok: true, removed: removed.id });
+    }
+  }
+
+  if (method === "GET" && url === "/api/approval-rules") {
+    const q = new URLSearchParams(req.url.split("?")[1] || "");
+    const projectId = q.get("project_id");
+    const kind = q.get("kind");
+    let list = state.approvalRules;
+    if (projectId) list = list.filter((r) => r.project_id === projectId);
+    if (kind) list = list.filter((r) => r.kind === kind);
+    return send(res, { rules: list });
+  }
+  if (url === "/api/approval-rules" && method === "POST") {
+    const body = await readBody(req);
+    if (!body.project_id || !body.kind || !body.match) {
+      return send(res, { error: "project_id, kind and match are required" }, 400);
+    }
+    if (body.kind === "command" && !body.match.program) {
+      return send(res, { error: "command rule requires match.program" }, 400);
+    }
+    if (body.kind === "http" && (!body.match.method || !body.match.host)) {
+      return send(res, { error: "http rule requires match.method and match.host" }, 400);
+    }
+    const project = state.projects.find((p) => p.id === body.project_id);
+    if (!project) return send(res, { error: "project not found" }, 404);
+    const rule = {
+      id: `arule_${state.approvalRules.length + 1}_${Date.now().toString(36)}`,
+      project_id: body.project_id,
+      project_name: project.name,
+      kind: body.kind,
+      match: body.match,
+      reason: body.reason || undefined,
+      created_by: "operator:admin",
+      created_from_approval_id: body.created_from_approval_id || undefined,
+      created_at: nowIso(),
+      expires_at: body.expires_at || undefined,
+      hit_count: 0,
+    };
+    state.approvalRules.unshift(rule);
+    broadcastEvent({
+      type: "approval_rules_changed",
+      content: "Approval rule created",
+      rule,
+      timestamp: nowIso(),
+    });
+    return send(res, rule);
+  }
+  const ruleDelete = url.match(/^\/api\/approval-rules\/([^/]+)$/);
+  if (ruleDelete && method === "DELETE") {
+    const idx = state.approvalRules.findIndex((r) => r.id === ruleDelete[1]);
+    if (idx < 0) return send(res, { error: "not found" }, 404);
+    const [removed] = state.approvalRules.splice(idx, 1);
+    broadcastEvent({
+      type: "approval_rules_changed",
+      content: "Approval rule deleted",
+      timestamp: nowIso(),
+    });
+    return send(res, { ok: true, removed: removed.id });
+  }
+
   // -------- R3.1: Guidance（人工在环插入意图）--------------------------------
   const taskGuidance = url.match(/^\/api\/tasks\/([^/]+)\/guidance$/);
   if (taskGuidance && method === "POST") {
@@ -1110,7 +1853,7 @@ const server = http.createServer(async (req, res) => {
     state.guidances.unshift(g);
     // 无乐观回显的另一半：服务端持久化后广播，transcript 从流里渲染人工 turn。
     const evtType = g.status === "injected" ? "guidance_injected" : "guidance_queued";
-    const wire = JSON.stringify({
+    broadcastEvent({
       type: evtType,
       content: message,
       timestamp: g.created_at,
@@ -1118,9 +1861,6 @@ const server = http.createServer(async (req, res) => {
       instance_id: g.instance_id,
       guidance: g,
     });
-    for (const client of wsClients) {
-      if (client.readyState === 1) client.send(wire);
-    }
     return send(res, {
       status: g.status,
       guidance_id: g.id,
@@ -1134,6 +1874,209 @@ const server = http.createServer(async (req, res) => {
       .slice(0, 50)
       .map(({ _request_id, ...rest }) => rest);
     return send(res, { items });
+  }
+
+  // -------- Run 账本投影（契约 §3.6）+ 任务情报（契约 §3.7）-----------------
+  // 确定性 fixture：已知 scan 返回同一份假设快照（含 observed/inferred、
+  // 引擎 source、finding_ref）；情报按 task 维度聚合，分诊 PATCH 落内存覆盖层。
+  const ledgerMatch = url.match(/^\/api\/scans\/([^/]+)\/ledger$/);
+  if (ledgerMatch && method === "GET") {
+    const scanId = decodeURIComponent(ledgerMatch[1]);
+    const known =
+      state.instances.some((inst) => inst.id === scanId) ||
+      state.scans.some((sc) => sc.id === scanId);
+    if (!known) return send(res, { error: "scan not found" }, 404);
+    const t0 = new Date(Date.now() - 3600_000).toISOString();
+    const t1 = new Date(Date.now() - 1800_000).toISOString();
+    const ev = (n, kind, summary, nature, source, confidence) => ({
+      id: `ev_${n}`,
+      kind,
+      summary,
+      nature,
+      ...(source ? { source } : {}),
+      confidence,
+      created_at: t1,
+    });
+    return send(res, {
+      scan_id: scanId,
+      ledger_present: true,
+      ledger_damaged: false,
+      incomplete: false,
+      counts: { queued: 2, testing: 1, proven: 1, rejected: 1, blocked: 0, exhausted: 0 },
+      hypotheses: [
+        {
+          id: "H-2",
+          dedup_key: "sqli|api.example.com/login|username",
+          title: "Login form /username 允许布尔盲注",
+          vuln_class: "sqli",
+          target: "https://api.example.com",
+          endpoint: "https://api.example.com/login",
+          parameter: "username",
+          status: "testing",
+          confidence: 0.72,
+          voi: 0.81,
+          voi_estimated: true,
+          assigned_to: "inst_01/spec-injection",
+          next_action: "时间盲注基线对照（sleep 3 vs 1）",
+          attempts: 2,
+          origin: "recon",
+          created_at: t0,
+          updated_at: t1,
+          evidence: [
+            ev(1, "baseline", "正常请求 200/118ms，参数原样回显", "observed", "", 0.9),
+            ev(2, "probe", "' OR 1=1-- 响应 500，日志出现 SQL 错误特征", "observed", "", 0.8),
+          ],
+        },
+        {
+          id: "H-1",
+          dedup_key: "xss|acme.com/search|q",
+          title: "/search 的 q 参数反射未编码输出",
+          vuln_class: "xss",
+          target: "https://acme.com",
+          endpoint: "https://acme.com/search",
+          parameter: "q",
+          status: "proven",
+          confidence: 1,
+          assigned_to: "inst_01/spec-xss",
+          attempts: 3,
+          origin: "recon",
+          created_at: t0,
+          updated_at: t1,
+          evidence: [
+            ev(3, "exploit", "<svg onload> 原样出现在响应 HTML", "observed", "verify_xss", 0.95),
+            ev(4, "finding_ref", "已按 XALG-2 上报", "observed", "", 1),
+          ],
+        },
+        {
+          id: "H-3",
+          dedup_key: "authbypass|api.example.com/admin",
+          title: "/admin 在无 Cookie 时返回 200（疑似网关配置）",
+          vuln_class: "authbypass",
+          target: "https://api.example.com",
+          endpoint: "https://api.example.com/admin",
+          status: "queued",
+          confidence: 0.4,
+          next_action: "对照直连与经网关两条路径的状态码",
+          attempts: 0,
+          origin: "llm",
+          created_at: t0,
+          updated_at: t0,
+          evidence: [
+            ev(5, "artifact", "直接访问返回登录页 HTML（内容与登录后一致）", "observed", "", 0.6),
+          ],
+        },
+        {
+          id: "H-4",
+          dedup_key: "sqli|api.example.com/export|date",
+          title: "/export 的 date 参数（已否决：参数化查询）",
+          vuln_class: "sqli",
+          target: "https://api.example.com",
+          endpoint: "https://api.example.com/export",
+          parameter: "date",
+          status: "rejected",
+          confidence: 0.1,
+          attempts: 2,
+          origin: "auto",
+          created_at: t0,
+          updated_at: t0,
+          evidence: [
+            ev(6, "control", "注入载荷被参数化驱动转义，行为与基线一致", "observed", "", 0.9),
+          ],
+        },
+        {
+          id: "H-5",
+          dedup_key: "idor|api.example.com/invoice/1",
+          title: "IDOR 探测排队中",
+          vuln_class: "idor",
+          target: "https://api.example.com",
+          endpoint: "https://api.example.com/invoice/1",
+          status: "queued",
+          confidence: 0.3,
+          attempts: 0,
+          origin: "llm",
+          created_at: t0,
+          updated_at: t0,
+        },
+      ],
+    });
+  }
+
+  const intelMatch = url.match(/^\/api\/tasks\/([^/]+)\/intelligence$/);
+  if (intelMatch && method === "GET") {
+    const taskId = decodeURIComponent(intelMatch[1]);
+    const task = state.tasks.find((tk) => tk.id === taskId);
+    if (!task) return send(res, { items: [], counts: { credential: 0, lead: 0, sensitive_data: 0 }, triage_available: true });
+    const run = state.runs.find((r) => r.task_id === taskId);
+    const scanId = run?.instance_id ?? run?.id ?? "inst_01";
+    const t0 = new Date(Date.now() - 5400_000).toISOString();
+    const t1 = new Date(Date.now() - 900_000).toISOString();
+    const items = [
+      {
+        id: "I-1",
+        fingerprint: "fp_mock_cred_admin01",
+        kind: "credential",
+        title: "Admin 面板接受默认凭据 admin:admin",
+        content: "POST /app/admin/login {username:\"admin\", password:\"admin\"} → 302 /admin/dashboard；响应 Set-Cookie SESSIONID=…（已脱敏）。建议首轮利用后立即改密并记录。",
+        endpoint: "acme.com/app/admin/login",
+        confidence: 0.9,
+        created_at: t0,
+        updated_at: t1,
+        scan_ids: [scanId],
+      },
+      {
+        id: "I-2",
+        fingerprint: "fp_mock_lead_invoices",
+        kind: "lead",
+        title: "发票 id 连续递增（疑似可遍历）",
+        content: "GET /invoice/1001 与 /invoice/1002 响应结构一致，id 为连续整数；配合未验证的会话权限，值得在取得任意有效会话后做 IDOR 矩阵。",
+        endpoint: "api.acme.com/invoice",
+        confidence: 0.6,
+        created_at: t0,
+        updated_at: t0,
+        scan_ids: [scanId],
+      },
+      {
+        id: "I-3",
+        fingerprint: "fp_mock_data_backup",
+        kind: "sensitive_data",
+        title: "/backup.sql 可匿名下载（约 4MB，含表结构）",
+        content: "GET https://acme.com/backup.sql → 200 text/sql，头部含 CREATE TABLE users 与样例行；不属于漏洞类目本身，按敏感数据披露记录。",
+        endpoint: "acme.com/backup.sql",
+        confidence: 0.95,
+        created_at: t0,
+        updated_at: t0,
+        scan_ids: [scanId],
+      },
+    ];
+    const triages = state.intelTriages.get(taskId);
+    if (triages) {
+      for (const it of items) {
+        const tg = triages.get(it.fingerprint);
+        if (tg) it.triage = { task_id: taskId, fingerprint: it.fingerprint, ...tg };
+      }
+    }
+    return send(res, {
+      items,
+      counts: { credential: 1, lead: 1, sensitive_data: 1 },
+      triage_available: true,
+    });
+  }
+  const intelTriageMatch = url.match(/^\/api\/tasks\/([^/]+)\/intelligence\/([^/]+)$/);
+  if (intelTriageMatch && (method === "PATCH" || method === "PUT")) {
+    const taskId = decodeURIComponent(intelTriageMatch[1]);
+    const fingerprint = decodeURIComponent(intelTriageMatch[2]);
+    const body = await readBody(req);
+    const status = body.status;
+    if (!["open", "confirmed", "dismissed"].includes(status)) {
+      return send(res, { error: "status must be open|confirmed|dismissed" }, 400);
+    }
+    let triages = state.intelTriages.get(taskId);
+    if (!triages) {
+      triages = new Map();
+      state.intelTriages.set(taskId, triages);
+    }
+    triages.set(fingerprint, { status, decided_by: "operator", decided_at: nowIso() });
+    return send(res, { fingerprint, status });
   }
 
   // Default. For an unhandled GET /api/* route fall back to an empty array
@@ -1161,93 +2104,90 @@ setInterval(() => {
 }, 1000);
 
 // ---------------------------------------------------------------------------
-// WebSocket: stream synthetic events to keep the live feed populated.
+// SSE: stream synthetic events to keep the live feed populated.
 // ---------------------------------------------------------------------------
-const wss = new WebSocketServer({ server, path: "/ws" });
-// 连接注册表：POST 产生的服务端事件（guidance_injected 等）向全部客户端广播，
-// 与契约 §3.1 的 WS 事件约定一致。
-const wsClients = new Set();
-wss.on("connection", (ws) => {
-  wsClients.add(ws);
-  ws.on("close", () => wsClients.delete(ws));
-  let i = 0;
-  const t = setInterval(() => {
-    const run = runningInstance();
-    if (!run) return; // pause the feed once everything is stopped
-    const isEmail = i % 6 === 0;
-    const isApprovalPing = i % 9 === 4;
-    if (isApprovalPing) {
-      const pending = state.approvals.find(
-        (a) => a.status === "pending" && a.instance_id === run.id,
-      );
-      if (pending) {
-        ws.send(
-          JSON.stringify({
-            type: "approval_requested",
-            content: pending.payload.command || `${pending.payload.method} ${pending.payload.url}`,
-            tool_name: pending.kind === "command" ? "terminal_execute" : "http_request",
-            timestamp: nowIso(),
-            agent_id: run.id,
-            instance_id: run.id,
-            current_phase: run.current_phase,
-            approval: pending,
-          }),
-        );
-      }
-      i++;
-      return;
-    }
-    const specialist = i % 3 === 2;
-    // LLM 对话回合合成：assistant 分析文本分片 delta 推送（每 ~9 tick 一次），
-    // 前端按 message_id 累积成打字气泡，done 后固化为事件行。
-    if (i % 9 === 5) {
-      const rounds = [
-        "The httpx sweep found 3 live endpoints on the api host. Combined with the 401/200 differential we recorded earlier, /api/v1/orders is the strongest IDOR candidate so far.",
-        "Nuclei came back clean on the passive set, so I'm moving the injection lane to claim the next hypothesis while the coordinator keeps widening endpoint coverage.",
-        "Two signals contradict on /admin: the role-A session got 200, but the fresh cookie replay got 401. Treating the first as stale-session noise and re-verifying before reporting.",
-      ];
-      const text = rounds[(i / 9 | 0) % rounds.length];
-      const msgId = `msg_${run.id}_${i}`;
-      const pieces = text.match(/.{1,28}/g) || [text];
-      pieces.forEach((piece, pi) => {
-        setTimeout(() => {
-          if (ws.readyState !== 1) return;
-          ws.send(
-            JSON.stringify({
-              type: pi === pieces.length - 1 ? "assistant_done" : "assistant_delta",
-              message_id: msgId,
-              delta: pi === pieces.length - 1 ? undefined : piece,
-              content: pi === pieces.length - 1 ? text : undefined,
-              agent_id: run.id,
-              instance_id: run.id,
-              timestamp: nowIso(),
-              current_phase: run.current_phase,
-            }),
-          );
-        }, pi * 220);
-      });
-      i++;
-      return;
-    }
-    ws.send(
-      JSON.stringify({
-        type: isEmail ? "email_received" : "tool_call",
-        content: isEmail
-          ? "Email from attacker@evil.test triaged"
-          : specialist
-            ? `httpx -silent ${run.parent_target || run.targets} endpoint ${i}`
-            : `nmap -sV ${run.parent_target || run.targets} probe ${i}`,
-        tool_name: isEmail ? "agentmail" : specialist ? "httpx" : "nmap",
+// 连接注册表在文件顶部（sseClients / broadcastEvent）；这里只负责合成事件。
+let tick = 0;
+setInterval(() => {
+  if (sseClients.size === 0) return;
+  const run = runningInstance();
+  if (!run) return; // pause the feed once everything is stopped
+  const i = tick++;
+  const isApprovalPing = i % 9 === 4;
+  if (isApprovalPing) {
+    const pending = state.approvals.find(
+      (a) => a.status === "pending" && a.instance_id === run.id,
+    );
+    if (pending) {
+      broadcastEvent({
+        type: "approval_requested",
+        content: pending.payload.command || `${pending.payload.method} ${pending.payload.url}`,
+        tool_name: pending.kind === "command" ? "terminal_execute" : "http_request",
         timestamp: nowIso(),
-        // coordinator = 主循环（agent_id 即实例 id）；specialist 用独立标识，
-        // 演示会话控制台的 agent 视角切换。instance_id 与 agent_id 正交：
-        // Run 过滤走前者，agent 视角走后者。
-        agent_id: specialist ? `${run.id}/spec-injection` : run.id,
+        agent_id: run.id,
         instance_id: run.id,
         current_phase: run.current_phase,
-      }),
-    );
-    i++;
-  }, 1500);
-  ws.on("close", () => clearInterval(t));
-});
+        approval: pending,
+      });
+    }
+    return;
+  }
+  // 审批规则命中演示（契约 §3.4）：每隔一段时间挑一条命中过的规则广播，
+  // 让 LiveFeed 的 approval_rule_hit 紫色行有真实样例可看。
+  if (i % 27 === 17) {
+    const hit = state.approvalRules.find((r) => r.hit_count > 0);
+    if (hit) {
+      broadcastEvent({
+        type: "approval_rule_hit",
+        content: `Approval rule matched — allowed without an approval row`,
+        timestamp: nowIso(),
+        agent_id: run.id,
+        instance_id: run.id,
+        rule: { ...hit, hit_count: hit.hit_count + 1 },
+      });
+    }
+    return;
+  }
+  const specialist = i % 3 === 2;
+  // LLM 对话回合合成：assistant 分析文本分片 delta 推送（每 ~9 tick 一次），
+  // 前端按 message_id 累积成打字气泡，done 后固化为事件行。
+  if (i % 9 === 5) {
+    const rounds = [
+      "The httpx sweep found 3 live endpoints on the api host. Combined with the 401/200 differential we recorded earlier, /api/v1/orders is the strongest IDOR candidate so far.",
+      "Nuclei came back clean on the passive set, so I'm moving the injection lane to claim the next hypothesis while the coordinator keeps widening endpoint coverage.",
+      "Two signals contradict on /admin: the role-A session got 200, but the fresh cookie replay got 401. Treating the first as stale-session noise and re-verifying before reporting.",
+    ];
+    const text = rounds[(i / 9 | 0) % rounds.length];
+    const msgId = `msg_${run.id}_${i}`;
+    const pieces = text.match(/.{1,28}/g) || [text];
+    pieces.forEach((piece, pi) => {
+      setTimeout(() => {
+        broadcastEvent({
+          type: pi === pieces.length - 1 ? "assistant_done" : "assistant_delta",
+          message_id: msgId,
+          delta: pi === pieces.length - 1 ? undefined : piece,
+          content: pi === pieces.length - 1 ? text : undefined,
+          agent_id: run.id,
+          instance_id: run.id,
+          timestamp: nowIso(),
+          current_phase: run.current_phase,
+        });
+      }, pi * 220);
+    });
+    return;
+  }
+  broadcastEvent({
+    type: "tool_call",
+    content: specialist
+      ? `httpx -silent ${run.parent_target || run.targets} endpoint ${i}`
+      : `nmap -sV ${run.parent_target || run.targets} probe ${i}`,
+    tool_name: specialist ? "httpx" : "nmap",
+    timestamp: nowIso(),
+    // coordinator = 主循环（agent_id 即实例 id）；specialist 用独立标识，
+    // 演示会话控制台的 agent 视角切换。instance_id 与 agent_id 正交：
+    // Run 过滤走前者，agent 视角走后者。
+    agent_id: specialist ? `${run.id}/spec-injection` : run.id,
+    instance_id: run.id,
+    current_phase: run.current_phase,
+  });
+}, 1500);

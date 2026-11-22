@@ -7,34 +7,39 @@ import {
   FolderKanban,
   Database,
   ListChecks,
+  MessagesSquare,
   FileText,
   LayoutGrid,
-  Mail,
   Plug,
   Plus,
   Radio,
   Server,
   Settings,
   ShieldAlert,
-  Star,
   Target,
+  Cable,
+  Sparkles,
+  Bot,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useVersion } from "@/api/queries";
 import { useI18n } from "@/i18n";
 import { ProjectSwitcher } from "@/components/project-switcher";
-
-const GITHUB_REPO = "xalgorix/xalgorix";
+import { AccountMenu } from "@/components/account-menu";
+import { useAuth } from "@/store/auth";
 
 // Nav groups around the Project→Task→Run model:
 // 1) unlabeled = the project-scoped work surfaces (what the operator lives in);
 // 2) "execution" = run lifecycle views (scans ARE runs since R1, rename per
 //    docs/REDESIGN.md D6; schedules is a transitional standalone page until
-//    its backend becomes a task attribute);
+//    its backend becomes a task attribute; 新建扫描直启入口已摘除——一切执行
+//    从任务发起（POST /api/tasks/{id}/runs）；
 // 3) "system" = low-frequency management.
+// minRole hides an entry from lower RBAC roles (server still enforces; this
+// is presentation only). Unset = visible to every signed-in role.
 const NAV_GROUPS: {
   labelKey?: string;
-  items: { to: string; labelKey: string; icon: typeof LayoutGrid; end?: boolean }[];
+  items: { to: string; labelKey: string; icon: typeof LayoutGrid; end?: boolean; minRole?: "admin" }[];
 }[] = [
   {
     // 主组顺序 = 实体层级：项目（作用域）→ 任务（目标）→ 审批（约束）→ 发现（产出）。
@@ -42,6 +47,7 @@ const NAV_GROUPS: {
       { to: "/", labelKey: "nav.overview", icon: LayoutGrid, end: true },
       { to: "/projects", labelKey: "nav.projects", icon: FolderKanban },
       { to: "/tasks", labelKey: "nav.tasks", icon: ListChecks },
+      { to: "/chat", labelKey: "nav.chat", icon: MessagesSquare },
       { to: "/approvals", labelKey: "nav.approvals", icon: BadgeCheck },
       { to: "/findings", labelKey: "nav.findings", icon: ShieldAlert },
       { to: "/info", labelKey: "nav.info", icon: Database },
@@ -53,7 +59,6 @@ const NAV_GROUPS: {
       { to: "/scans", labelKey: "nav.scans", icon: Target },
       { to: "/instances", labelKey: "nav.instances", icon: Server },
       { to: "/live", labelKey: "nav.live", icon: Radio },
-      { to: "/scans/new", labelKey: "nav.newScan", icon: Plus },
     ],
   },
   {
@@ -61,9 +66,12 @@ const NAV_GROUPS: {
     items: [
       { to: "/schedules", labelKey: "nav.schedules", icon: Clock },
       { to: "/reports", labelKey: "nav.reports", icon: FileText },
-      { to: "/email", labelKey: "nav.email", icon: Mail },
       { to: "/integrations", labelKey: "nav.integrations", icon: Plug },
-      { to: "/settings", labelKey: "nav.settings", icon: Settings },
+      { to: "/mcp", labelKey: "nav.mcp", icon: Cable },
+      { to: "/skills", labelKey: "nav.skills", icon: Sparkles },
+      { to: "/agents", labelKey: "nav.agents", icon: Bot },
+      // Settings edit provider keys / environment secrets — admin writes only.
+      { to: "/settings", labelKey: "nav.settings", icon: Settings, minRole: "admin" },
     ],
   },
 ];
@@ -71,6 +79,7 @@ const NAV_GROUPS: {
 export function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
   const { t } = useI18n();
   const { data: version } = useVersion();
+  const user = useAuth((s) => s.user);
   return (
     <aside className="flex h-full w-60 shrink-0 flex-col overflow-hidden rounded-xl border border-border bg-card shadow-sm">
       <div className="flex h-14 items-center gap-2 border-b border-border px-4">
@@ -85,8 +94,16 @@ export function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
         </div>
       </div>
       <ProjectSwitcher />
-      <nav className="flex-1 overflow-y-auto py-2" aria-label="Primary">
-        {NAV_GROUPS.map((group, gi) => (
+      <nav className="flex-1 overflow-y-auto py-2" aria-label={t("sidebar.navigation")}>
+        {NAV_GROUPS.map((group, gi) => {
+          // RBAC presentation filter: hide entries above the viewer's role
+          // (the server enforces the real boundary; auth-disabled mode shows
+          // everything, as before).
+          const items = group.items.filter(
+            (item) => !item.minRole || !user || user.role === "admin",
+          );
+          if (items.length === 0) return null;
+          return (
           <div key={gi} className={cn(gi > 0 && "mt-3 border-t border-border pt-3")}>
             {group.labelKey && (
               <div className="px-4 pb-1 pt-0.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
@@ -94,7 +111,7 @@ export function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
               </div>
             )}
             <ul className="space-y-0.5 px-2">
-              {group.items.map((item) => {
+              {items.map((item) => {
                 const Icon = item.icon;
                 return (
                   <li key={item.to}>
@@ -119,27 +136,10 @@ export function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
               })}
             </ul>
           </div>
-        ))}
+          );
+        })}
       </nav>
-      <div className="px-2 pb-2 pt-1">
-        <a
-          href={`https://github.com/${GITHUB_REPO}`}
-          target="_blank"
-          rel="noreferrer"
-          onClick={onNavigate}
-          className="group flex items-center justify-center gap-2 rounded-md border border-border bg-background px-3 py-2 text-sm font-medium text-muted-foreground transition-colors hover:border-amber-400/50 hover:text-foreground"
-          title={t("sidebar.githubTitle")}
-        >
-          <svg viewBox="0 0 16 16" className="h-4 w-4" fill="currentColor" aria-hidden>
-            <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.6 7.6 0 012-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z" />
-          </svg>
-          <span>{t("sidebar.github")}</span>
-          <Star
-            className="h-4 w-4 text-amber-500 dark:text-amber-400 transition-transform group-hover:scale-110"
-            aria-hidden
-          />
-        </a>
-      </div>
+      <AccountMenu onNavigate={onNavigate} />
       <div className="border-t border-border px-4 py-3 text-[10px] text-muted-foreground mono">
         <div className="flex items-center gap-1.5">
           <Activity className="h-3 w-3" aria-hidden />

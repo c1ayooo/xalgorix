@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Check, Copy } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { useI18n } from "@/i18n";
 import { copyToClipboard, cn } from "@/lib/utils";
 
 export function CopyButton({
@@ -14,6 +15,7 @@ export function CopyButton({
   size?: "icon" | "sm";
   label?: string;
 }) {
+  const { t } = useI18n();
   const [copied, setCopied] = useState(false);
   return (
     <Button
@@ -31,7 +33,7 @@ export function CopyButton({
       }}
     >
       {copied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
-      {label && <span className="text-xs">{copied ? "Copied" : label}</span>}
+      {label && <span className="text-xs">{copied ? t("common.copied") : label}</span>}
     </Button>
   );
 }

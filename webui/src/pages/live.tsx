@@ -5,8 +5,8 @@ import {
   eventOrderMs,
   mergeFeedEvents,
   toFeedEvent,
-  useWSStore,
-} from "@/store/ws"
+  useEventsStore,
+} from "@/store/events"
 import { LiveFeed, type FeedFilter } from "@/components/live-feed"
 import { ConnectionStatus } from "@/components/connection-status"
 import { api } from "@/api/client"
@@ -15,8 +15,8 @@ import { useActiveProjectId } from "@/lib/use-active-project"
 
 export default function LivePage() {
   const { t } = useI18n()
-  const events = useWSStore((s) => s.events)
-  const clearEvents = useWSStore((s) => s.clearEvents)
+  const events = useEventsStore((s) => s.events)
+  const clearEvents = useEventsStore((s) => s.clearEvents)
   const projectId = useActiveProjectId()
   const { data: instances } = useInstances(projectId ?? undefined)
   const [filter, setFilter] = useState<FeedFilter>("all")
@@ -58,7 +58,7 @@ export default function LivePage() {
         <div>
           <h1 className="font-sans text-2xl font-semibold tracking-tight">{t("live.title")}</h1>
           <p className="text-sm text-muted-foreground">
-            Streaming events from every active scan and worker.
+            {t("live.subtitle")}
           </p>
         </div>
         <ConnectionStatus />
@@ -73,8 +73,8 @@ export default function LivePage() {
           setClearedAt(Date.now())
           clearEvents()
         }}
-        emptyTitle="Quiet on the wire"
-        emptyDescription="Events from any running instance will appear here in real time."
+        emptyTitle={t("live.empty.title")}
+        emptyDescription={t("live.empty.description")}
       />
     </div>
   )

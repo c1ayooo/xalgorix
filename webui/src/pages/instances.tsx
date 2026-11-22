@@ -13,6 +13,16 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { Skeleton } from "@/components/ui/skeleton"
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog"
 import { EmptyState, ErrorState } from "@/components/states"
 import {
   useInstancesPage,
@@ -90,8 +100,8 @@ export default function InstancesPage() {
       {error ? (
         <ErrorState
           title={t("instances.loadError")}
-          description={error instanceof Error ? error.message : "Unknown error"}
-          action={<Button size="sm" variant="outline" onClick={() => refetch()}>Retry</Button>}
+          description={error instanceof Error ? error.message : t("common.unknownError")}
+          action={<Button size="sm" variant="outline" onClick={() => refetch()}>{t("common.retry")}</Button>}
         />
       ) : isLoading ? (
         <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
@@ -183,6 +193,7 @@ export default function InstancesPage() {
 }
 
 function ResourcesBar({ resources }: { resources: InstancesResponse["resources"] }) {
+  const { t } = useI18n()
   const cpu = Math.min(100, Math.round((resources.cpu_load_1m / Math.max(1, resources.cpu_cores)) * 100))
   const ramTotal = resources.ram_total_mb || 1
   const ramUsed = ramTotal - resources.ram_available_mb
@@ -194,7 +205,7 @@ function ResourcesBar({ resources }: { resources: InstancesResponse["resources"]
   const scanMem = resources.scan_memory_budget_mb ?? 0
   const runningInstances = resources.running_instances ?? 0
   const availableSlots = resources.available_instance_slots ?? Math.max(0, resources.effective_max_instances - runningInstances)
-  const toolLimitText = toolMem > 0 ? ` · tool cap ${toolMem}MB` : " · tool cap off"
+  const toolLimitText = toolMem > 0 ? ` · ${t("instances.res.toolCap")} ${toolMem}MB` : ` · ${t("instances.res.toolCapOff")}`
   const rss = resources.process_rss_mb ?? 0
   const heap = resources.go_heap_alloc_mb ?? 0
   const level = (resources.level || "").toLowerCase()
@@ -210,31 +221,31 @@ function ResourcesBar({ resources }: { resources: InstancesResponse["resources"]
       <CardContent className="grid gap-3 p-4 md:grid-cols-4">
         <ResourceStat
           icon={<Cpu className="h-3 w-3" />}
-          label="HOST CPU LOAD"
+          label={t("instances.res.cpu")}
           value={`${cpu}%`}
-          sub={`${resources.cpu_load_1m.toFixed(2)} / ${resources.cpu_cores} cores · heavy ${heavyActive}/${heavySlots}`}
+          sub={`${resources.cpu_load_1m.toFixed(2)} / ${resources.cpu_cores} ${t("overview.health.cores")} · ${t("instances.res.heavy")} ${heavyActive}/${heavySlots}`}
         />
         <ResourceStat
           icon={<MemoryStick className="h-3 w-3" />}
-          label="HOST MEMORY"
+          label={t("instances.res.memory")}
           value={`${ramPct}%`}
           sub={(() => {
-            const used = `${Math.round(ramUsed)}MB used${rss > 0 ? ` · xalgorix ${rss}MB RSS` : ""}`
-            const capacity = `Capacity ${resources.effective_max_instances} · ${runningInstances} running · ${availableSlots} available`
+            const used = `${Math.round(ramUsed)}MB ${t("instances.res.used")}${rss > 0 ? ` · xalgorix ${rss}MB RSS` : ""}`
+            const capacity = `${t("instances.res.capacity")} ${resources.effective_max_instances} · ${t("status.running")} ${runningInstances} · ${t("instances.res.available")} ${availableSlots}`
             const cap = scanMem > 0
-              ? `${capacity} · scan ${scanMem}MB${toolLimitText}`
+              ? `${capacity} · ${t("instances.res.scanMem")} ${scanMem}MB${toolLimitText}`
               : capacity
             return `${used} · ${cap}`
           })()}
         />
         <ResourceStat
           icon={<HardDrive className="h-3 w-3" />}
-          label="DISK FREE"
+          label={t("instances.res.disk")}
           value={`${diskFreeGb}GB`}
-          sub="Used for scan logs, tool output, reports"
+          sub={t("instances.res.diskHint")}
         />
         <div className={`rounded-md border px-3 py-2 text-xs ${levelColor}`}>
-          <div className="uppercase tracking-wide opacity-70">Host resource level</div>
+          <div className="uppercase tracking-wide opacity-70">{t("instances.res.level")}</div>
           <div className="mt-0.5 font-medium capitalize">{resources.level || "ok"}</div>
           {shouldShowResourceReason(resources) && (
             <div className="mt-0.5 opacity-70 line-clamp-2">{heap > 0 ? `Go heap ${heap}MB. ` : ""}{resources.reason}</div>
@@ -276,6 +287,7 @@ function ResourceStat({
 }
 
 function InstanceCard({ instance }: { instance: ScanInstance }) {
+  const { t } = useI18n()
   const stop = useStopInstance()
   const pause = usePauseInstance()
   const resume = useResumeInstance()
@@ -288,12 +300,9 @@ function InstanceCard({ instance }: { instance: ScanInstance }) {
   const canStop = status === "running" || status === "pending" || status === "paused"
   const canStart = status === "saved" || status === "stopped" || status === "failed" || status === "finished"
   const isActive = status === "running" || status === "pending" || status === "paused"
+  const [confirmDelete, setConfirmDelete] = useState(false)
 
   function handleDelete() {
-    const label = isActive
-      ? "This instance is still active. Deleting it will stop the scan and permanently remove the instance and its saved data. Continue?"
-      : "Permanently delete this instance and its saved data?"
-    if (!window.confirm(label)) return
     del.mutate(instance.id)
   }
 
@@ -317,17 +326,17 @@ function InstanceCard({ instance }: { instance: ScanInstance }) {
         <div className="grid grid-cols-3 gap-2">
           <Stat
             icon={<ShieldAlert className="h-3 w-3" />}
-            label="VULNS"
+            label={t("instances.stat.vulns")}
             value={String(instance.vuln_count ?? 0)}
           />
           <Stat
             icon={<Layers className="h-3 w-3" />}
-            label="ITERS"
+            label={t("instances.stat.iters")}
             value={String(instance.iterations ?? 0)}
           />
           <Stat
             icon={<Coins className="h-3 w-3" />}
-            label="TOKENS"
+            label={t("common.tokens")}
             value={
               instance.total_tokens
                 ? compactNumber(instance.total_tokens)
@@ -344,14 +353,14 @@ function InstanceCard({ instance }: { instance: ScanInstance }) {
         />
         <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border pt-2 text-xs text-muted-foreground">
           <div>
-            <div>Started {timeAgo(instance.started_at)}</div>
+            <div>{t("instances.startedPrefix")}{timeAgo(instance.started_at)}</div>
             <div className="mono">
               {formatDuration(instance.started_at, instance.finished_at)}
             </div>
           </div>
           <Button asChild size="sm" variant="ghost" className="h-7">
             <Link to={`/scans/${instance.id}`}>
-              Open <ExternalLink className="ml-1 h-3 w-3" />
+              {t("common.open")} <ExternalLink className="ml-1 h-3 w-3" />
             </Link>
           </Button>
         </div>
@@ -363,7 +372,7 @@ function InstanceCard({ instance }: { instance: ScanInstance }) {
               disabled={start.isPending}
               onClick={() => start.mutate(instance.id)}
             >
-              <Play className="mr-1 h-3.5 w-3.5" /> Start
+              <Play className="mr-1 h-3.5 w-3.5" /> {t("instances.action.start")}
             </Button>
           )}
           {canPause && (
@@ -373,7 +382,7 @@ function InstanceCard({ instance }: { instance: ScanInstance }) {
               disabled={pause.isPending}
               onClick={() => pause.mutate(instance.id)}
             >
-              <Pause className="mr-1 h-3.5 w-3.5" /> Pause
+              <Pause className="mr-1 h-3.5 w-3.5" /> {t("console.pause")}
             </Button>
           )}
           {canResume && (
@@ -383,7 +392,7 @@ function InstanceCard({ instance }: { instance: ScanInstance }) {
               disabled={resume.isPending}
               onClick={() => resume.mutate(instance.id)}
             >
-              <Play className="mr-1 h-3.5 w-3.5" /> Resume
+              <Play className="mr-1 h-3.5 w-3.5" /> {t("console.resume")}
             </Button>
           )}
           {canStop && (
@@ -393,7 +402,7 @@ function InstanceCard({ instance }: { instance: ScanInstance }) {
               disabled={stop.isPending}
               onClick={() => stop.mutate({ id: instance.id })}
             >
-              <Square className="mr-1 h-3.5 w-3.5" /> Stop
+              <Square className="mr-1 h-3.5 w-3.5" /> {t("console.stop")}
             </Button>
           )}
           <Button
@@ -402,19 +411,42 @@ function InstanceCard({ instance }: { instance: ScanInstance }) {
             disabled={restart.isPending}
             onClick={() => restart.mutate(instance.id)}
           >
-            <RotateCw className="mr-1 h-3.5 w-3.5" /> Restart
+            <RotateCw className="mr-1 h-3.5 w-3.5" /> {t("instances.action.restart")}
           </Button>
           <Button
             size="sm"
             variant="ghost"
             className="text-red-600 hover:bg-red-500/10 hover:text-red-700 dark:text-red-400 dark:hover:text-red-300"
             disabled={del.isPending}
-            onClick={handleDelete}
+            onClick={() => setConfirmDelete(true)}
           >
-            <Trash2 className="mr-1 h-3.5 w-3.5" /> Delete
+            <Trash2 className="mr-1 h-3.5 w-3.5" /> {t("common.delete")}
           </Button>
         </div>
       </CardContent>
+      <AlertDialog open={confirmDelete} onOpenChange={setConfirmDelete}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t("instances.deleteTitle")}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {isActive ? t("instances.deleteActive") : t("instances.deleteConfirm")}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
+            <AlertDialogAction
+              variant="destructive"
+              disabled={del.isPending}
+              onClick={() => {
+                handleDelete()
+                setConfirmDelete(false)
+              }}
+            >
+              {t("common.delete")}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </Card>
   )
 }

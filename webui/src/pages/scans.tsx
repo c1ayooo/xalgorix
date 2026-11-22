@@ -16,6 +16,16 @@ import {
 import { ScanStatusPill } from "@/components/scan-status-pill";
 import { EmptyState, ErrorState } from "@/components/states";
 import { Skeleton } from "@/components/ui/skeleton";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { useDeleteScan, useScansPage } from "@/api/queries";
 import { cn, timeAgo, shortId, menuContentClass, menuItemClass } from "@/lib/utils";
 import { useDebounced } from "@/lib/use-debounced";
@@ -31,16 +41,15 @@ import {
   ShieldAlert,
   Trash2,
 } from "lucide-react";
-import NewScanDialog from "@/components/new-scan-dialog";
 
 export default function ScansPage() {
   const { t } = useI18n();
   const [q, setQ] = useState("");
   const [status, setStatus] = useState<string>("all");
-  const [newOpen, setNewOpen] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState<number>(DEFAULT_PAGE_SIZE);
+  const [pendingDelete, setPendingDelete] = useState<string[] | null>(null);
   const debouncedQ = useDebounced(q, 300);
 
   // Reset to the first page whenever the filters change shape.
@@ -90,11 +99,6 @@ export default function ScansPage() {
   async function deleteScans(ids: string[]) {
     const uniqueIds = [...new Set(ids)].filter(Boolean);
     if (!uniqueIds.length) return;
-    const label =
-      uniqueIds.length === 1
-        ? t("scans.confirmDeleteOne")
-        : `${t("scans.confirmDeleteManyBefore")}${uniqueIds.length}${t("scans.confirmDeleteManyAfter")}`;
-    if (!window.confirm(label)) return;
     const settled = await Promise.allSettled(
       uniqueIds.map((id) => del.mutateAsync(id)),
     );
@@ -169,7 +173,7 @@ export default function ScansPage() {
               <BulkActionMenu
                 disabled={selectedIds.size === 0 || del.isPending}
                 selectedCount={selectedIds.size}
-                onDelete={() => void deleteScans([...selectedIds])}
+                onDelete={() => setPendingDelete([...selectedIds])}
               />
             </div>
           )}
@@ -193,9 +197,11 @@ export default function ScansPage() {
           title={t("scans.empty.title")}
           description={t("scans.empty.description")}
           action={
-            <Button onClick={() => setNewOpen(true)}>
-              <Plus className="mr-1 h-4 w-4" />
-              {t("scans.newScan")}
+            <Button asChild>
+              <Link to="/tasks">
+                <Plus className="mr-1 h-4 w-4" />
+                {t("tasks.create")}
+              </Link>
             </Button>
           }
         />
@@ -212,7 +218,7 @@ export default function ScansPage() {
               if (checked) selectAllVisible();
               else clearSelection();
             }}
-            onDelete={(id) => void deleteScans([id])}
+            onDelete={(id) => setPendingDelete([id])}
           />
           <Card>
             <Pagination
@@ -227,7 +233,35 @@ export default function ScansPage() {
         </>
       )}
 
-      <NewScanDialog open={newOpen} onOpenChange={setNewOpen} />
+      <AlertDialog
+        open={!!pendingDelete}
+        onOpenChange={(v) => !v && setPendingDelete(null)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t("scans.deleteTitle")}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {pendingDelete
+                ? pendingDelete.length === 1
+                  ? t("scans.confirmDeleteOne")
+                  : `${t("scans.confirmDeleteManyBefore")}${pendingDelete.length}${t("scans.confirmDeleteManyAfter")}`
+                : ""}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
+            <AlertDialogAction
+              variant="destructive"
+              onClick={() => {
+                void deleteScans(pendingDelete ?? []);
+                setPendingDelete(null);
+              }}
+            >
+              {t("common.delete")}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }
@@ -435,10 +469,12 @@ function BulkActionMenu({
           <DropdownMenu.Separator className="-mx-1 my-1 h-px bg-border" />
           <DropdownMenu.Item
             className={cn(menuItemClass, "text-red-600 focus:text-red-700 dark:text-red-400 dark:focus:text-red-300")}
-            onSelect={(event) => {
-              event.preventDefault();
-              onDelete();
-            }}
+            // Do NOT preventDefault: the menu must unmount before the confirm
+            // AlertDialog mounts, or the two stacked Radix modal layers capture
+            // mismatched body pointer-events originals and the last unmount
+            // leaves body { pointer-events: none } — the whole page dead until
+            // reload (see DismissableLayer last-restorer-wins).
+            onSelect={() => onDelete()}
           >
             <Trash2 className="h-3.5 w-3.5" />
             {t("scans.deleteSelected")}
@@ -491,10 +527,9 @@ function RowActionMenu({
               menuItemClass,
               "text-red-600 focus:text-red-700 dark:text-red-400 dark:focus:text-red-300 data-[disabled]:pointer-events-none data-[disabled]:opacity-50",
             )}
-            onSelect={(event) => {
-              event.preventDefault();
-              onDelete();
-            }}
+            // Same layer-ordering constraint as the bulk delete above: the
+            // menu must close before the confirm dialog opens.
+            onSelect={() => onDelete()}
           >
             <Trash2 className="h-3.5 w-3.5" />
             {t("scans.deleteScan")}

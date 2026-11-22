@@ -5,6 +5,7 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Button } from "@/components/ui/button"
 import { useAuth } from "@/store/auth"
+import { useI18n } from "@/i18n"
 import { HttpError } from "@/api/client"
 import { AlertCircle } from "lucide-react"
 
@@ -14,7 +15,7 @@ import { AlertCircle } from "lucide-react"
  * we can pick a friendly message per status code instead of leaking the
  * raw `HTTP 401 Unauthorized: {"error":"…"}` envelope.
  */
-function describeLoginError(err: unknown): string {
+function describeLoginError(err: unknown, t: (k: string) => string): string {
   if (err instanceof HttpError) {
     const serverMsg =
       err.data && typeof err.data === "object" && "error" in (err.data as Record<string, unknown>)
@@ -22,45 +23,51 @@ function describeLoginError(err: unknown): string {
         : ""
     switch (err.status) {
       case 0:
-        return "Cannot reach the server. Check your network or that the Xalgorix service is running."
+        return t("login.err.network")
       case 400:
-        return serverMsg || "Invalid request. Please try again."
+        return serverMsg || t("login.err.badRequest")
       case 401:
-        return "Invalid username or password."
+        return t("login.err.invalidCredentials")
       case 403:
-        return serverMsg || "Request blocked by the server (CSRF check failed)."
+        return serverMsg || t("login.err.forbidden")
       case 404:
         // The login endpoint is missing on the server. This is almost
         // always a stale Go binary — the SPA was rebuilt with the
         // /api/auth/login client but the embedded server wasn't.
-        return "Login endpoint not found on this server. The backend appears to be out of date — rebuild and redeploy the Xalgorix server."
+        return t("login.err.notFound")
       case 405:
-        return "This server doesn't accept the login request shape. Try refreshing the page."
+        return t("login.err.methodNotAllowed")
+      case 409:
+        return serverMsg || t("login.err.generic")
       case 429: {
         const wait = err.retryAfter ?? 0
         return wait > 0
-          ? `Too many failed attempts. Try again in ${wait}s.`
-          : serverMsg || "Too many failed attempts. Please wait a moment and try again."
+          ? `${t("login.err.rateLimitedBefore")}${wait}${t("login.err.rateLimitedAfter")}`
+          : serverMsg || t("login.err.rateLimited")
       }
       case 500:
       case 502:
       case 503:
       case 504:
-        return "Server error. Please try again in a moment."
+        return t("login.err.server")
       default:
-        return serverMsg || `Sign in failed (HTTP ${err.status}).`
+        return serverMsg || t("login.err.generic")
     }
   }
   if (err instanceof Error) return err.message
-  return "Sign in failed"
+  return t("login.err.generic")
 }
 
 export default function LoginPage() {
+  const { t } = useI18n()
   const navigate = useNavigate()
   const location = useLocation()
   const login = useAuth((s) => s.login)
+  const setup = useAuth((s) => s.setup)
+  const needsSetup = useAuth((s) => s.needsSetup)
   const [username, setUsername] = useState("")
   const [password, setPassword] = useState("")
+  const [confirm, setConfirm] = useState("")
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
 
@@ -71,10 +78,18 @@ export default function LoginPage() {
     setError(null)
     setLoading(true)
     try {
-      await login(username, password)
+      if (needsSetup) {
+        if (password !== confirm) {
+          setError(t("login.err.confirmMismatch"))
+          return
+        }
+        await setup(username, password)
+      } else {
+        await login(username, password)
+      }
       navigate(from, { replace: true })
     } catch (err) {
-      setError(describeLoginError(err))
+      setError(describeLoginError(err, t))
     } finally {
       setLoading(false)
     }
@@ -90,16 +105,15 @@ export default function LoginPage() {
         <div className="space-y-6">
           <div className="space-y-2">
             <h1 className="font-sans text-4xl font-semibold tracking-tight text-foreground text-balance">
-              The autonomous offensive AI platform.
+              {t("login.heroTitle")}
             </h1>
             <p className="max-w-md text-sm leading-relaxed text-muted-foreground">
-              Continuous reconnaissance, multi-phase exploitation, and AI-driven triage — orchestrated from a single
-              console.
+              {t("login.heroSubtitle")}
             </p>
           </div>
 
         </div>
-        <p className="text-xs text-muted-foreground">© Xalgorix · Internal use only</p>
+        <p className="text-xs text-muted-foreground">{t("login.footerInternal")}</p>
       </div>
 
       <div className="flex items-center justify-center p-6 sm:p-12">
@@ -110,13 +124,17 @@ export default function LoginPage() {
           </div>
           <Card>
             <CardHeader>
-              <CardTitle>Sign in</CardTitle>
-              <CardDescription>Operator console access</CardDescription>
+              <CardTitle>
+                {needsSetup ? t("login.setupTitle") : t("login.title")}
+              </CardTitle>
+              <CardDescription>
+                {needsSetup ? t("login.setupSubtitle") : t("login.subtitle")}
+              </CardDescription>
             </CardHeader>
             <CardContent>
               <form onSubmit={onSubmit} className="space-y-4">
                 <div className="space-y-2">
-                  <Label htmlFor="username">Username</Label>
+                  <Label htmlFor="username">{t("login.username")}</Label>
                   <Input
                     id="username"
                     autoComplete="username"
@@ -127,16 +145,29 @@ export default function LoginPage() {
                   />
                 </div>
                 <div className="space-y-2">
-                  <Label htmlFor="password">Password</Label>
+                  <Label htmlFor="password">{needsSetup ? t("login.setupPassword") : t("login.password")}</Label>
                   <Input
                     id="password"
                     type="password"
-                    autoComplete="current-password"
+                    autoComplete={needsSetup ? "new-password" : "current-password"}
                     value={password}
                     onChange={(e) => setPassword(e.target.value)}
                     required
                   />
                 </div>
+                {needsSetup && (
+                  <div className="space-y-2">
+                    <Label htmlFor="confirm">{t("login.confirmPassword")}</Label>
+                    <Input
+                      id="confirm"
+                      type="password"
+                      autoComplete="new-password"
+                      value={confirm}
+                      onChange={(e) => setConfirm(e.target.value)}
+                      required
+                    />
+                  </div>
+                )}
                 {error && (
                   <div className="flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive">
                     <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
@@ -144,13 +175,17 @@ export default function LoginPage() {
                   </div>
                 )}
                 <Button type="submit" className="w-full" disabled={loading}>
-                  {loading ? "Signing in…" : "Sign in"}
+                  {loading
+                    ? t("login.signingIn")
+                    : needsSetup
+                      ? t("login.setupSubmit")
+                      : t("login.signIn")}
                 </Button>
               </form>
             </CardContent>
           </Card>
           <p className="mt-6 text-center text-xs text-muted-foreground">
-            Protected by CSRF · Session cookies are HTTP-only
+            {needsSetup ? t("login.setupNote") : t("login.securityNote")}
           </p>
         </div>
       </div>

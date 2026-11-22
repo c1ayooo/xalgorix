@@ -9,12 +9,23 @@ import { EmptyState } from "@/components/states";
 import { useDeleteScan, useScansList } from "@/api/queries";
 import { timeAgo } from "@/lib/utils";
 import { useI18n } from "@/i18n";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 
 export default function ReportsPage() {
   const { t } = useI18n();
   const { data: scans, isLoading } = useScansList();
   const del = useDeleteScan();
   const [query, setQuery] = useState("");
+  const [deletingId, setDeletingId] = useState<string | null>(null);
 
   const list = useMemo(() => {
     const q = query.toLowerCase();
@@ -104,11 +115,7 @@ export default function ReportsPage() {
                     variant="ghost"
                     className="text-red-600 hover:text-red-700 dark:text-red-400 dark:hover:text-red-300"
                     disabled={del.isPending}
-                    onClick={() => {
-                      if (window.confirm(t("reports.confirmDelete"))) {
-                        del.mutate(s.id);
-                      }
-                    }}
+                    onClick={() => setDeletingId(s.id)}
                   >
                     <Trash2 className="h-3.5 w-3.5" /> {t("common.delete")}
                   </Button>
@@ -118,6 +125,33 @@ export default function ReportsPage() {
           </ul>
         )}
       </Card>
+
+      <AlertDialog
+        open={!!deletingId}
+        onOpenChange={(v) => !v && setDeletingId(null)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t("reports.deleteTitle")}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {t("reports.confirmDelete")}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
+            <AlertDialogAction
+              variant="destructive"
+              disabled={del.isPending}
+              onClick={() => {
+                if (deletingId) del.mutate(deletingId);
+                setDeletingId(null);
+              }}
+            >
+              {t("common.delete")}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

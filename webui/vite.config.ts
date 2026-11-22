@@ -100,7 +100,6 @@ export default defineConfig({
     port: 5173,
     proxy: {
       "/api": API_TARGET,
-      "/ws": { target: API_TARGET.replace(/^http/, "ws"), ws: true },
       "/uploads": API_TARGET,
     },
   },

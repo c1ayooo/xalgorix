@@ -30,8 +30,41 @@ export interface VulnSummary {
   tags?: string[];
 }
 
+// One raw HTTP request/response pair from the per-scan traffic archive
+// (GET /api/scans/{id}/traffic). request_raw / response_raw are wire-fidelity
+// renderings the proxy captured; nothing is masked.
+export interface HttpExchange {
+  seq: number;
+  at: string;
+  method: string;
+  url: string;
+  status?: number;
+  channel?: string; // bearer / subprocess
+  high_risk?: string; // AssessHTTP reason when the request pended the proxy gate
+  denied?: boolean; // 403 by the proxy-side approval gate
+  upstream?: string;
+  request_raw?: string;
+  response_raw?: string;
+  request_truncated?: boolean;
+  response_truncated?: boolean;
+}
+
+// GET /api/scans/{id}/traffic response. present distinguishes "no traffic
+// archive exists for this scan" from an empty match.
+export interface ScanTrafficView {
+  scan_id: string;
+  exchanges: HttpExchange[];
+  total_matched: number;
+  truncated: boolean;
+  present: boolean;
+}
+
 export interface WSEvent {
   type: string;
+  // SSE 实时帧的全局流序号（/api/stream id: 行同源）。仅实时扇出携带，
+  // REST 历史条目没有——只作 live 排序锚点，不参与 dedupe（dedupe 走
+  // ts|instance|type|tool|msg 键）。
+  seq?: number;
   content?: string;
   tool_name?: string;
   tool_args?: Record<string, string>;
@@ -116,6 +149,11 @@ export interface SubScanSummary extends AssessmentOutcome {
 export interface ScanRecord extends AssessmentOutcome {
   id: string;
   instance_id?: string;
+  // RESPONSE-ONLY linkage hints (server resolves the platform run mount at
+  // read time; empty = unmounted legacy scan). The guidance composer needs
+  // task_id to reach POST /api/tasks/{id}/guidance and hides without it.
+  run_id?: string;
+  task_id?: string;
   name?: string;
   target: string;
   parent_target?: string;
@@ -167,6 +205,41 @@ export interface ScanEventsPage {
   total: number;
   offset: number;
   limit: number;
+}
+
+/**
+ * Read-only artifact/workspace browser (GET /api/scans/{id}/files*).
+ * `type` distinguishes openable entries from symlinks (listed for visibility,
+ * refused on open) and special files (devices/fifos).
+ */
+export type ScanFileType = "dir" | "file" | "link" | "other";
+
+/** One row of a single-level directory listing. */
+export interface ScanFileEntry {
+  name: string;
+  type: ScanFileType;
+  size: number;
+  /** Unix epoch milliseconds. */
+  mtime: number;
+}
+
+/** Single-level listing of one directory inside the scan dir. */
+export interface ScanFileListing {
+  path: string;
+  entries: ScanFileEntry[];
+  /** True when the server capped the listing (deeper levels are fetched lazily). */
+  truncated: boolean;
+}
+
+/** Bounded inline text read of one file. Binary files carry no content. */
+export interface ScanFileContent {
+  path: string;
+  size: number;
+  mtime: number;
+  truncated: boolean;
+  binary: boolean;
+  /** Present only for text reads; omitted for binary files. */
+  content?: string;
 }
 
 export interface ScanListItem {
@@ -256,9 +329,31 @@ export interface VersionInfo {
   };
 }
 
+// RBAC role carried in JWT claims, /api/users and the auth status payload.
+export type Role = "admin" | "operator" | "viewer";
+
+export interface AuthUser {
+  username: string;
+  role: Role;
+}
+
 export interface AuthStatus {
   auth_enabled: boolean;
   authenticated: boolean;
+  // True when no account exists and no env credentials can seed one — the
+  // login page then offers the first-admin bootstrap form.
+  needs_setup: boolean;
+  // Authenticated identity (cookie session); null when anonymous.
+  user: AuthUser | null;
+}
+
+export interface ManagedUser {
+  id: string;
+  username: string;
+  role: Role;
+  disabled: boolean;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface ScanRequest {
@@ -430,12 +525,6 @@ export interface QueueStatus {
 export interface RateLimitSettings {
   requests: number;
   window: number;
-}
-
-export interface AgentMailSettings {
-  pod: string;
-  apiKey: string;
-  hasApiKey: boolean;
 }
 
 export interface LLMSettings {
@@ -640,6 +729,102 @@ export interface TaskPhasePolicy {
   intensity?: "active" | "passive";
 }
 
+/** Structured task objective (REDESIGN §3.1 "验收说明"). */
+export type ObjectiveKind =
+  | "engagement"
+  | "capability"
+  | "finding_class"
+  | "coverage";
+
+export type ObjectiveCriterionKind = "finding_class" | "capability" | "coverage";
+
+export type ObjectiveVerifyBy = "deterministic" | "verifier" | "manual";
+
+export type ObjectiveCriterionState =
+  | "met"
+  | "unmet"
+  | "undetermined"
+  | "manual_pending";
+
+export interface ObjectiveCriterion {
+  id?: string;
+  kind: ObjectiveCriterionKind;
+  vuln_class?: string;
+  capability?: string;
+  verify_by: ObjectiveVerifyBy;
+  required?: boolean;
+}
+
+export interface Objective {
+  kind: ObjectiveKind;
+  statement?: string;
+  criteria?: ObjectiveCriterion[];
+  /** 操作者 may/may-not 规则（goal 分析抽取）；只收窄不放大。 */
+  constraints?: string[];
+}
+
+/** POST /api/projects/{id}/analyze-goal 的判据草案行（R-goal）。 */
+export interface GoalProposalCriterion {
+  kind: ObjectiveCriterionKind;
+  vuln_class?: string;
+  capability?: string;
+  verify_by: ObjectiveVerifyBy;
+  required: boolean;
+  rationale?: string;
+}
+
+/** 目标意图分析草案：改写陈述 + 可判定判据 + 操作约束，供表单预填后编辑。 */
+export interface GoalProposal {
+  statement: string;
+  criteria?: GoalProposalCriterion[];
+  constraints?: string[];
+  notes?: string;
+}
+
+export interface ObjectiveCriterionStatus extends ObjectiveCriterion {
+  id: string;
+  state: ObjectiveCriterionState;
+  reason?: string;
+  evidence_finding_id?: string;
+  evidence_tag?: string;
+}
+
+export interface ObjectiveReport {
+  structured: boolean;
+  criteria: ObjectiveCriterionStatus[];
+  met: number;
+  unmet: number;
+  undetermined: number;
+  manual_pending: number;
+  attainment: number;
+}
+
+export interface ObjectiveSchedulable {
+  id: string;
+  vuln_class?: string;
+  endpoint?: string;
+  title?: string;
+  confidence: number;
+  voi?: number;
+}
+
+/** GET /api/tasks/{id}/objective — read-only objective evaluation. */
+export interface TaskObjectiveView {
+  objective: Objective | null;
+  structured: boolean;
+  report: ObjectiveReport;
+  runs: {
+    run_id: string;
+    scan_id: string;
+    status: string;
+    report: ObjectiveReport;
+  }[];
+  ring: string;
+  ring_basis: string;
+  gaps: string[];
+  schedulable: ObjectiveSchedulable[];
+}
+
 export interface TaskSchedule {
   interval: "hourly" | "daily" | "weekly" | "monthly";
   time?: string; // "HH:MM"
@@ -655,6 +840,8 @@ export interface Task {
   phase_policy?: TaskPhasePolicy;
   schedule?: TaskSchedule;
   context_paths?: string[];
+  /** Structured objective; absent = "not structured" (never inferred). */
+  objective?: Objective;
   created_at: string;
   updated_at?: string;
   archived_at?: string;
@@ -670,6 +857,10 @@ export interface Run {
   legacy_scan_id?: string;
   instance_id?: string;
   mode: string;
+  /** Conversation title shown in the chat sidebar (empty for pre-0011 mounts). */
+  title?: string;
+  pinned?: boolean;
+  archived?: boolean;
   status: string;
   started_at?: string;
   finished_at?: string;
@@ -742,12 +933,57 @@ export interface ApprovalsSummary {
   nearest_deadline?: string;
 }
 
+// 审批豁免规则（approve & remember，契约 §3.4）：两层闸共用查询，
+// 同一意图最多问一次。
+export interface ApprovalRuleMatch {
+  // kind = command
+  program?: string; // 程序 basename
+  // kind = http
+  method?: string;
+  host?: string;
+  path_prefix?: string;
+  // 共享收窄子串：命令文本 / URL+body
+  contains?: string;
+}
+
+export interface ApprovalRule {
+  id: string;
+  project_id: string;
+  project_name?: string;
+  kind: "command" | "http";
+  match: ApprovalRuleMatch;
+  reason?: string;
+  created_by?: string;
+  created_from_approval_id?: string;
+  created_at: string;
+  expires_at?: string;
+  hit_count: number;
+  last_hit_at?: string;
+}
+
+export interface ApprovalRuleRequest {
+  project_id: string;
+  kind: "command" | "http";
+  match: ApprovalRuleMatch;
+  reason?: string;
+  expires_at?: string;
+  created_from_approval_id?: string;
+}
+
+// 「批准并记住」的前端预填草稿（lib/approval-rule.ts 产出，卡片表单可编辑）。
+export type ApprovalRuleDraft = {
+  kind: "command" | "http";
+  match: ApprovalRuleMatch;
+};
+
 export interface TaskRequest {
   name: string;
   goal: string;
   instruction?: string;
   phase_policy?: TaskPhasePolicy;
   schedule?: TaskSchedule | null;
+  /** Structured objective; null clears it (PATCH), undefined leaves it. */
+  objective?: Objective | null;
 }
 
 export interface ProjectRequest {
@@ -765,6 +1001,7 @@ export interface Guidance {
   instance_id?: string;
   message: string;
   status: GuidanceStatus;
+  created_by?: string;
   created_at: string;
   consumed_at?: string;
 }
@@ -898,4 +1135,301 @@ export interface ColdPathSyncState {
   state: ColdPathState;
   last_error?: string;
   updated_at?: string;
+}
+
+// ── 集成模块：MCP 服务器 / 用户技能 / Agent 档案（契约 §integration-*） ──
+
+/** POST/GET /api/mcp-servers — MCP 服务器定义（env/headers 永远是打码回显）。 */
+export interface McpServer {
+  id: string;
+  name: string;
+  transport: "stdio" | "http";
+  command?: string;
+  args?: string[];
+  /** 打码回显："****" 前缀；提交原样回传表示「未修改」。 */
+  env?: Record<string, string>;
+  url?: string;
+  headers?: Record<string, string>;
+  enabled: boolean;
+  require_approval: boolean;
+  timeout_seconds: number;
+  tool_count: number;
+  last_healthy_at?: string;
+  last_error?: string;
+  created_by?: string;
+  created_at: string;
+  updated_at?: string;
+}
+
+export interface McpServerRequest {
+  name: string;
+  transport: "stdio" | "http";
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  url?: string;
+  headers?: Record<string, string>;
+  enabled: boolean;
+  require_approval: boolean;
+  timeout_seconds?: number;
+}
+
+export interface McpServerPatch {
+  name?: string;
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  url?: string;
+  headers?: Record<string, string>;
+  enabled?: boolean;
+  require_approval?: boolean;
+  timeout_seconds?: number;
+}
+
+/** GET /api/skills — 用户技能（内置语料在引擎侧，不在此列）。 */
+export interface UserSkill {
+  id: string;
+  name: string;
+  category: string;
+  description: string;
+  tags?: string[];
+  intent?: string;
+  body: string;
+  enabled: boolean;
+  created_by?: string;
+  created_at: string;
+  updated_at?: string;
+}
+
+export interface UserSkillRequest {
+  name: string;
+  description: string;
+  tags?: string[];
+  intent?: string;
+  body: string;
+  enabled: boolean;
+}
+
+export interface UserSkillPatch {
+  name?: string;
+  description?: string;
+  tags?: string[];
+  intent?: string;
+  body?: string;
+  enabled?: boolean;
+}
+
+/** GET /api/agent-profiles — 内置行（builtin=true，只读）与用户行合并。 */
+export interface AgentProfile {
+  id: string;
+  role: string;
+  focus: string;
+  vuln_classes?: string[];
+  evidence_contract: string;
+  stopping_rule: string;
+  tool_scope_hidden?: string[];
+  enabled: boolean;
+  builtin: boolean;
+  created_by?: string;
+  created_at: string;
+  updated_at?: string;
+}
+
+export interface AgentProfileRequest {
+  role: string;
+  focus: string;
+  vuln_classes?: string[];
+  evidence_contract: string;
+  stopping_rule: string;
+  tool_scope_hidden?: string[];
+  enabled: boolean;
+}
+
+export interface AgentProfilePatch {
+  role?: string;
+  focus?: string;
+  vuln_classes?: string[];
+  evidence_contract?: string;
+  stopping_rule?: string;
+  tool_scope_hidden?: string[];
+  enabled?: boolean;
+}
+
+/** 调用记录（跨扫描检索投影；模块 = mcp | skills | agents）。 */
+export type InvocationModule = "mcp" | "skills" | "agents";
+
+export interface InvocationRecord {
+  id: string;
+  module: InvocationModule;
+  ts: string;
+  instance_id?: string;
+  scan_id?: string;
+  agent_id?: string;
+  name: string;
+  server?: string;
+  status: "ok" | "error";
+  error?: string;
+  args?: string;
+  outcome?: string;
+}
+
+export interface InvocationList {
+  items: InvocationRecord[];
+  total: number;
+  page: number;
+  size: number;
+}
+
+export interface InvocationListParams {
+  page?: number;
+  size?: number;
+  instanceId?: string;
+  name?: string;
+  status?: "ok" | "error";
+}
+
+// ── Run 账本投影（GET /api/scans/{id}/ledger，契约 §3.6）────────────────────
+
+export type LedgerHypothesisStatus =
+  | "queued"
+  | "testing"
+  | "proven"
+  | "rejected"
+  | "blocked"
+  | "exhausted";
+
+export interface LedgerEvidence {
+  id: string;
+  kind: string;
+  summary: string;
+  request?: string;
+  response?: string;
+  finding_id?: string;
+  agent_id?: string;
+  /** 引擎 verifier 名（如 verify_sqli）；模型自写证据无此字段。 */
+  source?: string;
+  nature?: "observed" | "inferred";
+  supports?: string[];
+  confidence?: number;
+  created_at: string;
+}
+
+export interface LedgerHypothesis {
+  id: string;
+  dedup_key: string;
+  title: string;
+  vuln_class: string;
+  target?: string;
+  endpoint?: string;
+  parameter?: string;
+  role?: string;
+  data_flow?: string;
+  preconditions?: string[];
+  baseline?: string;
+  status: LedgerHypothesisStatus;
+  confidence: number;
+  voi?: number;
+  voi_estimated?: boolean;
+  assigned_to?: string;
+  next_action?: string;
+  attempts: number;
+  evidence?: LedgerEvidence[];
+  origin?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ScanLedgerView {
+  scan_id: string;
+  ledger_present: boolean;
+  ledger_damaged: boolean;
+  incomplete: boolean;
+  note?: string;
+  counts: Record<LedgerHypothesisStatus, number>;
+  hypotheses: LedgerHypothesis[];
+}
+
+// ── 任务情报（契约 §3.7）────────────────────────────────────────────────────
+
+export type IntelKind = "credential" | "lead" | "sensitive_data";
+export type IntelTriageStatus = "open" | "confirmed" | "dismissed";
+
+export interface IntelTriage {
+  task_id: string;
+  fingerprint: string;
+  status: IntelTriageStatus;
+  decided_by: string;
+  decided_at: string;
+}
+
+export interface IntelItem {
+  id: string;
+  fingerprint: string;
+  kind: IntelKind;
+  title: string;
+  content: string;
+  endpoint?: string;
+  confidence?: number;
+  created_at: string;
+  updated_at: string;
+  /** 记录了同一观测（同指纹）的各 Run。 */
+  scan_ids: string[];
+  triage?: IntelTriage;
+}
+
+export interface TaskIntelResponse {
+  items: IntelItem[];
+  counts: Record<IntelKind, number>;
+  triage_available: boolean;
+  damaged_runs?: number;
+  note?: string;
+}
+
+/** 会话转录的一行（docs/CHAT_PAGE_REDESIGN.md §4.2）。 */
+export type TranscriptKind =
+  | "human"
+  | "assistant"
+  | "tool_use"
+  | "tool_result"
+  | "approval"
+  | "finding"
+  | "system";
+
+export interface TranscriptItem {
+  seq: number;
+  kind: TranscriptKind;
+  role?: string;
+  text?: string;
+  tool?: string;
+  args?: unknown;
+  output?: string;
+  status?: string;
+  agent_id?: string;
+  at: string;
+  truncated?: boolean;
+}
+
+export interface TranscriptPage {
+  items: TranscriptItem[];
+  total: number;
+  has_more: boolean;
+  earliest_seq: number;
+  latest_seq: number;
+  running: boolean;
+}
+
+export interface ConversationRow extends Run {
+  task_name?: string;
+}
+
+export interface ConversationPatch {
+  title?: string;
+  pinned?: boolean;
+  archived?: boolean;
+}
+
+export interface ChatAttachment {
+  path: string;
+  name: string;
+  size: number;
 }

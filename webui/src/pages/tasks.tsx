@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
-import { CalendarClock, Play, Plus, Target } from "lucide-react";
+import { CalendarClock, Plus, Target } from "lucide-react";
 import { Link } from "react-router-dom";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -9,6 +9,7 @@ import { EmptyState, ErrorState } from "@/components/states";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ScanStatusPill } from "@/components/scan-status-pill";
 import { TaskFormDialog } from "@/components/task-form-dialog";
+import { TaskRunButton } from "@/components/task-run-button";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -19,7 +20,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
-import { useDeleteTask, useStartTaskRun, useTasks } from "@/api/queries";
+import { useDeleteTask, useTasks } from "@/api/queries";
 import { useActiveProjectId } from "@/lib/use-active-project";
 import { useI18n } from "@/i18n";
 import { timeAgo } from "@/lib/utils";
@@ -35,7 +36,6 @@ export default function TasksPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const projectId = useActiveProjectId();
   const { data, isLoading, error, refetch } = useTasks(projectId ?? undefined);
-  const startRun = useStartTaskRun();
   const del = useDeleteTask();
 
   const [formOpen, setFormOpen] = useState(false);
@@ -54,17 +54,6 @@ export default function TasksPage() {
       setSearchParams(sp, { replace: true });
     }
   }, [searchParams, setSearchParams]);
-
-  function runTask(task: Task) {
-    startRun.mutate(
-      { id: task.id },
-      {
-        onSuccess: () => toast.success(`${t("toast.runStarted")}: ${task.name}`),
-        onError: (err: Error) =>
-          toast.error(`${t("toast.runFailed")}: ${err.message}`),
-      },
-    );
-  }
 
   if (!projectId && !isLoading && !error) {
     return (
@@ -156,6 +145,15 @@ export default function TasksPage() {
                     {task.phase_policy?.scan_mode && (
                       <span className="mono">{task.phase_policy.scan_mode}</span>
                     )}
+                    {task.objective ? (
+                      <span className="rounded-sm bg-primary/10 px-1.5 py-0.5 text-primary">
+                        {t("tasks.objectiveBadge")}: {task.objective.kind}
+                      </span>
+                    ) : (
+                      <span className="text-muted-foreground/70">
+                        {t("taskDetail.objectiveNotStructured")}
+                      </span>
+                    )}
                     <span>
                       {t("tasks.runCount")} {task.run_count ?? 0}
                     </span>
@@ -176,14 +174,7 @@ export default function TasksPage() {
                   </div>
                 </div>
                 <div className="flex shrink-0 items-center gap-2">
-                  <Button
-                    size="sm"
-                    disabled={startRun.isPending}
-                    onClick={() => runTask(task)}
-                  >
-                    <Play className="h-3.5 w-3.5" />
-                    {t("tasks.run")}
-                  </Button>
+                  <TaskRunButton task={task} />
                   <Button
                     size="sm"
                     variant="outline"

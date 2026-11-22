@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 import { toast } from "sonner";
-import { useNavigate, useSearchParams } from "react-router-dom";
+import { useSearchParams } from "react-router-dom";
 import { Search, RefreshCw, Trash2, CheckCircle2, AlertTriangle } from "lucide-react";
 import {
   Card,
@@ -23,10 +23,19 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Switch } from "@/components/ui/switch";
 import { ErrorState } from "@/components/states";
 import {
-  useAgentMail,
   useAuthProfiles,
   useDeleteAuthProfile,
   useDiscoverProviderModels,
@@ -35,15 +44,12 @@ import {
   useProviders,
   useRateLimit,
   useRefreshAuthProfile,
-  useUpdateAgentMail,
   useUpdateEnvironmentSettings,
   useUpdateLLMSettings,
   useUpdateRateLimit,
-  useAuthStatus,
   useImportSettings,
 } from "@/api/queries";
 import { api } from "@/api/client";
-import { useAuth } from "@/store/auth";
 import type {
   AuthProfile,
   CatalogEntry,
@@ -60,7 +66,6 @@ const settingsTabs = [
   "llm",
   "engagement",
   "notifications",
-  "email",
   "environment",
   "account",
 ] as const;
@@ -122,15 +127,10 @@ export default function SettingsPage() {
   const { t } = useI18n();
   const rate = useRateLimit();
   const updateRate = useUpdateRateLimit();
-  const mail = useAgentMail();
-  const updateMail = useUpdateAgentMail();
   const llm = useLLMSettings();
   const updateLLM = useUpdateLLMSettings();
   const environment = useEnvironmentSettings();
   const updateEnvironment = useUpdateEnvironmentSettings();
-  const auth = useAuthStatus();
-  const logout = useAuth((s) => s.logout);
-  const navigate = useNavigate();
 
   const providers = useProviders();
   const profiles = useAuthProfiles();
@@ -138,7 +138,6 @@ export default function SettingsPage() {
   const deleteProfile = useDeleteAuthProfile();
 
   const [rateForm, setRateForm] = useState({ requests: 10, window: 1 });
-  const [mailForm, setMailForm] = useState({ pod: "", apiKey: "" });
   const [llmForm, setLLMForm] = useState<LLMFormState>(emptyLLMForm);
   const [oauthOpen, setOAuthOpen] = useState(false);
   const [notificationForm, setNotificationForm] = useState({
@@ -154,7 +153,6 @@ export default function SettingsPage() {
   const [envFilter, setEnvFilter] = useState("");
   const [envRestartRequired, setEnvRestartRequired] = useState(false);
   const [savedRate, setSavedRate] = useState(false);
-  const [savedMail, setSavedMail] = useState(false);
   const [savedLLM, setSavedLLM] = useState(false);
   const [savedNotifications, setSavedNotifications] = useState(false);
   const [savedEnvironment, setSavedEnvironment] = useState(false);
@@ -167,15 +165,6 @@ export default function SettingsPage() {
       });
     }
   }, [rate.data]);
-
-  useEffect(() => {
-    if (mail.data) {
-      setMailForm({
-        pod: mail.data.pod ?? "",
-        apiKey: mail.data.apiKey ?? "",
-      });
-    }
-  }, [mail.data]);
 
   useEffect(() => {
     if (!llm.data) return;
@@ -442,9 +431,7 @@ export default function SettingsPage() {
           <TabsTrigger value="llm">{t("settings.tab.llm")}</TabsTrigger>
           <TabsTrigger value="engagement">{t("settings.tab.engagement")}</TabsTrigger>
           <TabsTrigger value="notifications">{t("settings.tab.notifications")}</TabsTrigger>
-          <TabsTrigger value="email">{t("settings.tab.email")}</TabsTrigger>
           <TabsTrigger value="environment">{t("settings.tab.environment")}</TabsTrigger>
-          <TabsTrigger value="account">{t("settings.tab.account")}</TabsTrigger>
         </TabsList>
 
         <TabsContent value="llm">
@@ -1252,78 +1239,6 @@ export default function SettingsPage() {
           )}
         </TabsContent>
 
-        <TabsContent value="email">
-          {mail.isLoading ? (
-            <Skeleton className="h-72" />
-          ) : mail.error ? (
-            <ErrorState
-              title={t("settings.error.mail")}
-              description={mail.error instanceof Error ? mail.error.message : t("common.somethingWrong")}
-              action={
-                <Button size="sm" variant="outline" onClick={() => mail.refetch()}>
-                  {t("common.retry")}
-                </Button>
-              }
-            />
-          ) : (
-            <Card>
-              <CardHeader>
-                <CardTitle>{t("settings.card.agentMail")}</CardTitle>
-                <CardDescription>
-                  {t("settings.mail.desc")}
-                </CardDescription>
-              </CardHeader>
-              <CardContent className="space-y-5">
-                <div className="space-y-2">
-                  <Label htmlFor="pod">{t("settings.mail.pod")}</Label>
-                  <Input
-                    id="pod"
-                    value={mailForm.pod}
-                    onChange={(e) =>
-                      setMailForm({ ...mailForm, pod: e.target.value })
-                    }
-                    placeholder="xalgorix-prod"
-                    className="font-mono"
-                  />
-                </div>
-                <div className="space-y-2">
-                  <Label htmlFor="apikey">{t("settings.mail.apiKey")}</Label>
-                  <Input
-                    id="apikey"
-                    value={mailForm.apiKey}
-                    onChange={(e) =>
-                      setMailForm({ ...mailForm, apiKey: e.target.value })
-                    }
-                    placeholder={mail.data?.hasApiKey ? "**** (saved)" : "ak_..."}
-                    className="font-mono"
-                  />
-                  <p className="text-xs text-muted-foreground">
-                    {t("settings.mail.keepMasked")}
-                  </p>
-                </div>
-                <Separator />
-                <div className="flex items-center justify-end gap-3">
-                  {savedMail && (
-                    <span className="text-xs text-success">{t("settings.savedIndicator")}</span>
-                  )}
-                  <Button
-                    onClick={async () => {
-                      setSavedMail(false);
-                      await updateMail.mutateAsync(mailForm);
-                      setSavedMail(true);
-                      toast.success(t("toast.saved"));
-                      setTimeout(() => setSavedMail(false), 2500);
-                    }}
-                    disabled={updateMail.isPending}
-                  >
-                    {updateMail.isPending ? t("settings.saving") : t("common.save")}
-                  </Button>
-                </div>
-              </CardContent>
-            </Card>
-          )}
-        </TabsContent>
-
         <TabsContent value="environment">
           {environment.isLoading ? (
             <Skeleton className="h-96" />
@@ -1421,48 +1336,9 @@ export default function SettingsPage() {
           )}
         </TabsContent>
 
-        <TabsContent value="account">
-          <Card>
-            <CardHeader>
-              <CardTitle>{t("settings.card.account")}</CardTitle>
-              <CardDescription>{t("settings.account.desc")}</CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-4">
-              <div className="grid gap-2 text-sm sm:grid-cols-2">
-                <Field
-                  label={t("settings.account.auth")}
-                  value={
-                    auth.data?.auth_enabled
-                      ? auth.data.authenticated
-                        ? t("settings.account.authenticated")
-                        : t("settings.account.loggedOut")
-                      : t("settings.account.disabled")
-                  }
-                />
-                <Field
-                  label={t("settings.account.session")}
-                  value={auth.data?.authenticated ? t("settings.account.active") : t("settings.account.none")}
-                />
-              </div>
-              {auth.data?.auth_enabled && (
-                <>
-                  <Separator />
-                  <div className="flex justify-end">
-                    <Button
-                      variant="destructive"
-                      onClick={async () => {
-                        await logout();
-                        navigate("/login", { replace: true });
-                      }}
-                    >
-                      {t("settings.account.signOut")}
-                    </Button>
-                  </div>
-                </>
-              )}
-            </CardContent>
-          </Card>
-        </TabsContent>
+        {/* Account identity + sign-out live in the sidebar account menu
+            (components/account-menu.tsx) — this tab was removed to keep the
+            settings surface free of duplicated state. */}
       </Tabs>
     </div>
   );
@@ -1773,17 +1649,6 @@ function EnvironmentControl({
   );
 }
 
-function Field({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="rounded-md border border-border bg-muted/30 p-3">
-      <div className="text-xs uppercase tracking-wider text-muted-foreground">
-        {label}
-      </div>
-      <div className="mt-1 font-mono text-sm text-foreground">{value}</div>
-    </div>
-  );
-}
-
 function envValue(data: EnvironmentSettings | undefined, key: string) {
   return data?.variables.find((variable) => variable.key === key)?.value ?? "";
 }
@@ -1846,6 +1711,19 @@ function maskedTokenLabel(profile: AuthProfile, t: (key: string) => string): str
   return t("settings.llm.noToken");
 }
 
+// Human-readable tally of what a parsed backup file contains, shown as a
+// mono line inside the import confirmation dialog (UI_DESIGN §4 机器数据等宽).
+function backupCountsLine(
+  backup: SettingsBackup,
+  t: (key: string) => string,
+): string {
+  return [
+    `${Object.keys(backup.env ?? {}).length} ${t("settings.backup.countEnv")}`,
+    `${backup.profiles?.length ?? 0} ${t("settings.backup.countProfiles")}`,
+    `${backup.llm_keys?.length ?? 0} ${t("settings.backup.countKeys")}`,
+  ].join(", ");
+}
+
 // Backup & migration: export the full configuration (environment variables,
 // LLM auth profiles, provider keys — secrets in cleartext, operator-session
 // only) to a JSON file, or merge a previous backup into this install.
@@ -1860,6 +1738,7 @@ function BackupMigrationCard({
   const fileRef = useRef<HTMLInputElement>(null);
   const [summary, setSummary] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [pendingImport, setPendingImport] = useState<SettingsBackup | null>(null);
 
   async function onExport() {
     setError(null);
@@ -1887,12 +1766,14 @@ function BackupMigrationCard({
     if (!file) return;
     try {
       const backup = JSON.parse(await file.text()) as SettingsBackup;
-      const counts = [
-        `${Object.keys(backup.env ?? {}).length} ${t("settings.backup.countEnv")}`,
-        `${backup.profiles?.length ?? 0} ${t("settings.backup.countProfiles")}`,
-        `${backup.llm_keys?.length ?? 0} ${t("settings.backup.countKeys")}`,
-      ].join(", ");
-      if (!window.confirm(`${t("settings.backup.confirm")}\n${counts}`)) return;
+      setPendingImport(backup);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t("settings.backup.importFailed"));
+    }
+  }
+
+  async function runImport(backup: SettingsBackup) {
+    try {
       const res: SettingsImportResult = await importSettings.mutateAsync(backup);
       const bits = [
         `${res.env_applied} ${t("settings.backup.countEnv")}`,
@@ -1949,6 +1830,36 @@ function BackupMigrationCard({
           </span>
         )}
       </CardContent>
+      <AlertDialog
+        open={!!pendingImport}
+        onOpenChange={(v) => !v && setPendingImport(null)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t("settings.backup.confirmTitle")}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {t("settings.backup.confirm")}
+              {pendingImport && (
+                <span className="mono mt-2 block text-xs">
+                  {backupCountsLine(pendingImport, t)}
+                </span>
+              )}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={importSettings.isPending}
+              onClick={() => {
+                if (pendingImport) void runImport(pendingImport);
+                setPendingImport(null);
+              }}
+            >
+              {t("settings.backup.importAction")}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </Card>
   );
 }

@@ -1,6 +1,6 @@
 import { useEffect, type ReactNode } from "react";
 import { Navigate, useLocation } from "react-router-dom";
-import { useAuth, type AuthState } from "@/store/auth";
+import { useAuth, isAdmin, type AuthState } from "@/store/auth";
 import { AppShell } from "@/layout/app-shell";
 import { BackendUnreachable } from "@/pages/backend-unreachable";
 
@@ -45,8 +45,46 @@ export function RequireAuth() {
   return <AppShell />;
 }
 
+/**
+ * Route-level RBAC guard. `roles` lists the roles that may enter; a
+ * signed-in user with a different role is bounced to the overview page
+ * (their nav already hides the entry — this is the backstop, and it also
+ * covers direct URL entry).
+ */
+export function RequireRole({
+  roles,
+  children,
+}: {
+  roles: string[];
+  children: ReactNode;
+}) {
+  const user = useAuth((s: AuthState) => s.user);
+  if (user && !roles.includes(user.role)) {
+    return <Navigate to="/" replace />;
+  }
+  return <>{children}</>;
+}
+
+/** Admin-only convenience wrapper (settings, account management). */
+export function RequireAdmin({ children }: { children: ReactNode }) {
+  return (
+    <RequireRole roles={["admin"]}>
+      {children}
+    </RequireRole>
+  );
+}
+
+// Kept for readability at use sites that assert adminhood explicitly.
+export { isAdmin };
+
 export function RedirectIfAuthed({ children }: { children: ReactNode }) {
   const status = useAuth((s: AuthState) => s.status);
+  const needsSetup = useAuth((s: AuthState) => s.needsSetup);
+  // Auth disabled + no first admin yet: the login page is the bootstrap
+  // form, so do NOT bounce the operator back to the open dashboard.
+  if (status === "disabled" && needsSetup) {
+    return <>{children}</>;
+  }
   if (status === "authed" || status === "disabled") {
     return <Navigate to="/" replace />;
   }

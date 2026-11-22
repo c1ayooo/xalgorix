@@ -3,6 +3,7 @@ import {
   useDismissLegacyImport,
   useLegacyImportStatus,
 } from "@/api/queries";
+import { useI18n } from "@/i18n";
 
 /**
  * One-time banner surfaced after the server has migrated scan records
@@ -19,6 +20,7 @@ import {
  * spec, Property 6 (legacy-import idempotence).
  */
 export function LegacyImportBanner() {
+  const { t } = useI18n();
   const { data, isLoading } = useLegacyImportStatus();
   const dismiss = useDismissLegacyImport();
 
@@ -33,8 +35,8 @@ export function LegacyImportBanner() {
     >
       <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-2">
         <span>
-          Imported {data.count} legacy{" "}
-          {data.count === 1 ? "scan" : "scans"} from{" "}
+          {t("banner.importedBefore")} {data.count}{" "}
+          {t("banner.scansWord")}{" "}
           <code className="rounded bg-emerald-500/10 px-1 py-0.5 font-mono">
             ~/xalgorix-data/
           </code>
@@ -43,18 +45,18 @@ export function LegacyImportBanner() {
             to="/findings"
             className="underline underline-offset-2 hover:text-emerald-800 dark:hover:text-emerald-100"
           >
-            Click to review
+            {t("banner.reviewLink")}
           </Link>{" "}
-          or dismiss.
+          {t("banner.orDismiss")}
         </span>
         <button
           type="button"
           onClick={() => dismiss.mutate()}
           disabled={dismiss.isPending}
           className="rounded border border-emerald-500/40 bg-emerald-500/10 px-2 py-0.5 text-[11px] font-medium uppercase tracking-wider text-emerald-700 dark:text-emerald-100 hover:bg-emerald-500/20 disabled:opacity-60"
-          aria-label="Dismiss legacy import banner"
+          aria-label={t("banner.dismissAria")}
         >
-          {dismiss.isPending ? "Dismissing…" : "Dismiss"}
+          {dismiss.isPending ? t("banner.dismissing") : t("banner.dismiss")}
         </button>
       </div>
     </div>

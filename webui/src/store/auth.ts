@@ -1,5 +1,6 @@
 import { create } from "zustand"
 import { api, AUTH_EXPIRED, HttpError } from "@/api/client"
+import type { AuthUser } from "@/types/api"
 
 // "no-backend" is distinct from "anon": it means the SPA could not even
 // reach `/api/auth/status` (network error or 404). Without this state the
@@ -12,28 +13,44 @@ export interface AuthState {
   // Whether the backend has auth configured. When `false`, requests still
   // succeed but we don't show login UI.
   authEnabled: boolean
+  // True when no account exists and env seeding is impossible — the login
+  // page offers the first-admin bootstrap form instead of the login form.
+  needsSetup: boolean
+  // The authenticated identity (null when anonymous or auth is disabled).
+  user: AuthUser | null
   // Last error from the auth status probe, surfaced on the no-backend
   // page so operators can see "ECONNREFUSED" / "HTTP 404" verbatim.
   probeError: string | null
   refresh: () => Promise<void>
   login: (username: string, password: string) => Promise<void>
+  setup: (username: string, password: string) => Promise<void>
   logout: () => Promise<void>
 }
 
 export const useAuth = create<AuthState>((set) => ({
   status: "loading",
   authEnabled: false,
+  needsSetup: false,
+  user: null,
   probeError: null,
   refresh: async () => {
     try {
       const res = await api.authStatus()
       if (!res.auth_enabled) {
-        set({ status: "disabled", authEnabled: false, probeError: null })
+        set({
+          status: "disabled",
+          authEnabled: false,
+          needsSetup: res.needs_setup ?? false,
+          user: null,
+          probeError: null,
+        })
         return
       }
       set({
         status: res.authenticated ? "authed" : "anon",
         authEnabled: true,
+        needsSetup: res.needs_setup ?? false,
+        user: res.user ?? null,
         probeError: null,
       })
     } catch (err) {
@@ -46,6 +63,8 @@ export const useAuth = create<AuthState>((set) => ({
         set({
           status: "no-backend",
           authEnabled: false,
+          needsSetup: false,
+          user: null,
           probeError: err.message,
         })
         return
@@ -53,13 +72,27 @@ export const useAuth = create<AuthState>((set) => ({
       set({
         status: "anon",
         authEnabled: true,
+        needsSetup: false,
+        user: null,
         probeError: err instanceof Error ? err.message : null,
       })
     }
   },
   login: async (username, password) => {
-    await api.login(username, password)
-    set({ status: "authed", authEnabled: true, probeError: null })
+    const res = await api.login(username, password)
+    // Re-probe so needs_setup/user come from the same authority as the
+    // initial load; the login response carries the user already.
+    set({ status: "authed", authEnabled: true, user: res.user ?? null })
+    try {
+      const s = await api.authStatus()
+      set({ needsSetup: s.needs_setup ?? false, user: s.user ?? res.user ?? null })
+    } catch {
+      /* status refresh is best-effort */
+    }
+  },
+  setup: async (username, password) => {
+    const res = await api.setupAuth(username, password)
+    set({ status: "authed", authEnabled: true, needsSetup: false, user: res.user ?? null })
   },
   logout: async () => {
     try {
@@ -67,7 +100,7 @@ export const useAuth = create<AuthState>((set) => ({
     } catch {
       /* ignore */
     }
-    set({ status: "anon", authEnabled: true })
+    set({ status: "anon", authEnabled: true, user: null })
   },
 }))
 
@@ -81,7 +114,17 @@ if (typeof window !== "undefined") {
     // Only react if we currently think we're logged in. Avoids fighting
     // with the initial /api/auth/status probe when the app first loads.
     if (status === "authed" || authEnabled) {
-      useAuth.setState({ status: "anon", authEnabled: true })
+      useAuth.setState({ status: "anon", authEnabled: true, user: null })
     }
   })
+}
+
+/** Role helpers shared by the nav filter, route guards and the account menu. */
+export function hasRole(user: AuthUser | null, minRoles: string[]): boolean {
+  if (!user) return true // auth disabled — everything visible
+  return minRoles.includes(user.role)
+}
+
+export function isAdmin(user: AuthUser | null): boolean {
+  return !!user && user.role === "admin"
 }

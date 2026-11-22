@@ -52,6 +52,16 @@ import {
   Loader2,
 } from "lucide-react";
 import { api } from "@/api/client";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 
 const SEVERITIES = ["info", "low", "medium", "high", "critical"];
 type ActivityMode = "active" | "passive";
@@ -119,6 +129,10 @@ export default function SchedulesPage() {
   const llmQuery = useLLMSettings();
 
   const [q, setQ] = useState("");
+  const [confirmAction, setConfirmAction] = useState<{
+    kind: "trigger" | "delete";
+    schedule: ScanSchedule;
+  } | null>(null);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editingSchedule, setEditingSchedule] = useState<ScanSchedule | null>(
     null,
@@ -233,7 +247,7 @@ export default function SchedulesPage() {
     setModel(sch.model || "");
     setCompanyName(sch.company_name || "");
     setLogoPath(sch.logo_path || "");
-    setLogoFileName(sch.logo_path ? "Uploaded logo" : "");
+    setLogoFileName(sch.logo_path ? t("schedules.uploadedLogo") : "");
     setDiscordWebhook(sch.discord_webhook || "");
     setSeverityFilter(sch.severity_filter || []);
     setProviderProfile(sch.provider_profile || "");
@@ -257,12 +271,6 @@ export default function SchedulesPage() {
 
   // Trigger ad-hoc scan execution
   async function handleTrigger(sch: ScanSchedule) {
-    if (
-      !window.confirm(
-        `${t("schedules.triggerConfirmBefore")}${sch.name}${t("schedules.triggerConfirmAfter")}`,
-      )
-    )
-      return;
     try {
       await triggerMutation.mutateAsync(sch.id);
       toast.success(t("toast.scheduleTriggered"));
@@ -273,12 +281,6 @@ export default function SchedulesPage() {
 
   // Delete schedule
   async function handleDelete(sch: ScanSchedule) {
-    if (
-      !window.confirm(
-        `${t("schedules.deleteConfirmBefore")}${sch.name}${t("schedules.deleteConfirmAfter")}`,
-      )
-    )
-      return;
     try {
       await deleteMutation.mutateAsync(sch.id);
       toast.success(t("toast.taskDeleted"));
@@ -491,9 +493,9 @@ export default function SchedulesPage() {
                       <td className="px-4 py-3 align-middle text-right">
                         <ScheduleActionMenu
                           schedule={s}
-                          onTrigger={() => void handleTrigger(s)}
+                          onTrigger={() => setConfirmAction({ kind: "trigger", schedule: s })}
                           onEdit={() => handleEditSchedule(s)}
-                          onDelete={() => void handleDelete(s)}
+                          onDelete={() => setConfirmAction({ kind: "delete", schedule: s })}
                         />
                       </td>
                     </tr>
@@ -903,6 +905,47 @@ export default function SchedulesPage() {
           </form>
         </DialogContent>
       </Dialog>
+
+      {/* Trigger/Delete confirmation — replaces native window.confirm (UI_DESIGN §7) */}
+      <AlertDialog
+        open={!!confirmAction}
+        onOpenChange={(v) => !v && setConfirmAction(null)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {confirmAction?.kind === "delete"
+                ? t("schedules.deleteTitle")
+                : t("schedules.triggerTitle")}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {confirmAction?.kind === "delete"
+                ? `${t("schedules.deleteConfirmBefore")}${confirmAction.schedule.name}${t("schedules.deleteConfirmAfter")}`
+                : confirmAction
+                  ? `${t("schedules.triggerConfirmBefore")}${confirmAction.schedule.name}${t("schedules.triggerConfirmAfter")}`
+                  : ""}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
+            <AlertDialogAction
+              variant={confirmAction?.kind === "delete" ? "destructive" : "default"}
+              onClick={() => {
+                if (confirmAction?.kind === "delete") {
+                  void handleDelete(confirmAction.schedule);
+                } else if (confirmAction) {
+                  void handleTrigger(confirmAction.schedule);
+                }
+                setConfirmAction(null);
+              }}
+            >
+              {confirmAction?.kind === "delete"
+                ? t("common.delete")
+                : t("schedules.triggerAction")}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

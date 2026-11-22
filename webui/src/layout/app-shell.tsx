@@ -7,17 +7,21 @@ import { OpsPulse } from "@/components/ops-pulse";
 import { ConnectionBanner } from "@/components/connection-status";
 import { LegacyImportBanner } from "@/components/legacy-import-banner";
 import { CommandPalette } from "@/components/command-palette";
-import { useWSStore } from "@/store/ws";
+import { useEventsStore } from "@/store/events";
+import { useLifecycleRefetch } from "@/lib/use-lifecycle-refetch";
 import { useI18n } from "@/i18n";
 
 const MOBILE_NAV_ID = "mobile-nav";
 
 export function AppShell() {
   const { t } = useI18n();
-  const connect = useWSStore((s) => s.connect);
-  const disconnect = useWSStore((s) => s.disconnect);
+  const connect = useEventsStore((s) => s.connect);
+  const disconnect = useEventsStore((s) => s.disconnect);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const location = useLocation();
+
+  // run 生命周期事件 → 查询失效（运行按钮状态机/任务投影秒级跟随）。
+  useLifecycleRefetch();
 
   useEffect(() => {
     connect();

@@ -29,6 +29,16 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Separator } from "@/components/ui/separator";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { ScanStatusPill } from "@/components/scan-status-pill";
 import { SeverityBadge } from "@/components/severity-badge";
 import { Markdown } from "@/components/markdown";
@@ -37,10 +47,11 @@ import {
   PhaseProgress,
   PHASES,
   phaseVisual,
-  PHASE_STATUS_LABEL,
+  phaseStatusLabel,
 } from "@/components/phase-progress";
 import { CopyButton } from "@/components/copy-button";
 import { TokenUsageTab } from "@/components/token-usage";
+import { ScanFilesBrowser } from "@/components/scan-files-browser";
 import { ErrorState, EmptyState } from "@/components/states";
 import {
   useScan,
@@ -50,15 +61,18 @@ import {
   useStartSavedInstance,
   useDeleteScan,
   useDeleteVuln,
+  useSendTaskGuidance,
+  useScanTraffic,
 } from "@/api/queries";
 import { api } from "@/api/client";
+import { MAX_GUIDANCE_CHARS, newRequestId } from "@/lib/guidance";
 import {
   filterEventsForInstance,
   mergeFeedEvents,
   toFeedEvent,
-  useWSStore,
+  useEventsStore,
   type FeedEvent,
-} from "@/store/ws";
+} from "@/store/events";
 import {
   timeAgo,
   formatTime,
@@ -86,6 +100,7 @@ import {
   Loader2,
   Send,
   Activity,
+  FolderOpen,
 } from "lucide-react";
 import { LiveFeed, type FeedFilter } from "@/components/live-feed";
 import { Pagination, DEFAULT_PAGE_SIZE } from "@/components/Pagination";
@@ -102,9 +117,9 @@ export default function ScanDetailPage() {
   const resume = useResumeInstance();
   const start = useStartSavedInstance();
   const del = useDeleteScan();
-  const subscribe = useWSStore((s) => s.subscribe);
-  const unsubscribe = useWSStore((s) => s.unsubscribe);
-  const liveEvents = useWSStore((s) => s.events);
+  const subscribe = useEventsStore((s) => s.subscribe);
+  const unsubscribe = useEventsStore((s) => s.unsubscribe);
+  const liveEvents = useEventsStore((s) => s.events);
   const subscriptionId = scan?.instance_id || scan?.id || id;
 
   // Lazy-paged older events. The detail response only carries a tail of the
@@ -114,6 +129,7 @@ export default function ScanDetailPage() {
   const [olderEvents, setOlderEvents] = useState<WSEvent[]>([]);
   const [earliestLoaded, setEarliestLoaded] = useState<number | null>(null);
   const [loadingOlder, setLoadingOlder] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
 
   useEffect(() => {
     if (!subscriptionId) return;
@@ -153,11 +169,11 @@ export default function ScanDetailPage() {
   if (error)
     return (
       <ErrorState
-        title="Could not load scan"
-        description={error instanceof Error ? error.message : "Unknown error"}
+        title={t("scanDetail.loadFailed")}
+        description={error instanceof Error ? error.message : t("common.unknownError")}
         action={
           <Button size="sm" variant="outline" onClick={() => refetch()}>
-            Retry
+            {t("common.retry")}
           </Button>
         }
       />
@@ -166,15 +182,15 @@ export default function ScanDetailPage() {
   if (!scan)
     return (
       <ErrorState
-        title="Scan details are starting"
+        title={t("scanDetail.startingTitle")}
         description={
           isFetching
-            ? "Waiting for the running scan record to become available."
-            : "The scan route is open, but the backend has not returned the scan record yet."
+            ? t("scanDetail.startingFetching")
+            : t("scanDetail.startingStale")
         }
         action={
           <Button size="sm" variant="outline" onClick={() => refetch()}>
-            Retry
+            {t("common.retry")}
           </Button>
         }
       />
@@ -224,7 +240,7 @@ export default function ScanDetailPage() {
           className="inline-flex items-center text-xs text-muted-foreground hover:text-foreground"
         >
           <ChevronLeft className="mr-1 h-3 w-3" />
-          All scans
+          {t("scans.title")}
         </Link>
       </div>
 
@@ -239,10 +255,10 @@ export default function ScanDetailPage() {
           <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
             <span className="mono truncate max-w-full">{scan.id}</span>
             <span className="hidden sm:inline">·</span>
-            <span>Started {timeAgo(scan.started_at)}</span>
+            <span>{t("instances.startedPrefix")}{timeAgo(scan.started_at)}</span>
             <span className="hidden sm:inline">·</span>
             <span>
-              Duration {formatDuration(scan.started_at, scan.finished_at)}
+              {t("scanDetail.durationPrefix")}{formatDuration(scan.started_at, scan.finished_at)}
             </span>
             {scan.scan_mode && (
               <>
@@ -259,7 +275,7 @@ export default function ScanDetailPage() {
           <ScanStatusPill status={scan.status} />
           <Button variant="outline" size="sm" asChild>
             <a href={api.reportUrl(scan.id)} target="_blank" rel="noreferrer">
-              <Download className="mr-1 h-4 w-4" /> Report
+              <Download className="mr-1 h-4 w-4" /> {t("nav.reports")}
             </a>
           </Button>
           {canStart && (
@@ -281,7 +297,7 @@ export default function ScanDetailPage() {
               }
               disabled={start.isPending}
             >
-              <Play className="mr-1 h-4 w-4" /> Start
+              <Play className="mr-1 h-4 w-4" /> {t("instances.action.start")}
             </Button>
           )}
           {canPause && (
@@ -291,7 +307,7 @@ export default function ScanDetailPage() {
               onClick={() => pause.mutate(scan.instance_id || scan.id)}
               disabled={pause.isPending}
             >
-              <Pause className="mr-1 h-4 w-4" /> Pause
+              <Pause className="mr-1 h-4 w-4" /> {t("console.pause")}
             </Button>
           )}
           {canResume && (
@@ -301,7 +317,7 @@ export default function ScanDetailPage() {
               onClick={() => resume.mutate(scan.instance_id || scan.id)}
               disabled={resume.isPending}
             >
-              <Play className="mr-1 h-4 w-4" /> Resume
+              <Play className="mr-1 h-4 w-4" /> {t("console.resume")}
             </Button>
           )}
           {canStop && (
@@ -311,28 +327,16 @@ export default function ScanDetailPage() {
               onClick={() => stop.mutate({ id: scan.instance_id || scan.id })}
               disabled={stop.isPending}
             >
-              <X className="mr-1 h-4 w-4" /> Stop
+              <X className="mr-1 h-4 w-4" /> {t("console.stop")}
             </Button>
           )}
           <Button
             variant="ghost"
             size="sm"
-            onClick={() => {
-              if (
-                window.confirm(
-                  "Permanently delete this scan and all its events?",
-                )
-              ) {
-                del.mutate(scan.id, {
-                  onSuccess: () => {
-                    navigate("/scans", { replace: true });
-                  },
-                });
-              }
-            }}
+            onClick={() => setConfirmDelete(true)}
             disabled={del.isPending}
           >
-            <Trash2 className="mr-1 h-4 w-4" /> Delete
+            <Trash2 className="mr-1 h-4 w-4" /> {t("common.delete")}
           </Button>
         </div>
       </header>
@@ -342,10 +346,10 @@ export default function ScanDetailPage() {
           <CardHeader>
             <CardTitle className="text-sm">{t("scanDetail.phaseProgress")}</CardTitle>
             <CardDescription>
-              Xalgorix runs a {PHASES.length}-phase autonomous methodology.
-              Currently:{" "}
+              {t("scanDetail.methodologyBefore")} {PHASES.length}{" "}
+              {t("scanDetail.methodologyAfter")}{" "}
               <span className="text-foreground">
-                {currentPhaseLabel(scan.current_phase)}
+                {currentPhaseLabel(scan.current_phase, t("overview.ops.phaseWord"))}
               </span>
             </CardDescription>
           </CardHeader>
@@ -372,7 +376,7 @@ export default function ScanDetailPage() {
                 return (
                   <div
                     key={p.id}
-                    title={`${p.id}. ${p.name} — ${PHASE_STATUS_LABEL[visual.status]}`}
+                    title={`${p.id}. ${p.name} — ${phaseStatusLabel(visual.status, t)}`}
                     className={cn(
                       "flex items-baseline gap-1.5 rounded-md border border-border bg-muted/20 px-2 py-1.5 text-[11px]",
                       visual.status === "active" &&
@@ -402,7 +406,7 @@ export default function ScanDetailPage() {
           <CardHeader>
             <CardTitle className="text-sm">{t("scanDetail.riskOverview")}</CardTitle>
             <CardDescription>
-              {(scan.vulns ?? []).length} findings
+              {(scan.vulns ?? []).length} {t("common.findings")}
             </CardDescription>
           </CardHeader>
           <CardContent>
@@ -415,9 +419,9 @@ export default function ScanDetailPage() {
             <CardHeader>
               <CardTitle className="text-sm">{t("scanDetail.wildcardCoverage")}</CardTitle>
               <CardDescription>
-                {scan.sub_scan_completed ?? 0} scanned ·{" "}
-                {scan.sub_scan_running ?? 0} running ·{" "}
-                {scan.sub_scan_remaining ?? 0} remaining
+                {scan.sub_scan_completed ?? 0} {t("scans.subScanned")} ·{" "}
+                {scan.sub_scan_running ?? 0} {t("scans.subRunning")} ·{" "}
+                {scan.sub_scan_remaining ?? 0} {t("scans.subRemaining")}
               </CardDescription>
             </CardHeader>
             <CardContent>
@@ -456,6 +460,10 @@ export default function ScanDetailPage() {
             <ListChecks className="mr-1.5 h-3.5 w-3.5" />
             {t("scanDetail.tab.config")}
           </TabsTrigger>
+          <TabsTrigger value="files">
+            <FolderOpen className="mr-1.5 h-3.5 w-3.5" />
+            {t("scanDetail.tab.files")}
+          </TabsTrigger>
         </TabsList>
 
         <TabsContent value="findings" className="space-y-2">
@@ -466,6 +474,7 @@ export default function ScanDetailPage() {
             events={mergedEvents}
             scanId={scan.id}
             instanceId={eventInstanceId}
+            taskId={scan.task_id}
             status={status}
             target={scan.target}
             canLoadEarlier={canLoadEarlier}
@@ -485,15 +494,45 @@ export default function ScanDetailPage() {
         <TabsContent value="config">
           <ConfigTab scan={scan} />
         </TabsContent>
+        <TabsContent value="files">
+          <ScanFilesBrowser scanId={scan.id} running={status === "running"} />
+        </TabsContent>
       </Tabs>
+
+      <AlertDialog open={confirmDelete} onOpenChange={setConfirmDelete}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t("scanDetail.deleteTitle")}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {t("scanDetail.confirmDelete")}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
+            <AlertDialogAction
+              variant="destructive"
+              onClick={() => {
+                del.mutate(scan.id, {
+                  onSuccess: () => {
+                    navigate("/scans", { replace: true });
+                  },
+                });
+                setConfirmDelete(false);
+              }}
+            >
+              {t("common.delete")}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }
 
-function currentPhaseLabel(p?: number): string {
+function currentPhaseLabel(p?: number, phaseWord = "Phase "): string {
   if (!p) return "—";
   const found = PHASES.find((x) => x.id === p);
-  return found ? `${p}. ${found.name}` : `Phase ${p}`;
+  return found ? `${p}. ${found.name}` : `${phaseWord}${p}`;
 }
 
 function SubdomainProgress({
@@ -507,6 +546,7 @@ function SubdomainProgress({
   remaining: number;
   total: number;
 }) {
+  const { t } = useI18n();
   const denominator = Math.max(total, 1);
   const completedPct = (completed / denominator) * 100;
   const runningPct = (running / denominator) * 100;
@@ -522,10 +562,10 @@ function SubdomainProgress({
         />
       </div>
       <div className="grid gap-2 text-xs sm:grid-cols-4">
-        <ProgressStat label="Total" value={total} />
-        <ProgressStat label="Scanned" value={completed} />
-        <ProgressStat label="Running" value={running} />
-        <ProgressStat label="Remaining" value={remaining} />
+        <ProgressStat label={t("scanDetail.subTotal")} value={total} />
+        <ProgressStat label={t("scans.subScanned")} value={completed} />
+        <ProgressStat label={t("scans.subRunning")} value={running} />
+        <ProgressStat label={t("scans.subRemaining")} value={remaining} />
       </div>
     </div>
   );
@@ -543,6 +583,7 @@ function ProgressStat({ label, value }: { label: string; value: number }) {
 }
 
 function RiskBreakdown({ vulns }: { vulns: VulnSummary[] }) {
+  const { t } = useI18n();
   const counts = useMemo(() => {
     const c: Record<string, number> = {
       critical: 0,
@@ -600,7 +641,7 @@ function RiskBreakdown({ vulns }: { vulns: VulnSummary[] }) {
             className="flex min-w-[60px] flex-1 flex-col rounded-md border border-border bg-muted/20 px-2 py-1.5"
           >
             <span className="truncate uppercase tracking-wide text-muted-foreground">
-              {sev}
+              {t(`severity.${sev}`)}
             </span>
             <span className="mono text-base leading-tight text-foreground">
               {counts[sev as string]}
@@ -613,6 +654,7 @@ function RiskBreakdown({ vulns }: { vulns: VulnSummary[] }) {
 }
 
 function SubdomainsTab({ subScans }: { subScans: SubScanSummary[] }) {
+  const { t } = useI18n();
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState<number>(DEFAULT_PAGE_SIZE);
 
@@ -633,8 +675,8 @@ function SubdomainsTab({ subScans }: { subScans: SubScanSummary[] }) {
   if (subScans.length === 0) {
     return (
       <EmptyState
-        title="No subdomains recorded yet"
-        description="Discovered subdomains will appear here as the wildcard scan progresses."
+        title={t("scanDetail.subEmptyTitle")}
+        description={t("scanDetail.subEmptyDescription")}
       />
     );
   }
@@ -646,11 +688,11 @@ function SubdomainsTab({ subScans }: { subScans: SubScanSummary[] }) {
           <table className="w-full text-sm">
             <thead className="border-b border-border bg-muted/30 text-xs uppercase tracking-wider text-muted-foreground">
               <tr>
-                <Th>Subdomain</Th>
-                <Th>Status</Th>
-                <Th>Findings</Th>
-                <Th>Tokens</Th>
-                <Th>Started</Th>
+                <Th>{t("scanDetail.tab.subdomains")}</Th>
+                <Th>{t("scans.col.status")}</Th>
+                <Th>{t("scans.col.findings")}</Th>
+                <Th>{t("scans.col.tokens")}</Th>
+                <Th>{t("scans.col.started")}</Th>
               </tr>
             </thead>
             <tbody>
@@ -741,6 +783,7 @@ function FindingsTab({
   const del = useDeleteVuln();
   const [selected, setSelected] = useState<VulnSummary | null>(null);
   const [selectedKeys, setSelectedKeys] = useState<Set<string>>(() => new Set());
+  const [pendingDelete, setPendingDelete] = useState<string[] | null>(null);
   const sorted = useMemo(
     () =>
       [...vulns].sort(
@@ -792,11 +835,6 @@ function FindingsTab({
       );
     }
     if (!unique.size) return;
-    const label =
-      unique.size === 1
-        ? "Permanently delete this finding?"
-        : `Permanently delete ${unique.size} selected findings?`;
-    if (!window.confirm(label)) return;
     const identities = [...unique.values()];
     const settled = await Promise.allSettled(
       identities.map((identity) => del.mutateAsync(identity)),
@@ -826,8 +864,8 @@ function FindingsTab({
   if (sorted.length === 0)
     return (
       <EmptyState
-        title="No findings yet"
-        description="Vulnerabilities will appear here as the engagement progresses."
+        title={t("taskDetail.noFindingsTitle")}
+        description={t("taskDetail.noFindingsDescription")}
       />
     );
 
@@ -840,15 +878,15 @@ function FindingsTab({
           variant="outline"
           onClick={allSelected ? clearSelection : selectAll}
         >
-          {allSelected ? "Clear selection" : "Select all"}
+          {allSelected ? t("common.clearSelection") : t("scans.selectAll")}
         </Button>
         <span className="text-xs text-muted-foreground">
-          {selectedKeys.size} selected
+          {selectedKeys.size} {t("scans.selectedCount")}
         </span>
         <BulkActionMenu
           disabled={selectedKeys.size === 0 || del.isPending}
           selectedCount={selectedKeys.size}
-          onDelete={() => void deleteVulns([...selectedKeys])}
+          onDelete={() => setPendingDelete([...selectedKeys])}
         />
       </div>
       <div className="space-y-2">
@@ -932,7 +970,7 @@ function FindingsTab({
                   finding={f}
                   scanId={scanId}
                   deleting={del.isPending}
-                  onDelete={() => void deleteVulns([key])}
+                  onDelete={() => setPendingDelete([key])}
                 />
               </div>
             </Card>
@@ -940,9 +978,40 @@ function FindingsTab({
         })}
       </div>
       <FindingDetailsDialog
+        scanId={scanId}
         finding={selected}
         onOpenChange={(open) => !open && setSelected(null)}
       />
+
+      <AlertDialog
+        open={!!pendingDelete}
+        onOpenChange={(v) => !v && setPendingDelete(null)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t("findings.deleteTitle")}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {pendingDelete
+                ? pendingDelete.length === 1
+                  ? t("findings.confirmDeleteOne")
+                  : `${t("findings.confirmDeleteManyBefore")}${pendingDelete.length}${t("findings.confirmDeleteManyAfter")}`
+                : ""}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
+            <AlertDialogAction
+              variant="destructive"
+              onClick={() => {
+                void deleteVulns(pendingDelete ?? []);
+                setPendingDelete(null);
+              }}
+            >
+              {t("common.delete")}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </>
   );
 }
@@ -956,29 +1025,32 @@ function BulkActionMenu({
   selectedCount: number;
   onDelete: () => void;
 }) {
+  const { t } = useI18n();
   return (
     <DropdownMenu.Root>
       <DropdownMenu.Trigger asChild>
         <Button size="sm" variant="secondary" disabled={disabled}>
-          Actions
+          {t("scans.col.actions")}
           <MoreHorizontal className="h-3.5 w-3.5" />
         </Button>
       </DropdownMenu.Trigger>
       <DropdownMenu.Portal>
         <DropdownMenu.Content align="start" className={menuContentClass}>
           <DropdownMenu.Label className="px-2 py-1.5 text-xs text-muted-foreground">
-            {selectedCount} selected
+            {selectedCount} {t("scans.selectedCount")}
           </DropdownMenu.Label>
           <DropdownMenu.Separator className="-mx-1 my-1 h-px bg-border" />
           <DropdownMenu.Item
             className={cn(menuItemClass, "text-red-600 focus:text-red-700 dark:text-red-400 dark:focus:text-red-300")}
-            onSelect={(event) => {
-              event.preventDefault();
-              onDelete();
-            }}
+            // Do NOT preventDefault: the menu must unmount before the confirm
+            // AlertDialog mounts. Two stacked Radix modal layers capture
+            // mismatched body pointer-events originals and the last unmount
+            // leaves body { pointer-events: none } — the whole page dead
+            // until reload (DismissableLayer last-restorer-wins).
+            onSelect={() => onDelete()}
           >
             <Trash2 className="h-3.5 w-3.5" />
-            Delete selected
+            {t("scans.deleteSelected")}
           </DropdownMenu.Item>
         </DropdownMenu.Content>
       </DropdownMenu.Portal>
@@ -997,13 +1069,14 @@ function FindingRowMenu({
   deleting: boolean;
   onDelete: () => void;
 }) {
+  const { t } = useI18n();
   return (
     <DropdownMenu.Root>
       <DropdownMenu.Trigger asChild>
         <Button
           size="icon"
           variant="ghost"
-          aria-label={`Actions for ${finding.title}`}
+          aria-label={`${t("scans.actionsForAria")} ${finding.title}`}
           className="mt-1 shrink-0"
         >
           <MoreHorizontal className="h-4 w-4" />
@@ -1014,7 +1087,7 @@ function FindingRowMenu({
           <DropdownMenu.Item asChild className={menuItemClass}>
             <Link to={`/scans/${scanId}`}>
               <ExternalLink className="h-3.5 w-3.5" />
-              Open scan
+              {t("scans.openDetails")}
             </Link>
           </DropdownMenu.Item>
           <DropdownMenu.Separator className="-mx-1 my-1 h-px bg-border" />
@@ -1024,13 +1097,12 @@ function FindingRowMenu({
               menuItemClass,
               "text-red-600 focus:text-red-700 dark:text-red-400 dark:focus:text-red-300 data-[disabled]:pointer-events-none data-[disabled]:opacity-50",
             )}
-            onSelect={(event) => {
-              event.preventDefault();
-              onDelete();
-            }}
+            // Same layer-ordering constraint as the bulk delete above: the
+            // menu must close before the confirm dialog opens.
+            onSelect={() => onDelete()}
           >
             <Trash2 className="h-3.5 w-3.5" />
-            Delete finding
+            {t("findings.deleteOne")}
           </DropdownMenu.Item>
         </DropdownMenu.Content>
       </DropdownMenu.Portal>
@@ -1039,12 +1111,15 @@ function FindingRowMenu({
 }
 
 function FindingDetailsDialog({
+  scanId,
   finding,
   onOpenChange,
 }: {
+  scanId: string;
   finding: VulnSummary | null;
   onOpenChange: (open: boolean) => void;
 }) {
+  const { t } = useI18n();
   return (
     <Dialog open={!!finding} onOpenChange={onOpenChange}>
       <DialogContent className="max-h-[85vh] w-[calc(100vw-2rem)] min-w-0 max-w-3xl overflow-x-hidden overflow-y-auto">
@@ -1085,20 +1160,20 @@ function FindingDetailsDialog({
                 {finding.title}
               </DialogTitle>
               <DialogDescription>
-                Detailed vulnerability record from this scan.
+                {t("scanDetail.detailDesc")}
               </DialogDescription>
             </DialogHeader>
 
             <div className="grid min-w-0 max-w-full gap-3 rounded-md border border-border bg-muted/20 p-3 text-sm sm:grid-cols-2">
-              <DetailRow label="Target" value={finding.target} mono />
-              <DetailRow label="Endpoint" value={finding.endpoint} mono />
-              <DetailRow label="Method" value={finding.method} mono />
-              <DetailRow label="CVSS vector" value={finding.cvss_vector} mono />
+              <DetailRow label={t("scans.col.target")} value={finding.target} mono />
+              <DetailRow label={t("findings.field.endpoint")} value={finding.endpoint} mono />
+              <DetailRow label={t("approval.method")} value={finding.method} mono />
+              <DetailRow label={t("findings.field.cvssVector")} value={finding.cvss_vector} mono />
               <DetailRow label="CWE" value={finding.cwe_id} mono />
               <DetailRow label="OWASP" value={finding.owasp} mono />
-              <DetailRow label="Finding ID" value={finding.id} mono />
+              <DetailRow label={t("findings.field.id")} value={finding.id} mono />
               <DetailRow
-                label="Verification"
+                label={t("findings.field.verification")}
                 value={finding.verification_method}
               />
             </div>
@@ -1106,33 +1181,34 @@ function FindingDetailsDialog({
             <Separator />
 
             <div className="min-w-0 max-w-full space-y-4">
-              <DetailSection title="Description" value={finding.description} />
-              <DetailSection title="Impact" value={finding.impact} />
+              <DetailSection title={t("findings.section.description")} value={finding.description} />
+              <DetailSection title={t("findings.section.impact")} value={finding.impact} />
               <DetailSection
-                title="Technical analysis"
+                title={t("findings.section.analysis")}
                 value={finding.technical_analysis}
               />
               <DetailSection
-                title="Proof of concept"
+                title={t("findings.section.poc")}
                 value={finding.poc_description}
               />
               {finding.poc_script && (
                 <DetailSection
-                  title="PoC script"
+                  title={t("findings.section.pocScript")}
                   value={finding.poc_script}
                   code
                 />
               )}
               {finding.exploitation_proof && (
                 <DetailSection
-                  title="Exploitation proof"
+                  title={t("findings.section.exploitProof")}
                   value={finding.exploitation_proof}
                   code
                 />
               )}
-              <DetailSection title="Remediation" value={finding.remediation} />
+              <FindingHttpExchanges scanId={scanId} finding={finding} />
+              <DetailSection title={t("findings.section.remediation")} value={finding.remediation} />
               {finding.fix && (
-                <DetailSection title="Suggested fix" value={finding.fix} code />
+                <DetailSection title={t("findings.section.suggestedFix")} value={finding.fix} code />
               )}
             </div>
           </div>
@@ -1194,10 +1270,91 @@ function DetailSection({
   );
 }
 
+// 流量代理为该 finding 记录的原始 HTTP 交互（wire 包，未脱敏）。懒加载：
+// 打开详情弹窗才拉取；扫描没有流量归档（代理关闭或旧扫描）或无匹配时整段
+// 不渲染——不堆空态文案。
+function FindingHttpExchanges({
+  scanId,
+  finding,
+}: {
+  scanId: string;
+  finding: VulnSummary;
+}) {
+  const { t } = useI18n();
+  const { data } = useScanTraffic(
+    findingSourceScanId(scanId, finding),
+    finding.endpoint,
+    finding.method,
+  );
+  const exchanges = data?.exchanges ?? [];
+  if (exchanges.length === 0) return null;
+  return (
+    <section className="min-w-0 max-w-full space-y-2">
+      <h4 className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
+        {t("findings.section.httpExchanges")}
+      </h4>
+      <div className="min-w-0 max-w-full space-y-3">
+        {exchanges.map((ex) => (
+          <div
+            key={ex.seq}
+            className="min-w-0 max-w-full space-y-2 rounded-md border border-border p-2"
+          >
+            <div className="flex min-w-0 flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
+              <span className="mono font-medium text-foreground">{ex.method}</span>
+              <span className="mono min-w-0 truncate">{ex.url}</span>
+              {typeof ex.status === "number" && (
+                <span
+                  className={cn(
+                    "mono",
+                    ex.denied
+                      ? "text-destructive"
+                      : ex.status < 400
+                        ? "text-emerald-600 dark:text-emerald-400"
+                        : "text-amber-600 dark:text-amber-400",
+                  )}
+                >
+                  {ex.status}
+                </span>
+              )}
+              {ex.high_risk && (
+                <span className="mono min-w-0 truncate text-amber-600 dark:text-amber-400">
+                  {ex.high_risk}
+                </span>
+              )}
+            </div>
+            {ex.request_raw && (
+              <pre className="max-h-64 min-w-0 max-w-full overflow-auto whitespace-pre-wrap rounded-md border border-border bg-muted p-3 text-xs leading-relaxed text-foreground [overflow-wrap:anywhere]">
+                <code>
+                  {ex.request_raw}
+                  {ex.request_truncated ? `\n${t("findings.http.truncated")}` : ""}
+                </code>
+              </pre>
+            )}
+            {ex.response_raw && (
+              <pre className="max-h-64 min-w-0 max-w-full overflow-auto whitespace-pre-wrap rounded-md border border-border bg-muted p-3 text-xs leading-relaxed text-foreground [overflow-wrap:anywhere]">
+                <code>
+                  {ex.response_raw}
+                  {ex.response_truncated ? `\n${t("findings.http.truncated")}` : ""}
+                </code>
+              </pre>
+            )}
+          </div>
+        ))}
+      </div>
+      {data?.truncated && (
+        <p className="mono text-[11px] text-muted-foreground">
+          {t("findings.http.moreHidden").replace("%d", String(data.total_matched))}
+        </p>
+      )}
+    </section>
+  );
+}
+
 function EventsTab({
   events,
   scanId,
   instanceId,
+  taskId,
   status,
   target,
   canLoadEarlier,
@@ -1208,6 +1365,7 @@ function EventsTab({
   events: FeedEvent[];
   scanId: string;
   instanceId: string;
+  taskId?: string;
   status: string;
   target: string;
   canLoadEarlier: boolean;
@@ -1215,6 +1373,7 @@ function EventsTab({
   loadingOlder: boolean;
   onLoadEarlier: () => void;
 }) {
+  const { t } = useI18n();
   const [filter, setFilter] = useState<FeedFilter>("all");
   return (
     <div className="space-y-3">
@@ -1227,8 +1386,8 @@ function EventsTab({
             disabled={loadingOlder}
           >
             {loadingOlder
-              ? "Loading earlier events…"
-              : `Load earlier events (${remainingOlder.toLocaleString()} older)`}
+              ? t("console.loadingEarlier")
+              : `${t("scanDetail.loadEarlier")} (${remainingOlder.toLocaleString()} ${t("scanDetail.loadEarlierCount")})`}
           </Button>
         </div>
       )}
@@ -1238,127 +1397,106 @@ function EventsTab({
         onFilterChange={setFilter}
         exportFilePrefix={`xalgorix-${target || scanId}-events`}
         exportScope={scanId}
-        emptyTitle="No events yet"
-        emptyDescription="Once the scan starts producing output it will stream here."
+        emptyTitle={t("taskDetail.noEventsTitle")}
+        emptyDescription={t("taskDetail.noEventsDescription")}
       />
-      {status === "running" && (
-        <ScanGuidanceComposer instanceId={instanceId} />
+      {status === "running" && taskId && (
+        <ScanGuidanceComposer taskId={taskId} instanceId={instanceId} />
       )}
     </div>
   );
 }
 
-const GUIDANCE_SUGGESTIONS = [
-  "Focus next on authentication and session handling.",
-  "Prioritize IDOR and broken access control checks.",
-  "Verify the strongest finding with reproducible evidence.",
-  "Summarize progress, then continue with the highest-risk gap.",
-];
-
-function ScanGuidanceComposer({ instanceId }: { instanceId: string }) {
+/**
+ * Guidance composer on the legacy run page — the same unified HITL channel as
+ * the conversation pages (POST /api/tasks/{id}/guidance, contract §3.1): one
+ * persisted human turn per request_id, no optimistic echo, no /api/chat
+ * bypass. Rendered only when the run is mounted on a task (task_id present)
+ * and running; unmounted legacy scans have no unified channel.
+ */
+function ScanGuidanceComposer({
+  taskId,
+  instanceId,
+}: {
+  taskId: string;
+  instanceId: string;
+}) {
   const { t } = useI18n();
+  const sendGuidance = useSendTaskGuidance();
   const [message, setMessage] = useState("");
-  const [sending, setSending] = useState(false);
-  const [feedback, setFeedback] = useState<{
-    kind: "success" | "error";
-    text: string;
-  } | null>(null);
+  const [requestId, setRequestId] = useState(newRequestId);
 
   const trimmed = message.trim();
+  const codePoints = Array.from(message).length;
+  const over = codePoints > MAX_GUIDANCE_CHARS;
 
-  async function sendGuidance() {
-    if (!trimmed || sending) return;
-    setSending(true);
-    setFeedback(null);
-    try {
-      const result = await api.chat(trimmed, instanceId);
-      setMessage("");
-      setFeedback({
-        kind: "success",
-        text: result.response || "Guidance queued for the next agent iteration.",
-      });
-    } catch (err) {
-      setFeedback({
-        kind: "error",
-        text: err instanceof Error ? err.message : "Could not send guidance.",
-      });
-    } finally {
-      setSending(false);
-    }
+  function send() {
+    if (!trimmed || over || sendGuidance.isPending) return;
+    sendGuidance.mutate(
+      { id: taskId, message: trimmed, requestId, instanceId },
+      {
+        onSuccess: (result) => {
+          toast.success(
+            result.status === "injected"
+              ? t("toast.guidanceInjected")
+              : t("toast.guidanceQueued"),
+          );
+          setMessage("");
+          setRequestId(newRequestId());
+        },
+        onError: (error: Error) =>
+          toast.error(`${t("toast.guidanceFailed")}: ${error.message}`),
+      },
+    );
   }
 
   return (
     <Card>
       <CardHeader className="pb-3">
         <CardTitle className="text-sm">{t("scanDetail.guideScan")}</CardTitle>
-        <CardDescription>
-          Send a priority or correction to this agent. It will pick it up on
-          its next iteration without interrupting the scan.
-        </CardDescription>
+        <CardDescription>{t("scanDetail.guideScanDesc")}</CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">
-        <div className="flex flex-wrap gap-2" aria-label="Guidance suggestions">
-          {GUIDANCE_SUGGESTIONS.map((suggestion) => (
-            <Button
-              key={suggestion}
-              type="button"
-              size="sm"
-              variant="outline"
-              className="h-auto whitespace-normal py-1.5 text-left text-xs"
-              onClick={() => {
-                setMessage(suggestion);
-                setFeedback(null);
-              }}
-              disabled={sending}
-            >
-              {suggestion}
-            </Button>
-          ))}
-        </div>
         <div className="flex flex-col items-stretch gap-2 sm:flex-row sm:items-end">
           <Textarea
             value={message}
-            onChange={(event) => {
-              setMessage(event.target.value);
-              setFeedback(null);
-            }}
+            onChange={(event) => setMessage(event.target.value)}
             onKeyDown={(event) => {
               if (event.key === "Enter" && !event.shiftKey) {
                 event.preventDefault();
-                void sendGuidance();
+                send();
               }
             }}
             placeholder={t("scanDetail.guidancePlaceholder")}
             aria-label={t("scanDetail.guidanceAriaLabel")}
             rows={3}
-            maxLength={4000}
-            disabled={sending}
+            maxLength={MAX_GUIDANCE_CHARS}
+            disabled={sendGuidance.isPending}
           />
           <Button
             type="button"
-            onClick={() => void sendGuidance()}
-            disabled={!trimmed || sending}
+            onClick={send}
+            disabled={!trimmed || over || sendGuidance.isPending}
             className="shrink-0 sm:w-auto"
           >
-            {sending ? (
+            {sendGuidance.isPending ? (
               <Loader2 className="h-4 w-4 animate-spin" />
             ) : (
               <Send className="h-4 w-4" />
             )}
-            Send
+            {t("console.send")}
           </Button>
         </div>
         <div className="flex items-center justify-between gap-3 text-[11px] text-muted-foreground">
+          <span aria-live="polite">{t("scanDetail.guidanceHint")}</span>
           <span
-            aria-live="polite"
             className={cn(
-              feedback?.kind === "success" && "text-emerald-600 dark:text-emerald-400",
-              feedback?.kind === "error" && "text-red-600 dark:text-red-400",
+              "mono shrink-0 tabular-nums",
+              over && "text-red-600 dark:text-red-400",
             )}
           >
-            {feedback?.text || "Enter to send · Shift+Enter for a new line"}
+            {codePoints}/{MAX_GUIDANCE_CHARS}
           </span>
-          <span className="mono shrink-0">{message.length}/4000</span>
         </div>
       </CardContent>
     </Card>
@@ -1370,38 +1508,39 @@ function ConfigTab({
 }: {
   scan: NonNullable<ReturnType<typeof useScan>["data"]>;
 }) {
+  const { t } = useI18n();
   const items: Array<{ k: string; v: ReactNode }> = [
-    { k: "Scan mode", v: scan.scan_mode || "—" },
+    { k: t("tasks.fieldScanMode"), v: scan.scan_mode || "—" },
     {
-      k: "Recon access",
-      v: scan.recon_mode === "passive" ? "passive only" : "active allowed",
+      k: t("schedules.label.reconAccess"),
+      v: scan.recon_mode === "passive" ? t("schedules.access.passive") : t("schedules.access.active"),
     },
     {
-      k: "Testing access",
-      v: scan.scan_intensity === "passive" ? "passive only" : "active allowed",
+      k: t("schedules.label.testingAccess"),
+      v: scan.scan_intensity === "passive" ? t("schedules.access.passive") : t("schedules.access.active"),
     },
     {
-      k: "Severity filter",
-      v: (scan.severity_filter ?? []).join(", ") || "all",
+      k: t("schedules.label.severityFilter"),
+      v: (scan.severity_filter ?? []).join(", ") || t("scanDetail.config.all"),
     },
-    { k: "Phases", v: (scan.phases ?? []).join(", ") || "all" },
-    { k: "Iterations", v: <span className="mono">{scan.iterations}</span> },
-    { k: "Tool calls", v: <span className="mono">{scan.tool_calls}</span> },
+    { k: t("plan.phase"), v: (scan.phases ?? []).join(", ") || t("scanDetail.config.all") },
+    { k: t("scanDetail.config.iterations"), v: <span className="mono">{scan.iterations}</span> },
+    { k: t("scanDetail.config.toolCalls"), v: <span className="mono">{scan.tool_calls}</span> },
     {
-      k: "Tokens",
+      k: t("common.tokens"),
       v: (
         <span className="mono">{scan.total_tokens?.toLocaleString() ?? 0}</span>
       ),
     },
-    { k: "Stop reason", v: scan.stop_reason || "—" },
-    { k: "Started", v: formatTime(scan.started_at) },
-    { k: "Finished", v: scan.finished_at ? formatTime(scan.finished_at) : "—" },
+    { k: t("scanDetail.config.stopReason"), v: scan.stop_reason || "—" },
+    { k: t("scans.col.started"), v: formatTime(scan.started_at) },
+    { k: t("scanDetail.config.finished"), v: scan.finished_at ? formatTime(scan.finished_at) : "—" },
     {
-      k: "Discord webhook",
+      k: t("scanDetail.config.discordWebhook"),
       v:
         scan.discord_webhook_configured || scan.discord_webhook
-          ? "configured"
-          : "none",
+          ? t("scanDetail.config.configured")
+          : t("scanDetail.config.none"),
     },
   ];
   return (
@@ -1420,7 +1559,7 @@ function ConfigTab({
           {scan.instruction && (
             <div className="grid grid-cols-3 gap-2 px-4 py-3 text-sm">
               <dt className="text-muted-foreground flex items-center gap-1">
-                <Sparkles className="h-3 w-3" /> Instruction
+                <Sparkles className="h-3 w-3" /> {t("tasks.fieldInstruction")}
               </dt>
               <dd className="col-span-2 whitespace-pre-wrap text-foreground/90">
                 {scan.instruction}

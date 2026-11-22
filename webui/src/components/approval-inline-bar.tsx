@@ -3,9 +3,12 @@ import { Link } from "react-router-dom";
 import { toast } from "sonner";
 import { Check, Clock, ExternalLink, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { useDecideApproval } from "@/api/queries";
+import { Switch } from "@/components/ui/switch";
+import { useCreateApprovalRule, useDecideApproval } from "@/api/queries";
 import { useI18n } from "@/i18n";
+import { useActiveProjectId } from "@/lib/use-active-project";
 import { useCountdown, formatCountdown } from "@/lib/use-countdown";
+import { approvalRuleDraft } from "@/lib/approval-rule";
 import { cn } from "@/lib/utils";
 import type { Approval } from "@/types/api";
 
@@ -15,11 +18,15 @@ import type { Approval } from "@/types/api";
  * is looking, not only in the queue page). Decisions hit the same API as the
  * approvals page; a 409 (already decided elsewhere) flips the bar to a
  * decided chip with a deep link. Unfolded by default — HITL never hides
- * behind a collapsed row.
+ * behind a collapsed row. 「批准并记住」走紧凑开关：按默认草稿建规则（契约
+ * §3.4；要改粒度去队列页的卡片）。
  */
 export function ApprovalInlineBar({ approval }: { approval: Approval }) {
   const { t } = useI18n();
   const decide = useDecideApproval();
+  const createRule = useCreateApprovalRule();
+  const projectId = useActiveProjectId();
+  const [remember, setRemember] = useState(false);
   const [resolved, setResolved] = useState<
     "approved" | "rejected" | "conflict" | null
   >(null);
@@ -28,6 +35,7 @@ export function ApprovalInlineBar({ approval }: { approval: Approval }) {
     pending ? approval.deadline_at : undefined,
   );
   const urgent = pending && !expired && (remainingMs ?? 0) < 60_000;
+  const draft = pending ? approvalRuleDraft(approval) : null;
 
   const summary =
     approval.payload.command ||
@@ -44,6 +52,21 @@ export function ApprovalInlineBar({ approval }: { approval: Approval }) {
               ? t("toast.approvalApproved")
               : t("toast.approvalRejected"),
           );
+          if (decision === "approved" && remember && projectId && draft) {
+            createRule.mutate(
+              {
+                project_id: projectId,
+                kind: approval.kind,
+                match: draft.match,
+                created_from_approval_id: approval.id,
+              },
+              {
+                onSuccess: () => toast.success(t("approvalRules.createdToast")),
+                onError: (err) =>
+                  toast.error(`${t("approvalRules.failedToast")}: ${err.message}`),
+              },
+            );
+          }
         },
         onError: (err: unknown) => {
           const status =
@@ -106,7 +129,7 @@ export function ApprovalInlineBar({ approval }: { approval: Approval }) {
         )}
       </div>
       {pending ? (
-        <div className="mt-2 flex items-center gap-2">
+        <div className="mt-2 flex flex-wrap items-center gap-2">
           <Button size="sm" variant="destructive" disabled={decide.isPending} onClick={() => onDecide("rejected")}>
             <X className="h-3.5 w-3.5" />
             {t("approval.reject")}
@@ -115,6 +138,17 @@ export function ApprovalInlineBar({ approval }: { approval: Approval }) {
             <Check className="h-3.5 w-3.5" />
             {t("approval.approve")}
           </Button>
+          {draft && projectId && (
+            <label className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+              <Switch
+                checked={remember}
+                onCheckedChange={setRemember}
+                aria-label={t("approvalRules.remember")}
+                className="h-4 w-7"
+              />
+              {t("approvalRules.rememberShort")}
+            </label>
+          )}
           <Link
             to={`/approvals?focus=${approval.id}`}
             className="ml-auto flex items-center gap-1 text-[11px] text-muted-foreground transition-colors hover:text-foreground"

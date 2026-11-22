@@ -1,15 +1,30 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "./client";
 import type {
+  ApprovalRuleRequest,
   ColdPathSyncState,
+  ConversationPatch,
   InfoAssociationParams,
+  IntelTriageStatus,
   InfoContextParams,
   InfoRegionParams,
   ListParams,
   ProjectRequest,
+  Role,
   ScanRequest,
   ScanSchedule,
   TaskRequest,
+  AgentProfile,
+  AgentProfilePatch,
+  AgentProfileRequest,
+  InvocationList,
+  InvocationListParams,
+  McpServer,
+  McpServerPatch,
+  McpServerRequest,
+  UserSkill,
+  UserSkillPatch,
+  UserSkillRequest,
 } from "@/types/api";
 
 export const qk = {
@@ -28,7 +43,6 @@ export const qk = {
   instanceEvents: (id: string) => ["instance", id, "events"] as const,
   queue: ["queue"] as const,
   rateLimit: ["settings", "rate-limit"] as const,
-  agentMail: ["settings", "agentmail"] as const,
   llmSettings: ["settings", "llm"] as const,
   environmentSettings: ["settings", "environment"] as const,
   schedules: ["schedules"] as const,
@@ -50,9 +64,12 @@ export const qk = {
   task: (id: string) => ["task", id] as const,
   taskRuns: (id: string) => ["task", id, "runs"] as const,
   taskFindings: (id: string) => ["task", id, "findings"] as const,
-  approvals: (filter: string, projectId?: string) =>
-    ["approvals", filter, projectId ?? "all"] as const,
+  taskIntelligence: (id: string) => ["task", id, "intelligence"] as const,
+  approvals: (filter: string, projectId?: string, taskId?: string) =>
+    ["approvals", filter, projectId ?? "all", taskId ?? "all"] as const,
   approvalsSummary: ["approvals", "summary"] as const,
+  approvalRules: (projectId?: string, kind?: string) =>
+    ["approvals", "rules", projectId ?? "all", kind ?? "all"] as const,
   infoRegion: (params: InfoRegionParams) =>
     ["info", "region", params] as const,
   infoContext: (params: InfoContextParams) =>
@@ -60,6 +77,19 @@ export const qk = {
   infoAssociation: (params: InfoAssociationParams) =>
     ["info", "association", params] as const,
   coldPathSync: (scanId: string) => ["info", "coldpath", scanId] as const,
+  // 集成模块（MCP / Skills / Agents）：定义 + 调用记录。配置类无轮询，
+  // mutation 失效刷新；调用记录 15s 轻轮询。
+  mcpServers: ["mcp", "servers"] as const,
+  skills: ["skills"] as const,
+  agentProfiles: ["agent-profiles"] as const,
+  mcpInvocations: (params: InvocationListParams) =>
+    ["mcp", "invocations", params] as const,
+  skillInvocations: (params: InvocationListParams) =>
+    ["skills", "invocations", params] as const,
+  agentInvocations: (params: InvocationListParams) =>
+    ["agent-profiles", "invocations", params] as const,
+  // RBAC account management (admin-only page).
+  users: ["users"] as const,
 };
 
 export function useAuthStatus() {
@@ -142,6 +172,47 @@ export function useTokenUsage(id?: string, running?: boolean) {
   });
 }
 
+// 流量代理 raw 交换（finding 详情渲染 HTTP 请求/响应包）。按 finding 的
+// endpoint/method 过滤，懒加载：只在调用方 enabled 时请求。归档是扫描结束
+// 后仍在的文件，缓存 30s 足够新鲜。
+export function useScanTraffic(
+  scanId: string | undefined,
+  endpoint?: string,
+  method?: string,
+  enabled = true,
+) {
+  return useQuery({
+    queryKey: ["scan", scanId ?? "none", "traffic", endpoint ?? "", method ?? ""],
+    queryFn: () => api.scanTraffic(scanId!, { endpoint, method, limit: 20 }),
+    enabled: enabled && !!scanId,
+    staleTime: 30_000,
+    retry: false,
+  });
+}
+
+// Run 文件浏览器：单层目录列表。扫描运行中每 5s 轮询当前目录，让新产物
+// 自动出现；目录切换时 path 进 key，各目录独立缓存（懒展开）。
+export function useScanFiles(scanId: string | undefined, path: string, running?: boolean) {
+  return useQuery({
+    queryKey: ["scan", scanId ?? "none", "files", path],
+    queryFn: () => api.scanFiles(scanId!, path),
+    enabled: !!scanId,
+    refetchInterval: running ? 5000 : false,
+    retry: false,
+    placeholderData: (prev) => prev,
+  });
+}
+
+// 单个文件的文本读取（二进制由后端标记，不带 content）。只在选中文件时启用。
+export function useScanFileContent(scanId: string | undefined, path: string | null) {
+  return useQuery({
+    queryKey: ["scan", scanId ?? "none", "file-content", path],
+    queryFn: () => api.scanFileContent(scanId!, path!),
+    enabled: !!scanId && !!path,
+    retry: false,
+  });
+}
+
 export function useScan(id?: string) {
   return useQuery({
     queryKey: id ? qk.scan(id) : ["scan", "none"],
@@ -200,13 +271,6 @@ export function useRateLimit() {
   return useQuery({
     queryKey: qk.rateLimit,
     queryFn: api.rateLimit,
-  });
-}
-
-export function useAgentMail() {
-  return useQuery({
-    queryKey: qk.agentMail,
-    queryFn: api.agentMail,
   });
 }
 
@@ -333,17 +397,6 @@ export function useUpdateRateLimit() {
   });
 }
 
-export function useUpdateAgentMail() {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: api.updateAgentMail,
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: qk.agentMail });
-      qc.invalidateQueries({ queryKey: qk.environmentSettings });
-    },
-  });
-}
-
 export function useUpdateLLMSettings() {
   const qc = useQueryClient();
   return useMutation({
@@ -364,7 +417,6 @@ export function useUpdateEnvironmentSettings() {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: qk.environmentSettings });
       qc.invalidateQueries({ queryKey: qk.llmSettings });
-      qc.invalidateQueries({ queryKey: qk.agentMail });
       qc.invalidateQueries({ queryKey: qk.rateLimit });
       qc.invalidateQueries({ queryKey: qk.version });
       qc.invalidateQueries({ queryKey: qk.instances });
@@ -699,6 +751,42 @@ export function useTaskRuns(id?: string) {
   });
 }
 
+/** 会话转录：分页读最新一页；运行中短间隔轮询（SSE 之外无需新通道）。 */
+/** 会话侧栏：项目内全部 run（含任务名、标题、置顶、归档）。 */
+export function useProjectConversations(projectId?: string, includeArchived = false) {
+  return useQuery({
+    queryKey: ["conversation", "project", projectId ?? "none", includeArchived],
+    queryFn: () => api.projectConversations(projectId!, includeArchived),
+    enabled: !!projectId,
+    retry: false,
+    refetchInterval: 8000,
+    placeholderData: (prev) => prev,
+  });
+}
+
+export function useTranscript(instanceId?: string, beforeSeq?: number, limit = 80) {
+  return useQuery({
+    queryKey: ["conversation", instanceId ?? "none", "transcript", beforeSeq ?? 0, limit],
+    queryFn: () => api.conversationTranscript(instanceId!, beforeSeq, limit),
+    enabled: !!instanceId,
+    retry: false,
+    refetchInterval: (query) => (query.state.data?.running ? 2500 : false),
+    placeholderData: (prev) => prev,
+  });
+}
+
+export function useUpdateConversation(taskId?: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ instanceId, patch }: { instanceId: string; patch: ConversationPatch }) =>
+      api.updateConversation(instanceId, patch),
+    onSuccess: () => {
+      if (taskId) qc.invalidateQueries({ queryKey: qk.taskRuns(taskId) });
+      qc.invalidateQueries({ queryKey: ["conversation"] });
+    },
+  });
+}
+
 export function useTaskFindings(id?: string) {
   return useQuery({
     queryKey: id ? qk.taskFindings(id) : ["task", "none", "findings"],
@@ -710,12 +798,58 @@ export function useTaskFindings(id?: string) {
   });
 }
 
+// Run 账本投影（任务详情「账本」tab）。运行中 8s 轮询跟随假设生命周期变化；
+// 终态 run 一次拉取即可，但仍给 30s 低频兜底（快照只在引擎写时变化）。
+export function useScanLedger(scanId?: string, running?: boolean) {
+  return useQuery({
+    queryKey: ["scan", scanId ?? "none", "ledger"],
+    queryFn: () => api.scanLedger(scanId!),
+    enabled: !!scanId,
+    retry: false,
+    refetchInterval: running ? 8000 : 30000,
+    placeholderData: (prev) => prev,
+  });
+}
+
+// 任务情报（任务详情「情报」tab）：findings 同款 15s 节奏；分诊成功后由
+// mutation 失效刷新。
+export function useTaskIntelligence(taskId?: string) {
+  return useQuery({
+    queryKey: taskId
+      ? qk.taskIntelligence(taskId)
+      : ["task", "none", "intelligence"],
+    queryFn: () => api.taskIntelligence(taskId!),
+    enabled: !!taskId,
+    retry: false,
+    refetchInterval: 15000,
+    placeholderData: (prev) => prev,
+  });
+}
+
+export function useIntelTriage(taskId: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      fingerprint,
+      status,
+    }: { fingerprint: string; status: IntelTriageStatus }) =>
+      api.triageIntelligence(taskId, fingerprint, status),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: qk.taskIntelligence(taskId) });
+    },
+  });
+}
+
 export function useApprovals(
-  opts: { status?: "pending" | "decided" | "all"; projectId?: string } = {},
+  opts: {
+    status?: "pending" | "decided" | "all";
+    projectId?: string;
+    taskId?: string;
+  } = {},
 ) {
   const filter = opts.status ?? "pending";
   return useQuery({
-    queryKey: qk.approvals(filter, opts.projectId),
+    queryKey: qk.approvals(filter, opts.projectId, opts.taskId),
     queryFn: () => api.listApprovals(opts),
     retry: false,
     // 自适应轮询在组件层用 refetchInterval 函数表达：pending>0 → 5s。
@@ -772,9 +906,55 @@ export function useBatchDecideApprovals() {
 }
 
 // ---------------------------------------------------------------------------
+// 审批豁免规则（approve & remember，契约 §3.4）。列表挂在 ["approvals"]
+// 前缀下：规则增删会连带刷新审批相关缓存。
+
+export function useApprovalRules(
+  opts: { projectId?: string; kind?: "command" | "http" } = {},
+) {
+  return useQuery({
+    queryKey: qk.approvalRules(opts.projectId, opts.kind),
+    queryFn: () => api.listApprovalRules(opts),
+    retry: false,
+    placeholderData: (prev) => prev,
+  });
+}
+
+export function useCreateApprovalRule() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (req: ApprovalRuleRequest) => api.createApprovalRule(req),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["approvals"] });
+    },
+  });
+}
+
+export function useDeleteApprovalRule() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => api.deleteApprovalRule(id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["approvals"] });
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Guidance：人工在环插入意图（契约 §3.1）。4zreco 模式：发送即同步接受，
 // 无乐观回显——列表从服务端 refetch 渲染；request_id 幂等由调用方生成并持有。
 // ---------------------------------------------------------------------------
+
+export function useTaskObjective(id?: string) {
+  return useQuery({
+    queryKey: id ? ["task", id, "objective"] : ["task", "none", "objective"],
+    queryFn: () => api.taskObjective(id!),
+    enabled: !!id,
+    retry: false,
+    refetchInterval: 15000,
+    placeholderData: (prev) => prev,
+  });
+}
 
 export function useTaskGuidance(id?: string) {
   return useQuery({
@@ -782,13 +962,12 @@ export function useTaskGuidance(id?: string) {
     queryFn: () => api.taskGuidance(id!),
     enabled: !!id,
     retry: false,
-    refetchInterval: 8000,
+    // Initial history only. New turns and status changes arrive over SSE.
     placeholderData: (prev) => prev,
   });
 }
 
 export function useSendTaskGuidance() {
-  const qc = useQueryClient();
   return useMutation({
     mutationFn: ({
       id,
@@ -797,9 +976,6 @@ export function useSendTaskGuidance() {
       instanceId,
     }: { id: string; message: string; requestId: string; instanceId?: string }) =>
       api.sendTaskGuidance(id, message, requestId, instanceId),
-    onSuccess: (_data, vars) => {
-      qc.invalidateQueries({ queryKey: ["task", vars.id, "guidance"] });
-    },
   });
 }
 
@@ -850,3 +1026,201 @@ export function useColdPathSync(scanId: string, enabled = true) {
     retry: false,
   });
 }
+
+// ── 集成模块（MCP / Skills / Agents）─────────────────────────────────────────
+
+export function useMcpServers() {
+  return useQuery({
+    queryKey: qk.mcpServers,
+    queryFn: api.listMcpServers,
+    placeholderData: (prev) => prev,
+    retry: false,
+  });
+}
+
+export function useSkills() {
+  return useQuery({
+    queryKey: qk.skills,
+    queryFn: api.listSkills,
+    placeholderData: (prev) => prev,
+    retry: false,
+  });
+}
+
+export function useAgentProfiles() {
+  return useQuery({
+    queryKey: qk.agentProfiles,
+    queryFn: api.listAgentProfiles,
+    placeholderData: (prev) => prev,
+    retry: false,
+  });
+}
+
+function useInvocationsQuery<T extends InvocationList>(
+  key: readonly unknown[],
+  fn: () => Promise<T>,
+) {
+  return useQuery({
+    queryKey: key,
+    queryFn: fn,
+    placeholderData: (prev) => prev,
+    retry: false,
+    refetchInterval: 15_000,
+  });
+}
+
+export function useMcpInvocations(params: InvocationListParams) {
+  return useInvocationsQuery(qk.mcpInvocations(params), () =>
+    api.listInvocations("mcp", params));
+}
+
+export function useSkillInvocations(params: InvocationListParams) {
+  return useInvocationsQuery(qk.skillInvocations(params), () =>
+    api.listInvocations("skills", params));
+}
+
+export function useAgentInvocations(params: InvocationListParams) {
+  return useInvocationsQuery(qk.agentInvocations(params), () =>
+    api.listInvocations("agents", params));
+}
+
+/** invalidateIntegration 刷新同前缀的定义缓存（三模块共用 mutation 收尾）。 */
+export function useInvalidateIntegrations() {
+  const qc = useQueryClient();
+  return () => {
+    void qc.invalidateQueries({ queryKey: qk.mcpServers });
+    void qc.invalidateQueries({ queryKey: qk.skills });
+    void qc.invalidateQueries({ queryKey: qk.agentProfiles });
+    void qc.invalidateQueries({ queryKey: ["mcp", "invocations"] });
+    void qc.invalidateQueries({ queryKey: ["skills", "invocations"] });
+    void qc.invalidateQueries({ queryKey: ["agent-profiles", "invocations"] });
+  };
+}
+
+export function useCreateMcpServer() {
+  const invalidate = useInvalidateIntegrations();
+  return useMutation({
+    mutationFn: (req: McpServerRequest) => api.createMcpServer(req),
+    onSuccess: invalidate,
+  });
+}
+
+export function useUpdateMcpServer() {
+  const invalidate = useInvalidateIntegrations();
+  return useMutation({
+    mutationFn: ({ id, patch }: { id: string; patch: McpServerPatch }) =>
+      api.updateMcpServer(id, patch),
+    onSuccess: invalidate,
+  });
+}
+
+export function useDeleteMcpServer() {
+  const invalidate = useInvalidateIntegrations();
+  return useMutation({
+    mutationFn: (id: string) => api.deleteMcpServer(id),
+    onSuccess: invalidate,
+  });
+}
+
+export function useRefreshMcpServer() {
+  const invalidate = useInvalidateIntegrations();
+  return useMutation({
+    mutationFn: (id: string) => api.refreshMcpServer(id),
+    onSuccess: invalidate,
+  });
+}
+
+export function useCreateSkill() {
+  const invalidate = useInvalidateIntegrations();
+  return useMutation({
+    mutationFn: (req: UserSkillRequest) => api.createSkill(req),
+    onSuccess: invalidate,
+  });
+}
+
+export function useUpdateSkill() {
+  const invalidate = useInvalidateIntegrations();
+  return useMutation({
+    mutationFn: ({ id, patch }: { id: string; patch: UserSkillPatch }) =>
+      api.updateSkill(id, patch),
+    onSuccess: invalidate,
+  });
+}
+
+export function useDeleteSkill() {
+  const invalidate = useInvalidateIntegrations();
+  return useMutation({
+    mutationFn: (id: string) => api.deleteSkill(id),
+    onSuccess: invalidate,
+  });
+}
+
+export function useCreateAgentProfile() {
+  const invalidate = useInvalidateIntegrations();
+  return useMutation({
+    mutationFn: (req: AgentProfileRequest) => api.createAgentProfile(req),
+    onSuccess: invalidate,
+  });
+}
+
+export function useUpdateAgentProfile() {
+  const invalidate = useInvalidateIntegrations();
+  return useMutation({
+    mutationFn: ({ id, patch }: { id: string; patch: AgentProfilePatch }) =>
+      api.updateAgentProfile(id, patch),
+    onSuccess: invalidate,
+  });
+}
+
+export function useDeleteAgentProfile() {
+  const invalidate = useInvalidateIntegrations();
+  return useMutation({
+    mutationFn: (id: string) => api.deleteAgentProfile(id),
+    onSuccess: invalidate,
+  });
+}
+
+// ── RBAC account management (admin-only) ──────────────────────────────────
+
+export function useUsers() {
+  return useQuery({
+    queryKey: qk.users,
+    queryFn: api.listUsers,
+    staleTime: 30_000,
+    retry: false,
+  });
+}
+
+export function useCreateUser() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: api.createUser,
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.users }),
+  });
+}
+
+export function useUpdateUser() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      id,
+      patch,
+    }: {
+      id: string;
+      patch: { role?: Role; disabled?: boolean; password?: string };
+    }) => api.updateUser(id, patch),
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.users }),
+  });
+}
+
+export function useDeleteUser() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: api.deleteUser,
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.users }),
+  });
+}
+
+/** 类型仅作 API 返回形状标注的本地引用（避免 unused 告警由 hooks 消费）。 */
+export type { AgentProfile, McpServer, UserSkill };
+

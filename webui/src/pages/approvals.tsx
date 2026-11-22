@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
-import { Check, X } from "lucide-react";
+import { Check, ShieldCheck, X } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import {
@@ -12,17 +12,20 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { ApprovalCard } from "@/components/approval-card";
+import { ApprovalRulesDialog } from "@/components/approval-rules-dialog";
 import { EmptyState, ErrorState } from "@/components/states";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
+  useApprovalRules,
   useApprovals,
   useBatchDecideApprovals,
+  useCreateApprovalRule,
   useDecideApproval,
 } from "@/api/queries";
 import { useActiveProjectId } from "@/lib/use-active-project";
 import { useI18n } from "@/i18n";
 import { cn } from "@/lib/utils";
-import type { Approval } from "@/types/api";
+import type { Approval, ApprovalRuleDraft } from "@/types/api";
 
 const isMac =
   typeof navigator !== "undefined" && /mac/i.test(navigator.platform || "");
@@ -45,13 +48,17 @@ export default function ApprovalsPage() {
   const [focusedId, setFocusedId] = useState<string | null>(
     searchParams.get("focus"),
   );
+  const [rulesOpen, setRulesOpen] = useState(false);
 
   const { data, isLoading, error, refetch } = useApprovals({
     status: statusFilter,
     projectId: projectId ?? undefined,
   });
+  const { data: rulesData } = useApprovalRules({ projectId: projectId ?? undefined });
+  const createRule = useCreateApprovalRule();
   const decide = useDecideApproval();
   const batch = useBatchDecideApprovals();
+  const ruleCount = rulesData?.rules.length ?? 0;
 
   const approvals = useMemo(() => {
     const list = data?.approvals ?? [];
@@ -95,6 +102,43 @@ export default function ApprovalsPage() {
       );
     },
     [decide, t],
+  );
+
+  // 批准并记住（契约 §3.4）：先走常规决策，决策落定后按卡片编辑过的草稿
+  // 建规则（溯源 created_from_approval_id）。规则创建失败不回滚决策——
+  // 裁决与豁免是两件事，后者失败只提示。
+  const onDecideWithRule = useCallback(
+    (a: Approval, decision: "approved" | "rejected", draft: ApprovalRuleDraft) => {
+      decide.mutate(
+        { id: a.id, decision },
+        {
+          onSuccess: () => {
+            toast.success(
+              decision === "approved"
+                ? t("toast.approvalApproved")
+                : t("toast.approvalRejected"),
+            );
+            if (decision !== "approved" || !projectId) return;
+            createRule.mutate(
+              {
+                project_id: projectId,
+                kind: draft.kind,
+                match: draft.match,
+                created_from_approval_id: a.id,
+              },
+              {
+                onSuccess: () => toast.success(t("approvalRules.createdToast")),
+                onError: (err) =>
+                  toast.error(`${t("approvalRules.failedToast")}: ${err.message}`),
+              },
+            );
+          },
+          onError: (err) =>
+            toast.error(`${t("toast.approvalFailed")}: ${err.message}`),
+        },
+      );
+    },
+    [createRule, decide, projectId, t],
   );
 
   // Keyboard flow: j/k move, a approve, r reject, b select-all.
@@ -181,6 +225,20 @@ export default function ApprovalsPage() {
             <Kbd>r</Kbd>
             <Kbd>b</Kbd>
           </span>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setRulesOpen(true)}
+            aria-label={t("approvalRules.title")}
+          >
+            <ShieldCheck className="h-3.5 w-3.5" aria-hidden />
+            {t("approvalRules.title")}
+            {ruleCount > 0 && (
+              <span className="ml-1 rounded-sm bg-muted px-1.5 py-0.5 text-[10px] tabular-nums mono">
+                {ruleCount}
+              </span>
+            )}
+          </Button>
           <Select
             value={statusFilter}
             onValueChange={(v) => {
@@ -278,6 +336,7 @@ export default function ApprovalsPage() {
                   deciding={decide.isPending}
                   focused={focusedId === a.id}
                   onDecide={onDecide}
+                  onDecideWithRule={onDecideWithRule}
                 />
               </div>
             </div>
@@ -289,6 +348,7 @@ export default function ApprovalsPage() {
           )}
         </div>
       )}
+      <ApprovalRulesDialog open={rulesOpen} onOpenChange={setRulesOpen} projectId={projectId ?? undefined} />
     </div>
   );
 }

@@ -1,9 +1,13 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { Check, ChevronDown, Clock, TriangleAlert, X } from "lucide-react";
-import type { Approval } from "@/types/api";
+import type { Approval, ApprovalRuleDraft } from "@/types/api";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
 import { useI18n } from "@/i18n";
 import { useCountdown, formatCountdown } from "@/lib/use-countdown";
+import { approvalRuleDraft } from "@/lib/approval-rule";
 import { cn } from "@/lib/utils";
 
 /**
@@ -14,17 +18,27 @@ import { cn } from "@/lib/utils";
  * count) sits beside the decision buttons. The deadline countdown is the
  * visual anchor — timeout means rejection, so remaining time is always shown
  * and turns urgent under a minute.
+ *
+ * 「批准并记住」（契约 §3.4）：记住开关打开后显示预填规则草稿（程序名 +
+ * 目标主机子串 / method+host+path 前缀），批准时经 onDecideWithRule 一并
+ * 创建规则。deny 形状不受规则影响——后端匹配期兜底。
  */
 export function ApprovalCard({
   approval,
   deciding,
   focused,
   onDecide,
+  onDecideWithRule,
 }: {
   approval: Approval;
   deciding?: boolean;
   focused?: boolean;
   onDecide: (a: Approval, decision: "approved" | "rejected") => void;
+  onDecideWithRule?: (
+    a: Approval,
+    decision: "approved" | "rejected",
+    draft: ApprovalRuleDraft,
+  ) => void;
 }) {
   const { t } = useI18n();
   const [showJson, setShowJson] = useState(false);
@@ -33,6 +47,20 @@ export function ApprovalCard({
     pending ? approval.deadline_at : undefined,
   );
   const urgent = pending && !expired && (remainingMs ?? 0) < 60_000;
+
+  // 「批准并记住」：草稿按 approval kind 预填一次（pending 期间不随输入抖动）。
+  const initialDraft = useMemo(() => approvalRuleDraft(approval), [approval]);
+  const [remember, setRemember] = useState(false);
+  const [draft, setDraft] = useState<ApprovalRuleDraft | null>(initialDraft);
+  const rememberAvailable = pending && !!onDecideWithRule && !!initialDraft;
+
+  function onApprove() {
+    if (remember && rememberAvailable && draft) {
+      onDecideWithRule(approval, "approved", draft);
+      return;
+    }
+    onDecide(approval, "approved");
+  }
 
   return (
     <div
@@ -191,23 +219,118 @@ export function ApprovalCard({
 
         {/* Decision row */}
         {pending ? (
-          <div className="flex items-center gap-2 border-t border-border pt-3">
-            <Button
-              size="sm"
-              variant="destructive"
-              disabled={deciding}
-              onClick={() => onDecide(approval, "rejected")}
-            >
-              <X className="h-3.5 w-3.5" />
-              {t("approval.reject")}
-            </Button>
-            <Button size="sm" disabled={deciding} onClick={() => onDecide(approval, "approved")}>
-              <Check className="h-3.5 w-3.5" />
-              {t("approval.approve")}
-            </Button>
-            <span className="ml-auto text-[11px] text-muted-foreground">
-              {t("approval.timeoutHint")}
-            </span>
+          <div className="space-y-2 border-t border-border pt-3">
+            {rememberAvailable && (
+              <div className="flex items-center gap-2">
+                <Switch
+                  id={`remember-${approval.id}`}
+                  checked={remember}
+                  onCheckedChange={(v) => setRemember(v)}
+                  aria-label={t("approvalRules.remember")}
+                />
+                <Label
+                  htmlFor={`remember-${approval.id}`}
+                  className="cursor-pointer text-xs text-muted-foreground"
+                >
+                  {t("approvalRules.remember")}
+                </Label>
+              </div>
+            )}
+            {remember && rememberAvailable && draft && (
+              <div className="rounded-sm border border-border bg-muted/30 p-2.5">
+                {draft.kind === "command" ? (
+                  <div className="grid gap-2 sm:grid-cols-[minmax(0,120px)_minmax(0,1fr)]">
+                    <div className="space-y-1">
+                      <Label htmlFor={`rule-program-${approval.id}`} className="text-[11px] text-muted-foreground">
+                        {t("approvalRules.fieldProgram")}
+                      </Label>
+                      <Input
+                        id={`rule-program-${approval.id}`}
+                        value={draft.match.program ?? ""}
+                        onChange={(e) =>
+                          setDraft({ ...draft, match: { ...draft.match, program: e.target.value } })
+                        }
+                        className="mono h-8 text-xs"
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <Label htmlFor={`rule-contains-${approval.id}`} className="text-[11px] text-muted-foreground">
+                        {t("approvalRules.fieldContains")}
+                      </Label>
+                      <Input
+                        id={`rule-contains-${approval.id}`}
+                        value={draft.match.contains ?? ""}
+                        onChange={(e) =>
+                          setDraft({ ...draft, match: { ...draft.match, contains: e.target.value } })
+                        }
+                        placeholder={t("approvalRules.containsPlaceholder")}
+                        className="mono h-8 text-xs"
+                      />
+                    </div>
+                  </div>
+                ) : (
+                  <div className="grid gap-2 sm:grid-cols-[minmax(0,96px)_minmax(0,1fr)_minmax(0,1fr)]">
+                    <div className="space-y-1">
+                      <Label htmlFor={`rule-method-${approval.id}`} className="text-[11px] text-muted-foreground">
+                        {t("approval.method")}
+                      </Label>
+                      <Input
+                        id={`rule-method-${approval.id}`}
+                        value={draft.match.method ?? ""}
+                        disabled
+                        className="mono h-8 text-xs"
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <Label htmlFor={`rule-host-${approval.id}`} className="text-[11px] text-muted-foreground">
+                        {t("approvalRules.fieldHost")}
+                      </Label>
+                      <Input
+                        id={`rule-host-${approval.id}`}
+                        value={draft.match.host ?? ""}
+                        onChange={(e) =>
+                          setDraft({ ...draft, match: { ...draft.match, host: e.target.value } })
+                        }
+                        className="mono h-8 text-xs"
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <Label htmlFor={`rule-path-${approval.id}`} className="text-[11px] text-muted-foreground">
+                        {t("approvalRules.fieldPathPrefix")}
+                      </Label>
+                      <Input
+                        id={`rule-path-${approval.id}`}
+                        value={draft.match.path_prefix ?? ""}
+                        onChange={(e) =>
+                          setDraft({ ...draft, match: { ...draft.match, path_prefix: e.target.value } })
+                        }
+                        placeholder={t("approvalRules.anyPath")}
+                        className="mono h-8 text-xs"
+                      />
+                    </div>
+                  </div>
+                )}
+                <p className="mt-1.5 text-[11px] text-muted-foreground">{t("approvalRules.rememberHint")}</p>
+              </div>
+            )}
+            <div className="flex items-center gap-2">
+              <Button
+                size="sm"
+                variant="destructive"
+                disabled={deciding}
+                onClick={() => onDecide(approval, "rejected")}
+              >
+                <X className="h-3.5 w-3.5" />
+                {t("approval.reject")}
+              </Button>
+              <Button size="sm" disabled={deciding} onClick={onApprove}>
+                <Check className="h-3.5 w-3.5" />
+                {t("approval.approve")}
+              </Button>
+              <span className="ml-auto text-[11px] text-muted-foreground">
+                {t("approval.timeoutHint")}
+              </span>
+            </div>
           </div>
         ) : (
           <div className="flex flex-wrap gap-x-4 gap-y-1 border-t border-border pt-3 text-xs text-muted-foreground">

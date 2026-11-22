@@ -16,7 +16,7 @@
 // Everything here is deterministic over the same event array so pagination and
 // live merges produce the same transcript.
 
-import type { FeedEvent } from "@/store/ws";
+import type { FeedEvent } from "@/store/events";
 
 export type PlanTaskStatus = "pending" | "in_progress" | "completed" | "skipped";
 

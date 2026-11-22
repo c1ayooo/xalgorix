@@ -1,4 +1,4 @@
-import type { FeedEvent } from "@/store/ws";
+import type { FeedEvent } from "@/store/events";
 
 export type FeedExportFormat = "json" | "jsonl" | "txt";
 

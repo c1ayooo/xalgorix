@@ -186,6 +186,7 @@ function AgentFilter({
   value: string;
   onChange: (v: string) => void;
 }) {
+  const { t } = useI18n();
   const options = ["all", ...agentTypes];
   return (
     <div className="flex flex-wrap gap-1.5">
@@ -200,7 +201,7 @@ function AgentFilter({
               : "border-border text-muted-foreground hover:border-primary/40"
           }`}
         >
-          {opt === "all" ? "All" : agentLabel(opt)}
+          {opt === "all" ? t("token.all") : agentLabel(opt)}
         </button>
       ))}
     </div>
@@ -222,6 +223,7 @@ function SourceBars({
   skill: number;
   userOther: number;
 }) {
+  const { t } = useI18n();
   const total = Math.max(1, system + assistant + tool + userOther);
   const seg = (v: number) => `${((v / total) * 100).toFixed(2)}%`;
   return (
@@ -231,17 +233,17 @@ function SourceBars({
         <span className="font-mono text-muted-foreground">{fmtBytes(total)}</span>
       </div>
       <div className="flex h-2.5 w-full overflow-hidden rounded-full bg-muted">
-        <div style={{ width: seg(system), background: "#60a5fa" }} title={`System ${fmtBytes(system)}`} />
-        <div style={{ width: seg(assistant), background: "#a78bfa" }} title={`Assistant ${fmtBytes(assistant)}`} />
-        <div style={{ width: seg(tool), background: "#f87171" }} title={`Tool results ${fmtBytes(tool)}`} />
-        <div style={{ width: seg(userOther), background: "#9ca3af" }} title={`Other user ${fmtBytes(userOther)}`} />
+        <div style={{ width: seg(system), background: "#60a5fa" }} title={`${t("token.src.system")} ${fmtBytes(system)}`} />
+        <div style={{ width: seg(assistant), background: "#a78bfa" }} title={`${t("token.src.assistant")} ${fmtBytes(assistant)}`} />
+        <div style={{ width: seg(tool), background: "#f87171" }} title={`${t("token.src.tool")} ${fmtBytes(tool)}`} />
+        <div style={{ width: seg(userOther), background: "#9ca3af" }} title={`${t("token.src.otherUser")} ${fmtBytes(userOther)}`} />
       </div>
       <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-muted-foreground">
-        <span>System {fmtBytes(system)}</span>
-        <span>Assistant history {fmtBytes(assistant)}</span>
-        <span>Tool results {fmtBytes(tool)}</span>
-        <span>Skill results {fmtBytes(skill)}</span>
-        <span>Other user history {fmtBytes(userOther)}</span>
+        <span>{t("token.src.system")} {fmtBytes(system)}</span>
+        <span>{t("token.src.assistantHistory")} {fmtBytes(assistant)}</span>
+        <span>{t("token.src.tool")} {fmtBytes(tool)}</span>
+        <span>{t("token.src.skill")} {fmtBytes(skill)}</span>
+        <span>{t("token.src.otherUserHistory")} {fmtBytes(userOther)}</span>
       </div>
     </div>
   );
@@ -295,12 +297,12 @@ function TokenUsageBody({
             <CardTitle className="text-sm">{t("scanDetail.token.total")}</CardTitle>
           </CardHeader>
           <CardContent className="grid grid-cols-3 gap-3">
-            <Metric label="TOTAL" value={fmtInt(d.total_tokens)} />
-            <Metric label="Prompt" value={fmtInt(d.prompt_tokens)} />
-            <Metric label="Output" value={fmtInt(d.completion_tokens)} />
-            <Metric label="Cached" value={d.cached_input_tokens === null ? "unknown" : fmtInt(d.cached_input_tokens)} />
-            <Metric label="Uncached" value={d.uncached_input_tokens === null ? "unknown" : fmtInt(d.uncached_input_tokens)} />
-            <Metric label="Cache hit %" value={fmtPct(d.cache_hit_rate)} />
+            <Metric label={t("token.total")} value={fmtInt(d.total_tokens)} />
+            <Metric label={t("token.prompt")} value={fmtInt(d.prompt_tokens)} />
+            <Metric label={t("token.output")} value={fmtInt(d.completion_tokens)} />
+            <Metric label={t("token.cached")} value={d.cached_input_tokens === null ? t("token.unknown") : fmtInt(d.cached_input_tokens)} />
+            <Metric label={t("token.uncached")} value={d.uncached_input_tokens === null ? t("token.unknown") : fmtInt(d.uncached_input_tokens)} />
+            <Metric label={t("token.cacheHit")} value={fmtPct(d.cache_hit_rate)} />
           </CardContent>
         </Card>
         <Card>
@@ -308,12 +310,12 @@ function TokenUsageBody({
             <CardTitle className="text-sm">{t("scanDetail.token.requests")}</CardTitle>
           </CardHeader>
           <CardContent className="grid grid-cols-3 gap-3">
-            <Metric label="LLM requests" value={`${d.total_llm_requests}`} />
-            <Metric label="Avg prompt" value={fmtInt(d.average_prompt_tokens_per_request)} />
-            <Metric label="Max prompt" value={fmtInt(d.largest_prompt_tokens)} />
-            <Metric label="Cache reported" value={`${d.cache_reported_requests}/${d.total_llm_requests}`} />
-            <Metric label="Largest conv" value={fmtBytes(d.largest_conversation_bytes)} />
-            <Metric label="Output avg" value={fmtInt(d.average_completion_tokens_per_request)} />
+            <Metric label={t("token.llmRequests")} value={`${d.total_llm_requests}`} />
+            <Metric label={t("token.avgPrompt")} value={fmtInt(d.average_prompt_tokens_per_request)} />
+            <Metric label={t("token.maxPrompt")} value={fmtInt(d.largest_prompt_tokens)} />
+            <Metric label={t("token.cacheReported")} value={`${d.cache_reported_requests}/${d.total_llm_requests}`} />
+            <Metric label={t("token.largestConv")} value={fmtBytes(d.largest_conversation_bytes)} />
+            <Metric label={t("token.outputAvg")} value={fmtInt(d.average_completion_tokens_per_request)} />
           </CardContent>
         </Card>
       </div>
@@ -328,18 +330,18 @@ function TokenUsageBody({
         </CardHeader>
         <CardContent className="space-y-3">
           <div className="grid grid-cols-2 gap-3 md:grid-cols-6">
-            <Metric label="First prompt" value={fmtInt(d.growth.first_prompt_tokens)} />
-            <Metric label="Last prompt" value={fmtInt(d.growth.last_prompt_tokens)} />
-            <Metric label="Growth" value={fmtRatio(d.growth.prompt_growth_ratio)} />
-            <Metric label="Median" value={fmtInt(d.growth.median_prompt_tokens)} />
+            <Metric label={t("token.firstPrompt")} value={fmtInt(d.growth.first_prompt_tokens)} />
+            <Metric label={t("token.lastPrompt")} value={fmtInt(d.growth.last_prompt_tokens)} />
+            <Metric label={t("token.growth")} value={fmtRatio(d.growth.prompt_growth_ratio)} />
+            <Metric label={t("token.median")} value={fmtInt(d.growth.median_prompt_tokens)} />
             <Metric label="P95" value={fmtInt(d.growth.p95_prompt_tokens)} />
-            <Metric label="Cumulative" value={fmtInt(d.growth.cumulative_prompt_tokens)} />
+            <Metric label={t("token.cumulative")} value={fmtInt(d.growth.cumulative_prompt_tokens)} />
           </div>
           <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-            <Metric label="Tool-result bytes" value={fmtBytes(d.tool_result_bytes)} />
-            <Metric label="Skill-result bytes" value={fmtBytes(d.skill_result_bytes)} />
-            <Metric label="Context sent (Σ)" value={fmtBytes(d.context.cumulative_context_bytes_sent)} />
-            <Metric label="Resend amplification" value={fmtRatio(d.context.resend_amplification_ratio)} />
+            <Metric label={t("token.toolBytes")} value={fmtBytes(d.tool_result_bytes)} />
+            <Metric label={t("token.skillBytes")} value={fmtBytes(d.skill_result_bytes)} />
+            <Metric label={t("token.contextSent")} value={fmtBytes(d.context.cumulative_context_bytes_sent)} />
+            <Metric label={t("token.resendAmp")} value={fmtRatio(d.context.resend_amplification_ratio)} />
           </div>
           <AgentFilter agentTypes={agentTypes} value={filter} onChange={setFilter} />
           <PromptTokensChart series={resp.series} agentTypes={agentTypes} filter={filter} />
@@ -355,17 +357,17 @@ function TokenUsageBody({
           <table className="w-full min-w-[720px] text-xs">
             <thead>
               <tr>
-                <th className={TH}>Agent</th>
-                <th className={TH}>Reqs</th>
-                <th className={TH}>Prompt</th>
-                <th className={TH}>Output</th>
-                <th className={TH}>Cached</th>
-                <th className={TH}>Uncached</th>
-                <th className={TH}>Avg prompt</th>
-                <th className={TH}>Max prompt</th>
-                <th className={TH}>Tool bytes</th>
-                <th className={TH}>Skill bytes</th>
-                <th className={TH}>Iters</th>
+                <th className={TH}>{t("token.agent")}</th>
+                <th className={TH}>{t("token.reqs")}</th>
+                <th className={TH}>{t("token.prompt")}</th>
+                <th className={TH}>{t("token.output")}</th>
+                <th className={TH}>{t("token.cached")}</th>
+                <th className={TH}>{t("token.uncached")}</th>
+                <th className={TH}>{t("token.avgPrompt")}</th>
+                <th className={TH}>{t("token.maxPrompt")}</th>
+                <th className={TH}>{t("token.toolBytesShort")}</th>
+                <th className={TH}>{t("token.skillBytesShort")}</th>
+                <th className={TH}>{t("token.iters")}</th>
               </tr>
             </thead>
             <tbody>
@@ -397,7 +399,7 @@ function TokenUsageBody({
             {d.sources.latest.map((c) => (
               <SourceBars
                 key={c.agent_id}
-                label={`${agentLabel(c.agent_type)} (iter ${c.iteration}, ${c.message_count} msgs)`}
+                label={`${agentLabel(c.agent_type)} (${t("token.iterWord")} ${c.iteration}, ${c.message_count} ${t("token.msgsWord")})`}
                 system={c.system_bytes}
                 assistant={c.assistant_bytes}
                 tool={c.tool_result_bytes}
@@ -415,12 +417,12 @@ function TokenUsageBody({
             <CardTitle className="text-sm">{t("scanDetail.token.recovery")}</CardTitle>
           </CardHeader>
           <CardContent className="grid grid-cols-2 gap-3">
-            <Metric label="Retries" value={`${rec.retry_requests} / ${fmtInt(rec.retry_tokens)}`} />
-            <Metric label="No-tool recovery" value={`${rec.no_tool_requests} / ${fmtInt(rec.no_tool_tokens)}`} />
-            <Metric label="Malformed-tool recovery" value={`${rec.malformed_tool_requests} / ${fmtInt(rec.malformed_tool_tokens)}`} />
-            <Metric label="Finish-rejection" value={`${rec.finish_rejection_requests} / ${fmtInt(rec.finish_rejection_tokens)}`} />
-            <Metric label="Recovery tokens" value={fmtInt(recoveryTokens)} />
-            <Metric label="Recovery share" value={d.total_tokens > 0 ? fmtPct(recoveryTokens / d.total_tokens) : "—"} />
+            <Metric label={t("token.retries")} value={`${rec.retry_requests} / ${fmtInt(rec.retry_tokens)}`} />
+            <Metric label={t("token.noToolRecovery")} value={`${rec.no_tool_requests} / ${fmtInt(rec.no_tool_tokens)}`} />
+            <Metric label={t("token.malformedRecovery")} value={`${rec.malformed_tool_requests} / ${fmtInt(rec.malformed_tool_tokens)}`} />
+            <Metric label={t("token.finishRejection")} value={`${rec.finish_rejection_requests} / ${fmtInt(rec.finish_rejection_tokens)}`} />
+            <Metric label={t("token.recoveryTokens")} value={fmtInt(recoveryTokens)} />
+            <Metric label={t("token.recoveryShare")} value={d.total_tokens > 0 ? fmtPct(recoveryTokens / d.total_tokens) : "—"} />
           </CardContent>
           <CardContent className="flex flex-wrap gap-1.5 pt-0">
             {Object.entries(d.category_tokens).map(([cat, tok]) => (

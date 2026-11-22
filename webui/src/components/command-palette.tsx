@@ -30,7 +30,7 @@ export const useCommandPalette = create<PaletteState>((set) => ({
 
 const NAV_ITEMS = [
   { labelKey: "nav.overview", to: "/", icon: LayoutGrid },
-  { labelKey: "nav.newScan", to: "/scans/new", icon: Plus },
+  { labelKey: "tasks.create", to: "/tasks?create=1", icon: Plus },
   { labelKey: "nav.scans", to: "/scans", icon: Target },
   { labelKey: "nav.findings", to: "/findings", icon: ShieldAlert },
   { labelKey: "nav.live", to: "/live", icon: Radio },
@@ -82,16 +82,16 @@ export function CommandPalette() {
   return (
     <Dialog open={open} onOpenChange={setOpen}>
       <DialogContent className="p-0 max-w-xl overflow-hidden">
-        <Command label="Command palette" className="flex flex-col">
+        <Command label={t("palette.label")} className="flex flex-col">
           <Command.Input
             placeholder={t("palette.placeholder")}
             className="h-11 w-full border-b border-border bg-transparent px-4 text-sm outline-none placeholder:text-muted-foreground"
           />
           <Command.List className="max-h-96 overflow-y-auto p-2">
             <Command.Empty className="px-3 py-6 text-center text-xs text-muted-foreground">
-              No results found.
+              {t("palette.noResults")}
             </Command.Empty>
-            <Command.Group heading="Navigate" className="text-[10px] uppercase tracking-wide text-muted-foreground [&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1">
+            <Command.Group heading={t("palette.navigate")} className="text-[10px] uppercase tracking-wide text-muted-foreground [&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1">
               {NAV_ITEMS.map((n) => {
                 const Icon = n.icon;
                 return (
@@ -106,7 +106,7 @@ export function CommandPalette() {
               })}
             </Command.Group>
             {scanItems.length > 0 && (
-              <Command.Group heading="Scans" className="text-[10px] uppercase tracking-wide text-muted-foreground [&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1">
+              <Command.Group heading={t("scans.title")} className="text-[10px] uppercase tracking-wide text-muted-foreground [&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1">
                 {scanItems.map((s) => (
                   <Command.Item
                     key={s.id}
