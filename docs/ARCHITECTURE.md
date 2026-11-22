@@ -59,6 +59,8 @@ After the v4.5.44 decomposition this package is split into cohesive files
 | `scan_audit.go` | read-only domain audit projection and cold-path sync state APIs |
 | `queue_state.go` | scan-queue persistence, resume, admission control |
 | `scan_record.go` / `scan_query.go` / `scan_list.go` | scan-record assembly, lookup, listing/caching |
+| `scan_state_backend.go` | R6.1 record state-authority seam (`web.SetScanStateBackend`): record safe point → PG `run_scan_records` + runs takeover columns, scan.json stopped; durable-row-first reads with the legacy file as pre-import fallback; run-state purge on deletion/retention |
+| `scan_event_journal.go` | R6.1 event-journal seam (`web.SetEventStateBackend`): conversation/telemetry events → PG `run_events` ((scan_id, seq), instance-stamped); instance-union reads for run-form requests (D11), legacy `events.jsonl` only as import fallback |
 | `scan_audit.go` | read-only domain audit projection + cold-path sync views (`/api/scans/{id}/audit`, `/api/scans/{id}/coldpath`) |
 | `notify.go` | Discord + Telegram notifications (severity-gated) |
 | `chat.go` | in-scan / post-scan chat with the agent |
@@ -125,8 +127,13 @@ The ledger is the scan's durable "global exploitation context": a typed graph of
 attack hypotheses and the evidence gathered for each. It lives on the shared
 `ScanContext` (so the coordinator and every specialist read/write the same
 graph), is deduplicated by normalized class/endpoint/parameter/role, is
-memory-bounded, and persists atomically to `<scanDir>/ledger.json` so it
-survives restart/resume. A hypothesis carries identity, preconditions, a
+memory-bounded, and persists through `scanctx.LedgerBackend` so it survives
+restart/resume. From R6.1 (PG primary storage, REDESIGN D12) production
+persists whole snapshots into the `run_ledger_snapshots` row at every mutation
+boundary (in-memory graph stays the run-time authority; `<scanDir>/ledger.json`
+is only the nil-backend test path and the pre-import read fallback); snapshot
+resolution is own row → newest same-`instance_id` sibling row (D11 continuity
+for a re-dispatched session) → legacy file. A hypothesis carries identity, preconditions, a
 baseline/control, confidence, a lifecycle status (`queued`, `testing`, `proven`,
 `rejected`, `blocked`, `exhausted`), the owning specialist, a next-best action,
 and append-only evidence; confirmed findings are referenced by their reporting
@@ -177,6 +184,18 @@ scheduling, verification, and precision finish-gate as everything else.
 capability:
 
 - `terminal` — sandboxed shell execution (the workhorse for CLI security tools)
+- `portscan` — the `port_scan` tool: invokes the external `gogo` CLI
+  (chainreactors/gogo, GPL-3.0 — see `NOTICE`) as a child process for
+  port/service/banner/fingerprint discovery. Deliberately out-of-process: the
+  gogo module root is `package main`, and importing its packages would make the
+  whole binary a GPL derivative. The child rides the same safety envelope as
+  `terminal`/`python` (process group + tree kill, `egress` proxy env and
+  credential because a native scanner bypasses `DialGuard`, sanitised
+  environment, bounded IO, rlimits); `target` is checked by the scope guard and
+  the call is command-class for the approval gate. Results are parsed from the
+  JSONL archive (`-o jl -f <file>`), deduplicated per host:port, and attributed
+  to `service_discovery` / `tech_fingerprint` recon coverage. Missing binary =
+  soft failure with an install hint, never a circuit-breaker failure.
 - `browser` + `pageagent` — headless browser automation (JS-heavy apps, auth flows)
 - `httpclient` — direct HTTP requests
 - `websearch`, `codesearch`, `fileedit`, `notes`, `python` — research / analysis helpers
@@ -221,11 +240,16 @@ replace scan state or the report/verifier authority chain.
 - `internal/infoitem` — InfoItem model (seven coordinate dimensions, stable ID,
   observed/inferred nature, supports, relations) and the bounded
   region/association/context `Reader` contract.
-- `internal/domainjournal` — per-scan `domain_journal.jsonl` with monotonic
-  `seq`, fsync on append, trailing-line repair, duplicate/gap/disorder
-  projection, and non-blocking append observers used for cold-path wakeups.
-- `internal/storage.AppendSync` — the shared append+fsync primitive used by the
-  domain journal.
+- `internal/domainjournal` — per-scan domain audit journal with monotonic
+  `seq`, trailing-line repair, duplicate/gap/disorder projection, and
+  non-blocking append observers used for cold-path wakeups. From R6.1 (PG
+  primary storage, REDESIGN D12) appends persist through
+  `domainjournal.Backend` into the `run_journal` table ((scan_id, seq)
+  idempotent, rows stamped with the run's `instance_id`); the legacy
+  `<scanDir>/domain_journal.jsonl` file remains only the nil-backend test
+  path and the pre-import read fallback, and a backend read error surfaces
+  instead of silently reading a stale file. `internal/storage.AppendSync`
+  remains the append+fsync primitive of the legacy file path.
 - `internal/infoitem/postgres` — optional PostgreSQL replica for InfoItems,
   relation edges, audit records and contiguous sync watermarks. It implements
   the three activation queries and never participates in verdicts.
@@ -264,10 +288,13 @@ replace scan state or the report/verifier authority chain.
   never `failed`). Both live in `web/scan_audit.go`; the projection never
   mutates ledger state and never participates in verdicts.
 
-Hot-path mutations remain in memory + `ledger.json`; the journal is the durable
-domain audit. PostgreSQL is a readable replica and can be absent. When present,
-`XALGORIX_DATABASE_URL` enables startup migrations, River, and reconciliation;
-PostgreSQL errors disable the cold path and never gate a scan.
+Hot-path mutations remain in memory (the run-time authority); the durable
+domain audit lives in PG `run_journal` (R6.1), with the per-scan file as the
+legacy fallback. PostgreSQL is the primary store per REDESIGN D12 — a DSN is a
+startup requirement, not an option: `XALGORIX_DATABASE_URL` enables startup
+migrations, River, and reconciliation; PostgreSQL errors never gate a running
+scan (failures record `failed` watermarks and the reconciler catches up,
+charter §6.4).
 
 The InfoItem `Reader` is process-global because it is infrastructure, not
 per-scan state. Every query is still scoped by the caller's current `scan_id`.
@@ -288,17 +315,28 @@ for *organization*, never a second scan-state authority.
   migrator (`infoitem/postgres/migrations/0002_...` and `0004_...`; the
   `migrate.go` engine is untouched). Explicit `project_id` with no wired store
   fails closed with 503 instead of returning an unfiltered cross-project view.
-- **Runs are mount records, not state.** A run row stores only `task_id`,
-  `instance_id` (unique), `legacy_scan_id`, `mode`, `trigger`, `created_at`.
-  Status/started/finished/vuln/token numbers are projected at read time from
-  `findAllScanSummaries` keyed by `instance_id` (fallback
-  `legacy_scan_id == rec.ID`) — `scan.json` remains the single authority
-  (charter §6). Nothing status-like is persisted in either store.
-- **Degradation** (charter §6): no DSN → file store, platform API fully
-  usable, implicit `default` project (fixed id, not deletable). DSN set but
-  PostgreSQL unreachable → store stays nil, platform endpoints answer 503
-  (`requirePlatformStore`), scanning is unaffected — assembly failure is
-  log-only in `cmd/xalgorix/main.go`, mirroring the `coldpath` posture.
+- **Runs are mount records, not state — and since R6.1 the mount carries the
+  takeover columns.** The run row keeps `task_id`, `instance_id` (unique),
+  `legacy_scan_id`, `mode`, `trigger`, `created_at`; migration 0012 added the
+  takeover columns (`scan_status` … `scan_detail`) that the newest TOP-LEVEL
+  per-scan record stamps onto it at every record safe point. The per-record
+  durable home is `run_scan_records` (migration 0016, one row per scan record
+  keyed by the workspace directory basename, verbatim record as TEXT plus a
+  dataDir-relative anchor): the web layer's record safe point writes it through
+  `web.SetScanStateBackend` (`runstate.Store.PutScanRecord`, one transaction
+  for the record row + the top-level runs-column update) and **never writes
+  `scan.json` again** (charter v3.0 §5.1, REDESIGN D12 — the file is only the
+  nil-backend test path and the pre-import fallback). The full scan set
+  (`findAllScanSummaries`) sweeps `platform.Repository.ScanRunRecords` first
+  and keeps the file walk only for un-imported directory residue; status/
+  plan counters ride in the verbatim record instead of being re-derived from
+  files.
+- **Degradation** (charter v3.0 §6.6): PG is a required deployment dependency —
+  no DSN refuses startup with guidance (`cmd/xalgorix/main.go` fail-fast);
+  the platform `FileStore` (`_platform/platform.json`) remains only as the
+  R6.0 importer's read-only migration source and the test harness. A store
+  that cannot start (pool, ping, migrations) is a fatal configuration error,
+  not a degraded mode.
 - `POST /api/tasks/{id}/runs` reuses the exact `/api/scan` dispatch sequence
   (reserve → queue ownership → pending-dispatch snapshot → durable queue
   state → `runMultiScan`) plus the same pre-dispatch guards
@@ -318,16 +356,20 @@ for *organization*, never a second scan-state authority.
   tasks with a `schedule` property (legacy-only fields recorded in task
   `context`, which never reaches the wire). Original scan directories are never
   modified — pinned by a whole-tree content+mtime hash test.
-- **Task findings** are a cold-path projection of already-accepted scan.json
-  findings. With a DSN, `run_findings` stores one row per `(run_id, dedup_key)`
-  and task reads use `DISTINCT ON` (newest run wins); without one, the web
-  layer pages through every run and applies the same deterministic dedup.
-  Projection writes happen after scan finalization with startup backfill; they
-  never participate in acceptance or verification.
-- A mount whose `scan.json` disappeared without a durable pending-dispatch
-  snapshot projects as `missing`, not `pending`, so it neither counts as an
-  active run nor blocks project deletion. Retention and manual scan deletion
-  remove the corresponding mount (findings cascade).
+- **Task findings** are a cold-path projection of already-accepted scan-record
+  findings (the verbatim record row or, legacy, `scan.json`). With a DSN,
+  `run_findings` stores one row per `(run_id, dedup_key)` (keyed by the shared
+  `findingContentKey`) and task reads use `DISTINCT ON` (newest run wins);
+  without one, the web layer pages through every run and applies the same
+  deterministic dedup. Projection writes happen after scan finalization with
+  startup backfill; they never participate in acceptance or verification.
+- A mount whose record disappeared — directory removed or durable row deleted —
+  without a durable pending-dispatch snapshot projects as `missing`, not
+  `pending`, so it neither counts as an active run nor blocks project deletion.
+  Retention and manual scan deletion remove the corresponding mount, the
+  dispatch tombstone, and the run's durable state rows (`deleteScanRecordState`
+  → record row + `run_events` + journal/ledger/state-files/watermark purge;
+  findings cascade) — PG rows follow the run lifecycle (D12).
 - Existing endpoints accept an optional `project_id` query parameter
   (`/api/instances`, `/api/findings`, `/api/findings/summary`, `/api/scans`);
   without the parameter behavior is byte-identical to before.
@@ -606,10 +648,13 @@ target + instruction
    → web: create scan instance (own goroutine + scanctx)
    → coordinator: recon → decompose hypotheses → parallel specialist agents
    → each agent: reason → tool call → observe (events stream over WebSocket live)
-   → ledger mutation: domain_journal.jsonl append + fsync, then ledger.json
+   → ledger mutation: domain journal append (PG run_journal via
+     domainjournal.Backend; legacy fsync file only in nil-backend test mode),
+     then the ledger snapshot (PG run_ledger_snapshots via scanctx.LedgerBackend)
    → reporting: gated + verified findings persisted to the scan record
-   → storage: atomic scan.json per scan dir
-   → optional cold path: journal observer/reconciler → River → PostgreSQL
+   → storage: record safe point → PG run_scan_records + runs takeover columns
+     (web.SetScanStateBackend; scan.json only in nil-backend test mode)
+   → cold path: journal observer/reconciler → River → PostgreSQL
    → search_info: bounded region/association/context reads (no verdict role)
    → report.go / internal/reporting: branded PDF on demand
    → notify.go: Discord/Telegram lifecycle + finding notifications
@@ -618,18 +663,28 @@ target + instruction
 
 ## Persistence & isolation
 
-- `internal/storage` — atomic file writes (never a torn `scan.json`).
+- `internal/storage` — atomic file writes for the byte-artifact layer (never a
+  torn tool-output archive or traffic packet; the legacy state-file path uses
+  the same primitive).
 - `internal/scanctx` — per-scan context keyed by ID; findings stores and the
   delegation graph are scoped to it; each agent registry owns its verifier, so
   concurrent scans and parallel specialists are isolated.
-- Each scan record (metadata, events, findings) is a `scan.json` under its own
-  scan directory in the data dir; finished records are immutable and cached.
-- Each scan also writes `domain_journal.jsonl` (durable domain audit) and
-  `ledger.json` (current hypothesis/evidence state). The journal is not the
-  state authority and is not reconstructed from best-effort telemetry.
-- PostgreSQL, when configured, stores InfoItem/edge/audit projections and sync
-  watermarks. It is a replica: `(scan_id, seq)` makes replay idempotent and a
-  reconciler fills gaps after crashes. No DSN means file-only mode.
+- **PG primary storage (R6, REDESIGN D12, charter v3.0)** — each scan record
+  (metadata, events, findings) persists as a `run_scan_records` row plus the
+  runs mount row's takeover columns; events live in `run_events` (seq = the
+  1-based journal line order), the domain audit in `run_journal`, and the
+  ledger snapshot in `run_ledger_snapshots`. The in-memory `ScanContext` stays
+  the run-time authority; the per-scan directory keeps only byte artifacts
+  (tool-output archives, traffic packets `traffic/tr_*.json`, uploads, report
+  deliverables, sandbox scratch). A missing DSN refuses startup (fail-fast).
+- The domain journal is not the state authority and is not reconstructed from
+  best-effort telemetry.
+- PostgreSQL is the single durable state (not a replica): `(scan_id, seq)`
+  makes writes idempotent, rows carry the run's `instance_id`, watermarks
+  distinguish `pending/applied/gap/failed`, and a reconciler fills gaps after
+  crashes. The R6.0 importer (`internal/runstate`) backfills pre-R6 scan
+  directories once (watermark-guarded); the directories stay as byte-artifact
+  homes and the legacy-file read fallback.
 
 ## Configuration
 
@@ -671,3 +726,74 @@ running-instance comparison. A scan admitted during the last 30 seconds also
 reserves one of those adaptive headroom slots while its agent and tool
 allocations catch up with the operating system's `MemAvailable` reading; this
 prevents concurrent pending waiters from reusing one snapshot.
+
+## Tool execution plane — `internal/runtime`
+
+> The implementation plan (tool inventory, image contract, runnerd API,
+> concurrency/isolation, resources/lifecycle, extension rules and open gaps) is
+> in [`docs/TOOLBOX_CONTAINER_PLAN.md`](TOOLBOX_CONTAINER_PLAN.md).
+
+Tools are described by `internal/tools`, but *where* they run is decided by
+`internal/runtime`. Two backends exist behind one `Driver` interface:
+
+| Backend | When | Behaviour |
+|---|---|---|
+| `native` (default) | `XALGORIX_RUNTIME_BACKEND` unset/`native` | Historical: the tool spawns its subprocess in the platform process. These code paths are preserved verbatim — they carry shell preludes, apt auto-install, credential files and RLIMIT guards whose byte-level parity is an acceptance criterion. |
+| `docker` | `XALGORIX_RUNTIME_BACKEND=docker` | One container per scan ("project"). The container executes the command; the platform keeps policy, state and audit. |
+
+Transports for the `docker` backend (`XALGORIX_RUNTIME_TRANSPORT`):
+
+- `runnerd` (recommended for containerised platforms) — a host-side service
+  (`cmd/runnerd`) owns `/var/run/docker.sock` and exposes only the eight
+  operations the executor needs. The platform never sees the Docker socket.
+- `socket` — the platform talks to the Docker socket directly (fastest to try,
+  equivalent to host root; development only).
+
+### Invariants
+
+1. **The security chain runs before dispatch.** `scopeguard`, `sandbox.Policy`,
+   `SanitEnv`, proxy injection and the approval gate all live in the platform.
+   A driver is an executor, not a security boundary.
+2. **Exec is never retried.** Docker's at-least-once semantics do not apply here:
+   `Exec` is called once per tool invocation. Only `EnsureProject` / `StopProject`
+   / `RemoveProject` are idempotent.
+3. **Same-path mounts.** The scan directory is bind-mounted at the *same*
+   absolute path inside the container, so `sandbox.Policy`, `tool-outputs/` and
+   `traffic/` need no translation layer. Scan state itself has no file resident
+   since R6.1 (PG primary storage) — the container only touches the byte
+   artifacts in the workspace.
+4. **River stays on the cold path.** The `toolbox` River queue owns janitorial
+   work (orphan reclamation, adoption after restart, image prefetch, selftest,
+   image GC) and nudges the desired/applied watermark. It never owns the scan
+   loop, tool dispatch, approvals, or the SSE stream (charter §8).
+5. **Desired vs actual state.** The container runtime owns actual state (read
+   back through `xalgorix.*` labels). PostgreSQL (`toolbox_projects`) owns the
+   desired state and the `desired_gen`/`applied_gen` watermark; the reconciler
+   closes the gap after a crash.
+6. **Capability minimisation.** Containers run with `--cap-drop=ALL` and add back
+   only what the profile declares (`full` → `NET_RAW`,`NET_ADMIN`; `debug` →
+   `SYS_PTRACE`). Read-only rootfs, `no-new-privileges`, never `--privileged`,
+   never a Docker socket inside a tool container.
+7. **Network posture.** `proxy-only` projects join an `--internal` network whose
+   only reachable peer is the platform traffic proxy (fail-closed). `raw`
+   projects get the capabilities they need plus the scope-guard's CIDR allow-list.
+   Chromium cannot read `HTTP_PROXY`, so `XALGORIX_TOOLBOX_BROWSER_PROXY` must be
+   set to a container-reachable proxy URL whenever browser traffic is proxied.
+
+### Package layout
+
+```
+internal/runtime/contract.go     Driver, ExecSpec/ExecResult, error codes
+internal/runtime/native.go       in-process driver (tests + reference)
+internal/runtime/docker_client.go minimal Engine API over the UNIX socket
+internal/runtime/docker_driver.go per-project containers, CDP endpoint, image GC
+internal/runtime/runnerd_client.go client + server handler for the runnerd wire contract
+internal/runtime/mounts.go       same-path mount plan and validation
+internal/runtime/reconcile.go    desired→actual reconciler and orphan sweeper
+internal/runtime/toolbox.go      handler set used by the River toolbox workers
+internal/runtime/postgres/       DesiredStateStore backed by toolbox_projects
+internal/jobs/toolbox.go         seven idempotent River jobs on the toolbox queue
+cmd/runnerd/                     host-side service
+cmd/toolshim/                    in-container filesystem / code-search executor
+tools/toolbox/                   image definition, tool manifest, selftest
+```

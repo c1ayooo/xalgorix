@@ -18,6 +18,18 @@
 - 事件形状与既有 `WSEvent` JSON 完全一致（新增可选 `seq` 字段）；事件清单见各节的「事件流事件」。慢客户端（发送缓冲满）直接断开——与原 WS 纪律一致；上限 50 并发连接。
 - `WSEvent` 类型名保留（历史名称），前端 `store/events.ts`（原 `store/ws.ts`）经 EventSource 消费。`onmessage` 只接收匿名/`message` 帧；契约内其他命名类型必须通过 `addEventListener(type, handler)` 注册，新增事件类型时同步登记。对话 Guidance 不做周期轮询或发送后刷新，初始 REST 快照之外的增量与状态变化只由本流驱动。
 
+**委派与计划的生命周期失效帧（2026-11-23 增补）**：
+
+| 事件 | 触发点 | `result_meta` | 消费纪律 |
+|---|---|---|---|
+| `agent_queued` | agentsgraph 准入时并发槽已满 | `{agent_id, lane, status:"queued", limit, running, queued}` | 仅失效 `["instance-agents", id]`，不得据此拼装状态 |
+| `agent_started` | 准入取得并发槽 / 队首提升 | 同上（status:"running"） | 同上 |
+| `agent_completed` | 子 agent 正常结束 | 同上（status:"completed"） | 同上 |
+| `agent_failed` | 失败或父扫描停止 | 同上（status:"failed"） | 同上 |
+| `plan_updated` | 引擎/模型计划发生实际变化（指纹变化才发） | `{source, total, completed, skipped, unfinished, plan_revision}` | 仅失效 `["scan-plan", id]` |
+
+> 权威仍是 `GET /api/instances/{id}/agents` 与 `GET /api/scans/{id}/plan`（宪章 §5.1/§6：事件是审计投影，不是状态）。`safeSend(...,0)` 可丢弃，因此任何面板都不得把"没收到帧"当作"状态未变"。
+
 ## 1. Projects
 
 ```ts
@@ -112,9 +124,9 @@ interface Task {
 | GET `/api/tasks/{id}` | — | `Task` |
 | PATCH `/api/tasks/{id}` | 同 POST 字段（部分更新） | `Task` |
 | DELETE `/api/tasks/{id}` | — | `{ status: "deleted" }` |
-| POST `/api/tasks/{id}/runs` | `ScanRequest` 的部分覆盖（targets 缺省取项目 scope.targets；任务 `context_paths` 与请求 `scan_context` 全部合并；其余字段同现有 `/api/scan`） | `{ status: "pending", run_id, instance_id }`（instance_id 兼容现有实例页/scan-detail 直链；`status` 为真实 dispatch 状态，与 `POST /api/scan` 一致——入队后为 `pending`，admission 授予并发槽后才转 `running`，权威状态轮询 `GET /api/instances`）。**任务:运行 = 1:1（2026-11-22 增补，修订本行此前的"续驱=发起新 Run"语义）**：任务永久只挂**一个** Run——活跃（`pending/running/paused`）时返回 `409 { error, run_id, instance_id }`（守卫与调度触发同规则不变）；**终态 Run（stopped/failed/finished/saved）再次 POST = 重派同一 instance**：`run_id`/`instance_id` 与上次完全相同（挂载复用，永不新建 Run 记录），同一 scan dir 上 notes/ledger/execution checkpoint 连续，agent 按**热启动降级阶梯**续跑（eino checkpoint → events.jsonl 对话转录投影 → resume briefing + stop_reason 兜底；转录是提示词上下文，状态权威仍是 scan.json + notes + ledger，见 REDESIGN D11）。续驱方式 = PATCH task 的 goal/instruction 后重发 POST runs（新意图覆盖旧 instruction）。stopping 中的 Run 返回 409（等终态再重派）。定时调度触发保持每周期一条 Run 记录（1:N，后续里程碑收敛） |
+| POST `/api/tasks/{id}/runs` | `ScanRequest` 的部分覆盖（targets 缺省取项目 scope.targets；任务 `context_paths` 与请求 `scan_context` 全部合并；其余字段同现有 `/api/scan`） | `{ status: "pending", run_id, instance_id }`（instance_id 兼容现有实例页/scan-detail 直链；`status` 为真实 dispatch 状态，与 `POST /api/scan` 一致——入队后为 `pending`，admission 授予并发槽后才转 `running`，权威状态轮询 `GET /api/instances`）。**任务:运行 = 1:1（2026-11-22 增补，修订本行此前的"续驱=发起新 Run"语义）**：任务永久只挂**一个** Run——活跃（`pending/running/paused`）时返回 `409 { error, run_id, instance_id }`（守卫与调度触发同规则不变）；**终态 Run（stopped/failed/finished/saved）再次 POST = 重派同一 instance**：`run_id`/`instance_id` 与上次完全相同（挂载复用，永不新建 Run 记录），同一 run 上 notes/ledger/execution checkpoint 连续，agent 按**热启动降级阶梯**续跑（eino checkpoint → 事件 journal 对话转录投影 → resume briefing + stop_reason 兜底；转录是提示词上下文，**状态权威 = 进程内内存 + PG 持久态**（R6.1 起，REDESIGN D12/宪章 v3.0：转录从 PG `run_events` 读该 run 全历史，ledger/notes 按 instance 连续性读，D11 修订注记同 REDESIGN §9）。续驱方式 = PATCH task 的 goal/instruction 后重发 POST runs（新意图覆盖旧 instruction）。stopping 中的 Run 返回 409（等终态再重派）。定时调度触发保持每周期一条 Run 记录（1:N，后续里程碑收敛） |
 | GET `/api/tasks/{id}/runs` | `?page&size` | `Paginated<Run>` |
-| GET `/api/tasks/{id}/findings` | — | `FlatFinding[]`（任务级累积投影，跨 Run 按 target/endpoint/title/severity 去重，最新 Run 胜出；有 DSN 时读 PG `run_findings` 冷路径，无 DSN 时全量分页遍历 scan.json，不设 500 Run 上限） |
+| GET `/api/tasks/{id}/findings` | — | `FlatFinding[]`（任务级累积投影，跨 Run 按 target/endpoint/title/severity 去重，最新 Run 胜出；读 PG `run_findings` 冷路径（R6 起 DSN 必需），不设 500 Run 上限；旧文件分页遍历仅存留为无库测试模式的兜底） |
 | GET `/api/tasks/{id}/objective` | — | `TaskObjectiveView`（只读：结构化目标 + 判据状态 + 达成度 + 所处环节 + 缺口 + 可调度假设）。任务无目标时 `structured=false` 且不折算达成度 |
 | POST `/api/projects/{id}/analyze-goal` | `{ goal, instruction? }` | `{ proposal: { statement, criteria: [{ kind, vuln_class?, capability?, verify_by, required, rationale? }], constraints?, notes? } }`。**R-goal 纯预览端点（2026-11-22）**：一次 LLM 意图分析，把模糊 goal 改写为可验证陈述 + 可判定判据草案（判据上限同 objective），**不落盘**——任务表单「分析目标」按钮消费后由操作者编辑/确认保存。空 goal → 400；项目不存在 → 404；LLM 失败/无法解析 → 502（body 携带原因，表单不阻塞手填）；服务未装配 LLM → 503。run 启动时若任务仍无结构化目标，引擎自动执行同一分析并持久化（第 0 轮，`XALGORIX_GOAL_ANALYSIS` 默认 on；超时/失败回退原始 goal 直跑），伴随 `goal_analyzed` 事件流事件（ResultMeta: `task_id` / `project_id` / `status=analyzed\|skipped` / `statement?` / `criteria?`） |
 
@@ -149,11 +161,11 @@ interface TaskObjectiveView {
 interface Run {
   id: string;
   task_id: string;
-  legacy_scan_id?: string;   // 旧 scan.json 关联
+  legacy_scan_id?: string;   // 旧扫描目录关联（R6 起记录权威在 PG run_scan_records/runs）
   instance_id?: string;      // 活跃/历史实例，前端用 /scans/{instance_id} 直链
   mode: string;              // 同 scan_mode
   status: string;            // running/pending/paused/finished/stopped/failed/saved/missing
-                             // missing = 挂载存在但 scan.json 已不存在且无待调度证据；
+                             // missing = 挂载存在但扫描记录已不存在（目录与持久行均无）且无待调度证据；
                              // 不计入 active_runs，也不阻止项目删除
   started_at?: string;
   finished_at?: string;
@@ -256,11 +268,26 @@ interface Guidance {
 **身份归因**（2026-11-22 增补）：`created_by` 由**服务端**从已验证 dashboard session 写入（JWT claims 的 username）；请求体**不收任何身份字段**，浏览器自报不信任。认证关闭（开放模式）与历史行为空串——空 = 无身份，不推断归属。会话视图的「仅本人」过滤（`created_by == 当前会话 username`）是客户端投影，认证开启时空身份行不展示为本人消息。`guidance_injected` 广播前服务端已持久化并更新对象状态（帧内 status 不会是过期的 `queued`）；`guidance_consumed` 只更新原行 `status/consumed_at`，不产生新 turn。
 
 **注入语义**（后端实现要点）：
-- 目标 Run **running** → 走 in-scan chat 通道（`internal/web/chat.go`）注入下一轮 user turn，`status=injected`；
+- 目标 Run **running** → `SendMessage` 把消息写入 pending-injection 队列（`internal/agent/agent.go`），`BeforeTurn` 在下一个模型轮把队列排进 ADK turn nudge——即「下一轮 user turn」，`status=injected`。Eino 重编排后 `a.messages` 只是 Run 启动种子，run 开始后没有读者；2026-11-22 修复前的注入是死信（消息进了无人消费的缓冲，R2a consumed 闭环因此静默失效）。
 - 目标 Run 暂停/停止/无 Run → `status=queued`，Run 启动时并入 briefing（等价 4zreco"暂停后发消息继续"的 xalgorix 变体：不必先暂停，排队即可）；
 - `message` 超过 4000 码点 → 400；`request_id` 缺失 → 400；
 - **仪表盘 composer 全量统一（2026-11-22 增补）**：任务详情会话页、`/chat` 与 Run 详情页（scan-detail）的意图 composer 全部走本端点；仪表盘前端已不再消费 `/api/chat` 旁路（该端点保留为未文档化的机器遗留面）。Run 详情页按 scan-detail 反查提示拿 `task_id`，未挂载扫描不渲染 composer；三处 composer 共享同一 request_id 幂等原语（`webui/src/lib/guidance.ts`）。
 - **consumed 翻转闭环**：injected 行由 domain journal 观察者（`internal/web/guidance_observer.go`）闭环——引擎产出（hypothesis/evidence 记录的 summary、InfoItem 文本）引用 `gi:<id>` → `UpdateGuidanceStatus(consumed)` + `guidance_consumed` 事件流事件；briefing 并入路径无逐行标记载体，如实保持 injected（操作者从 injected 即可理解该 turn 已带入上下文）；store 失败只留日志，观察者永远 fail-open。
+
+### 3.1a 旁路提问（2026-11-22 增补，`internal/web/chat_questions.go`）
+
+对**运行中**的 Run 提出一个不经扫描主循环的问题：独立、无工具的一次 LLM 调用，上下文 = 提问时刻的扫描快照（实例事实 + 最近事件尾 + findings，`writeScanChatSnapshot`），回答以 journal 事件回流转录。4zreco 对话页 `/btw` 旁路语义的 xalgorix 变体。
+
+| Method+Path | 请求 | 响应 |
+|---|---|---|
+| POST `/api/tasks/{id}/questions` | `{ message: string, request_id?: string, instance_id?: string }` | 202 `{ status: "pending", accepted: true, run_id?, instance_id?, request_id? }`；同一 Run 已有一条在途 → 409（不排队，操作者重试）；目标归属校验同 guidance（跨任务 instance → 400） |
+
+- **回答的传输通道就是转录**：`chat_question`（human 行）与 `chat_reply`（assistant 行，`role:"chat"`）写进 run journal 并经 SSE 广播；`chat_reply` 失败时 `error` 非空、`result_meta.status="failed"`，转录如实渲染失败行（前端本地化「回答失败」框），从不静默。响应体不带回答——零乐观回显，转录即传输。
+- **超时 120s**（`questionAnswerTimeout`，对齐 goal 分析预算）；每次调用现建 client（catalog → legacy resolver 决策序与 `/api/scan` 一致），尊重调用方 deadline。
+- **权威边界**（宪章 §3.5）：回答是模型自述 = 最低等级，只读快照投影，不进 InfoItem 判定路径、不构成第二执行通道（无工具、无状态写入）；提问本身不是 guidance 行，不参与 injected/queued/consumed 生命周期。
+- **前端语义**：运行中 Composer 显示「提问 | 指令」切换，默认提问（保证有回应、不消耗扫描轮次）；指令模式即本节 guidance 端点；空闲/终态 Run 维持 guidance 单通道不变。SSE 命名事件表（`NAMED_STREAM_EVENT_TYPES`）与转录桥（`TRANSCRIPT_EVENT_TYPES`）已收录 `chat_question` / `chat_reply`。
+- **转录 phase 字段**（同批增补）：`TranscriptItem.phase?` 携带工具事件的推断方法论阶段（`current_phase`），前端在阶段变化处插「阶段 N」分隔行，让上一轮终态与新一轮工作在视觉上分开（实例槽跨 scan 轮复用时，转录是跨轮 journal 的拼接）。
+- **诚实流式指示**（同批增补）：转录页「实时流式中…」改为跟随实例真实事件年龄（`use-instance-activity`，5s 窗口），停滞时显示 amber「已 {duration} 无新输出」，本页未观测到事件时显示中性等待行——running 状态投影不再冒充流式。
 
 ## 3.2 项目维度过滤（overview 项目化，2026-11-20 增补；运行页接入 2026-11-22）
 
@@ -308,6 +335,7 @@ interface ApprovalRule {
   project_id: string;
   project_name?: string;     // 列表附带
   kind: "command" | "http";  // 沿用审批 kind 词汇
+  decision?: "allow" | "deny"; // v4.6：allow=豁免（缺省/空等价 allow）；deny=范围观测 Agent 自动拒绝
   match: {
     // kind=command
     program?: string;        // 程序 basename（"curl" 匹配 /usr/bin/curl）
@@ -330,7 +358,7 @@ interface ApprovalRule {
 | Method+Path | 请求 | 响应 |
 |---|---|---|
 | GET `/api/approval-rules` | `?project_id=&kind=` | `{ rules: ApprovalRule[] }`（新在前；过期行**不**过滤——状态由 UI 呈现） |
-| POST `/api/approval-rules` | `{ project_id!, kind!, match!, reason?, expires_at?, created_from_approval_id? }` | `ApprovalRule`（kind/match 不协调 → 400；project 不存在 → 404） |
+| POST `/api/approval-rules` | `{ project_id!, kind!, decision?, match!, reason?, expires_at?, created_from_approval_id? }` | `ApprovalRule`（kind/match 不协调 → 400；project 不存在 → 404） |
 | DELETE `/api/approval-rules/{id}` | — | `{ ok: true }`（再次删除 → 404） |
 
 **事件流事件**：
@@ -342,6 +370,10 @@ interface ApprovalRule {
 - HTTP 规则 = method + host + path 前缀 + 可选 contains。
 - **硬边界：deny 形状永不被规则豁免**——`$()`/`<(`/重定向/`PATH=` 冒名/`system(` 等段形状即使规则命中也直接拒绝（规则只能豁免分类器已干净判定的 Require 类目，不能豁免"分类器看不见的东西"）。
 - 失败姿态：store 缺失/读取失败一律回落正常审批流（读失败绝不自动放行）。
+
+**范围观测 Agent（v4.6，`internal/web/scope_observer.go`）**：两层闸在项目围栏（fence）之后、人工挂起之前统一调用观测者。判定顺序 = 项目内 `decision=deny` 规则 → 项目内 `decision=allow` 规则 → 内置基线（`internal/approval` `DefaultScopeRules`）：批量删除 / 文件上传 / OSS 对象写 → **自动拒绝**（终态行 `decided_by="scope-observer"`，模型收到 ⛔ 文案）；目标自身 web 控制面写与批量导出 → 保持人工义务（不自动放行）。定时与非定时运行同一路径；store 缺失或读失败一律回落人工审批。
+
+**预置规则**：服务启动、项目创建、项目 scope 变更时，按项目 scope 前 5 个 host 幂等写入基线 deny 规则（`created_by="preset:scope-observer"`，可见可删）；require 类基线只在内置分类器内生效，避免被“豁免”语义误放行。
 
 ## 3.5 Run 文件浏览器（只读，2026-11-22 增补）
 
@@ -360,7 +392,7 @@ interface ApprovalRule {
 
 ## 3.6 Run 账本投影（只读，2026-11-22 增补）
 
-> hypothesis/evidence 快照的只读投影（任务详情「账本」tab，即 4zreco 探索链路的 xalgorix 原生形态）。状态权威 = `<scanDir>/ledger.json`（宪章 §5/§6.3：JSON 是写入源），本端点服务权威本身而非事件重放；严格只读，不参与漏洞判定。
+> hypothesis/evidence 快照的只读投影（任务详情「账本」tab，即 4zreco 探索链路的 xalgorix 原生形态）。状态权威 = PG `run_ledger_snapshots` 行（R6.1 起，宪章 v3.0 §5.1/REDESIGN D12——内存是运行时权威、PG 是持久权威，本端点读快照本身而非事件重放；`<scanDir>/ledger.json` 仅余 nil 后端测试模式与 pre-import 目录的读兜底）；严格只读，不参与漏洞判定。
 
 | Method+Path | 请求 | 响应 |
 |---|---|---|
@@ -369,6 +401,51 @@ interface ApprovalRule {
 - **Hypothesis/evidence 形状 = scanctx 原生 JSON**（`internal/scanctx/ledger.go`：id/title/vuln_class/target/endpoint/parameter/role/status/confidence/voi/assigned_to/next_action/attempts/evidence[]，evidence 含 nature observed\|inferred、source（引擎 verifier 名）、agent_id、finding_id）。
 - **诚实标志**：`ledger_present=false`（无快照：pre-ledger 扫描或尚未认领任何假设）→ `incomplete=true` + note；`ledger_damaged=true`（快照存在但不解析）→ `incomplete=true` + note 且**不带部分假设**——损坏永不折叠为"干净空账本"。空但合法的快照读作 present+clean（跑过但没认领是真实状态）。
 - 排序是**展示序**（活跃 testing/queued/blocked 在前、settled proven/rejected/exhausted 在后、组内 updatedAt 新者先），调度序（VOI 加权）是另一件事，不在此复刻。未知 scan → 404。
+
+## 3.6a 计划投影 + Worker 池投影（只读，2026-11-23 增补）
+
+> 修复两个"面板读事件"的缺陷：Planner 区域曾从 `build_plan`/`update_plan` 的 tool_call 反推计划（引擎自建计划不产生这些调用 → 区域常年为空），Workers 组曾从历史事件去重 `agent_id` 并把 run 级状态当每行状态（→ 两个 worker 只有一个在干活却都显示"运行中"）。两个端点都只读，都不是判定来源。
+
+| Method+Path | 请求 | 响应 |
+|---|---|---|
+| GET `/api/scans/{id}/plan` | — | `PlanView`（见下） |
+| GET `/api/instances/{id}/agents` | — | `{ available, concurrency:{limit,running,queued}, agents: AgentEntry[], partial_reason? }` |
+
+```jsonc
+// PlanView
+{
+  "present": true,
+  "source": "engine" | "model" | "mixed" | "none",
+  "plan_revision": "<surface fingerprint>",
+  "surface_revision": "<same fingerprint, kept separate so staleness is visible>",
+  "current_phase": 6,
+  "counters": { "total": 12, "completed": 5, "skipped": 2, "unfinished": 5 },
+  "tasks": [{
+    "id": "test-sqli", "title": "Test SQLi", "phase": 6,
+    "vuln_class": "sqli", "endpoint": "/search", "status": "pending|active|completed|skipped",
+    "depends_on": ["recon"], "notes": "...", "disposition": "blocked_missing_auth",
+    "origin": "auto|auto-plan|auto-plan-surface|llm", "prerequisite": false, "whole_target": false
+  }],
+  "partial": false, "partial_reason": "not_persisted|truncated|cold_path"
+}
+
+// AgentEntry
+{
+  "agent_id": "sub_1_1699999999999999999",
+  "lane": "injection-serverside",
+  "status": "queued|running|completed|failed",
+  "task": "...", "target": "https://example.test",
+  "started_at": "...", "completed_at": "...", "error": "...",
+  "queued_position": 1, "partial_events": 3, "collected": false,
+  "claimed_hypotheses": [{ "id": "h_...", "vuln_class": "sqli", "endpoint": "/search", "status": "testing" }]
+}
+```
+
+- **plan 解析顺序**：live agent 的 `PlanSnapshot()`（发布在 owner-loop 回合边界，immutable）→ 终态 `ScanRecord.PlanView`（与 plan 计数同一写入点持久化）→ 仅计数时 `partial:"not_persisted"` → `present:false`。**绝不把"明细缺失"渲染成"没有计划"**。
+- **agents 解析顺序**：`inst.agent.DelegationSnapshot()`（agentsgraph 内存状态）→ 终态读 `<scanDir>/execution-graph.json`（graph 自己写的 checkpoint，非第二套持久权威）；checkpoint 里的 `running/queued` 一律降级为 `failed`（进程/运行结束后不可能还在跑），并置 `partial_reason:"checkpoint"`。未知实例 → `available:false, partial_reason:"no_run"`，200 而非 404（面板需要中性态）。
+- **`claimed_hypotheses`** 是 ledger 的只读 join（仅 `status=testing` 且 `assigned_to` 非空），回答"这个 worker 现在到底在做什么"。
+- **限额语义**：`limit = min(XALGORIX_MAX_CONCURRENT_AGENTS(默认3,上限10), 生命周期委派上限)`；`running + queued` 不会超过 `limit`。
+- 只读：两个端点都不参与 finding 判定、闸门或收工结论。
 
 ## 3.7 情报（任务级聚合 + 操作者分诊，2026-11-22 增补）
 
@@ -388,7 +465,7 @@ interface ApprovalRule {
 
 ## 3.8 流量代理 raw 交换归档（只读，2026-11-22 增补）
 
-> 流量代理为归因流量持久化的原始 HTTP 请求/响应包（wire 保真：header 值与 body **不脱敏**，2026-11-22 操作者裁决修正 R2b 的「header 只记名」红线——摘要层 InfoItem 仍掩码，raw 归档是权威包体）。存储 = `<scanDir>/traffic/tr_<seq>.json`（`storage.WriteAtomic`，一交换一文件，重启续号不覆盖），**无 DSN 完整可用**；findings 详情弹窗按 finding 的 endpoint/method 懒加载渲染。
+> 流量代理为归因流量持久化的原始 HTTP 请求/响应包（wire 保真：header 值与 body **不脱敏**，2026-11-22 操作者裁决修正 R2b 的「header 只记名」红线——摘要层 InfoItem 仍掩码，raw 归档是权威包体）。存储 = `<scanDir>/traffic/tr_<seq>.json`（`storage.WriteAtomic`，一交换一文件，重启续号不覆盖）——流量原始包是**字节产物**，R6 PG 主存储切换后仍留文件层（宪章 v3.0 §6.2，DSN 为启动必需）；findings 详情弹窗按 finding 的 endpoint/method 懒加载渲染。
 
 | Method+Path | 请求 | 响应 |
 |---|---|---|
@@ -425,6 +502,18 @@ interface ApprovalRule {
 | GET `/api/mcp-servers/invocations` | `?page&size&instance_id&name&status(ok\|error)` | `{items,total,page,size}` |
 | GET `/api/skills/invocations` | 同上 | 同上 |
 | GET `/api/agent-profiles/invocations` | 同上 | 同上 |
+
+## 3.9a 内置工具目录 + 工具调用记录（2026-11-22 增补）
+
+> 侧栏「工具」页的两块只读数据：目录是**静态投影**（`internal/web/tools_catalog.go`，镜像 `internal/agent` 的注册面），记录是 §3.9 调用记录投影的第四模块 `tools`。两者都不构成判定：目录不代表单个 Run 的启用/裁剪状态（`tool_scope_hidden`、阶段工具面、Verifier 工具面仍在 Run 内决定），记录不外溢为审计权威（per-scan 权威仍是 domainjournal）。
+
+| Method+Path | 请求 | 响应 |
+|---|---|---|
+| GET `/api/tools` | `?category=<key>&q=<substring>`（可选；q 匹配 name/description，大小写不敏感） | `{ tools: [{name, category, description, approval?, parameters:[{name, required, desc?}]}], categories: string[] }` |
+| GET `/api/tools/invocations` | `?page&size&instance_id&name&status(ok\|error)` | `{items,total,page,size}` |
+
+- **记录归属**：`tool_result` 事件按模块唯一归属——`read_skill` → skills、`mcp_*` → mcp、`spawn_agent/create_agent` 与委派完成 → agents；其余具名工具（`terminal_execute`、`http_request`、`browser_action`、`verify_*` 等）→ tools。`ToolName` 为空的事件不记录。投影文件 `<dataDir>/_invocations/tools.jsonl`，轮转/缺失语义与 §3.9 一致。
+- **approval 字段**：镜像 `internal/approval` 的 `classifyCall`（command / http / browser）；缺省 = 不参与审批闸（只读工具、ledger/plan 工具、Verifier 工具）。是否实际弹审批仍由 Run 的审批策略（off / rules / remember）与工具参数决定。
 
 - 凭据红线：`mcp-servers` 的 `env/headers` 永不回传明文（`maskAuthCredential` 打码），提交 `****` 前缀 = 未修改；`/api/mcp-servers` 加入机器令牌黑名单（session-only）。
 - `McpServer`：`{id,name,transport,command?,args?,env?,url?,headers?,enabled,require_approval,timeout_seconds,tool_count,last_healthy_at?,last_error?,created_by?,created_at,updated_at?}`。

@@ -79,6 +79,31 @@ reconciler 按既有 M3 水位协议追赶。PG 成为必需依赖（无 DSN fai
      验收：`redispatch_projections_test` 九个子测试语义不变地通过。
    - **R6.3 收口**：读层合并辅助代码退役、retention 扩展（PG 行随 run）、文档回写
      （ARCHITECTURE/API_CONTRACT）、`make build` 全门禁。
+
+   **批次状态（2026-11-23，以代码为准）**：
+   - **R6.0 ✅**（`0012`/`0013` 迁移 + DSN 必需门 + `deploy/docker-compose.yml` +
+     `internal/runstate` 目录导入器，`dir_import` watermark 防重跑）。
+   - **R6.1 ✅ 主体**：ledger（`scanctx.SetLedgerBackend`）、events（`web.SetEventStateBackend`
+     → `run_events`，seq = 1-based journal 行序）、domain journal（`domainjournal.SetBackend`
+     → `run_journal`，`ReadRecordsResolved` 后端优先、reconciler 增 PG 源枚举）、
+     scan.json 接管（`0016_run_scan_records.sql` + `web.SetScanStateBackend`，记录安全点
+     单事务写记录行 + 顶层 runs 接管列，`findAllScanSummaries` 全量集改 PG sweep 优先）。
+     `main.go` 注册四后端 + 启动期 `ImportDataDir`。**缺口：intelligence/notes/coverage 三快照
+     的接缝与仓内接线、测试已落地（`intelligence.Backend` + `scanctx.StateFilesBackend`，
+     runstate 对前者有适配、对后者缺 seq 签名适配），但 `main.go` 未注册生产后端——生产
+     仍写三个 JSON 文件，R6.3 收口必须补注册 + session 侧 instance 戳**。
+   - **R6.2 ✅**：events 窗口/对话转录/安全链/探索链路/播报板/任务情报/任务详情/续跑重放
+     全部改读 PG（本 scan 行 → 同 instance 兄弟联合 → 遗留文件仅 pre-import 兜底）；
+     回归平移 = 新增 `redispatch_projections_pg_test.go`（PG 双胞，DSN 门控）九子测试 +
+     `TestScanLedgerPanelReadsPGSnapshot` 语义不变通过，原文件模式九子测试保留为
+     nil-backend 孪生；retention/手动删除接入 `deleteScanRecordState` +
+     `deleteDispatchSnapshotState`（PG 行随 run 生命周期，user story 9）。
+     验收实测（本地 PG 实库）：金样本 `TestGoldenSchedulingParity` ✓、Verifier 时序门
+     （eino 两测试）✓、runstate/web/domainjournal/platform DSN 门控集成测试 ✓、
+     `go build ./...` ✓（coldpath 全包 run 有两个 River 测试在共享库上互相争抢 worker
+     的隔离性 flake，单跑均过，非本批回归）。
+   - **R6.3 余片**：三快照生产注册补齐、读层 sibling 合并辅助代码退役评估、
+     ARCHITECTURE/API_CONTRACT 回写（✅ 本批已做）、`make build` 全门禁。
 10. **并行线协调**：finding 身份键重构（findingContentKey）进行中；run_findings 升级为
     findings 唯一存储（scan.json vulns 停写）落在 R6.1，以该重构落定的键为准。
 
@@ -108,3 +133,28 @@ run；审批/guidance/intel triage（已在 PG，不动）；定时调度 Run 1:
 - 本会话已落地的读层修复（09d06a3e 延伸）是 R6.2 前的过渡正确性保障，R6.2 后退役其合并逻辑
   但测试语义保留（平移到 PG 数据源）。
 - 单二进制保留：go:embed 前端 + 自包含引擎不变；"PG 必需"是部署要求，不是进程形态变化。
+
+## 追加：计划明细投影的 R6.1 迁移项（2026-11-23）
+
+`GET /api/scans/{id}/plan` 需要计划任务明细（`Plan.Task[]`），但当前 `scan.json` 只持久化
+`plan_present/plan_tasks_*` 五个计数。2026-11-23 的实现把 `agent.PlanView` 写进
+`ScanRecord.PlanView`（与计数同一终态写入点，随既有原子写落盘），**这是过渡实现，不是第二套持久权威**。
+
+R6.1 切换状态权威时必须一并迁移：
+
+- 落点：PG。建议 `run_plan_tasks(run_id, task_id, title, phase, vuln_class, endpoint, status,
+  depends_on[], notes, disposition, origin, prerequisite, whole_target, updated_at)`，
+  或 `runs.plan_view JSONB`（任务数有界，二选一按 R6.1 批次裁决）。
+- 写入点不变：仍是终态 safe point（`capturePlanDisposition`）；幂等键 `(scan_id, seq)` + 行级
+  `instance_id` 盖章遵循本规格 §3。
+- 读切换：`GET /api/scans/{id}/plan` 的"内存 → 记录"两跳改为"内存 → PG"，`PlanRecord.PlanView`
+  文件字段随 `scan.json` 停写一并退役；`partial_reason:"not_persisted"` 只保留给迁移前的历史 run。
+- 验收：金样本 plan（engine/model/mixed、依赖、typed disposition、空计划）+ 杀死进程后续跑，
+  明细与迁移前一致；`partial` 语义不回归。
+
+**R6.1 落地注记（2026-11-23）**：迁移取了第三种形态——`PlanView` 随 **verbatim 记录 JSON**
+存进 `run_scan_records.scan_detail`（TEXT，迁移 `0016`），不设独立 `run_plan_tasks` 表、
+不动 `runs.plan_view`。`GET /api/scans/{id}/plan` 的读链已是"内存 → 记录"，而记录读取经
+`web.SetScanStateBackend` 先解析持久行（`handlers_scan_plan.go`：live → record →
+counters-only `partial_reason:"not_persisted"` 兜底），`scan.json` 停写后明细天然随行。
+任务数有界 + TEXT 整读整写（`0013` 字节保真纪律），独立表拆分无消费者需求，不再立项。

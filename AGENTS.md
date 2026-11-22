@@ -50,6 +50,8 @@
 5. **findings 验证语义三选一**：`verified`（独立 Verifier 复现）/ `exploit-proven`（自带具体利用证据）/ `needs-manual-verification`（Verifier 不确定时**保留**，不得丢弃）。`report_vulnerability` 的门管线顺序（dedup→fabrication→method→proof→CVSS 复算→verifier→severity cap）不可重排。
 6. **事件流单向**：工具与 agent 只发事件到 per-scan channel → `processEvent`（每会话单 goroutine）→ SSE 事件流广播（`/api/stream`，原 WS 已移除）。不得在工具代码里直接 broadcast 或写 HTTP 响应。
 7. **Verifier 与闸门不可改**：`verifier.go` 的判定逻辑、工具面裁剪、轮次/时限，以及 `report_vulnerability` 的闸门顺序，在改造 InfoItem/点亮/VOI 时一律不动。
+7.5 **工具执行面可切换，语义不变（v4.6 起）**：`XALGORIX_RUNTIME_BACKEND=native|docker`。native 是默认且行为逐字节保留；docker 时每扫描一个 toolbox 容器（`internal/runtime`），但安全链六环仍在平台侧 dispatch 前判定，容器不是安全边界。`Exec` 绝不重试，只有 EnsureProject/StopProject/RemoveProject 幂等。容器实际状态权威是运行时（`xalgorix.*` 标签），期望态与 `desired_gen/applied_gen` 水位在 PG `toolbox_projects`；River 的 `toolbox` 队列只做保洁与追赶，不接管扫描循环/调度/审批/SSE。容器一律 `--cap-drop=ALL`，按 profile 加回 NET_RAW/NET_ADMIN/SYS_PTRACE，rootfs 只读，**工具容器内禁止出现 docker socket**。令牌/job 载荷内不得含密钥。
+
 8. **信息层不得有孤儿事实**：任何被持久化的 finding 必须同时产出 `finding_ref` evidence 与一条 `purpose=finding` 的 InfoItem（`report_vulnerability` 落库后由引擎投影，不依赖模型二次调用）；工具输出中的敏感文件/凭据命中由引擎侧捕获为 `tool_observation`（密钥必须掩码）。收工闸门在「有 finding、无 evidence」时拒绝收工。
 
 ## 已知脆弱点（改动这些区域前先读对应测试）
