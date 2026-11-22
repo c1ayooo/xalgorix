@@ -57,6 +57,18 @@ type transcriptItem struct {
 	// Truncated marks an output cut for transport; the full text stays in the
 	// scan directory and the event archive.
 	Truncated bool `json:"truncated,omitempty"`
+	// Approval carries the structured decision so the UI can render the row in
+	// the operator's language instead of the server's.
+	Approval *approvalView `json:"approval,omitempty"`
+}
+
+// approvalView is the transcript projection of an approval event.
+type approvalView struct {
+	Kind      string `json:"kind"`
+	Status    string `json:"status"`
+	DecidedBy string `json:"decided_by,omitempty"`
+	Reason    string `json:"reason,omitempty"`
+	Decided   bool   `json:"decided"`
 }
 
 const (
@@ -418,6 +430,13 @@ func (s *Server) transcriptEvents(instanceID string, run *platform.Run) []transc
 				Text:   approvalTranscriptLine(ev.Type, ev.Approval),
 				Status: ev.Approval.Status,
 				At:     at,
+				Approval: &approvalView{
+					Kind:      ev.Approval.Kind,
+					Status:    ev.Approval.Status,
+					DecidedBy: ev.Approval.DecidedBy,
+					Reason:    ev.Approval.Reason,
+					Decided:   ev.Type == "approval_decided",
+				},
 			})
 		case "finished":
 			status := "finished"

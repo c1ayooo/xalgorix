@@ -213,18 +213,28 @@ function TranscriptRow({ item }: { item: TranscriptItem }) {
           tone="muted"
         />
       );
-    case "approval":
+    case "approval": {
+      const approval = item.approval;
+      const headline = approval
+        ? `${t("chat.approvalRequest")} · ${approval.kind}`
+        : item.text || t("chat.approvalRequest");
+      const outcome = approval
+        ? approval.decided
+          ? [approval.status, approval.decided_by, approval.reason].filter(Boolean).join(" · ")
+          : t("chat.awaitingDecision")
+        : item.status;
       return (
         <div className="flex gap-2 rounded-lg border border-sky-500/40 bg-sky-500/5 px-3 py-2">
           <ShieldCheck className="mt-0.5 size-4 shrink-0 text-sky-600 dark:text-sky-400" aria-hidden />
           <div className="min-w-0 text-sm">
-            <p className="break-words">{item.text}</p>
-            {item.status && (
-              <p className="mt-0.5 font-mono text-[10px] text-muted-foreground">{item.status}</p>
+            <p className="break-words">{headline}</p>
+            {outcome && (
+              <p className="mt-0.5 font-mono text-[10px] text-muted-foreground">{outcome}</p>
             )}
           </div>
         </div>
       );
+    }
     case "finding":
       return (
         <div className="flex gap-2 rounded-lg border border-amber-500/40 bg-amber-500/5 px-3 py-2">

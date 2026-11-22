@@ -1407,6 +1407,14 @@ export interface TranscriptItem {
   agent_id?: string;
   at: string;
   truncated?: boolean;
+  /** Structured approval payload; present on approval rows so the UI can localize them. */
+  approval?: {
+    kind: string;
+    status: string;
+    decided_by?: string;
+    reason?: string;
+    decided: boolean;
+  };
 }
 
 export interface TranscriptPage {
