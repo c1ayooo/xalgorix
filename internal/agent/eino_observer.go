@@ -94,6 +94,25 @@ func (o *einoObserver) BeforeTurn(_ context.Context, turn int) engine.TurnDecisi
 			result.Nudge = injected
 		}
 	}
+	// Plan projection refresh (owner-loop safe point). Panels read this
+	// snapshot instead of rebuilding the plan from build_plan/update_plan
+	// telemetry — the engine builds and refreshes most plans without ever
+	// emitting those tool calls (charter §5.1/§6). The event is a pure
+	// invalidation signal, emitted only when the plan actually moved.
+	if view, changed := a.publishPlanSnapshot(); changed && view.Present {
+		a.emit(Event{
+			Type:    "plan_updated",
+			Content: fmt.Sprintf("plan %s: %d tasks (%d completed, %d skipped, %d unfinished)", view.Source, view.Counters.Total, view.Counters.Completed, view.Counters.Skipped, view.Counters.Unfinished),
+			Meta: map[string]any{
+				"source":        view.Source,
+				"total":         view.Counters.Total,
+				"completed":     view.Counters.Completed,
+				"skipped":       view.Counters.Skipped,
+				"unfinished":    view.Counters.Unfinished,
+				"plan_revision": view.PlanRevision,
+			},
+		})
+	}
 	return engine.TurnDecision{Nudge: result.Nudge, EmitMessage: result.EmitMessage}
 }
 
@@ -128,6 +147,9 @@ func (o *einoObserver) BeforeTool(_ context.Context, name string, args map[strin
 	}
 	if blocked, reason := a.shouldBlockForTargetScope(name, merged); blocked {
 		return block("⛔ OUTSIDE SCAN BOUNDARY — ", reason)
+	}
+	if blocked, reason := a.shouldBlockForDwellBudget(name, merged); blocked {
+		return block("⛔ DWELL BUDGET EXHAUSTED — ", reason)
 	}
 	if name == "finish" {
 		finish := a.hooks.Fire(OnFinishAttempt, a.state, nil)

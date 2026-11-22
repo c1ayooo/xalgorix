@@ -212,8 +212,9 @@ type Config struct {
 	Workspace      string // XALGORIX_WORKSPACE — workspace root dir
 	DataDir        string // Active per-installation data root. Defaults to ~/.xalgorix/data/. Override via XALGORIX_DATA_DIR.
 	WorkspaceRoot  string // Resolution root used by Filesystem_Tools when no Scan_Context.ScanDir is in effect. Equals DataDir.
-	// DatabaseURL enables the optional PostgreSQL InfoItem cold path. Empty
-	// means pure file mode; scanning must never require a database.
+	// DatabaseURL points at the required PostgreSQL primary store (charter
+	// v3.0 / REDESIGN D12): state and panel data are persisted there; an
+	// empty DSN is a startup configuration error (fail-fast in main).
 	DatabaseURL string // XALGORIX_DATABASE_URL
 	// ColdPathReconcileSeconds controls how often the reconciler scans local
 	// domain journals for sequences that have not reached PostgreSQL.
@@ -245,6 +246,9 @@ type Config struct {
 	ApprovalMaxPending int  // XALGORIX_APPROVAL_MAX_PENDING, default 1
 	DisableBrowser     bool // XALGORIX_DISABLE_BROWSER
 	MaxIterations      int  // XALGORIX_MAX_ITERATIONS — 0 = unlimited
+	// DwellMaxCalls caps tool calls per private-IPv4 endpoint (benchmark
+	// rotation discipline, dwell_guard.go). 0 = off.
+	DwellMaxCalls int // XALGORIX_DWELL_MAX_CALLS
 	MinIterations      int  // XALGORIX_MIN_ITERATIONS — minimum testing floor (default 50)
 	// IterationDelaySec optionally pauses (in seconds) between agent reasoning
 	// iterations to pace LLM request velocity and conserve provider rolling-window
@@ -610,6 +614,7 @@ func load() *Config {
 		legacyCWD:               cwd,
 		DisableBrowser:          envOrBool("XALGORIX_DISABLE_BROWSER", false),
 		MaxIterations:           envOrInt("XALGORIX_MAX_ITERATIONS", 0),
+		DwellMaxCalls:           envOrInt("XALGORIX_DWELL_MAX_CALLS", 0),
 		MinIterations:           envOrInt("XALGORIX_MIN_ITERATIONS", 50),
 		IterationDelaySec:       envOrFloat("XALGORIX_ITERATION_DELAY", 0),
 		MaxWildcardSubdomains:   envOrInt("XALGORIX_MAX_WILDCARD_SUBDOMAINS", -1),

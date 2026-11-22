@@ -38,6 +38,7 @@ import (
 	"github.com/xalgord/xalgorix/v4/internal/tools/notes"
 	oobtool "github.com/xalgord/xalgorix/v4/internal/tools/oob"
 	"github.com/xalgord/xalgorix/v4/internal/tools/pageagent"
+	"github.com/xalgord/xalgorix/v4/internal/tools/portscan"
 	"github.com/xalgord/xalgorix/v4/internal/tools/proxy"
 	"github.com/xalgord/xalgorix/v4/internal/tools/python"
 	"github.com/xalgord/xalgorix/v4/internal/tools/reporting"
@@ -53,6 +54,9 @@ var thinkRegex = regexp.MustCompile(`(?s)<think>.*?</think>`)
 var toolHardTimeout = map[string]time.Duration{
 	"terminal_execute": 65 * time.Minute,
 	"browser_action":   10 * time.Minute,
+	// port_scan accepts timeout up to 3600s internally; the default 15-minute
+	// ceiling would cancel a legitimate full-port sweep first.
+	"port_scan": 65 * time.Minute,
 }
 
 // init injects the notes-blob accessor into the hooks package so the planner
@@ -175,6 +179,10 @@ type Event struct {
 	AbortReason string
 	// Resumable distinguishes external cancellation from a terminal outcome.
 	Resumable bool
+	// Meta carries structured telemetry for panel invalidation (agent_* and
+	// plan_updated lifecycle frames). It is projected to WSEvent.ResultMeta and
+	// is never the state authority: consumers re-read the projection APIs.
+	Meta map[string]any
 }
 
 func (a *Agent) protocolResetNudge(nudge string) string {
@@ -213,9 +221,12 @@ type Agent struct {
 	checkpointStore            adk.CheckPointStore
 	approvalBroker             engine.ApprovalBroker
 	scanFinished               atomic.Bool
-	finishAccepted             atomic.Bool                        // set when the finish gate accepts a finish call; StopCheck reads it because AfterTool (completeWithFinish) can race the ADK's next model turn
-	goalAchievedEmitted        atomic.Bool                        // once-only guard for the R-goal auto-stop (goal_achieved)
-	forceContinuation          atomic.Bool                        // 1:1 re-open of a finished run (REDESIGN D11): suppress the plan-complete auto-finalize the restored checkpoint would re-fire
+	finishAccepted             atomic.Bool // set when the finish gate accepts a finish call; StopCheck reads it because AfterTool (completeWithFinish) can race the ADK's next model turn
+	goalAchievedEmitted        atomic.Bool // once-only guard for the R-goal auto-stop (goal_achieved)
+	forceContinuation          atomic.Bool
+	dwellMaxCalls              int // XALGORIX_DWELL_MAX_CALLS (0=off, dwell_guard.go)
+	dwellMu                    sync.Mutex
+	dwellStats                 map[string]*dwellStat              // 1:1 re-open of a finished run (REDESIGN D11): suppress the plan-complete auto-finalize the restored checkpoint would re-fire
 	runCancel                  atomic.Pointer[context.CancelFunc] // set by runLoop; completeWithFinish cancels it so the ADK graph stops before another model call
 	nextTemperature            atomic.Pointer[float64]            // one-shot per-role temperature for the next model turn
 	scanCtx                    *scanctx.ScanContext               // per-session state (vulns, notes, terminal, browser)
@@ -289,7 +300,11 @@ type Agent struct {
 	terminalOutcome     atomic.Pointer[terminalCheckpoint]
 	resumeFindings      []reporting.Vulnerability
 	publishedAssessment atomic.Pointer[assessmentSnapshot]
-	livenessExpired     atomic.Bool
+	// publishedPlan is the immutable read projection of the root plan. It is
+	// rebuilt on the owner loop at turn boundaries and read verbatim by HTTP
+	// handlers (never from mutable ScanState).
+	publishedPlan   atomic.Pointer[PlanView]
+	livenessExpired atomic.Bool
 
 	// deferNoteSuppressed restores the specialist-wave defer detail latch
 	// across server restarts: a resumed run emits only compact defer notes
@@ -580,6 +595,10 @@ func NewAgent(cfg *config.Config, name string, events chan Event, localGuard sco
 	reg.SetScanContextID(sctx.ID)
 
 	terminal.Register(reg)
+	// port_scan wraps the external gogo CLI (see internal/tools/portscan).
+	// Registered on the MAIN registry only: the Verifier's read-only tool
+	// surface is frozen (charter §7) and a port sweep is not a re-test.
+	portscan.Register(reg)
 	fileedit.Register(reg)
 	proxy.Register(reg)
 	httpclient.Register(reg)
@@ -603,24 +622,25 @@ func NewAgent(cfg *config.Config, name string, events chan Event, localGuard sco
 	RegisterDefaultHooks(hookReg)
 
 	a := &Agent{
-		ID:           fmt.Sprintf("agent_%d", time.Now().UnixNano()),
-		Name:         name,
-		cfg:          cfg,
-		client:       llm.NewClient(cfg),
-		registry:     reg,
-		scanCtx:      sctx,
-		events:       events,
-		maxIter:      cfg.MaxIterations,
-		ctx:          context.Background(),
-		lastActivity: time.Now(),
-		hooks:        hookReg,
-		state:        NewScanState(),
-		localGuard:   localGuard,
-		targetAuth:   cfg.TargetAuth,
-		targetAuthB:  cfg.TargetAuthSecondary,
-		sourceRepo:   cfg.SourceRepo,
-		scanContext:  cfg.ScanContext,
-		children:     make(map[*Agent]struct{}),
+		ID:            fmt.Sprintf("agent_%d", time.Now().UnixNano()),
+		Name:          name,
+		cfg:           cfg,
+		client:        llm.NewClient(cfg),
+		registry:      reg,
+		scanCtx:       sctx,
+		events:        events,
+		maxIter:       cfg.MaxIterations,
+		dwellMaxCalls: cfg.DwellMaxCalls,
+		ctx:           context.Background(),
+		lastActivity:  time.Now(),
+		hooks:         hookReg,
+		state:         NewScanState(),
+		localGuard:    localGuard,
+		targetAuth:    cfg.TargetAuth,
+		targetAuthB:   cfg.TargetAuthSecondary,
+		sourceRepo:    cfg.SourceRepo,
+		scanContext:   cfg.ScanContext,
+		children:      make(map[*Agent]struct{}),
 	}
 	// Redirect hops get the same local-machine and port-pin checks as the
 	// URL a tool is called with, and every direct connection gets the
@@ -891,6 +911,29 @@ func NewAgent(cfg *config.Config, name string, events chan Event, localGuard sco
 			log.Printf("[audit] delegation record skipped: %v", err)
 		}
 	})
+	// Delegation lifecycle telemetry → the scan event stream. These frames only
+	// invalidate the client's cached /agents projection; the projection stays
+	// authoritative (charter §5.1: telemetry is not state).
+	//
+	// Only the ROOT installs the sink: every child shares the same graph, and a
+	// child closure would emit into its own subEvents channel (closed when the
+	// child exits), silently killing later notifications for every sibling.
+	if a.delegatedAgentID == "" {
+		a.agentGraph.SetStateSink(func(ev agentsgraph.StateEvent) {
+			a.emit(Event{
+				Type:    ev.Kind,
+				Content: ev.Lane,
+				Meta: map[string]any{
+					"agent_id": ev.AgentID,
+					"lane":     ev.Lane,
+					"status":   ev.Status,
+					"limit":    ev.Limit,
+					"running":  ev.Running,
+					"queued":   ev.Queued,
+				},
+			})
+		})
+	}
 	// Only the root coordinator can delegate. Prompt wording alone is not a
 	// sufficient boundary: removing the graph tools from child registries makes
 	// nested delegation impossible and keeps the one-wave lifetime budget exact.
@@ -1040,7 +1083,22 @@ func (a *Agent) reconIncompleteReasons() []string {
 func (a *Agent) maybeAutoDelegate(targets []string) string {
 	if a == nil || a.state == nil || a.registry == nil || a.agentGraph == nil ||
 		a.delegatedAgentID != "" || a.ctfDelegationBlocked() || a.state.DiscoveryMode ||
-		a.state.ReconOnlyMode || a.state.DelegationAttempted {
+		a.state.ReconOnlyMode {
+		return ""
+	}
+	// Opt-in bounded reschedule (P2, XALGORIX_WAVE_RESCHEDULE): after the first
+	// wave drains, still-unfinished plan classes may justify ONE more lane.
+	// Checked before the DelegationAttempted early return below, which the
+	// initial wave sets and which would otherwise end delegation permanently.
+	if a.state.WaveLaunched {
+		if !a.state.DelegationEnabled {
+			return ""
+		}
+		if note := a.maybeRescheduleWave(targets); note != "" {
+			return note
+		}
+	}
+	if a.state.DelegationAttempted {
 		return ""
 	}
 	// Single-agent mode (XALGORIX_DISABLE_AUTO_DELEGATE=true, or every
@@ -1126,6 +1184,7 @@ func (a *Agent) maybeAutoDelegate(targets []string) string {
 	}
 	a.state.DelegationAttempted = true
 	a.state.WaveLaunched = true
+	a.state.WaveCount = 1
 	a.state.DelegationNudgeFired = true
 	a.state.DelegationDeferReason = ""
 	return fmt.Sprintf("🚀 ENGINE DELEGATION STARTED: launched %d non-overlapping specialists (%s). "+
@@ -1136,6 +1195,82 @@ func (a *Agent) maybeAutoDelegate(targets []string) string {
 		"collected, independently verify every claimed finding and CONTINUE TESTING uncovered surface — "+
 		"specialist completion is NOT a finish signal. Do not launch another wave.",
 		len(spawned), strings.Join(spawned, ", "))
+}
+
+// waveRescheduleEnabled is the opt-in switch for a bounded second wave. It is
+// env-only on purpose: this changes delegation dynamics, so it stays off unless
+// an operator deliberately enables it.
+func waveRescheduleEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("XALGORIX_WAVE_RESCHEDULE"))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+// maybeRescheduleWave launches at most one additional specialist lane after the
+// first wave has fully drained, and only for a role whose assigned classes are
+// still unfinished in the plan. Bounds that keep it safe:
+//   - opt-in (XALGORIX_WAVE_RESCHEDULE) and at most 2 waves per scan;
+//   - the previous wave must be idle (no running/queued agent);
+//   - the lifetime delegation budget must still have room;
+//   - one lane per call, so the coordinator keeps integrating evidence.
+//
+// The finish gate is untouched: an extra lane only adds work the plan already
+// owes, so it cannot shorten or bypass any obligation.
+func (a *Agent) maybeRescheduleWave(targets []string) string {
+	if a == nil || a.agentGraph == nil || a.state == nil || a.state.Plan == nil {
+		return ""
+	}
+	if !waveRescheduleEnabled() || a.state.WaveCount == 0 || a.state.WaveCount >= 2 {
+		return ""
+	}
+	if a.agentGraph.RunningCount() > 0 {
+		return ""
+	}
+	if a.agentGraph.DelegationCount() >= a.agentGraph.MaxAgents() {
+		return ""
+	}
+	unfinished := make(map[string]bool)
+	for _, task := range a.state.Plan.Tasks {
+		if task == nil || task.VulnClass == "" {
+			continue
+		}
+		if task.Status == TaskPending || task.Status == TaskActive {
+			unfinished[strings.ToLower(task.VulnClass)] = true
+		}
+	}
+	if len(unfinished) == 0 {
+		return ""
+	}
+	liveLanes := make(map[string]bool)
+	for _, agent := range a.agentGraph.Snapshot().Agents {
+		if agent.Status == "running" || agent.Status == "queued" {
+			liveLanes[agent.Lane] = true
+		}
+	}
+	for _, profile := range a.mergedSpecialistProfiles() {
+		if profile.Role == "recon-discovery" || liveLanes[profile.Role] || a.specialistDisabled(profile.Role) {
+			continue
+		}
+		overlap := false
+		for _, class := range profile.VulnClasses {
+			if unfinished[strings.ToLower(class)] {
+				overlap = true
+				break
+			}
+		}
+		if !overlap {
+			continue
+		}
+		if id := a.spawnSpecialistProfile(profile, targets); id != "" {
+			a.state.WaveCount++
+			return fmt.Sprintf("🔁 ENGINE WAVE RESCHEDULE (opt-in): the first wave drained while %d plan class(es) are still unfinished, so lane %q was relaunched (%s). Keep integrating evidence; specialist completion is still NOT a finish signal.",
+				len(unfinished), profile.Role, id)
+		}
+	}
+	return ""
 }
 
 func (a *Agent) eligibleSpecialistProfiles() []specialistProfile {
@@ -1792,6 +1927,11 @@ func (a *Agent) Run(targets []string, instruction string) {
 	a.nativeToolCalling = a.client != nil && a.client.NativeToolCallingSupported()
 	if a.scanBudget != nil {
 		a.scanBudget.start()
+		// Register this agent as a live sharer for the remainder of Run. The
+		// shared cap is fair-shared only while two or more agents are live;
+		// single-agent paths keep the exact configured cap.
+		a.scanBudget.enter()
+		defer a.scanBudget.leave()
 	}
 	stopSemanticWatchdog := a.startSemanticWatchdog()
 	defer stopSemanticWatchdog()
