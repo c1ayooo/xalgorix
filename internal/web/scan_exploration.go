@@ -225,6 +225,10 @@ func buildExploration(view *explorationView, ledger map[string]scanctx.Hypothesi
 		ledger:   ledger,
 		nodes:    map[string]*explorationNode{},
 		edgeSeen: map[[3]string]struct{}{},
+		// Non-nil from the start: a journal with only observations (no edges
+		// yet) must marshal edges as [] — nil would serialize as JSON null and
+		// crash the dashboard's array iteration.
+		edges: []explorationEdge{},
 	}
 	for i := range records {
 		b.consume(&records[i])

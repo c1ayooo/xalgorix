@@ -148,10 +148,14 @@ const scanMetaFile = "scan.meta.json"
 func buildDetailMeta(rec *ScanRecord) *ScanRecord {
 	light := *rec
 	total := max(rec.EventsTotal, len(rec.Events))
+	// Copy the tail into a non-nil slice: append on a nil source would leave
+	// Events nil for a zero-event scan, marshaling as JSON null both here and
+	// in the persisted scan.meta.json sidecar.
+	light.Events = make([]WSEvent, 0, min(len(rec.Events), detailEventTail))
 	if len(rec.Events) > detailEventTail {
-		light.Events = append([]WSEvent(nil), rec.Events[len(rec.Events)-detailEventTail:]...)
+		light.Events = append(light.Events, rec.Events[len(rec.Events)-detailEventTail:]...)
 	} else {
-		light.Events = append([]WSEvent(nil), rec.Events...)
+		light.Events = append(light.Events, rec.Events...)
 	}
 	light.EventsTotal = total
 	light.EventsTruncated = total > len(light.Events)
@@ -285,7 +289,8 @@ func (s *Server) loadScanRecordForDetail(dir string, tail int) (*ScanRecord, boo
 	}
 	rec.Events = decodeEvents(ring)
 	if rec.EventsJournal {
-		rec.Events = nil
+		// Non-nil seed: a zero-event journal must marshal as [] not null.
+		rec.Events = []WSEvent{}
 		var journalErr error
 		total, _, journalErr = walkEventJournal(dir, func(_ int, event WSEvent) {
 			if tail > 0 {

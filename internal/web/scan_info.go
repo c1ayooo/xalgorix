@@ -81,6 +81,16 @@ func writeInfoDisabled(w http.ResponseWriter) {
 	})
 }
 
+// nonNilItems normalizes a reader result so empty result sets marshal as []
+// instead of JSON null: the dashboard iterates these arrays unconditionally,
+// and a nil slice from any Reader implementation would crash the page.
+func nonNilItems(items []infoitem.Item) []infoitem.Item {
+	if items == nil {
+		return []infoitem.Item{}
+	}
+	return items
+}
+
 func writeInfoUnavailable(w http.ResponseWriter, err error) {
 	writeJSONStatus(w, http.StatusServiceUnavailable, map[string]any{
 		"available": false,
@@ -260,6 +270,7 @@ func (s *Server) handleInfoRegion(w http.ResponseWriter, r *http.Request) {
 		writeJSONStatus(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
+	res.Items = nonNilItems(res.Items)
 	writeJSONStatus(w, http.StatusOK, infoRegionResponse{Available: true, RegionResult: res})
 }
 
@@ -310,6 +321,7 @@ func (s *Server) handleInfoContext(w http.ResponseWriter, r *http.Request) {
 		writeJSONStatus(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
+	res.Items = nonNilItems(res.Items)
 	writeJSONStatus(w, http.StatusOK, infoContextResponse{Available: true, ContextResult: res})
 }
 
@@ -388,7 +400,9 @@ func (s *Server) associationQuery(w http.ResponseWriter, r *http.Request, scanID
 		consulted = consulted[:maxProjectAssociationScans]
 		capped = true
 	}
-	merged := infoitem.AssociationResult{}
+	// Hits starts non-nil so a zero-hit traversal marshals as [] not null
+	// (the dashboard iterates hits unconditionally).
+	merged := infoitem.AssociationResult{Hits: []infoitem.AssociationHit{}}
 	seen := map[string]struct{}{}
 	for _, scan := range consulted {
 		q := infoitem.AssociationQuery{

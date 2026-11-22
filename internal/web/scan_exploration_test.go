@@ -329,6 +329,34 @@ func byNodeID(view explorationView, id string) (explorationNode, bool) {
 	return explorationNode{}, false
 }
 
+// Empty edge sets marshal as [] not null: the dashboard iterates view.edges
+// unconditionally (探索链路拓扑 + 播报板流水), and an observations-only journal
+// (no hypothesis/evidence structure yet) is a normal live-run state.
+func TestScanExplorationEndpoint_ZeroEdgesMarshallAsEmptyArray(t *testing.T) {
+	s := newTestServer(t, nil)
+	id := "explore-obs-only-1"
+	dir := ledgerTestScan(t, s, id)
+	j, err := domainjournal.Open(filepath.Join(dir, domainjournal.FileName), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustAppend(t, j, domainjournal.Record{
+		Actor:     domainjournal.Actor{Kind: domainjournal.ActorEngine, Source: "trafficproxy"},
+		Operation: domainjournal.OpObserveTraffic, Summary: "GET https://example.com/ -> 200 OK",
+	})
+
+	rr := explorationGet(t, s, id)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if strings.Contains(rr.Body.String(), `"edges":null`) {
+		t.Fatalf("edges marshaled as null: %s", rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), `"edges":[]`) {
+		t.Fatalf("edges not marshaled as empty array: %s", rr.Body.String())
+	}
+}
+
 // D11: an instance is a run identity — a multi-target dispatch owns several
 // top-level scan records. Instance-form requests bind to the NEWEST session
 // (matching scanDirRecordForRun) and disclose the fan-out in the note;

@@ -24,9 +24,11 @@ import (
 //	                when nothing was planned.
 func Evaluate(spec *Spec, sig Signal) Report {
 	if spec == nil {
-		return Report{Structured: false}
+		// criteria is a non-omitempty wire field: keep the empty-array contract
+		// so unstructured tasks don't marshal it as null.
+		return Report{Structured: false, Criteria: []CriterionStatus{}}
 	}
-	report := Report{Structured: true}
+	report := Report{Structured: true, Criteria: []CriterionStatus{}}
 	decided := 0
 	for _, c := range spec.Criteria {
 		status := evaluateCriterion(c, sig)

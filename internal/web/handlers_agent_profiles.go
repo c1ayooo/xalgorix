@@ -36,10 +36,13 @@ func builtinProfileRows() []platform.AgentProfile {
 	// the canonical strings here.
 	for _, role := range roles {
 		out = append(out, platform.AgentProfile{
-			ID:      "builtin:" + role,
-			Role:    role,
-			Builtin: true,
-			Enabled: true,
+			ID:   "builtin:" + role,
+			Role: role,
+			// vuln_classes is a non-omitempty wire field; keep the empty-array
+			// contract (nil would marshal as null in every builtin row).
+			VulnClasses: []string{},
+			Builtin:     true,
+			Enabled:     true,
 		})
 	}
 	return out

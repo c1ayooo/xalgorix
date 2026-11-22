@@ -108,7 +108,7 @@ func (s *Server) hydrateTerminalIntegrity(inst *ScanInstance) {
 	if isTerminalScanStatus(inst.Status) {
 		applyRecordIntegrityLocked(inst, rec)
 		if inst.ScanMode == "wildcard" {
-			inst.SubScans = cloneSubScanSummaries(rec.SubScans)
+			inst.SubScans = nonNilSubScans(cloneSubScanSummaries(rec.SubScans))
 			inst.SubScanTotal, inst.SubScanCompleted = rec.SubScanTotal, rec.SubScanCompleted
 			inst.SubScanRunning, inst.SubScanRemaining = rec.SubScanRunning, rec.SubScanRemaining
 			inst.Discovery, inst.SubScanSkipped = cloneSubScanSummary(rec.Discovery), rec.SubScanSkipped

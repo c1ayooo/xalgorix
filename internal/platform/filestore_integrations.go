@@ -211,7 +211,8 @@ func (s *FileStore) CreateSkill(_ context.Context, in SkillInput) (*Skill, error
 func (s *FileStore) ListSkills(_ context.Context) ([]Skill, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	out := append([]Skill(nil), s.data.Skills...)
+	out := make([]Skill, 0, len(s.data.Skills))
+	out = append(out, s.data.Skills...)
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
 	for i := range out {
 		out[i] = normalizeSkill(out[i])

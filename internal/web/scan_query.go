@@ -629,6 +629,16 @@ func cloneSubScanSummaries(source []SubScanSummary) []SubScanSummary {
 	return cloned
 }
 
+// nonNilSubScans normalizes for the wire: sub_scans is a non-omitempty field
+// whose empty array is the "no wildcard children" capability marker (nil would
+// marshal as JSON null on GET /api/instances/{id}).
+func nonNilSubScans(source []SubScanSummary) []SubScanSummary {
+	if source == nil {
+		return []SubScanSummary{}
+	}
+	return source
+}
+
 func (s *Server) scanRecordFromInstance(inst *ScanInstance) *ScanRecord {
 	if inst == nil {
 		return nil
@@ -1486,7 +1496,7 @@ func (s *Server) rebuildInstancesFromDisk() {
 			DiscordWebhook:     entry.rec.DiscordWebhook,
 			Vulns:              entry.rec.Vulns,
 			CurrentPhase:       entry.rec.CurrentPhase,
-			SubScans:           cloneSubScanSummaries(entry.rec.SubScans),
+			SubScans:           nonNilSubScans(cloneSubScanSummaries(entry.rec.SubScans)),
 			SubScanTotal:       entry.rec.SubScanTotal,
 			SubScanCompleted:   entry.rec.SubScanCompleted,
 			SubScanRunning:     entry.rec.SubScanRunning,

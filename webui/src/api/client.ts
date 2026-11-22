@@ -270,6 +270,12 @@ const INVOCATION_PATHS: Record<InvocationListModule, string> = {
   agents: "/api/agent-profiles/invocations",
 };
 
+/**
+ * Go 的 nil slice 会序列化成 JSON null（旧二进制/未来回归都可能），前端在
+ * 客户端边界统一归一化为空数组，消费方可以无条件迭代（.length/.map/for…of）。
+ */
+const arr = <T>(value: T[] | null | undefined): T[] => value ?? [];
+
 export const api = {
   authStatus: () =>
     http<AuthStatus>("/api/auth/status", { timeoutMs: 10_000 }),
@@ -803,7 +809,10 @@ export const api = {
     if (params.after) sp.set("after", params.after);
     if (params.before) sp.set("before", params.before);
     if (params.limit) sp.set("limit", String(params.limit));
-    return http<InfoRegionResult>(`/api/info/region?${sp.toString()}`);
+    return http<InfoRegionResult>(`/api/info/region?${sp.toString()}`).then((r) => ({
+      ...r,
+      items: arr(r.items),
+    }));
   },
   infoContext: (params: InfoContextParams) => {
     const sp = new URLSearchParams({
@@ -815,7 +824,10 @@ export const api = {
     if (params.since) sp.set("since", params.since);
     if (params.until) sp.set("until", params.until);
     if (params.limit) sp.set("limit", String(params.limit));
-    return http<InfoContextResult>(`/api/info/context?${sp.toString()}`);
+    return http<InfoContextResult>(`/api/info/context?${sp.toString()}`).then((r) => ({
+      ...r,
+      items: arr(r.items),
+    }));
   },
   infoAssociation: (params: InfoAssociationParams) => {
     const sp = new URLSearchParams({
@@ -828,7 +840,10 @@ export const api = {
     if (params.edgeTypes?.length) sp.set("edge_types", params.edgeTypes.join(","));
     if (params.maxDepth) sp.set("max_depth", String(params.maxDepth));
     if (params.limit) sp.set("limit", String(params.limit));
-    return http<InfoAssociationResult>(`/api/info/association?${sp.toString()}`);
+    return http<InfoAssociationResult>(`/api/info/association?${sp.toString()}`).then((r) => ({
+      ...r,
+      hits: arr(r.hits),
+    }));
   },
 
   // 冷路径同步状态（只读；契约 §3.3「既有端点复用」）。disabled = 无 DSN 的
@@ -838,11 +853,20 @@ export const api = {
 
   // 领域审计投影（宪章 M2 只读投影）：认领历史 + 时间线 + 缺口检测。
   scanAudit: (scanId: string) =>
-    http<ScanAuditView>(`/api/scans/${encodeURIComponent(scanId)}/audit`),
+    http<ScanAuditView>(`/api/scans/${encodeURIComponent(scanId)}/audit`).then((v) => ({
+      ...v,
+      projection: v.projection
+        ? { ...v.projection, timeline: arr(v.projection.timeline), claims: arr(v.projection.claims) }
+        : v.projection,
+    })),
 
   // 探索投影（4zreco 双图同源）：探索链路图 + 播报板共用的 node/edge 模型。
   scanExploration: (scanId: string) =>
-    http<ExplorationView>(`/api/scans/${encodeURIComponent(scanId)}/exploration`),
+    http<ExplorationView>(`/api/scans/${encodeURIComponent(scanId)}/exploration`).then((v) => ({
+      ...v,
+      nodes: arr(v.nodes),
+      edges: arr(v.edges),
+    })),
 
   // ── 集成模块：MCP 服务器 / 用户技能 / Agent 档案（契约 §integration-*）──
   listMcpServers: () => http<{ servers: McpServer[] }>("/api/mcp-servers"),

@@ -485,9 +485,11 @@ type Claim struct {
 // duplicates, disorder and missing sequence ranges.
 func Project(scanID string, records []Record) Projection {
 	p := Projection{
-		ScanID:          scanID,
-		Status:          "empty",
-		Timeline:        append([]Record(nil), records...),
+		ScanID: scanID,
+		Status: "empty",
+		// Non-nil even for an empty journal: nil would marshal as JSON null
+		// and the dashboard iterates timeline unconditionally.
+		Timeline:        append([]Record{}, records...),
 		HypothesisFinal: map[string]State{},
 	}
 	if len(records) == 0 {

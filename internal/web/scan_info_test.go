@@ -114,6 +114,27 @@ func TestInfoContextRejectsCrossProjectScan(t *testing.T) {
 	}
 }
 
+// Empty result sets marshal as [] not null: the dashboard iterates items/hits
+// unconditionally, and a nil slice from any Reader implementation (PG cold
+// path returns nil on zero rows) would crash the page.
+func TestInfoEmptyResultSetsMarshalAsEmptyArrays(t *testing.T) {
+	s, projectA, _ := infoTestServer(t)
+	s.SetInfoReader(&fakeInfoReader{}) // zero values: nil Items / nil Hits
+
+	rr := infoRequest(t, s, "/api/info/region?project_id="+projectA.ID)
+	if rr.Code != http.StatusOK || strings.Contains(rr.Body.String(), `"items":null`) {
+		t.Fatalf("region empty body = %d %s", rr.Code, rr.Body.String())
+	}
+	rr = infoRequest(t, s, "/api/info/context?project_id="+projectA.ID+"&scan_id=inst-a")
+	if rr.Code != http.StatusOK || strings.Contains(rr.Body.String(), `"items":null`) {
+		t.Fatalf("context empty body = %d %s", rr.Code, rr.Body.String())
+	}
+	rr = infoRequest(t, s, "/api/info/association?project_id="+projectA.ID+"&ids=i1")
+	if rr.Code != http.StatusOK || strings.Contains(rr.Body.String(), `"hits":null`) {
+		t.Fatalf("association empty body = %d %s", rr.Code, rr.Body.String())
+	}
+}
+
 func TestInfoDisabledIsExplicit(t *testing.T) {
 	s, projectA, _ := infoTestServer(t)
 	s.SetInfoReader(&fakeInfoReader{err: errors.New("infoitem/postgres: store unavailable")})

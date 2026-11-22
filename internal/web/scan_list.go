@@ -72,7 +72,10 @@ func (s *Server) cachedScanList() []scanListItem {
 	if s.scanListCache != nil && time.Since(s.scanListCacheAt) < scanListCacheTTL {
 		return s.scanListCache
 	}
+	// Non-nil seed: an empty deployment must serve [] (and let the cache hit),
+	// not a bare null body.
 	var scans []scanListItem
+	scans = make([]scanListItem, 0)
 	// Walk the data dir ONCE (events-free + per-file cached) and reuse the
 	// entry slice for child resolution. Previously each top-level scan
 	// triggered its own findAllScans() walk via attachWildcardSubScans, making
