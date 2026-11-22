@@ -711,6 +711,8 @@ const en: Dict = {
 
   // Findings page
   "findings.title": "Findings",
+  "findings.scope": "Project scope",
+  "findings.allProjects": "All projects",
   "findings.allSeverities": "All severities",
 
   // Scans page
@@ -2620,6 +2622,8 @@ const zhCN: Dict = {
 
   // Findings page
   "findings.title": "发现",
+  "findings.scope": "项目作用域",
+  "findings.allProjects": "全部项目",
   "findings.allSeverities": "全部严重级别",
 
   // Scans page
