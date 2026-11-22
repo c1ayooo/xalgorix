@@ -13,8 +13,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/domainjournal"
-	"github.com/xalgord/xalgorix/v4/internal/tools"
+	"github.com/c1ayooo/xalgorix/v4/internal/domainjournal"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools"
 )
 
 const (
@@ -71,6 +71,9 @@ type Graph struct {
 	persistPath  string
 	persistErr   error
 	audit        AuditSink
+	// stateSink receives best-effort lifecycle notifications for panel
+	// invalidation (see SetStateSink). Never the authority: Snapshot() is.
+	stateSink func(StateEvent)
 }
 
 // SetAuditSink installs the per-scan invocation audit sink (wired by the
@@ -224,6 +227,34 @@ func (g *Graph) capacityResult(action string) tools.Result {
 	return tools.Result{Output: fmt.Sprintf("Cannot %s: %d/%d delegated agents are already active. Collect or wait for one before delegating more.\nRunning agents:\n%s", action, g.RunningCount(), g.maxAgents, g.listRunningAgents())}
 }
 
+// syncDelegationNote is the correctable nudge attached to a synchronously
+// delegated result. create_agent blocks the coordinator for the child's whole
+// runtime and holds one concurrent slot the entire time, so a scan that only
+// ever calls it cannot be parallel no matter how large the pool is. The note is
+// stated on the success path where the model is about to decide what to do next.
+func (g *Graph) syncDelegationNote() string {
+	if g == nil {
+		return ""
+	}
+	g.mu.Lock()
+	limit := g.maxConcurrent
+	g.mu.Unlock()
+	if limit <= 1 {
+		return ""
+	}
+	return fmt.Sprintf("NOTE: create_agent is synchronous — this call blocked the coordinator for the child's full runtime and held 1 of %d concurrent slots. Use spawn_agent for lanes that should run in parallel.\n\n", limit)
+}
+
+// notifyAgentStatus emits the admission notification for a freshly admitted
+// delegation: "agent_started" when it took a slot, "agent_queued" otherwise.
+func (g *Graph) notifyAgentStatus(agentID, lane string, started bool) {
+	if started {
+		g.notify("agent_started", agentID, lane, "running")
+		return
+	}
+	g.notify("agent_queued", agentID, lane, "queued")
+}
+
 func (g *Graph) nextIDLocked(prefix string) string {
 	g.counter++
 	return fmt.Sprintf("%s_%d_%d", prefix, g.counter, time.Now().UnixNano())
@@ -245,9 +276,9 @@ func (g *Graph) runAgent(state *subAgentState) {
 
 func (g *Graph) onAgentDone() {
 	g.mu.Lock()
-	defer g.mu.Unlock()
 	if g.stopped || g.ctx.Err() != nil {
 		g.activeAgents--
+		g.mu.Unlock()
 		return
 	}
 	if len(g.queue) > 0 {
@@ -263,13 +294,18 @@ func (g *Graph) onAgentDone() {
 			g.activeAgents--
 			next.Status = "queued"
 			g.queue = append([]*subAgentState{next}, g.queue...)
+			g.mu.Unlock()
 			return
 		}
 		g.wg.Add(1)
+		agentID, lane := next.ID, next.Name
+		g.mu.Unlock()
 		go g.runAgent(next)
-	} else {
-		g.activeAgents--
+		g.notify("agent_started", agentID, lane, "running")
+		return
 	}
+	g.activeAgents--
+	g.mu.Unlock()
 }
 
 func (g *Graph) createAgent(args map[string]string) (tools.Result, error) {
@@ -320,8 +356,10 @@ func (g *Graph) createAgent(args map[string]string) (tools.Result, error) {
 		state.Status = "queued"
 		g.queue = append(g.queue, state)
 	}
+	started := state.Status == "running"
 	g.mu.Unlock()
 
+	g.notifyAgentStatus(agentID, name, started)
 	g.auditDelegation(domainjournal.OpAgentDelegat, fmt.Sprintf("create_agent id=%s role=%q task=%q", agentID, name, truncTask(task, 200)))
 
 	select {
@@ -337,11 +375,12 @@ func (g *Graph) createAgent(args map[string]string) (tools.Result, error) {
 	state.Observed = true
 	g.mu.Unlock()
 
+	note := g.syncDelegationNote()
 	if runErr != "" {
-		return tools.Result{Output: fmt.Sprintf("Sub-agent %q failed after %s: %s", name, elapsed.Round(time.Second), runErr)}, nil
+		return tools.Result{Output: note + fmt.Sprintf("Sub-agent %q failed after %s: %s", name, elapsed.Round(time.Second), runErr)}, nil
 	}
 	return tools.Result{
-		Output: fmt.Sprintf("Sub-agent %q completed in %s\n%s", name, elapsed.Round(time.Second), result),
+		Output: note + fmt.Sprintf("Sub-agent %q completed in %s\n%s", name, elapsed.Round(time.Second), result),
 		Metadata: map[string]any{
 			"agent_id":   agentID,
 			"agent_name": name,
@@ -396,8 +435,10 @@ func (g *Graph) spawnAgent(args map[string]string) (tools.Result, error) {
 		state.Status = "queued"
 		g.queue = append(g.queue, state)
 	}
+	started := state.Status == "running"
 	g.mu.Unlock()
 
+	g.notifyAgentStatus(agentID, name, started)
 	g.auditDelegation(domainjournal.OpAgentDelegat, fmt.Sprintf("spawn_agent id=%s role=%q task=%q", agentID, name, truncTask(task, 200)))
 
 	target := ""
@@ -416,9 +457,9 @@ func (g *Graph) spawnAgent(args map[string]string) (tools.Result, error) {
 
 func (g *Graph) complete(agentID, summary string, runErr error) {
 	g.mu.Lock()
-	defer g.mu.Unlock()
 	state, ok := g.agents[agentID]
 	if !ok || (state.Status != "running" && state.Status != "queued") {
+		g.mu.Unlock()
 		return
 	}
 	state.CompletedAt = time.Now()
@@ -447,6 +488,13 @@ func (g *Graph) complete(agentID, summary string, runErr error) {
 			g.audit(domainjournal.OpAgentDelegat, fmt.Sprintf("delegate_result id=%s role=%q status=completed in=%s", state.ID, state.Name, elapsed))
 		}
 	}
+	lane, status := state.Name, state.Status
+	g.mu.Unlock()
+	kind := "agent_completed"
+	if status == "failed" {
+		kind = "agent_failed"
+	}
+	g.notify(kind, agentID, lane, status)
 }
 
 type agentSnapshot struct {
@@ -694,16 +742,21 @@ func (g *Graph) Stop() {
 	g.cancel()
 	now := time.Now()
 	g.queue = nil
+	var stopped []AgentState
 	for _, state := range g.agents {
 		if state.Status == "running" || state.Status == "queued" {
 			state.Status = "failed"
 			state.Error = "parent scan stopped"
 			state.CompletedAt = now
 			state.doneOnce.Do(func() { close(state.done) })
+			stopped = append(stopped, AgentState{AgentID: state.ID, Lane: state.Name})
 		}
 	}
 	_ = g.persistLocked()
 	g.mu.Unlock()
+	for _, agent := range stopped {
+		g.notify("agent_failed", agent.AgentID, agent.Lane, "failed")
+	}
 }
 
 // WaitStopped waits for delegated runner goroutines to unwind. It is mainly
