@@ -532,12 +532,13 @@ func NewAgent(cfg *config.Config, name string, events chan Event, localGuard sco
 		cfg = config.Get()
 	}
 
-	// An iteration cap below the engine default starves a single-target scan:
-	// recon alone consumes most of it and the report never lands. The engine
-	// default is 20; an operator override is honoured but flagged, because the
-	// symptom (completion=partial, zero findings) looks like a model failure.
+	// A small iteration cap starves a single-target scan: recon alone consumes
+	// most of it and the report never lands. 0 means unlimited (the engine
+	// translates it past the ADK's implicit 20-iteration floor); a low positive
+	// override is honoured but flagged, because the symptom
+	// (completion=partial, zero findings) looks like a model failure.
 	if cfg.MaxIterations > 0 && cfg.MaxIterations < 20 {
-		log.Printf("[agent] XALGORIX_MAX_ITERATIONS=%d is below the engine default 20 — single-target scans will likely end partial before reporting", cfg.MaxIterations)
+		log.Printf("[agent] XALGORIX_MAX_ITERATIONS=%d is below the recommended minimum 20 (0 = unlimited) — single-target scans will likely end partial before reporting", cfg.MaxIterations)
 	}
 	fixHttpxConflict()
 

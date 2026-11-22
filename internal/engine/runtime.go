@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"time"
@@ -138,9 +139,15 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 			ExecuteSequentially: true, // report_vulnerability and live state stay serial
 		},
 	}
+	// "0 = unlimited" (the config contract): the ADK applies the cap only when
+	// the value is positive and silently defaults 0 to its own 20-iteration
+	// floor (adk/react.go genReactState), so translate unlimited into a
+	// sentinel the run cannot reach. Duration/token/tool-call budgets still
+	// bound the scan; the old <=0 → 20 floor capped every unset scan at 20
+	// model requests (CORE_LOOP_AUDIT §4.2).
 	maxIterations := cfg.MaxIterations
 	if maxIterations <= 0 {
-		maxIterations = 20
+		maxIterations = math.MaxInt32
 	}
 	chatModel := NewChatModel(cfg.Client).
 		WithNativeTools(cfg.NativeTools).
