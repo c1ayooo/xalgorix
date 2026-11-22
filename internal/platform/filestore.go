@@ -32,12 +32,23 @@ type FileStore struct {
 // the model hides fields from the API (task.Context) or projects fields the
 // web layer fills at read time (approval.project_name/task_name).
 type fileSnapshot struct {
-	Version   int            `json:"version"`
-	Projects  []Project      `json:"projects"`
-	Tasks     []taskWire     `json:"tasks"`
-	Runs      []runWire      `json:"runs"`
-	Approvals []approvalWire `json:"approvals,omitempty"`
-	Guidance  []guidanceWire `json:"guidance,omitempty"`
+	Version       int            `json:"version"`
+	Projects      []Project      `json:"projects"`
+	Tasks         []taskWire     `json:"tasks"`
+	Runs          []runWire      `json:"runs"`
+	Approvals     []approvalWire `json:"approvals,omitempty"`
+	ApprovalRules []ApprovalRule `json:"approval_rules,omitempty"`
+	Guidance      []guidanceWire `json:"guidance,omitempty"`
+	// Integrations definitions (MCP servers / user skills / agent profiles).
+	// Low-frequency operator configuration — full-snapshot rewrite per
+	// mutation is fine here; high-frequency invocation records live in the
+	// web layer's JSONL journals instead.
+	McpServers    []McpServer    `json:"mcp_servers,omitempty"`
+	Skills        []Skill        `json:"skills,omitempty"`
+	AgentProfiles []AgentProfile `json:"agent_profiles,omitempty"`
+	// IntelTriage rows: operator labels on recorded intelligence (0009
+	// mirror; the observed items themselves live in scan dirs).
+	IntelTriage []IntelTriage `json:"intel_triage,omitempty"`
 }
 
 // approvalWire persists the approval record while suppressing the projected
@@ -82,6 +93,9 @@ type runWire struct {
 	InstanceID   string    `json:"instance_id,omitempty"`
 	Mode         string    `json:"mode,omitempty"`
 	Trigger      string    `json:"trigger,omitempty"`
+	Title        string    `json:"title,omitempty"`
+	Pinned       bool      `json:"pinned,omitempty"`
+	Archived     bool      `json:"archived,omitempty"`
 	CreatedAt    time.Time `json:"created_at"`
 }
 
@@ -180,12 +194,13 @@ func (s *FileStore) CreateProject(_ context.Context, name string, scope Scope) (
 	for _, p := range s.data.Projects {
 		existing[p.Slug] = struct{}{}
 	}
-	base := slugify(name, "")
-	if base == "" {
-		return nil, fmt.Errorf("%w: project name must contain ASCII slug characters", ErrValidation)
-	}
+	// A name with no ASCII slug characters (e.g. a Chinese display name — the
+	// dashboard defaults to zh-CN) slugifies to empty; fall back to the fresh
+	// id so the project is still creatable, matching the mock contract.
+	projectID := uuid.NewString()
+	base := slugify(name, projectID)
 	p := Project{
-		ID:        uuid.NewString(),
+		ID:        projectID,
 		Name:      name,
 		Slug:      uniqueSlug(base, existing),
 		Scope:     normalizeScope(scope),
@@ -393,6 +408,16 @@ func (s *FileStore) UpdateTask(_ context.Context, id string, upd TaskUpdate) (*T
 		if upd.ContextPaths != nil {
 			tw.ContextPaths = normalizeContextPaths(upd.ContextPaths)
 		}
+		if upd.ClearObjective {
+			tw.Objective = nil
+		}
+		if upd.Objective != nil {
+			objective, err := NormalizeObjective(upd.Objective)
+			if err != nil {
+				return nil, err
+			}
+			tw.Objective = objective
+		}
 		if upd.Context != nil {
 			merged := tw.Context
 			if merged == nil {
@@ -452,6 +477,62 @@ func (s *FileStore) DeleteTask(_ context.Context, id string) error {
 	return s.save()
 }
 
+// SetRunLegacyScanID implements Repository.SetRunLegacyScanID.
+func (s *FileStore) SetRunLegacyScanID(_ context.Context, instanceID, legacyScanID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	instanceID = strings.TrimSpace(instanceID)
+	legacyScanID = strings.TrimSpace(legacyScanID)
+	if instanceID == "" || legacyScanID == "" {
+		return fmt.Errorf("%w: instance_id and legacy_scan_id are required", ErrValidation)
+	}
+	for i := range s.data.Runs {
+		if s.data.Runs[i].InstanceID != instanceID {
+			continue
+		}
+		if s.data.Runs[i].LegacyScanID == "" {
+			s.data.Runs[i].LegacyScanID = legacyScanID
+			return s.save()
+		}
+		return nil
+	}
+	return fmt.Errorf("%w: run %s not found", ErrNotFound, instanceID)
+}
+
+// RenameRun implements Repository.RenameRun.
+func (s *FileStore) RenameRun(_ context.Context, instanceID, title string) error {
+	return s.updateRunFlag(instanceID, func(w *runWire) { w.Title = strings.TrimSpace(title) })
+}
+
+// SetRunPinned implements Repository.SetRunPinned.
+func (s *FileStore) SetRunPinned(_ context.Context, instanceID string, pinned bool) error {
+	return s.updateRunFlag(instanceID, func(w *runWire) { w.Pinned = pinned })
+}
+
+// SetRunArchived implements Repository.SetRunArchived.
+func (s *FileStore) SetRunArchived(_ context.Context, instanceID string, archived bool) error {
+	return s.updateRunFlag(instanceID, func(w *runWire) { w.Archived = archived })
+}
+
+// updateRunFlag applies one mutation to the run owning instanceID and persists
+// the snapshot; unknown ids return ErrNotFound.
+func (s *FileStore) updateRunFlag(instanceID string, mutate func(*runWire)) error {
+	instanceID = strings.TrimSpace(instanceID)
+	if instanceID == "" {
+		return fmt.Errorf("%w: instance_id is required", ErrValidation)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.data.Runs {
+		if s.data.Runs[i].InstanceID != instanceID {
+			continue
+		}
+		mutate(&s.data.Runs[i])
+		return s.save()
+	}
+	return fmt.Errorf("%w: run %s not found", ErrNotFound, instanceID)
+}
+
 // CreateRun implements Repository.CreateRun.
 func (s *FileStore) CreateRun(_ context.Context, taskID string, mount RunMount) (*Run, error) {
 	s.mu.Lock()
@@ -474,6 +555,7 @@ func (s *FileStore) CreateRun(_ context.Context, taskID string, mount RunMount) 
 		InstanceID:   mount.InstanceID,
 		Mode:         mount.Mode,
 		Trigger:      mount.Trigger,
+		Title:        strings.TrimSpace(mount.Title),
 		CreatedAt:    time.Now().UTC(),
 	}
 	s.data.Runs = append(s.data.Runs, runToWire(run))
@@ -681,6 +763,7 @@ func (s *FileStore) ImportLegacyRun(_ context.Context, taskID string, mount RunM
 		InstanceID:   mount.InstanceID,
 		Mode:         mount.Mode,
 		Trigger:      mount.Trigger,
+		Title:        strings.TrimSpace(mount.Title),
 		CreatedAt:    time.Now().UTC(),
 	}
 	s.data.Runs = append(s.data.Runs, runToWire(run))
@@ -781,6 +864,11 @@ func (s *FileStore) createTaskLocked(projectID string, in TaskInput, contextSeed
 	if in.Name == "" {
 		return nil, fmt.Errorf("%w: task name is required", ErrValidation)
 	}
+	objective, err := NormalizeObjective(in.Objective)
+	if err != nil {
+		return nil, err
+	}
+	in.Objective = objective
 	existing := map[string]struct{}{}
 	for _, t := range s.data.Tasks {
 		if t.ProjectID != projectID {
@@ -797,11 +885,14 @@ func (s *FileStore) createTaskLocked(projectID string, in TaskInput, contextSeed
 	for k, v := range contextSeed {
 		contextMap[k] = v
 	}
+	// Same ASCII-slug fallback as CreateProject: a non-ASCII task name falls
+	// back to the fresh id instead of an empty slug.
+	taskID := uuid.NewString()
 	if _, has := contextMap["slug"]; !has {
-		contextMap["slug"] = uniqueSlug(slugify(in.Name, ""), existing)
+		contextMap["slug"] = uniqueSlug(slugify(in.Name, taskID), existing)
 	}
 	t := Task{
-		ID:           uuid.NewString(),
+		ID:           taskID,
 		ProjectID:    projectID,
 		Name:         in.Name,
 		Goal:         in.Goal,
@@ -809,6 +900,7 @@ func (s *FileStore) createTaskLocked(projectID string, in TaskInput, contextSeed
 		PhasePolicy:  in.PhasePolicy,
 		Schedule:     in.Schedule,
 		ContextPaths: normalizeContextPaths(in.ContextPaths),
+		Objective:    in.Objective,
 		Context:      contextMap,
 		CreatedAt:    time.Now().UTC(),
 	}
@@ -852,6 +944,9 @@ func runToWire(r Run) runWire {
 		InstanceID:   r.InstanceID,
 		Mode:         r.Mode,
 		Trigger:      r.Trigger,
+		Title:        r.Title,
+		Pinned:       r.Pinned,
+		Archived:     r.Archived,
 		CreatedAt:    r.CreatedAt,
 	}
 }
@@ -864,6 +959,9 @@ func runFromWire(w runWire) Run {
 		InstanceID:   w.InstanceID,
 		Mode:         w.Mode,
 		Trigger:      w.Trigger,
+		Title:        w.Title,
+		Pinned:       w.Pinned,
+		Archived:     w.Archived,
 		CreatedAt:    w.CreatedAt,
 	}
 }

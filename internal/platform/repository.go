@@ -56,6 +56,20 @@ type Repository interface {
 	ListRunsByProject(ctx context.Context, projectID string) ([]Run, error)
 	// RunsByInstanceID returns the mount records pointing at an instance ID.
 	RunsByInstanceID(ctx context.Context, instanceID string) ([]Run, error)
+	// SetRunLegacyScanID records the scan-data identity a dispatched run is
+	// executing (the scan-context id used by scan.json, ledger.json and the
+	// domain journal). Runs are mounted before the scan directory exists, so
+	// this is a second write rather than a CreateRun field. The call is
+	// idempotent and never overwrites an existing legacy id (imported runs
+	// already point at their own scan). Unknown instance ids return ErrNotFound.
+	SetRunLegacyScanID(ctx context.Context, instanceID, legacyScanID string) error
+	// RenameRun sets the conversation title shown in the chat sidebar.
+	RenameRun(ctx context.Context, instanceID, title string) error
+	// SetRunPinned pins/unpins a conversation to the top of its task group.
+	SetRunPinned(ctx context.Context, instanceID string, pinned bool) error
+	// SetRunArchived soft-deletes a conversation. Archived runs keep their
+	// findings, journal and scan directory; only the sidebar hides them.
+	SetRunArchived(ctx context.Context, instanceID string, archived bool) error
 	// AllRuns returns every mount record. Used only by cold-path backfills
 	// (findings projection); it is not an API list endpoint.
 	AllRuns(ctx context.Context) ([]Run, error)
@@ -124,6 +138,22 @@ type Repository interface {
 	// pending deadline (OpsPulse, API_CONTRACT §3).
 	PendingSummary(ctx context.Context) (ApprovalSummary, error)
 
+	// ── approval rules (approve & remember, REDESIGN §5.2, API_CONTRACT §3.2) ─
+	// CreateApprovalRule persists an operator-authored exemption consulted by
+	// both gate layers before an approval row is created. Kind/match
+	// coherence violations are ErrValidation.
+	CreateApprovalRule(ctx context.Context, in ApprovalRuleInput) (*ApprovalRule, error)
+	// ListApprovalRules returns rules newest first. Expired rows are
+	// deliberately included: expiry is a match-time concern and the UI shows
+	// the state (hit_count/last_hit_at are the operator's tuning evidence).
+	ListApprovalRules(ctx context.Context, filter ApprovalRuleFilter) ([]ApprovalRule, error)
+	// DeleteApprovalRule removes the rule; ErrNotFound when missing.
+	DeleteApprovalRule(ctx context.Context, id string) error
+	// RecordApprovalRuleHit increments hit_count and stamps last_hit_at. A
+	// missing rule is not an error — hit bookkeeping is a best-effort audit
+	// projection, the rule row is the authority.
+	RecordApprovalRuleHit(ctx context.Context, id string) error
+
 	// ── guidance (R2a HITL-intent, API_CONTRACT §3.1) ───────────────────────
 	// CreateGuidance persists a human intent turn. Idempotent on
 	// (task_id, request_id) when request_id is non-empty: a retry returns the
@@ -135,6 +165,48 @@ type Repository interface {
 	// UpdateGuidanceStatus flips a guidance row's status (queued→injected,
 	// injected→consumed). Setting consumed stamps consumed_at.
 	UpdateGuidanceStatus(ctx context.Context, id, status string) (*Guidance, error)
+
+	// ── integrations: MCP servers / user skills / agent profiles ────────────
+	// Operator-authored definitions consumed at scan launch. They are
+	// configuration, never judgements (charter §3.5): the engine treats every
+	// value as input, and a nil/empty set must leave scanning fully capable
+	// (single-binary degradation, charter §6.6).
+	//
+	// CreateMcpServer persists one MCP server definition. A duplicate name is
+	// ErrConflict; structural violations are ErrValidation. Env/Headers may
+	// carry credential material — callers (web layer) mask on read and treat
+	// "****"-prefixed submissions as unchanged; the repository persists
+	// whatever it is given.
+	CreateMcpServer(ctx context.Context, in McpServerInput) (*McpServer, error)
+	// ListMcpServers returns every server newest first, enabled or not.
+	ListMcpServers(ctx context.Context) ([]McpServer, error)
+	GetMcpServer(ctx context.Context, id string) (*McpServer, error)
+	// UpdateMcpServer applies the PATCH semantics of McpServerUpdate (nil =
+	// unchanged). The refresh action uses the ToolCount/LastHealthyAt/
+	// LastError fields to stamp connectivity projections.
+	UpdateMcpServer(ctx context.Context, id string, upd McpServerUpdate) (*McpServer, error)
+	DeleteMcpServer(ctx context.Context, id string) error
+
+	// CreateSkill persists one user skill. A duplicate name is ErrConflict
+	// (unique among user skills; the embedded corpus is a separate namespace).
+	CreateSkill(ctx context.Context, in SkillInput) (*Skill, error)
+	// ListSkills returns every user skill newest first, enabled or not.
+	ListSkills(ctx context.Context) ([]Skill, error)
+	GetSkill(ctx context.Context, id string) (*Skill, error)
+	UpdateSkill(ctx context.Context, id string, upd SkillUpdate) (*Skill, error)
+	DeleteSkill(ctx context.Context, id string) error
+
+	// CreateAgentProfile persists one delegation profile. A duplicate role is
+	// ErrConflict. Reserved built-in roles are rejected by the web layer (the
+	// repository stays decoupled from the agent package).
+	CreateAgentProfile(ctx context.Context, in AgentProfileInput) (*AgentProfile, error)
+	// ListAgentProfiles returns every user profile newest first, enabled or
+	// not. Built-in specialist profiles are merged by the web layer — they are
+	// never stored rows.
+	ListAgentProfiles(ctx context.Context) ([]AgentProfile, error)
+	GetAgentProfile(ctx context.Context, id string) (*AgentProfile, error)
+	UpdateAgentProfile(ctx context.Context, id string, upd AgentProfileUpdate) (*AgentProfile, error)
+	DeleteAgentProfile(ctx context.Context, id string) error
 }
 
 // FindingsStore is the optional PostgreSQL-only findings projection seam. The

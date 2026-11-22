@@ -140,10 +140,10 @@ func (s *Store) CreateProject(ctx context.Context, name string, scope Scope) (*P
 		return nil, err
 	}
 	id := uuid.NewString()
-	base := slugify(name, "")
-	if base == "" {
-		return nil, fmt.Errorf("%w: project name must contain ASCII slug characters", ErrValidation)
-	}
+	// A name with no ASCII slug characters (e.g. a Chinese display name — the
+	// dashboard defaults to zh-CN) slugifies to empty; fall back to the fresh
+	// id so the project is still creatable, matching the mock contract.
+	base := slugify(name, id)
 	if base == DefaultProjectSlug {
 		return nil, fmt.Errorf("%w: slug %q is reserved", ErrConflict, DefaultProjectSlug)
 	}
@@ -289,7 +289,18 @@ func (s *Store) DeleteProject(ctx context.Context, id string) error {
 
 // ── tasks ────────────────────────────────────────────────────────────────────
 
-const taskColumns = `id, project_id, name, goal, instruction, context_paths, context, phase_policy, schedule, created_at, updated_at, archived_at`
+// taskColumns is used only with taskObjectiveJoin (the task_objectives row
+// also carries project_id), so every column is table-qualified: a bare
+// project_id made every joined task query fail with SQLSTATE 42702
+// (ambiguous column reference).
+const taskColumns = `tasks.id, tasks.project_id, tasks.name, tasks.goal, tasks.instruction, tasks.context_paths, tasks.context, tasks.phase_policy, tasks.schedule, tasks.created_at, tasks.updated_at, tasks.archived_at`
+
+// taskObjectiveJoin attaches the 1:1 objective extension row. LEFT JOIN keeps
+// every task visible, including the ones without a structured objective.
+const taskObjectiveJoin = ` LEFT JOIN task_objectives o ON o.task_id = tasks.id`
+
+// taskObjectiveColumn is the extra projected column of the join.
+const taskObjectiveColumn = `, o.objective`
 
 func scanTaskRow(row pgx.Row) (*Task, error) {
 	var (
@@ -298,16 +309,32 @@ func scanTaskRow(row pgx.Row) (*Task, error) {
 		contextJSON      []byte
 		policyJSON       []byte
 		scheduleJSON     []byte
+		objectiveJSON    []byte
 	)
 	if err := row.Scan(&t.ID, &t.ProjectID, &t.Name, &t.Goal, &t.Instruction, &contextPathsJSON, &contextJSON,
-		&policyJSON, &scheduleJSON, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt); err != nil {
+		&policyJSON, &scheduleJSON, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &objectiveJSON); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
 		}
 		return nil, fmt.Errorf("platform/postgres: scan task: %w", err)
 	}
 	hydrateTaskJSON(&t, contextPathsJSON, contextJSON, policyJSON, scheduleJSON)
+	hydrateTaskObjective(&t, objectiveJSON)
 	return &t, nil
+}
+
+// hydrateTaskObjective decodes the joined objective extension row. An absent
+// row (or an undecodable payload) means "not structured" - never a partial
+// objective.
+func hydrateTaskObjective(t *Task, objectiveJSON []byte) {
+	if len(objectiveJSON) == 0 {
+		return
+	}
+	var obj Objective
+	if err := json.Unmarshal(objectiveJSON, &obj); err != nil {
+		return
+	}
+	t.Objective = &obj
 }
 
 func hydrateTaskJSON(t *Task, contextPathsJSON, contextJSON, policyJSON, scheduleJSON []byte) {
@@ -360,10 +387,19 @@ func (s *Store) createTaskInternal(ctx context.Context, projectID uuid.UUID, in 
 	if in.Name == "" {
 		return nil, fmt.Errorf("%w: task name is required", ErrValidation)
 	}
+	objective, err := NormalizeObjective(in.Objective)
+	if err != nil {
+		return nil, err
+	}
+	in.Objective = objective
 	siblingSlugs, err := s.siblingSlugs(ctx, projectID)
 	if err != nil {
 		return nil, err
 	}
+	// id is generated here (not at the INSERT below) so the ASCII-slug
+	// fallback can reuse it: a non-ASCII task name falls back to the task id
+	// instead of an empty slug, matching the mock contract.
+	id := uuid.NewString()
 	contextMap := map[string]any{}
 	for k, v := range in.Context {
 		contextMap[k] = v
@@ -372,7 +408,7 @@ func (s *Store) createTaskInternal(ctx context.Context, projectID uuid.UUID, in 
 		contextMap[k] = v
 	}
 	if _, has := contextMap["slug"]; !has {
-		contextMap["slug"] = uniqueSlug(slugify(in.Name, ""), siblingSlugs)
+		contextMap["slug"] = uniqueSlug(slugify(in.Name, id), siblingSlugs)
 	}
 	contextJSON, err := marshalJSON(contextMap)
 	if err != nil {
@@ -391,7 +427,6 @@ func (s *Store) createTaskInternal(ctx context.Context, projectID uuid.UUID, in 
 		return nil, err
 	}
 	now := time.Now().UTC()
-	id := uuid.NewString()
 	stmt := `
 		INSERT INTO tasks (id, project_id, name, goal, instruction, context_paths, context, phase_policy, schedule, created_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`
@@ -406,6 +441,13 @@ func (s *Store) createTaskInternal(ctx context.Context, projectID uuid.UUID, in 
 	}
 	if idempotent && tag.RowsAffected() == 0 {
 		return nil, nil // a concurrent creator won; caller re-reads by context key
+	}
+	createdID, err := parseUUID(id)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.writeTaskObjective(ctx, createdID, projectID.String(), in.Objective); err != nil {
+		return nil, err
 	}
 	return s.GetTask(ctx, id)
 }
@@ -442,9 +484,9 @@ func (s *Store) ListTasks(ctx context.Context, projectID string) ([]Task, error)
 		return nil, err
 	}
 	rows, err := s.query(ctx,
-		`SELECT `+taskColumns+` FROM tasks
-		 WHERE project_id = $1 AND archived_at IS NULL
-		 ORDER BY created_at, id`, parsed)
+		`SELECT `+taskColumns+taskObjectiveColumn+` FROM tasks`+taskObjectiveJoin+`
+		 WHERE tasks.project_id = $1 AND tasks.archived_at IS NULL
+		 ORDER BY tasks.created_at, tasks.id`, parsed)
 	if err != nil {
 		return nil, fmt.Errorf("platform/postgres: list tasks: %w", err)
 	}
@@ -457,12 +499,14 @@ func (s *Store) ListTasks(ctx context.Context, projectID string) ([]Task, error)
 			contextJSON      []byte
 			policyJSON       []byte
 			scheduleJSON     []byte
+			objectiveJSON    []byte
 		)
 		if err := rows.Scan(&t.ID, &t.ProjectID, &t.Name, &t.Goal, &t.Instruction, &contextPathsJSON, &contextJSON,
-			&policyJSON, &scheduleJSON, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt); err != nil {
+			&policyJSON, &scheduleJSON, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &objectiveJSON); err != nil {
 			return nil, fmt.Errorf("platform/postgres: scan task: %w", err)
 		}
 		hydrateTaskJSON(&t, contextPathsJSON, contextJSON, policyJSON, scheduleJSON)
+		hydrateTaskObjective(&t, objectiveJSON)
 		out = append(out, t)
 	}
 	return out, rows.Err()
@@ -475,7 +519,8 @@ func (s *Store) GetTask(ctx context.Context, id string) (*Task, error) {
 		return nil, err
 	}
 	return scanTaskRow(s.queryRow(ctx,
-		`SELECT `+taskColumns+` FROM tasks WHERE id = $1`, parsed))
+		`SELECT `+taskColumns+taskObjectiveColumn+` FROM tasks`+taskObjectiveJoin+`
+		 WHERE tasks.id = $1`, parsed))
 }
 
 // UpdateTask implements Repository.UpdateTask.
@@ -505,6 +550,16 @@ func (s *Store) UpdateTask(ctx context.Context, id string, upd TaskUpdate) (*Tas
 	}
 	if upd.ContextPaths != nil {
 		current.ContextPaths = upd.ContextPaths
+	}
+	if upd.ClearObjective {
+		current.Objective = nil
+	}
+	if upd.Objective != nil {
+		objective, err := NormalizeObjective(upd.Objective)
+		if err != nil {
+			return nil, err
+		}
+		current.Objective = objective
 	}
 	if upd.Context != nil {
 		if current.Context == nil {
@@ -548,11 +603,15 @@ func (s *Store) UpdateTask(ctx context.Context, id string, upd TaskUpdate) (*Tas
 	current.UpdatedAt = &now
 	if _, err := s.exec(ctx, `
 		UPDATE tasks SET name = $2, goal = $3, instruction = $4, context_paths = $5,
-		                 context = $6, phase_policy = $7, schedule = $8, updated_at = $9, archived_at = $10
+		                 context = $6, phase_policy = $7, schedule = $8,
+		                 updated_at = $9, archived_at = $10
 		WHERE id = $1`,
 		parsed, current.Name, current.Goal, current.Instruction, contextPathsJSON,
 		contextJSON, policyJSON, scheduleJSON, now, current.ArchivedAt); err != nil {
 		return nil, fmt.Errorf("platform/postgres: update task: %w", err)
+	}
+	if err := s.writeTaskObjective(ctx, parsed, current.ProjectID, current.Objective); err != nil {
+		return nil, err
 	}
 	return s.GetTask(ctx, id)
 }
@@ -575,11 +634,11 @@ func (s *Store) DeleteTask(ctx context.Context, id string) error {
 
 // ── runs (mount records) ─────────────────────────────────────────────────────
 
-const runColumns = `id, task_id, legacy_scan_id, instance_id, mode, "trigger", created_at`
+const runColumns = `id, task_id, legacy_scan_id, instance_id, mode, "trigger", title, pinned, archived, created_at`
 
 func scanRunRow(row pgx.Row) (*Run, error) {
 	var r Run
-	if err := row.Scan(&r.ID, &r.TaskID, &r.LegacyScanID, &r.InstanceID, &r.Mode, &r.Trigger, &r.CreatedAt); err != nil {
+	if err := row.Scan(&r.ID, &r.TaskID, &r.LegacyScanID, &r.InstanceID, &r.Mode, &r.Trigger, &r.Title, &r.Pinned, &r.Archived, &r.CreatedAt); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
 		}
@@ -594,7 +653,7 @@ func scanRunRows(rows pgx.Rows) ([]Run, error) {
 	out := []Run{}
 	for rows.Next() {
 		var r Run
-		if err := rows.Scan(&r.ID, &r.TaskID, &r.LegacyScanID, &r.InstanceID, &r.Mode, &r.Trigger, &r.CreatedAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.TaskID, &r.LegacyScanID, &r.InstanceID, &r.Mode, &r.Trigger, &r.Title, &r.Pinned, &r.Archived, &r.CreatedAt); err != nil {
 			return nil, fmt.Errorf("platform/postgres: scan run: %w", err)
 		}
 		r.CreatedAt = r.CreatedAt.UTC()
@@ -614,9 +673,10 @@ func (s *Store) CreateRun(ctx context.Context, taskID string, mount RunMount) (*
 	}
 	id := uuid.NewString()
 	_, err = s.exec(ctx, `
-		INSERT INTO runs (id, task_id, legacy_scan_id, instance_id, mode, "trigger", created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-		id, parsedTask, mount.LegacyScanID, mount.InstanceID, mount.Mode, mount.Trigger, time.Now().UTC())
+		INSERT INTO runs (id, task_id, legacy_scan_id, instance_id, mode, "trigger", title, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		id, parsedTask, mount.LegacyScanID, mount.InstanceID, mount.Mode, mount.Trigger,
+		strings.TrimSpace(mount.Title), time.Now().UTC())
 	if err != nil {
 		return nil, mapConstraintErr(err, "mount run")
 	}
@@ -665,7 +725,8 @@ func (s *Store) ListRunsByProject(ctx context.Context, projectID string) ([]Run,
 		return nil, err
 	}
 	rows, err := s.query(ctx, `
-		SELECT r.id, r.task_id, r.legacy_scan_id, r.instance_id, r.mode, r."trigger", r.created_at
+		SELECT r.id, r.task_id, r.legacy_scan_id, r.instance_id, r.mode, r."trigger",
+		       r.title, r.pinned, r.archived, r.created_at
 		FROM runs r JOIN tasks t ON t.id = r.task_id
 		WHERE t.project_id = $1
 		ORDER BY r.created_at DESC, r.id ASC`, parsed)
@@ -711,6 +772,69 @@ func (s *Store) RunsByInstanceID(ctx context.Context, instanceID string) ([]Run,
 		return nil, fmt.Errorf("platform/postgres: runs by instance: %w", err)
 	}
 	return scanRunRows(rows)
+}
+
+// SetRunLegacyScanID implements Repository.SetRunLegacyScanID. It only fills an
+// empty legacy id: an imported run already points at its own scan and must keep
+// it, and a re-dispatch of the same instance must not steal another scan's id.
+func (s *Store) SetRunLegacyScanID(ctx context.Context, instanceID, legacyScanID string) error {
+	instanceID = strings.TrimSpace(instanceID)
+	legacyScanID = strings.TrimSpace(legacyScanID)
+	if instanceID == "" || legacyScanID == "" {
+		return fmt.Errorf("%w: instance_id and legacy_scan_id are required", ErrValidation)
+	}
+	tag, err := s.exec(ctx, `
+		UPDATE runs SET legacy_scan_id = $2
+		WHERE instance_id = $1 AND (legacy_scan_id IS NULL OR legacy_scan_id = '')`,
+		instanceID, legacyScanID)
+	if err != nil {
+		return fmt.Errorf("platform/postgres: set run legacy scan id: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		// Either the run does not exist, or it already carries a scan id.
+		// Distinguish the two so a genuine wiring bug is not masked.
+		var existing string
+		err := s.queryRow(ctx, `SELECT legacy_scan_id FROM runs WHERE instance_id = $1`, instanceID).Scan(&existing)
+		if err != nil {
+			return fmt.Errorf("%w: run %s not found", ErrNotFound, instanceID)
+		}
+		return nil
+	}
+	return nil
+}
+
+// RenameRun implements Repository.RenameRun.
+func (s *Store) RenameRun(ctx context.Context, instanceID, title string) error {
+	return s.updateRunFlag(ctx, "title", instanceID, strings.TrimSpace(title))
+}
+
+// SetRunPinned implements Repository.SetRunPinned.
+func (s *Store) SetRunPinned(ctx context.Context, instanceID string, pinned bool) error {
+	return s.updateRunFlag(ctx, "pinned", instanceID, pinned)
+}
+
+// SetRunArchived implements Repository.SetRunArchived.
+func (s *Store) SetRunArchived(ctx context.Context, instanceID string, archived bool) error {
+	return s.updateRunFlag(ctx, "archived", instanceID, archived)
+}
+
+// updateRunFlag writes one conversation-metadata column on the run that owns
+// instanceID. Column names are call-site constants (never user input), which is
+// why they can be interpolated; values stay parameterised.
+func (s *Store) updateRunFlag(ctx context.Context, column, instanceID string, value any) error {
+	instanceID = strings.TrimSpace(instanceID)
+	if instanceID == "" {
+		return fmt.Errorf("%w: instance_id is required", ErrValidation)
+	}
+	tag, err := s.exec(ctx,
+		`UPDATE runs SET `+column+` = $2 WHERE instance_id = $1`, instanceID, value)
+	if err != nil {
+		return fmt.Errorf("platform/postgres: update run %s: %w", column, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("%w: run %s not found", ErrNotFound, instanceID)
+	}
+	return nil
 }
 
 // ProjectScanIDs implements Repository.ProjectScanIDs.
@@ -809,9 +933,10 @@ func (s *Store) ImportLegacyRun(ctx context.Context, taskID string, mount RunMou
 	}
 	id := uuid.NewString()
 	_, err = s.exec(ctx, `
-		INSERT INTO runs (id, task_id, legacy_scan_id, instance_id, mode, "trigger", created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-		id, parsedTask, mount.LegacyScanID, mount.InstanceID, mount.Mode, mount.Trigger, time.Now().UTC())
+		INSERT INTO runs (id, task_id, legacy_scan_id, instance_id, mode, "trigger", title, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		id, parsedTask, mount.LegacyScanID, mount.InstanceID, mount.Mode, mount.Trigger,
+		strings.TrimSpace(mount.Title), time.Now().UTC())
 	if err != nil {
 		if existing, selErr := s.runByIdentity(ctx, mount.LegacyScanID, mount.InstanceID); selErr == nil {
 			// A concurrent importer won the race — same idempotent outcome.
@@ -902,9 +1027,9 @@ func (s *Store) ImportScheduleTask(ctx context.Context, projectID string, in Tas
 
 func (s *Store) taskByContextKey(ctx context.Context, projectID uuid.UUID, key, value string) (*Task, error) {
 	return scanTaskRow(s.queryRow(ctx,
-		`SELECT `+taskColumns+` FROM tasks
-		 WHERE project_id = $1 AND context->>$2 = $3
-		 ORDER BY created_at, id LIMIT 1`, projectID, key, value))
+		`SELECT `+taskColumns+taskObjectiveColumn+` FROM tasks`+taskObjectiveJoin+`
+		 WHERE tasks.project_id = $1 AND tasks.context->>$2 = $3
+		 ORDER BY tasks.created_at, tasks.id LIMIT 1`, projectID, key, value))
 }
 
 // TaskByLegacyScheduleID implements Repository.TaskByLegacyScheduleID: one
@@ -916,4 +1041,35 @@ func (s *Store) TaskByLegacyScheduleID(ctx context.Context, projectID, legacySch
 		return nil, err
 	}
 	return s.taskByContextKey(ctx, parsed, "legacy_schedule_id", legacyScheduleID)
+}
+
+// writeTaskObjective stores (or clears) the structured objective of a task.
+// The objective is a 1:1 extension row; a nil objective deletes it, which is
+// the honest "not structured" state.
+func (s *Store) writeTaskObjective(ctx context.Context, taskID uuid.UUID, projectID string, obj *Objective) error {
+	if obj == nil {
+		if _, err := s.exec(ctx, `DELETE FROM task_objectives WHERE task_id = $1`, taskID); err != nil {
+			return fmt.Errorf("platform/postgres: clear task objective: %w", err)
+		}
+		return nil
+	}
+	parsedProject, err := parseUUID(projectID)
+	if err != nil {
+		return err
+	}
+	payload, err := marshalJSON(obj)
+	if err != nil {
+		return err
+	}
+	if _, err := s.exec(ctx, `
+		INSERT INTO task_objectives (task_id, project_id, objective, updated_at)
+		VALUES ($1, $2, $3, now())
+		ON CONFLICT (task_id) DO UPDATE
+		SET project_id = EXCLUDED.project_id,
+		    objective = EXCLUDED.objective,
+		    updated_at = now()`,
+		taskID, parsedProject, payload); err != nil {
+		return fmt.Errorf("platform/postgres: write task objective: %w", err)
+	}
+	return nil
 }

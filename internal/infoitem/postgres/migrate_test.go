@@ -28,8 +28,14 @@ func TestEmbeddedMigrationsAreOrderedAndNonEmpty(t *testing.T) {
 		if strings.Contains(m.sql, "info_items") {
 			someMigrationDefinesInfoItems = true
 		}
-		if !strings.Contains(m.sql, "CREATE TABLE") {
-			t.Fatalf("migration %q defines no tables", m.name)
+		// Later migrations are not all table-creating: 0010 adds a column to
+		// guidance. Any of the DDL forms counts as a real migration; an empty
+		// or comment-only file still fails.
+		if !strings.Contains(m.sql, "CREATE TABLE") &&
+			!strings.Contains(m.sql, "ALTER TABLE") &&
+			!strings.Contains(m.sql, "CREATE INDEX") &&
+			!strings.Contains(m.sql, "CREATE UNIQUE INDEX") {
+			t.Fatalf("migration %q contains no DDL", m.name)
 		}
 	}
 	if !someMigrationDefinesInfoItems {

@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -81,24 +82,163 @@ type TaskSchedule struct {
 	Timezone string `json:"timezone,omitempty"`
 }
 
+// ── objective (structured task goal) ─────────────────────────────────────────
+//
+// Objective is the platform-level structured goal: what the operator wants
+// achieved and what "achieved" means. It is configuration, never a second
+// judgement authority — the evaluator in internal/objective only observes
+// findings the report pipeline already accepted (charter §3.5 / §9).
+//
+// An absent objective means "not structured": the UI must say so instead of
+// inventing attainment (REDESIGN §3.1 "验收说明").
+
+// Objective kinds.
+const (
+	ObjectiveKindEngagement   = "engagement"
+	ObjectiveKindCapability   = "capability"
+	ObjectiveKindFindingClass = "finding_class"
+	ObjectiveKindCoverage     = "coverage"
+)
+
+// Criterion kinds.
+const (
+	CriterionKindFindingClass = "finding_class"
+	CriterionKindCapability   = "capability"
+	CriterionKindCoverage     = "coverage"
+)
+
+// Verification modes a criterion accepts.
+const (
+	CriterionVerifyDeterministic = "deterministic"
+	CriterionVerifyVerifier      = "verifier"
+	CriterionVerifyManual        = "manual"
+)
+
+// MaxObjectiveCriteria bounds the criteria list so one task cannot turn into
+// an unbounded checklist (and so the prompt section stays readable).
+const MaxObjectiveCriteria = 12
+
+// MaxObjectiveConstraints bounds the operator-stated constraint lines that
+// NormalizeObjective keeps (advisory narrowing rules rendered into the
+// objective prompt section — an uncapped list would bloat every run prompt).
+const MaxObjectiveConstraints = 8
+
+// Objective is the structured goal of a task.
+type Objective struct {
+	Kind      string      `json:"kind"`
+	Statement string      `json:"statement,omitempty"`
+	Criteria  []Criterion `json:"criteria,omitempty"`
+	// Constraints are operator-stated operational boundaries (may/may-not
+	// rules extracted from the goal text, e.g. "no brute forcing"). They only
+	// ever NARROW what the engine may do — they never widen scope or relax a
+	// methodology phase — and render into the objective prompt section.
+	Constraints []string `json:"constraints,omitempty"`
+}
+
+// Criterion is one decidable acceptance line of an objective.
+type Criterion struct {
+	// ID is assigned by the server (C1, C2, …) so evidence references are
+	// stable across reads; clients may send it but never choose it.
+	ID         string `json:"id,omitempty"`
+	Kind       string `json:"kind"`
+	VulnClass  string `json:"vuln_class,omitempty"`
+	Capability string `json:"capability,omitempty"`
+	VerifyBy   string `json:"verify_by"`
+	Required   bool   `json:"required,omitempty"`
+}
+
+// NormalizeObjective validates the objective and returns a normalized copy:
+// trimmed fields, canonical kind values and server-assigned criterion IDs.
+// A nil objective is valid and normalizes to nil ("not structured").
+func NormalizeObjective(obj *Objective) (*Objective, error) {
+	if obj == nil {
+		return nil, nil
+	}
+	out := &Objective{
+		Kind:      strings.TrimSpace(obj.Kind),
+		Statement: strings.TrimSpace(obj.Statement),
+	}
+	for _, c := range obj.Constraints {
+		if s := strings.TrimSpace(c); s != "" {
+			out.Constraints = append(out.Constraints, s)
+		}
+		if len(out.Constraints) == MaxObjectiveConstraints {
+			break // advisory lines: cap silently, never reject the objective
+		}
+	}
+	switch out.Kind {
+	case ObjectiveKindEngagement, ObjectiveKindCapability, ObjectiveKindFindingClass, ObjectiveKindCoverage:
+	case "":
+		return nil, fmt.Errorf("%w: objective kind is required", ErrValidation)
+	default:
+		return nil, fmt.Errorf("%w: objective kind must be engagement, capability, finding_class or coverage", ErrValidation)
+	}
+	if out.Statement == "" {
+		return nil, fmt.Errorf("%w: objective statement is required", ErrValidation)
+	}
+	if len(obj.Criteria) > MaxObjectiveCriteria {
+		return nil, fmt.Errorf("%w: objective supports at most %d criteria", ErrValidation, MaxObjectiveCriteria)
+	}
+	for i := range obj.Criteria {
+		c := obj.Criteria[i]
+		out.Criteria = append(out.Criteria, Criterion{
+			ID:         fmt.Sprintf("C%d", i+1),
+			Kind:       strings.TrimSpace(c.Kind),
+			VulnClass:  strings.TrimSpace(c.VulnClass),
+			Capability: strings.TrimSpace(c.Capability),
+			VerifyBy:   strings.TrimSpace(c.VerifyBy),
+			Required:   c.Required,
+		})
+	}
+	for i, c := range out.Criteria {
+		switch c.Kind {
+		case CriterionKindFindingClass:
+			if c.VulnClass == "" {
+				return nil, fmt.Errorf("%w: criterion %s requires vuln_class", ErrValidation, c.ID)
+			}
+		case CriterionKindCapability:
+			if c.Capability == "" {
+				return nil, fmt.Errorf("%w: criterion %s requires capability", ErrValidation, c.ID)
+			}
+		case CriterionKindCoverage:
+		case "":
+			return nil, fmt.Errorf("%w: criterion %s requires kind", ErrValidation, c.ID)
+		default:
+			return nil, fmt.Errorf("%w: criterion %s kind must be finding_class, capability or coverage", ErrValidation, c.ID)
+		}
+		switch c.VerifyBy {
+		case CriterionVerifyDeterministic, CriterionVerifyVerifier, CriterionVerifyManual:
+		case "":
+			return nil, fmt.Errorf("%w: criterion %s requires verify_by", ErrValidation, c.ID)
+		default:
+			return nil, fmt.Errorf("%w: criterion %s verify_by must be deterministic, verifier or manual", ErrValidation, c.ID)
+		}
+		_ = i
+	}
+	return out, nil
+}
+
 // Task is a Goal + Context host whose runs accumulate into cold-path
 // projections (REDESIGN §3.1). Context is free-form jsonb: the legacy
 // importer parks no-contract fields (run day, report branding, webhook,
 // model) and idempotency keys (legacy_schedule_id) there per §3.2. It is
 // never serialized to the wire (API_CONTRACT Task has no such field).
 type Task struct {
-	ID           string         `json:"id"`
-	ProjectID    string         `json:"project_id"`
-	Name         string         `json:"name"`
-	Goal         string         `json:"goal,omitempty"`
-	Instruction  string         `json:"instruction,omitempty"`
-	PhasePolicy  *PhasePolicy   `json:"phase_policy,omitempty"`
-	Schedule     *TaskSchedule  `json:"schedule,omitempty"`
-	ContextPaths []string       `json:"context_paths,omitempty"`
-	Context      map[string]any `json:"-"`
-	CreatedAt    time.Time      `json:"created_at"`
-	UpdatedAt    *time.Time     `json:"updated_at,omitempty"`
-	ArchivedAt   *time.Time     `json:"archived_at,omitempty"`
+	ID           string        `json:"id"`
+	ProjectID    string        `json:"project_id"`
+	Name         string        `json:"name"`
+	Goal         string        `json:"goal,omitempty"`
+	Instruction  string        `json:"instruction,omitempty"`
+	PhasePolicy  *PhasePolicy  `json:"phase_policy,omitempty"`
+	Schedule     *TaskSchedule `json:"schedule,omitempty"`
+	ContextPaths []string      `json:"context_paths,omitempty"`
+	// Objective is the structured goal: absent = "not structured". It never
+	// replaces Goal (free text) and never grants authority over findings.
+	Objective  *Objective     `json:"objective,omitempty"`
+	Context    map[string]any `json:"-"`
+	CreatedAt  time.Time      `json:"created_at"`
+	UpdatedAt  *time.Time     `json:"updated_at,omitempty"`
+	ArchivedAt *time.Time     `json:"archived_at,omitempty"`
 	// RunCount / LastRunAt / LastRunStatus / FindingCount are cold-path
 	// projections assembled by the web layer from runs + scan.json
 	// (API_CONTRACT §2); the repository never fills them. RunCount and
@@ -120,19 +260,26 @@ type RunMount struct {
 	InstanceID   string // /api/scan-style instance ID; also the scan.json instance_id
 	Mode         string // scan_mode the run was launched with
 	Trigger      string // manual | schedule | rerun; empty for legacy imports
+	Title        string // conversation title shown in the chat sidebar; empty falls back to the task name
 }
 
 // Run is the wire shape of a mount record plus the projected fields the web
 // layer fills from findAllScanSummaries. Only the mount fields plus identity
 // are persisted.
 type Run struct {
-	ID           string    `json:"id"`
-	TaskID       string    `json:"task_id"`
-	LegacyScanID string    `json:"legacy_scan_id,omitempty"`
-	InstanceID   string    `json:"instance_id,omitempty"`
-	Mode         string    `json:"mode,omitempty"`
-	Trigger      string    `json:"trigger,omitempty"`
-	CreatedAt    time.Time `json:"created_at,omitempty"`
+	ID           string `json:"id"`
+	TaskID       string `json:"task_id"`
+	LegacyScanID string `json:"legacy_scan_id,omitempty"`
+	InstanceID   string `json:"instance_id,omitempty"`
+	Mode         string `json:"mode,omitempty"`
+	Trigger      string `json:"trigger,omitempty"`
+	// Conversation metadata (chat sidebar). Persisted, unlike the projected
+	// fields below: a run is the conversation host, so its title/pin/archive
+	// state must survive restarts.
+	Title     string    `json:"title,omitempty"`
+	Pinned    bool      `json:"pinned"`
+	Archived  bool      `json:"archived"`
+	CreatedAt time.Time `json:"created_at,omitempty"`
 
 	// Projected at read time (never stored):
 	Status      string `json:"status,omitempty"`
@@ -289,6 +436,88 @@ type ApprovalSummary struct {
 	NearestDeadline *time.Time
 }
 
+// ── approval rules (approve & remember, REDESIGN §5.2, API_CONTRACT §3.2) ────
+
+// ApprovalRuleMatch carries a rule's matching coordinates. Command rules use
+// {program, contains}; HTTP rules use {method, host, path_prefix, contains}.
+// The matching semantics live in internal/approval (Policy.MatchCommandRule /
+// MatchHTTPRule) so both gate layers reuse them verbatim.
+type ApprovalRuleMatch struct {
+	// kind=command: program basename ("curl" matches /usr/bin/curl too).
+	Program string `json:"program,omitempty"`
+	// kind=http
+	Method     string `json:"method,omitempty"`      // exact, case-insensitive
+	Host       string `json:"host,omitempty"`        // exact or subdomain suffix
+	PathPrefix string `json:"path_prefix,omitempty"` // "" = any path
+	// Shared narrowing substring — command text (command rules) or URL+body
+	// (HTTP rules), case-insensitive. "" = unrestricted.
+	Contains string `json:"contains,omitempty"`
+}
+
+// ApprovalRule is one operator-authored allow rule: the persistent half of
+// the "approve & remember" loop. Both gate layers consult the rules before
+// creating an approval row, so the same intent is asked at most once.
+// CreatedFromApprovalID traces the decision the rule was remembered from —
+// the approval row itself may be retention-deleted while the rule survives
+// (ON DELETE SET NULL); empty for hand-authored rules.
+type ApprovalRule struct {
+	ID                    string            `json:"id"`
+	ProjectID             string            `json:"project_id"`
+	Kind                  string            `json:"kind"` // ApprovalKindCommand / ApprovalKindHTTP
+	Match                 ApprovalRuleMatch `json:"match"`
+	Reason                string            `json:"reason,omitempty"`
+	CreatedBy             string            `json:"created_by,omitempty"` // "operator:<user>"
+	CreatedFromApprovalID string            `json:"created_from_approval_id,omitempty"`
+	CreatedAt             time.Time         `json:"created_at"`
+	ExpiresAt             *time.Time        `json:"expires_at,omitempty"`
+	HitCount              int               `json:"hit_count"`
+	LastHitAt             *time.Time        `json:"last_hit_at,omitempty"`
+
+	// Projected by the web layer (never stored):
+	ProjectName string `json:"project_name,omitempty"`
+}
+
+// ApprovalRuleInput is the create request (REST POST /api/approval-rules and
+// the approval card's "approve & remember" path).
+type ApprovalRuleInput struct {
+	ProjectID             string
+	Kind                  string
+	Match                 ApprovalRuleMatch
+	Reason                string
+	CreatedBy             string
+	CreatedFromApprovalID string
+	ExpiresAt             *time.Time
+}
+
+// ApprovalRuleFilter selects rules for ListApprovalRules. ProjectID empty is
+// the cross-project operator view (same D7 exception as the approval queue);
+// Kind optional.
+type ApprovalRuleFilter struct {
+	ProjectID string
+	Kind      string
+}
+
+// validateApprovalRule checks kind/match coherence (shared by both stores).
+func validateApprovalRule(in ApprovalRuleInput) error {
+	if in.Kind != ApprovalKindCommand && in.Kind != ApprovalKindHTTP {
+		return fmt.Errorf("%w: approval rule kind must be command or http", ErrValidation)
+	}
+	if strings.TrimSpace(in.ProjectID) == "" {
+		return fmt.Errorf("%w: approval rule project_id is required", ErrValidation)
+	}
+	switch in.Kind {
+	case ApprovalKindCommand:
+		if strings.TrimSpace(in.Match.Program) == "" {
+			return fmt.Errorf("%w: command rule requires match.program", ErrValidation)
+		}
+	case ApprovalKindHTTP:
+		if strings.TrimSpace(in.Match.Method) == "" || strings.TrimSpace(in.Match.Host) == "" {
+			return fmt.Errorf("%w: http rule requires match.method and match.host", ErrValidation)
+		}
+	}
+	return nil
+}
+
 // ── guidance (R2a HITL-intent, API_CONTRACT §3.1) ───────────────────────────
 
 // Guidance lifecycle statuses: injected = handed to a running agent's next
@@ -315,6 +544,7 @@ type Guidance struct {
 	InstanceID string     `json:"instance_id,omitempty"`
 	Message    string     `json:"message"`
 	Status     string     `json:"status"`
+	CreatedBy  string     `json:"created_by,omitempty"`
 	CreatedAt  time.Time  `json:"created_at"`
 	ConsumedAt *time.Time `json:"consumed_at,omitempty"`
 
@@ -329,6 +559,7 @@ type GuidanceInput struct {
 	InstanceID string
 	Message    string
 	RequestID  string
+	CreatedBy  string
 }
 
 // ProjectUpdate is the PATCH body for a project (API_CONTRACT §1). Nil
@@ -348,7 +579,9 @@ type TaskInput struct {
 	PhasePolicy  *PhasePolicy
 	Schedule     *TaskSchedule
 	ContextPaths []string
-	Context      map[string]any
+	// Objective is the structured goal; nil = not structured.
+	Objective *Objective
+	Context   map[string]any
 }
 
 // TaskUpdate is the PATCH body for a task (API_CONTRACT §2).
@@ -359,8 +592,13 @@ type TaskUpdate struct {
 	PhasePolicy  *PhasePolicy // non-nil replaces the policy; nil leaves it
 	Schedule     *TaskSchedule
 	ContextPaths []string
-	Context      map[string]any
-	Archived     *bool
+	// Objective non-nil replaces the structured goal; nil leaves it as is.
+	Objective *Objective
+	// ClearObjective removes the structured goal (an explicit "objective": null
+	// in the wire body). Without it an objective can never be deleted.
+	ClearObjective bool
+	Context        map[string]any
+	Archived       *bool
 }
 
 // normalizeContextPaths trims, drops empties and de-duplicates while keeping
@@ -435,4 +673,292 @@ func marshalJSON(v any) ([]byte, error) {
 		return nil, err
 	}
 	return data, nil
+}
+
+// ── integrations: MCP servers / user skills / agent profiles ────────────────
+//
+// Operator-authored configuration entities consumed by the engine at scan
+// launch. They are definitions, never judgements: an MCP server row does not
+// vouch for its tools' output (field-level authority, charter §3.5), a user
+// skill is prompt input (a Hint, not evidence), and an agent profile bounds
+// delegation — it never bypasses the verifier or the finish gate.
+
+// MCP transports.
+const (
+	McpTransportStdio = "stdio"
+	McpTransportHTTP  = "http"
+)
+
+// DefaultMcpTimeoutSeconds is the per-call default when TimeoutSeconds is 0.
+const DefaultMcpTimeoutSeconds = 120
+
+// McpServer is one operator-registered MCP server definition. Env/Headers may
+// carry credential material: the web layer masks them on every read (the API
+// never returns secrets) and treats "****"-prefixed submissions as "unchanged"
+// — the repository persists whatever it is given, so callers must unmask
+// before write and mask after read.
+type McpServer struct {
+	ID              string            `json:"id"`
+	Name            string            `json:"name"`
+	Transport       string            `json:"transport"` // McpTransportStdio / McpTransportHTTP
+	Command         string            `json:"command,omitempty"`
+	Args            []string          `json:"args,omitempty"`
+	Env             map[string]string `json:"env,omitempty"`
+	URL             string            `json:"url,omitempty"`
+	Headers         map[string]string `json:"headers,omitempty"`
+	Enabled         bool              `json:"enabled"`
+	RequireApproval bool              `json:"require_approval"`
+	TimeoutSeconds  int               `json:"timeout_seconds"`
+	// Refresh projections (web layer only — set via UpdateMcpServer by the
+	// refresh action; the repository never fills them on its own).
+	ToolCount     int        `json:"tool_count"`
+	LastHealthyAt *time.Time `json:"last_healthy_at,omitempty"`
+	LastError     string     `json:"last_error,omitempty"`
+
+	CreatedBy string     `json:"created_by,omitempty"`
+	CreatedAt time.Time  `json:"created_at"`
+	UpdatedAt *time.Time `json:"updated_at,omitempty"`
+}
+
+// McpServerInput is the POST body material for MCP server creation.
+type McpServerInput struct {
+	Name            string
+	Transport       string
+	Command         string
+	Args            []string
+	Env             map[string]string
+	URL             string
+	Headers         map[string]string
+	Enabled         bool
+	RequireApproval bool
+	TimeoutSeconds  int
+	CreatedBy       string
+}
+
+// McpServerUpdate is the PATCH body material. Nil pointers / nil slices / nil
+// maps leave the field unchanged; non-nil replaces (an empty slice/map is an
+// explicit clear).
+type McpServerUpdate struct {
+	Name            *string
+	Command         *string
+	Args            []string
+	Env             map[string]string
+	URL             *string
+	Headers         map[string]string
+	Enabled         *bool
+	RequireApproval *bool
+	TimeoutSeconds  *int
+	// Refresh projections:
+	ToolCount     *int
+	LastHealthyAt *time.Time
+	LastError     *string
+}
+
+// normalizeMcpServer JSON-stabilizes slices/maps and clamps the timeout so
+// file snapshots and PG jsonb round-trip identically.
+func normalizeMcpServer(s McpServer) McpServer {
+	if s.Args == nil {
+		s.Args = []string{}
+	}
+	if s.Env == nil {
+		s.Env = map[string]string{}
+	}
+	if s.Headers == nil {
+		s.Headers = map[string]string{}
+	}
+	if s.TimeoutSeconds <= 0 {
+		s.TimeoutSeconds = DefaultMcpTimeoutSeconds
+	}
+	return s
+}
+
+// validateMcpServer checks structural coherence (shared by both stores).
+// URL-level operator-machine rejection lives in the web layer and the engine's
+// connect path (scopeguard) — the repository only sees shape.
+func validateMcpServer(name, transport, command, url string) error {
+	if strings.TrimSpace(name) == "" {
+		return fmt.Errorf("%w: MCP server name is required", ErrValidation)
+	}
+	if len([]rune(name)) > 64 {
+		return fmt.Errorf("%w: MCP server name must be at most 64 characters", ErrValidation)
+	}
+	switch transport {
+	case McpTransportStdio:
+		if strings.TrimSpace(command) == "" {
+			return fmt.Errorf("%w: stdio MCP server requires command", ErrValidation)
+		}
+	case McpTransportHTTP:
+		if strings.TrimSpace(url) == "" {
+			return fmt.Errorf("%w: http MCP server requires url", ErrValidation)
+		}
+	default:
+		return fmt.Errorf("%w: MCP transport must be stdio or http", ErrValidation)
+	}
+	return nil
+}
+
+// SkillCategoryUser is the fixed category of user-authored skills; the
+// embedded corpus keeps its own categories and is never stored here.
+const SkillCategoryUser = "user"
+
+// MaxSkillBodyBytes bounds one user skill body so neither the snapshot file
+// nor a prompt-sized read explodes.
+const MaxSkillBodyBytes = 128 * 1024
+
+// Skill is one user-authored skill document (SKILL.md conventions: kebab
+// name, short description, optional tags/intent, markdown body). User skills
+// merge into read_skill/list_skills/search_skills alongside the embedded
+// corpus with source=user.
+type Skill struct {
+	ID          string     `json:"id"`
+	Name        string     `json:"name"`
+	Category    string     `json:"category"`
+	Description string     `json:"description"`
+	Tags        []string   `json:"tags,omitempty"`
+	Intent      string     `json:"intent,omitempty"`
+	Body        string     `json:"body"`
+	Enabled     bool       `json:"enabled"`
+	CreatedBy   string     `json:"created_by,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
+	UpdatedAt   *time.Time `json:"updated_at,omitempty"`
+}
+
+// SkillInput is the POST body material for skill creation.
+type SkillInput struct {
+	Name        string
+	Description string
+	Tags        []string
+	Intent      string
+	Body        string
+	Enabled     bool
+	CreatedBy   string
+}
+
+// SkillUpdate is the PATCH body material; nil leaves unchanged.
+type SkillUpdate struct {
+	Name        *string
+	Description *string
+	Tags        []string
+	Intent      *string
+	Body        *string
+	Enabled     *bool
+}
+
+// skillNamePattern is the kebab-case contract the skills tools document
+// (read_skill name=analyzing-active-directory-acl-abuse).
+var skillNamePattern = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
+
+// normalizeSkill JSON-stabilizes slices.
+func normalizeSkill(s Skill) Skill {
+	if s.Tags == nil {
+		s.Tags = []string{}
+	}
+	if s.Category == "" {
+		s.Category = SkillCategoryUser
+	}
+	return s
+}
+
+// validateSkill checks the shared skill shape.
+func validateSkill(name, description, body string) error {
+	if !skillNamePattern.MatchString(strings.TrimSpace(name)) {
+		return fmt.Errorf("%w: skill name must be kebab-case (lowercase letters/digits separated by single hyphens)", ErrValidation)
+	}
+	if len(name) > 96 {
+		return fmt.Errorf("%w: skill name must be at most 96 characters", ErrValidation)
+	}
+	if strings.TrimSpace(description) == "" {
+		return fmt.Errorf("%w: skill description is required", ErrValidation)
+	}
+	if strings.TrimSpace(body) == "" {
+		return fmt.Errorf("%w: skill body is required", ErrValidation)
+	}
+	if len(body) > MaxSkillBodyBytes {
+		return fmt.Errorf("%w: skill body exceeds %d bytes", ErrValidation, MaxSkillBodyBytes)
+	}
+	return nil
+}
+
+// AgentProfile is one operator-authored delegation profile merged alongside
+// the built-in specialist profiles (ledger hooks): the coordinator may
+// auto-delegate into it and the model may spawn it by role name. Role is the
+// spawn vocabulary; reserved built-in roles are rejected by the web layer
+// (the repository stays decoupled from the agent package).
+type AgentProfile struct {
+	ID               string   `json:"id"`
+	Role             string   `json:"role"`
+	Focus            string   `json:"focus"`
+	VulnClasses      []string `json:"vuln_classes"`
+	EvidenceContract string   `json:"evidence_contract"`
+	StoppingRule     string   `json:"stopping_rule"`
+	ToolScopeHidden  []string `json:"tool_scope_hidden,omitempty"`
+	Enabled          bool     `json:"enabled"`
+	// Builtin marks the code-defined specialist rows the web layer merges
+	// into GET responses. It is never persisted true: stored rows are always
+	// operator-authored (builtin mutations are rejected at the handler).
+	Builtin   bool       `json:"builtin"`
+	CreatedBy string     `json:"created_by,omitempty"`
+	CreatedAt time.Time  `json:"created_at"`
+	UpdatedAt *time.Time `json:"updated_at,omitempty"`
+}
+
+// AgentProfileInput is the POST body material for profile creation.
+type AgentProfileInput struct {
+	Role             string
+	Focus            string
+	VulnClasses      []string
+	EvidenceContract string
+	StoppingRule     string
+	ToolScopeHidden  []string
+	Enabled          bool
+	CreatedBy        string
+}
+
+// AgentProfileUpdate is the PATCH body material; nil slices leave unchanged.
+type AgentProfileUpdate struct {
+	Role             *string
+	Focus            *string
+	VulnClasses      []string
+	EvidenceContract *string
+	StoppingRule     *string
+	ToolScopeHidden  []string
+	Enabled          *bool
+}
+
+// agentRolePattern matches the built-in role vocabulary shape
+// (recon-discovery, authz-logic, …).
+var agentRolePattern = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
+
+// normalizeAgentProfile JSON-stabilizes slices.
+func normalizeAgentProfile(p AgentProfile) AgentProfile {
+	if p.VulnClasses == nil {
+		p.VulnClasses = []string{}
+	}
+	if p.ToolScopeHidden == nil {
+		p.ToolScopeHidden = []string{}
+	}
+	return p
+}
+
+// validateAgentProfile checks the shared profile shape. The delegation
+// contract triple (focus / evidence_contract / stopping_rule) is required —
+// an agent without an explicit stopping rule is exactly the "run more agents"
+// failure mode the built-in profiles encode against.
+func validateAgentProfile(role, focus, evidenceContract, stoppingRule string) error {
+	if !agentRolePattern.MatchString(strings.TrimSpace(role)) {
+		return fmt.Errorf("%w: agent role must be kebab-case (lowercase letters/digits separated by single hyphens)", ErrValidation)
+	}
+	if len(role) > 64 {
+		return fmt.Errorf("%w: agent role must be at most 64 characters", ErrValidation)
+	}
+	if strings.TrimSpace(focus) == "" {
+		return fmt.Errorf("%w: agent focus is required", ErrValidation)
+	}
+	if strings.TrimSpace(evidenceContract) == "" {
+		return fmt.Errorf("%w: agent evidence_contract is required", ErrValidation)
+	}
+	if strings.TrimSpace(stoppingRule) == "" {
+		return fmt.Errorf("%w: agent stopping_rule is required", ErrValidation)
+	}
+	return nil
 }
