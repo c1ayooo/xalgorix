@@ -1,4 +1,4 @@
-.PHONY: build run clean test test-ci test-cover test-race install fmt vet lint tidy all webui webui-install webui-dev
+.PHONY: build run clean test test-ci test-cover test-race install fmt vet lint tidy all webui webui-install webui-dev toolbox-build toolbox-verify toolbox-selftest toolbox-shim image-platform image-toolbox image-runnerd deploy-check
 
 BINARY=xalgorix
 BUILD_DIR=./build
@@ -26,7 +26,7 @@ build: webui
 	@echo "Built: $(BUILD_DIR)/$(BINARY)"
 
 run:
-	go run ./cmd/xalgorix/ $(ARGS)
+	$(if $(filter docker,$(RUNTIME_MODE)),XALGORIX_RUNTIME_BACKEND=docker ,)go run ./cmd/xalgorix/ $(ARGS)
 
 clean:
 	rm -rf $(BUILD_DIR)
@@ -77,5 +77,103 @@ lint: fmt vet
 
 tidy:
 	go mod tidy
+
+# ── Build / deploy variant selectors ─────────────────────────────────────────
+# Topology is a build/deploy-time choice, NEVER a Go build tag: every image
+# ships the same xalgorix binary, and the container it runs in decides whether
+# tools execute natively or in per-project toolbox containers.
+#
+#   PLATFORM_VARIANT  slim      control-plane only (no security tooling)
+#                     allinone  batteries-included Kali image (default)
+#   RUNTIME_MODE      native    tools run in the platform container (default)
+#                     docker    tools run in per-project toolbox containers
+#   TOOLBOX_PROFILE   core      baseline recon/HTTP web toolset (default)
+#                     full      core + exploitation/SAST tooling
+#                     web       core + browser/DAST tooling
+PLATFORM_VARIANT ?= allinone
+RUNTIME_MODE     ?= native
+TOOLBOX_PROFILE  ?= core
+
+PLATFORM_IMAGE ?= xalgorix:$(VERSION)
+TOOLBOX_IMAGE  ?= xalgorix-toolbox:dev
+RUNNERD_IMAGE  ?= xalgorix-runnerd:dev
+
+# Expand to a parse-time error so `make -n <target>` rejects typos too, before
+# any Docker command is printed or executed.
+define require_one_of
+$(if $(filter $(2),$(3)),,$(error $(1)='$(2)' is invalid; expected one of: $(3)))
+endef
+
+ifneq (,$(filter image-platform,$(MAKECMDGOALS)))
+$(call require_one_of,PLATFORM_VARIANT,$(PLATFORM_VARIANT),slim allinone)
+endif
+ifneq (,$(filter image-toolbox toolbox-build toolbox-verify toolbox-push toolbox-selftest,$(MAKECMDGOALS)))
+$(call require_one_of,TOOLBOX_PROFILE,$(TOOLBOX_PROFILE),core full web)
+endif
+ifneq (,$(filter run,$(MAKECMDGOALS)))
+$(call require_one_of,RUNTIME_MODE,$(RUNTIME_MODE),native docker)
+endif
+
+# Platform image: <repo>:<version>-<variant>. The slim variant is the
+# control-plane half of the split deployment and is only useful together with
+# XALGORIX_RUNTIME_BACKEND=docker.
+image-platform:
+	@echo "Building platform image $(PLATFORM_VARIANT): $(PLATFORM_IMAGE)-$(PLATFORM_VARIANT)"
+	docker build -f Dockerfile --target platform-$(PLATFORM_VARIANT) -t $(PLATFORM_IMAGE)-$(PLATFORM_VARIANT) .
+
+# Toolbox image: <toolbox-repo>:<version>-<profile>.
+image-toolbox:
+	@echo "Building toolbox image $(TOOLBOX_PROFILE): $(TOOLBOX_IMAGE)-$(TOOLBOX_PROFILE)"
+	docker build -f tools/toolbox/Dockerfile --target $(TOOLBOX_PROFILE) -t $(TOOLBOX_IMAGE)-$(TOOLBOX_PROFILE) .
+
+# Host-side runtime service used by the recommended split deployment.
+image-runnerd:
+	@echo "Building runnerd image: $(RUNNERD_IMAGE)"
+	docker build -f Dockerfile --target runnerd -t $(RUNNERD_IMAGE) .
+
+# Validate both deployment shapes without contacting a Docker daemon: the
+# profiles must render, and the default (no profile) must still select services
+# so `docker compose up -d` keeps working for existing users.
+deploy-check:
+	docker compose -f docker-compose.yml --profile allinone config >/dev/null
+	docker compose -f docker-compose.yml --profile split config >/dev/null
+	docker compose -f deploy/docker-compose.yml --profile allinone config >/dev/null
+	docker compose -f deploy/docker-compose.yml --profile split config >/dev/null
+	@test -n "$$(docker compose -f docker-compose.yml config --services)" || { \
+		echo "deploy-check: docker-compose.yml selects no services without a profile" >&2; exit 1; }
+	@test -n "$$(docker compose -f deploy/docker-compose.yml config --services)" || { \
+		echo "deploy-check: deploy/docker-compose.yml selects no services without a profile" >&2; exit 1; }
+	@echo "deploy-check: compose variants are valid"
+
+# ── Toolbox image (per-project execution plane) ──────────────────────────────
+# TOOLBOX_IMAGE / TOOLBOX_PROFILE are declared with the selectors above.
+
+# Build the image target (alias of image-toolbox). Requires a Docker daemon and
+# network access; expect tens of minutes on a cold cache and several GB of disk.
+toolbox-build: image-toolbox
+
+# Build and run the self-test gate inside the resulting image.
+toolbox-verify: toolbox-build
+	docker run --rm --entrypoint /opt/xalgorix/bin/toolbox-selftest $(TOOLBOX_IMAGE)-$(TOOLBOX_PROFILE) --profile $(TOOLBOX_PROFILE) --json
+
+# Run the self-test against the local host (useful while iterating on the
+# manifest; most tools will be missing, which is the point).
+toolbox-selftest:
+	go run ./tools/toolbox/selftest --profile $(TOOLBOX_PROFILE) --toolpack tools/toolbox/toolpack.yaml
+
+# Build the in-container helpers without Docker.
+toolbox-shim:
+	go build -trimpath -o $(BUILD_DIR)/toolshim ./cmd/toolshim
+	go build -trimpath -o $(BUILD_DIR)/toolbox-selftest ./tools/toolbox/selftest
+	go build -trimpath -o $(BUILD_DIR)/runnerd ./cmd/runnerd
+
+TOOLBOX_IMAGE_PUSH ?= ghcr.io/c1ayooo/xalgorix-toolbox
+
+# Push both the semver tag and the digest-pinned reference the platform expects.
+toolbox-push:
+	@test -n "$(VERSION)" || (echo "VERSION is required" && exit 1)
+	docker tag $(TOOLBOX_IMAGE)-$(TOOLBOX_PROFILE) $(TOOLBOX_IMAGE_PUSH):$(VERSION)-$(TOOLBOX_PROFILE)
+	docker push $(TOOLBOX_IMAGE_PUSH):$(VERSION)-$(TOOLBOX_PROFILE)
+	@docker inspect --format='{{index .RepoDigests 0}}' $(TOOLBOX_IMAGE_PUSH):$(VERSION)-$(TOOLBOX_PROFILE)
 
 all: tidy lint build

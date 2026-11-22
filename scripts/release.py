@@ -47,8 +47,8 @@ import re
 import subprocess
 import tempfile
 
-REPO_DEFAULT = "xalgorix/xalgorix"
-ORIGIN_URL = "https://github.com/xalgorix/xalgorix.git"
+REPO_DEFAULT = "c1ayooo/xalgorix"
+ORIGIN_URL = "https://github.com/c1ayooo/xalgorix.git"
 PLATFORMS = [("linux", "amd64"), ("linux", "arm64"), ("darwin", "amd64"), ("darwin", "arm64")]
 FILE_ARCH = {
     ("linux", "amd64"): "x86-64",

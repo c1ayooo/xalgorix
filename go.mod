@@ -1,4 +1,4 @@
-module github.com/xalgord/xalgorix/v4
+module github.com/c1ayooo/xalgorix/v4
 
 go 1.26.0
 

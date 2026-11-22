@@ -1,0 +1,52 @@
+Xalgorix
+Copyright 2025-2026 The Xalgorix Authors
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product ships as an aggregate with the third-party programs listed
+below. They are installed as SEPARATE, UNMODIFIED binaries and are invoked
+out-of-process (via os/exec). No code from them is compiled into, linked
+into, or vendored into the Xalgorix source tree, and the Xalgorix source
+remains Apache-2.0 licensed.
+
+===============================================================================
+chainreactors/gogo — GPL-3.0
+===============================================================================
+
+  Component : gogo (automated port / service / banner / fingerprint scanner)
+  Used by   : the `port_scan` tool (internal/tools/portscan)
+  Location  : /go/bin/gogo in the published container image; otherwise
+              resolved from PATH or XALGORIX_GOGO_PATH
+  Upstream  : https://github.com/chainreactors/gogo
+  License   : GNU General Public License v3.0
+
+  GPL-3.0 compliance note for binary redistribution
+  -------------------------------------------------
+  Any distribution of a container image or installer that includes the gogo
+  binary is a distribution of a GPL-3.0 work and MUST be accompanied by the
+  corresponding complete source code for that exact gogo version (or a
+  written offer valid for at least three years to provide it).
+
+  The image build installs it from the upstream module, so the corresponding
+  source for a released image is obtainable at:
+
+      https://github.com/chainreactors/gogo  (tag/commit matching the build)
+      go install github.com/chainreactors/gogo/v2@latest
+
+  A verbatim copy of the GPL-3.0 text is available at:
+
+      https://www.gnu.org/licenses/gpl-3.0.txt
+
+  The license of a separate program does not extend to Xalgorix: gogo runs as
+  its own process, communicates through its CLI and JSONL output files, and
+  is not linked with the Xalgorix binary. Users who never invoke `port_scan`
+  (or who never install gogo) are unaffected by this notice.
+
+===============================================================================
+Other external command-line tools
+===============================================================================
+
+The container image also installs unrelated open-source security tools
+(nmap, ffuf, katana, nuclei, httpx, naabu, golangci-lint, ...) and invokes
+them the same way — as separate processes. Their licenses and copyright
+notices remain with their respective upstream projects; they are not part of
+the Xalgorix source distribution.

@@ -8,33 +8,37 @@
 # XALGORIX_USERNAME + XALGORIX_PASSWORD (or XALGORIX_PASSWORD_HASH).
 set -euo pipefail
 
-# Persist dashboard-configured settings on the /data volume. The engine writes
+# Persist dashboard-configured settings on the data volume. The engine writes
 # runtime settings (LLM model/key, integrations, etc.) to ~/.xalgorix.env
-# (=/root/.xalgorix.env). Symlinking it onto /data means anything you set under
-# Settings survives `docker run --rm` / container recreation, not just restarts.
-mkdir -p /data
-if [ ! -e /data/.xalgorix.env ]; then
+# (=/root/.xalgorix.env). Symlinking it onto the data directory means anything
+# you set under Settings survives `docker run --rm` / container recreation, not
+# just restarts. The directory follows XALGORIX_DATA_DIR: the split shape mounts
+# a host directory at a different absolute path and would otherwise write this
+# state into the image's anonymous /data volume.
+DATA_DIR="${XALGORIX_DATA_DIR:-/data}"
+mkdir -p "$DATA_DIR"
+if [ ! -e "$DATA_DIR/.xalgorix.env" ]; then
   if [ -f /root/.xalgorix.env ] && [ ! -L /root/.xalgorix.env ]; then
-    mv /root/.xalgorix.env /data/.xalgorix.env
+    mv /root/.xalgorix.env "$DATA_DIR/.xalgorix.env"
   else
-    : >/data/.xalgorix.env
+    : >"$DATA_DIR/.xalgorix.env"
   fi
 fi
-ln -sf /data/.xalgorix.env /root/.xalgorix.env
+ln -sf "$DATA_DIR/.xalgorix.env" /root/.xalgorix.env
 
-# Persist the traffic-proxy CA (R2b) on the /data volume the same way: the
+# Persist the traffic-proxy CA (R2b) on the data volume the same way: the
 # interception CA (~/.xalgorix/ca, default XALGORIX_CA_DIR) is generated once
 # and pinned by every consumer trust store (curl --cacert, python bundles,
 # browser), so it must survive container recreation. -m 700 matters: the
 # engine's EnsureSecureDir does NOT tighten the mode of an already-existing
-# directory, so a loose /data/ca would stay loose across restarts.
-mkdir -m 700 -p /data/ca /root/.xalgorix
+# directory, so a loose data/ca would stay loose across restarts.
+mkdir -m 700 -p "$DATA_DIR/ca" /root/.xalgorix
 if [ ! -L /root/.xalgorix/ca ]; then
-  if [ -d /root/.xalgorix/ca ] && [ -n "$(ls -A /root/.xalgorix/ca 2>/dev/null)" ] && [ ! -n "$(ls -A /data/ca 2>/dev/null)" ]; then
-    mv /root/.xalgorix/ca/* /data/ca/ 2>/dev/null || true
+  if [ -d /root/.xalgorix/ca ] && [ -n "$(ls -A /root/.xalgorix/ca 2>/dev/null)" ] && [ ! -n "$(ls -A "$DATA_DIR/ca" 2>/dev/null)" ]; then
+    mv /root/.xalgorix/ca/* "$DATA_DIR/ca/" 2>/dev/null || true
     rmdir /root/.xalgorix/ca
   fi
-  ln -sf /data/ca /root/.xalgorix/ca
+  ln -sf "$DATA_DIR/ca" /root/.xalgorix/ca
 fi
 
 bind="${XALGORIX_BIND:-0.0.0.0}"

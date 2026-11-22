@@ -40,9 +40,9 @@ Kubernetes: `>=1.19.0-0`
 | httproute.hostname | string | Matches all traffic on the Gateway. | Hostname to match. A hostname prefixed with a dot (e.g. `.example.com`) matches all subdomains. |
 | httproute.hostnames | list | `[]` | Additional hostnames to match. |
 | httproute.matches | list | Matches the `/` path prefix. | Match rules for the route. An empty list matches all traffic. |
-| image | object | `{"pullPolicy":"IfNotPresent","repository":"ghcr.io/xalgord/xalgorix","tag":""}` | Container image settings. |
+| image | object | `{"pullPolicy":"IfNotPresent","repository":"ghcr.io/c1ayooo/xalgorix","tag":""}` | Container image settings. |
 | image.pullPolicy | string | `"IfNotPresent"` | Image pull policy. |
-| image.repository | string | `"ghcr.io/xalgord/xalgorix"` | Image repository. |
+| image.repository | string | `"ghcr.io/c1ayooo/xalgorix"` | Image repository. |
 | image.tag | string | The chart `appVersion`. | Image tag. |
 | imagePullSecrets | list | `[]` | Names of existing secrets with registry credentials for private images. |
 | ingress | object | `{"annotations":{},"className":"traefik","enabled":false,"hosts":[{"host":"xalgorix.local","paths":[{"path":"/","pathType":"Prefix"}]}],"tls":[]}` | Ingress resource for exposing the dashboard. Requires an ingress controller installed in the cluster. Add dashboard auth before exposing the dashboard beyond loopback. |

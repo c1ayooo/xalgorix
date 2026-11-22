@@ -21,7 +21,7 @@ docker run --rm -p 9137:9137 \
   -e XALGORIX_LLM=openai/gpt-5.6 \
   -e XALGORIX_API_KEY=your_openai_api_key \
   -v xalgorix-data:/data \
-  xalgord/xalgorix:latest
+  c1ayooo/xalgorix:latest
 ```
 
 Then open **http://127.0.0.1:9137**.
@@ -59,11 +59,53 @@ An extensive toolset ships preinstalled — `nmap`, `nuclei`, `httpx`, `subfinde
 
 | Tag | Meaning |
 | --- | --- |
-| `latest` | Most recent release. |
-| `X.Y.Z` (e.g. `4.5.50`) | A specific, immutable release. |
-| `X.Y` (e.g. `4.5`) | Latest patch of that minor line. |
+| `latest` | Most recent release (all-in-one). |
+| `X.Y.Z` (e.g. `4.5.50`) | A specific, immutable release (all-in-one). |
+| `X.Y` (e.g. `4.5`) | Latest patch of that minor line (all-in-one). |
+| `X.Y.Z-allinone`, `X.Y-allinone` | Explicit alias of an all-in-one release. |
+| `X.Y.Z-slim`, `X.Y-slim` | Control-plane-only variant of a release. |
+| `slim` | Most recent release of the control-plane-only variant. |
 
 **Platforms:** `linux/amd64` and `linux/arm64`. Docker automatically selects the native image for the host.
+
+## Image variants
+
+| Variant | Contents | Use it for |
+| --- | --- | --- |
+| **all-in-one** (`latest`, `X.Y.Z`, `X.Y`, `<version>-allinone`) | Platform + full Kali toolset + runtime toolchains | Single-container scans. This is the default `docker build` target and is unchanged. |
+| **slim** (`slim`, `<version>-slim`) | Platform binary, CA certificates and timezone data only — no scanners, no package managers | Split deployments: the platform is the control plane and every scan's tools run in a per-project toolbox container (`XALGORIX_RUNTIME_BACKEND=docker`). |
+
+`latest` and the semver tags keep pointing at all-in-one, so existing users are unaffected. Slim images are never privileged: they do not execute tools themselves.
+
+### Split deployment (slim + toolbox containers)
+
+Prerequisites:
+
+1. **PostgreSQL** — required by the platform since v3.0.
+2. **Digest-pinned toolbox image** — e.g. `ghcr.io/c1ayooo/xalgorix-toolbox:4.6.133-core@sha256:<64hex>`. Only `repo@sha256:...` is accepted; tag references are refused unless `XALGORIX_ALLOW_UNPINNED_TOOLBOX=1` (development only).
+3. **Proxy URL reachable from the project network** — set `XALGORIX_TOOLBOX_PROXY_URL`. Docker-backend tools fail closed when proxy is required and this is unset; they never silently fall back to a direct connection.
+4. **Host data directory at an identical absolute path** — e.g. `/srv/xalgorix/data` mounted the same way in the platform container and readable by the runner.
+
+Build the pieces locally:
+
+```bash
+make image-platform PLATFORM_VARIANT=slim   # <repo>:<version>-slim
+make image-toolbox  TOOLBOX_PROFILE=core    # <toolbox-repo>:<version>-core
+make image-runnerd                          # host-side runtime service
+```
+
+Start the split stack (the all-in-one service has no profile, so name `app-split` to avoid starting it too):
+
+```bash
+XALGORIX_DATA_DIR=/srv/xalgorix/data \
+XALGORIX_TOOLBOX_IMAGE=ghcr.io/c1ayooo/xalgorix-toolbox:4.6.133-core@sha256:<64hex> \
+XALGORIX_TOOLBOX_PROXY_URL=http://<proxy-host>:<port> \
+  docker compose -f deploy/docker-compose.yml --profile split up -d app-split
+```
+
+The dashboard is published on `127.0.0.1:9138` by default (`XALGORIX_SPLIT_PORT` overrides it); `allinone` remains the default shape on `9137` and `--profile allinone` is equivalent to it.
+
+Current limits of the split shape: the platform CLI wiring for project quotas, max-life and host-path preflight is not finished yet, and `web`-profile browser automation's CDP endpoint is only reachable from a host-binary platform (no relay inside containers yet). The proxy must be provided by the operator — the platform's built-in traffic proxy listens on loopback.
 
 ## Security notes
 
@@ -73,7 +115,7 @@ An extensive toolset ships preinstalled — `nmap`, `nuclei`, `httpx`, `subfinde
 
 ## Links
 
-- **Source & docs:** https://github.com/xalgorix/xalgorix
+- **Source & docs:** https://github.com/c1ayooo/xalgorix
 - **Documentation:** https://docs.xalgorix.com
 - **Hosted (no install):** https://www.xalgorix.com
 - **One-line install (Linux or macOS, amd64/arm64):** `curl -sSL https://www.xalgorix.com/install | bash`

@@ -20,7 +20,22 @@
 #           -e XALGORIX_LLM=openai/gpt-5.6 \
 #           -e XALGORIX_API_KEY=your_provider_api_key \
 #           -v xalgorix-data:/data \
-#           ghcr.io/xalgord/xalgorix:latest
+#           ghcr.io/c1ayooo/xalgorix:latest
+#
+# ── Build variants ──────────────────────────────────────────────────────────
+# The default build (no --target) is the batteries-included all-in-one image,
+# exactly as before. Deployment topology is a build-time choice, never a Go
+# build tag — every variant embeds the same xalgorix binary:
+#
+#   docker build --target platform-allinone  -t xalgorix:VERSION-allinone .
+#   docker build --target platform-slim      -t xalgorix:VERSION-slim .
+#   docker build --target runnerd            -t xalgorix-runnerd:VERSION .
+#
+# platform-slim is control-plane only (CA/timezone + binary, no security
+# tooling): pair it with XALGORIX_RUNTIME_BACKEND=docker and a digest-pinned
+# toolbox image. runnerd is the host-side service that owns the Docker socket
+# for that split deployment. `make image-platform PLATFORM_VARIANT=...` wraps
+# the first two; `make image-runnerd` wraps the third.
 #
 # --privileged gives the toolset the same host-like access it has when run
 # natively as root. Docker's DEFAULT sandbox drops capabilities (NET_ADMIN, …)
@@ -108,10 +123,62 @@ RUN set -eux; \
       github.com/zricethezav/gitleaks/v8@latest \
     ; do go install -v "$pkg" || echo "WARN: go install $pkg failed (installable at runtime)"; done; \
     CGO_ENABLED=1 go install -v github.com/projectdiscovery/naabu/v2/cmd/naabu@latest \
-      || echo "WARN: naabu build failed (installable at runtime)"
+      || echo "WARN: naabu build failed (installable at runtime)"; \
+    # gogo (chainreactors) backs the port_scan tool. GPL-3.0 — see NOTICE.
+    # -tags goregexp is required by its build (plain build hits a go-re2 wasm
+    # failure on some targets). Installed out-of-tree, never linked in.
+    GOBIN=/go/bin go install -tags goregexp github.com/chainreactors/gogo/v2@latest \
+      || echo "WARN: gogo install failed (port_scan degrades to an install hint)"
 
-# ── Stage 3: runtime — Kali Linux, full toolset, runs as root ────────────────
-FROM kalilinux/kali-rolling
+# ── Stage 3: platform-slim — control plane only, no security tooling ─────────
+# The split deployment's platform half. It carries the exact same embedded
+# binary as all-in-one; only the runtime payload differs (CA + timezone, no
+# scanners, no package managers). Tools execute in per-project toolbox
+# containers via XALGORIX_RUNTIME_BACKEND=docker, so this image never needs
+# --privileged and never runs the toolset itself.
+FROM debian:bookworm-slim AS platform-slim
+ENV DEBIAN_FRONTEND=noninteractive
+# openssl is required by docker-entrypoint.sh to generate the one-time admin
+# password when no dashboard auth is supplied; bash is already in the base.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates tzdata openssl \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=gobuild /out/xalgorix /usr/local/bin/xalgorix
+
+ENV XALGORIX_BIND=0.0.0.0 \
+    XALGORIX_DATA_DIR=/data \
+    XALGORIX_ALLOW_AUTO_INSTALL=0 \
+    XALGORIX_NO_AUTO_UPDATE=1
+
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh && mkdir -p /data
+VOLUME ["/data"]
+EXPOSE 9137
+ENTRYPOINT ["docker-entrypoint.sh"]
+CMD ["--web"]
+
+# ── Stage 4: runnerd — host-side runtime service for the split deployment ────
+# Stateless execution endpoint: owns /var/run/docker.sock and exposes only
+# ensure/exec/stop/remove/inspect/list/capacity over a unix socket. It has no
+# database access and no scan knowledge; the platform container talks to it via
+# a bind-mounted socket and never sees the daemon socket itself.
+FROM golang:1.26-bookworm AS runnerd-build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+ARG VERSION=docker
+RUN CGO_ENABLED=0 go build -ldflags "-s -w -X main.version=${VERSION}" \
+    -o /out/runnerd ./cmd/runnerd/
+
+FROM gcr.io/distroless/static-debian12 AS runnerd
+COPY --from=runnerd-build /out/runnerd /usr/local/bin/runnerd
+ENTRYPOINT ["/usr/local/bin/runnerd"]
+
+# ── Stage 5: all-in-one runtime — Kali Linux, full toolset, runs as root ─────
+# MUST stay the last stage: `docker build .` with no --target keeps producing
+# this image, so existing users are unaffected by the new variants above.
+FROM kalilinux/kali-rolling AS platform-allinone
 
 ARG TARGETARCH
 ENV DEBIAN_FRONTEND=noninteractive

@@ -8,7 +8,7 @@ replicaCount: 1
 # -- Container image settings.
 image:
   # -- Image repository.
-  repository: ghcr.io/xalgord/xalgorix
+  repository: ghcr.io/c1ayooo/xalgorix
   # -- Image tag.
   # @default -- The chart `appVersion`.
   tag: ""

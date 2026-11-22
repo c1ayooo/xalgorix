@@ -2,7 +2,7 @@
 
 > 单 Go 二进制运行的自主 AI 渗透测试引擎：内嵌 React 仪表盘，本地执行 22 阶段方法论扫描，BYO-LLM（自带模型/密钥），全流程证据可追溯。Apache-2.0。
 >
-> 当前维护仓库：**[c1ayooo/xalgorix](https://github.com/c1ayooo/xalgorix)**。本项目源自 **[xalgord/xalgorix](https://github.com/xalgord/xalgorix)**，原作者 **xalgord**，遵循 Apache-2.0 许可。详见 [15. 来源与致谢](#15-来源与致谢)。
+> 当前维护仓库：**[c1ayooo/xalgorix](https://github.com/c1ayooo/xalgorix)**。本项目源自 **[c1ayooo/xalgorix](https://github.com/c1ayooo/xalgorix)**，原作者 **xalgord**，遵循 Apache-2.0 许可。详见 [15. 来源与致谢](#15-来源与致谢)。
 
 本文档以**架构**为主线，内容以本仓代码与 `docs/CORE_PHILOSOPHY.md`（v2.1 二开宪章）、`docs/ARCHITECTURE.md` 为准。凡是与实现冲突的目标设计，以宪章为验收基线；凡是“现状是什么”的事实描述，以代码和测试为准。
 
@@ -547,7 +547,7 @@ xalgorix --setup           # 交互式配置 provider / 模型 / 密钥
 xalgorix --web             # 启动仪表盘：http://127.0.0.1:9137
 ```
 
-> 模块路径仍为 `github.com/xalgord/xalgorix/v4`（沿用上游 module 声明），因此 `go install` 请按该路径或直接克隆本仓 `make build`；不要使用与本仓 remote 不一致的 `go install` 路径。
+> 模块路径为 `github.com/c1ayooo/xalgorix/v4`（已随本 fork 迁移），因此 `go install github.com/c1ayooo/xalgorix/v4/cmd/xalgorix@latest` 或直接克隆本仓 `make build` 均可。
 
 **质量门**：
 
@@ -672,9 +672,9 @@ docs/                    CORE_PHILOSOPHY / ARCHITECTURE / REDESIGN / API_CONTRAC
 本仓库是 **[c1ayooo/xalgorix](https://github.com/c1ayooo/xalgorix)**，在上游开源项目 **Xalgorix** 的基础上继续开发。
 
 - **原作者**：xalgord（[github.com/xalgord](https://github.com/xalgord)）
-- **上游仓库**：<https://github.com/xalgord/xalgorix>（镜像 / 组织地址：<https://github.com/xalgorix/xalgorix>）
+- **上游项目**：Xalgorix（原作者主页：<https://github.com/xalgord>）
 - **许可**：Apache License 2.0（见 [`LICENSE`](LICENSE)）
-- **模块路径**：`github.com/xalgord/xalgorix/v4`（沿用上游声明，未随 fork 更改）
+- **模块路径**：`github.com/c1ayooo/xalgorix/v4`（本 fork 的 module 声明）
 
 上游项目完成了核心引擎、22 阶段方法论、ledger、Verifier 与报告门、仪表盘等绝大部分工作；本仓在其之上进行二次开发与架构演进（`docs/CORE_PHILOSOPHY.md` v2.1 信息驱动循环、domain journal/冷路径、平台层与 HITL 等）。所有原始版权与许可声明保留不变。
 
@@ -682,5 +682,5 @@ docs/                    CORE_PHILOSOPHY / ARCHITECTURE / REDESIGN / API_CONTRAC
 
 ---
 
-<p align="center"><sub>Built on the shoulders of <a href="https://github.com/xalgord/xalgorix">Xalgorix</a> by xalgord. 感谢原作者的开源贡献。</sub></p>
+<p align="center"><sub>Built on the shoulders of <a href="https://github.com/c1ayooo/xalgorix">Xalgorix</a> by xalgord. 感谢原作者的开源贡献。</sub></p>
 
