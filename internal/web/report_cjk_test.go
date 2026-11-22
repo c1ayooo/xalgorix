@@ -13,8 +13,8 @@ func TestLanguageNeedsEmbeddedFont(t *testing.T) {
 	if languageNeedsEmbeddedFont("en") {
 		t.Error("English should not need an embedded font")
 	}
-	if languageNeedsEmbeddedFont("") {
-		t.Error("default (English) should not need an embedded font")
+	if !languageNeedsEmbeddedFont("") {
+		t.Error("default (zh-CN) should need an embedded font")
 	}
 }
 

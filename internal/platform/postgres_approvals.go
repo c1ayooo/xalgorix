@@ -287,11 +287,11 @@ func (s *Store) PendingSummary(ctx context.Context) (ApprovalSummary, error) {
 
 // ── guidance ─────────────────────────────────────────────────────────────────
 
-const guidanceColumns = `id, task_id, COALESCE(run_id::text, ''), instance_id, message, status, request_id, created_at, consumed_at`
+const guidanceColumns = `id, task_id, COALESCE(run_id::text, ''), instance_id, message, status, request_id, created_by, created_at, consumed_at`
 
 func scanGuidanceRow(row pgx.Row) (*Guidance, error) {
 	var g Guidance
-	if err := row.Scan(&g.ID, &g.TaskID, &g.RunID, &g.InstanceID, &g.Message, &g.Status, &g.RequestID, &g.CreatedAt, &g.ConsumedAt); err != nil {
+	if err := row.Scan(&g.ID, &g.TaskID, &g.RunID, &g.InstanceID, &g.Message, &g.Status, &g.RequestID, &g.CreatedBy, &g.CreatedAt, &g.ConsumedAt); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
 		}
@@ -310,7 +310,7 @@ func scanGuidanceRows(rows pgx.Rows) ([]Guidance, error) {
 	out := []Guidance{}
 	for rows.Next() {
 		var g Guidance
-		if err := rows.Scan(&g.ID, &g.TaskID, &g.RunID, &g.InstanceID, &g.Message, &g.Status, &g.RequestID, &g.CreatedAt, &g.ConsumedAt); err != nil {
+		if err := rows.Scan(&g.ID, &g.TaskID, &g.RunID, &g.InstanceID, &g.Message, &g.Status, &g.RequestID, &g.CreatedBy, &g.CreatedAt, &g.ConsumedAt); err != nil {
 			return nil, fmt.Errorf("platform/postgres: scan guidance: %w", err)
 		}
 		g.CreatedAt = g.CreatedAt.UTC()
@@ -347,10 +347,10 @@ func (s *Store) CreateGuidance(ctx context.Context, in GuidanceInput) (*Guidance
 	}
 	id := uuid.NewString()
 	tag, err := s.exec(ctx, `
-		INSERT INTO guidance (id, task_id, run_id, instance_id, message, status, request_id, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		INSERT INTO guidance (id, task_id, run_id, instance_id, message, status, request_id, created_by, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		ON CONFLICT DO NOTHING`,
-		id, taskArg, runArg, in.InstanceID, in.Message, GuidanceQueued, in.RequestID, time.Now().UTC())
+		id, taskArg, runArg, in.InstanceID, in.Message, GuidanceQueued, in.RequestID, in.CreatedBy, time.Now().UTC())
 	if err != nil {
 		// A concurrent creator won the partial unique index before the
 		// ON CONFLICT clause could infer it (or an unexpected constraint

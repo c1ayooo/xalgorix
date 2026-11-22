@@ -32,6 +32,14 @@ var machineTokenRouteDenylist = []string{
 	"/api/settings/",
 	"/api/auth/profiles",
 	"/api/chat",
+	// MCP server definitions carry credential material (env/headers for the
+	// remote servers) — session-auth only, same posture as settings.
+	"/api/mcp-servers",
+	// Account management is a human-admin surface (auth_rbac.go): automation
+	// identities are not people and never manage people.
+	"/api/users",
+	"/api/auth/setup",
+	"/api/auth/password",
 }
 
 // machineTokenPathAllowed reports whether a machine token may authorize the
@@ -46,10 +54,11 @@ func machineTokenPathAllowed(path string) bool {
 }
 
 // isMachineAPIPath reports whether the path belongs to the machine API surface
-// (JSON APIs and the scan event WebSocket). Machine tokens authorize these
-// only — never dashboard page routes.
+// (JSON APIs; the dashboard event stream /api/stream is cookie-session only —
+// EventSource cannot carry Bearer headers, so machine clients poll REST).
+// Machine tokens authorize these only — never dashboard page routes.
 func isMachineAPIPath(path string) bool {
-	return strings.HasPrefix(path, "/api/") || path == "/ws"
+	return strings.HasPrefix(path, "/api/")
 }
 
 // apiTokenHashes returns SHA-256 digests of the configured machine API

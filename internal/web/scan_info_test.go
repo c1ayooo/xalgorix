@@ -269,3 +269,91 @@ func TestInfoAssociationProjectFormCapsScanFanOut(t *testing.T) {
 		t.Fatalf("cap disclosure = %+v", body)
 	}
 }
+
+// taskNarrowFixture builds one project with two tasks (one run each) plus a
+// foreign project with its own task, for task_id narrowing tests.
+func taskNarrowFixture(t *testing.T) (*Server, *platform.Project, *platform.Task, *platform.Task, *platform.Task) {
+	t.Helper()
+	s := newPlatformTestServer(t)
+	store := s.currentPlatformStore()
+	ctx := context.Background()
+	project, err := store.CreateProject(ctx, "Task Narrow", platform.Scope{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := store.CreateProject(ctx, "Task Narrow Other", platform.Scope{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskOne, err := store.CreateTask(ctx, project.ID, platform.TaskInput{Name: "One"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskTwo, err := store.CreateTask(ctx, project.ID, platform.TaskInput{Name: "Two"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreignTask, err := store.CreateTask(ctx, other.ID, platform.TaskInput{Name: "Foreign"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for task, inst := range map[string]string{taskOne.ID: "inst-n1", taskTwo.ID: "inst-n2"} {
+		if _, err := store.CreateRun(ctx, task, platform.RunMount{InstanceID: inst, Mode: "single"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return s, project, taskOne, taskTwo, foreignTask
+}
+
+func TestInfoRegionTaskIDNarrowsWhitelist(t *testing.T) {
+	s, project, taskOne, _, foreignTask := taskNarrowFixture(t)
+	reader := &fakeInfoReader{}
+	s.SetInfoReader(reader)
+
+	// task_id narrows the whitelist to that task's run scan ids.
+	rr := infoRequest(t, s, "/api/info/region?project_id="+project.ID+"&task_id="+taskOne.ID)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if len(reader.regionQ.ScanIDs) != 1 || reader.regionQ.ScanIDs[0] != "inst-n1" {
+		t.Fatalf("task scope passed to reader = %v", reader.regionQ.ScanIDs)
+	}
+
+	// Without task_id the project whitelist is unchanged.
+	if rr := infoRequest(t, s, "/api/info/region?project_id="+project.ID); rr.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if len(reader.regionQ.ScanIDs) != 2 {
+		t.Fatalf("project scope = %v, want both tasks", reader.regionQ.ScanIDs)
+	}
+
+	// A task of another project is 404, never an empty cross-project view.
+	if rr := infoRequest(t, s, "/api/info/region?project_id="+project.ID+"&task_id="+foreignTask.ID); rr.Code != http.StatusNotFound {
+		t.Fatalf("cross-project task code=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if rr := infoRequest(t, s, "/api/info/region?project_id="+project.ID+"&task_id=missing"); rr.Code != http.StatusNotFound {
+		t.Fatalf("unknown task code=%d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestInfoAssociationTaskIDAggregatesOverTaskScans(t *testing.T) {
+	s, project, taskOne, _, foreignTask := taskNarrowFixture(t)
+	reader := &fakeInfoReader{}
+	s.SetInfoReader(reader)
+
+	rr := infoRequest(t, s, "/api/info/association?project_id="+project.ID+"&task_id="+taskOne.ID+"&ids=i1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if len(reader.assocCalls) != 1 || reader.assocCalls[0].ScanID != "inst-n1" {
+		t.Fatalf("association queries outside task scope: %+v", reader.assocCalls)
+	}
+
+	// A foreign task must not fan out any query.
+	if rr := infoRequest(t, s, "/api/info/association?project_id="+project.ID+"&task_id="+foreignTask.ID+"&ids=i1"); rr.Code != http.StatusNotFound {
+		t.Fatalf("cross-project task code=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if len(reader.assocCalls) != 1 {
+		t.Fatalf("rejected task fanned out queries: %+v", reader.assocCalls)
+	}
+}

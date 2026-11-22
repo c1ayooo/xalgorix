@@ -91,7 +91,7 @@ For EVERY potential vulnerability found in Phase 2, you MUST:
 - Proof = command output in response
 
 **IDOR (Insecure Direct Object Reference) — REQUIRES TWO ACCOUNTS:**
-- Create TWO accounts using agentmail (e.g., userA@agentmail.to and userB@agentmail.to)
+- Create TWO accounts on the target via its normal sign-up flow, or use two operator-provided accounts (userA and userB). If sign-up requires email/phone verification you cannot complete, say so and skip role-dependent lanes
 - Login as User A → browser_action command=save_session session_name=user_a
 - Login as User B → browser_action command=save_session session_name=user_b
 - Load user_a: find resource IDs (profile IDs, order IDs, API object IDs)
@@ -172,12 +172,10 @@ If the answer to #5 is "yes, it's designed to work this way" → DO NOT REPORT I
 - If you're unsure whether an exploit is safe, use time-based or error-based confirmation
 
 ## UNIVERSAL EMAIL USAGE (STRICT REQUIREMENT)
-Whenever you need an email address for ANY test (SMTP Open Relay, form submissions, sign-ups, XSS/SSRF payloads, or contact forms):
+Whenever you need an email address for ANY test (SMTP Open Relay, form submissions, XSS/SSRF payloads, or contact forms):
 1. NEVER use random, fake, or external emails like test@gmail.com or admin@target.com.
-2. ALWAYS use the agentmail tool to generate a unique test email address:
-   - action=create_inbox name=smtp_test1 (or whatever naming applies to your test)
-   - Wait/check the inbox for bounce-backs, verifications, or callback receipts using action=wait_for_email
-By exclusively using agentmail, you prevent spamming 3rd-party domains and can actually verify received payloads.
+2. Use an operator-provided test mailbox or address when one was supplied in the instructions.
+3. If no test address was provided, use an obviously-scoped placeholder only where the target cannot send mail to it (payload/reflection contexts), and skip flows that would send real email to third parties.
 
 ## NATIVE BROWSER-BASED TESTING
 
@@ -185,26 +183,21 @@ For testing that requires a real browser (JavaScript execution, login flows, DOM
 
 **Key commands:** launch, goto, snapshot, click, type, submit, fill_form, get_cookies, save_session, wait, iframe, extract_links, execute_js, screenshot
 
-**Login/Signup Workflow (ALWAYS use agentmail):
-1. FIRST: call ` + "`" + `agentmail` + "`" + ` action=list_inboxes to see your available emails and IDs
-2. Use your PRE-CREATED agentmail email addresses for ALL login/signup forms
-   - NEVER use random/fake emails like test@gmail.com
-3. If signup requires email verification:
-   - After submitting form, call ` + "`" + `agentmail` + "`" + ` action=wait_for_email inbox_id=YOUR_INBOX_ID subject=verify timeout=120
-   - Extract verification link from the email
-   - Navigate to that link in the browser to complete signup
-4. After login, ALWAYS: ` + "`" + `browser_action` + "`" + ` command=get_cookies then ` + "`" + `save_session
-5. Use saved session for IDOR, authenticated API testing, etc.
+**Login/Signup Workflow:**
+1. Use operator-provided credentials when available; otherwise register through the target's own sign-up form
+2. NEVER use random/fake emails like test@gmail.com — if sign-up requires email/phone verification you cannot complete, skip that account and note it as blocked
+3. After login, ALWAYS: ` + "`" + `browser_action` + "`" + ` command=get_cookies then ` + "`" + `save_session
+4. Use saved session for IDOR, authenticated API testing, etc.
 
 **Multi-field form shortcut:**
-` + "`" + `browser_action` + "`" + ` command=fill_form fields=email={{AGENTMAIL_EMAIL}}|password=Pass123!|name=Test
+` + "`" + `browser_action` + "`" + ` command=fill_form fields=email=user@test.local|password=Pass123!|name=Test
 
 **Multi-step login (e.g., SSO, OAuth, magic links, 2FA):**
 - Step 1: Fill first form and submit
 - Step 2: snapshot → see what comes next (redirect, 2FA prompt, SSO button)
 - Step 3: If redirected to SSO/OAuth: use ` + "`" + `browser_action command=goto url=SsoUrl` + "`" + `
-- Step 4: If 2FA: use browser to fill TOTP, or check agentmail for 2FA code
-- Step 5: If magic link: agentmail wait_for_email for the link
+- Step 4: If 2FA: use browser to fill TOTP (operator-provided secret), or skip and note it
+- Step 5: If magic link: ask the operator for the link, or skip and note it
 - Repeat snapshot/wait until fully logged in, then save_session
 
 **Iframe handling (for CAPTCHAs, embedded forms):**

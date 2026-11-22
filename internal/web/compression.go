@@ -20,13 +20,14 @@ var gzipWriterPool = sync.Pool{
 // highly compressible (typically ~8-10x), so this cuts transfer time for large
 // scans without any handler changes.
 //
-// The WebSocket endpoint (/ws) is never wrapped: it hijacks the raw connection
-// and must not have its ResponseWriter replaced. Responses are only compressed
-// when the Content-Type is text-like and the handler did not already set a
-// Content-Encoding.
+// The event stream endpoint (/api/stream) is never wrapped: it is a
+// long-lived SSE response whose frames must reach the client unbuffered, and
+// wrapping it in the pooled gzip writer would delay frames past the per-frame
+// Flush contract. Responses are only compressed when the Content-Type is
+// text-like and the handler did not already set a Content-Encoding.
 func gzipMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/ws" || !clientAcceptsGzip(r) {
+		if r.URL.Path == "/api/stream" || !clientAcceptsGzip(r) {
 			next.ServeHTTP(w, r)
 			return
 		}

@@ -1100,73 +1100,14 @@ If credentials like "Login with: admin@email.com / Password123":
    curl -b "session_id=VALUE; csrf_token=VALUE" https://TARGET/api/user/profile
 
 **Option 2: API Key Authentication**
-If API credentials provided (e.g., "API: am_us_xxx, username: agentmail"):
+If API credentials provided (e.g., "API: tok_xxx"):
 1. Look for API documentation or endpoints
 2. Try authentication endpoints: /api/auth, /api/login, /api/token
 3. Test with: curl -H "Authorization: Bearer API_KEY" or -H "X-API-Key: API_KEY"
 4. Test authenticated API endpoints with the token
 5. Look for IDOR in API endpoints (change IDs in API calls)
 
-**Option 3: Sign Up with AgentMail + Browser (RECOMMENDED for targets with registration)**
-STEP-BY-STEP WORKFLOW:
-
-Step 1 - Create email inbox:
-  agentmail action=create_inbox username=xalgotest123
-  → Saves: inbox_id=XXX, email=xalgotest123@agentmail.to
-
-Step 2 - Navigate to signup page:
-  browser_action command=launch url=https://TARGET/signup
-  browser_action command=snapshot → identify all form fields
-
-Step 3 - Fill the registration form:
-  browser_action command=fill_form fields=email=xalgotest123@agentmail.to|password=SecureP@ss123!|name=Test User
-  OR fill fields individually:
-  browser_action command=type selector=@e3 text=xalgotest123@agentmail.to
-  browser_action command=type selector=@e5 text=SecureP@ss123!
-  browser_action command=type selector=@e7 text=Test User
-
-Step 4 - Submit the form:
-  browser_action command=submit
-  browser_action command=wait text=navigation timeout=10
-  browser_action command=snapshot → check for success message or errors
-
-Step 5 - Get verification email:
-  agentmail action=wait_for_email inbox_id=XXX subject=verify timeout=120
-  → Extract the verification URL from the email body
-
-Step 6 - Complete verification:
-  browser_action command=goto url=VERIFICATION_URL_FROM_EMAIL
-  browser_action command=wait text=navigation
-  browser_action command=snapshot → confirm account is verified
-
-Step 7 - Login with account A and save as named session:
-  browser_action command=goto url=https://TARGET/login
-  browser_action command=fill_form fields=email=xalgotest123@agentmail.to|password=SecureP@ss123!
-  browser_action command=submit
-  browser_action command=wait text=navigation
-  browser_action command=get_cookies → capture session
-  browser_action command=save_session session_name=user_a
-
-Step 8 - Create second account and save as separate session:
-  → Create a SECOND account using agentmail (different email, e.g. xalgotest456@agentmail.to)
-  → Complete signup + verification flow for account B
-  browser_action command=goto url=https://TARGET/login
-  browser_action command=fill_form fields=email=xalgotest456@agentmail.to|password=SecureP@ss456!
-  browser_action command=submit
-  browser_action command=wait text=navigation
-  browser_action command=save_session session_name=user_b
-
-Step 9 - IDOR Two-Account Testing Workflow:
-  With TWO sessions saved, perform IDOR and privilege escalation tests:
-  a) Load user_a session → browse to profile/resource → note the resource ID/URL
-     browser_action command=load_session session_name=user_a
-  b) Load user_b session → try to access user_a's resource by modifying the ID
-     browser_action command=load_session session_name=user_b
-     browser_action command=goto url=https://TARGET/api/resource/USER_A_ID
-  c) Compare responses — if user_b can see user_a's data → IDOR confirmed!
-  d) Test API endpoints too: use get_cookies after load_session and send_request with those cookies
-  e) Use list_sessions to see all saved sessions:
-     browser_action command=list_sessions
+**Sign-up without credentials:** If no credentials were provided and the target allows open registration, register ONE account through the sign-up form in the browser and save a named session (save_session session_name=user_a). If sign-up requires email/phone verification you cannot complete, say so and mark role-dependent lanes as blocked. Two-account IDOR guidance lives in the phase methodology.
 
 IMPORTANT BROWSER TIPS:
 - ALWAYS use snapshot before interacting — it shows you the exact element IDs
@@ -1179,8 +1120,6 @@ IMPORTANT BROWSER TIPS:
 - Use list_sessions to see all saved sessions (memory + disk)
 - If the page has iframes (e.g., CAPTCHA), use iframe/main_frame to switch context
 - Use extract_links to find all links on a page (useful for navigation)
-
-TIP: If the target requires email verification, ALWAYS use agentmail — it gives you real working email addresses instantly.
 
 ### Caido Proxy
 All HTTP requests via the send_request tool are automatically routed through the Caido proxy (port 8080) for traffic analysis.

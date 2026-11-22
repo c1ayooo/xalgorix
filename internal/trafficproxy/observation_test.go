@@ -21,7 +21,6 @@ import (
 )
 
 func TestBufferedSinkDropsOnOverflowAndCounts(t *testing.T) {
-
 	var drained atomic.Int32
 	release := make(chan struct{})
 	b := NewBufferedSink(func(TrafficObservation) {

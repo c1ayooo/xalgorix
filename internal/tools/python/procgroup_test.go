@@ -8,6 +8,8 @@ import (
 	"os/exec"
 	"testing"
 	"time"
+
+	"github.com/xalgord/xalgorix/v4/internal/scanctx"
 )
 
 // TestConfigureProcessGroupKill reproduces the orphaned-child hang: a shell
@@ -17,6 +19,27 @@ import (
 // so cmd.Wait() blocks until the child's own 60s sleep ends. With
 // configureProcessGroupKill the whole process group is SIGKILLed, so both die
 // and Wait() returns promptly.
+func TestExecutePythonCancellationIsFailure(t *testing.T) {
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 is not available")
+	}
+	sc := scanctx.New("python-cancel", t.TempDir())
+	scanctx.Activate(sc)
+	t.Cleanup(func() { scanctx.Deactivate(sc.ID) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	res, err := executePythonForContextCtx(ctx, sc.ID, map[string]string{
+		"code": "import time\ntime.sleep(5)\n",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Error == "" {
+		t.Fatalf("canceled python returned success: %+v", res)
+	}
+}
+
 func TestConfigureProcessGroupKill(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()

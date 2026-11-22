@@ -47,7 +47,11 @@ func (o *recordingObserver) BeforeTool(_ context.Context, name string, _ map[str
 	return GuardVerdict{Allowed: true}
 }
 
-func (o *recordingObserver) AfterTool(_ context.Context, name string, _ map[string]string, output string, _ error) {
+func (o *recordingObserver) TransformToolOutput(_ context.Context, _ string, _ map[string]string, output string, _ map[string]any, _ error) string {
+	return output
+}
+
+func (o *recordingObserver) AfterTool(_ context.Context, name string, _ map[string]string, output string, _ map[string]any, _ error) {
 	o.mu.Lock()
 	o.afters = append(o.afters, name+":"+output)
 	o.mu.Unlock()

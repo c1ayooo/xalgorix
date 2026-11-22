@@ -177,6 +177,36 @@ func (r *KeyRotator) MarkLastQuotaExhausted() {
 	r.markKey("", keyPoolQuotaCooldown)
 }
 
+// MarkInvalidKey removes a key from the pool for the lifetime of the process.
+// A 401/403 is an authentication failure, not a rate limit: cooling it down
+// only to retry it later cannot succeed, and in round-robin mode a single dead
+// key fails every other request while the healthy keys sit idle. Dropping it
+// makes the remaining keys carry the scan with no 401 storm. The pool may
+// become empty; Pick then returns "" and the caller surfaces a clear error
+// instead of looping.
+func (r *KeyRotator) MarkInvalidKey(key string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if key == "" {
+		key = r.last
+	}
+	if key == "" {
+		return
+	}
+	kept := r.keys[:0]
+	for _, k := range r.keys {
+		if k != key {
+			kept = append(kept, k)
+		}
+	}
+	r.keys = kept
+	delete(r.cooldown, key)
+	if r.idx >= len(r.keys) {
+		r.idx = 0
+	}
+	r.last = ""
+}
+
 // markKey cools the supplied key, or the most recent Pick when key is empty
 // (compatibility for callers without an endpoint in scope).
 func (r *KeyRotator) markKey(key string, d time.Duration) {

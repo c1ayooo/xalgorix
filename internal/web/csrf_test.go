@@ -11,13 +11,22 @@ import (
 )
 
 // minimalCfgForCSRF returns a Config with auth enabled so the CSRF gate
-// runs alongside the auth check. Setting credentials forces the
-// session-cookie path; CSRF rejection should still happen first.
+// runs alongside the auth check. Setting credentials seeds an admin into
+// the user store, forcing the session-cookie path; CSRF rejection should
+// still happen first.
 func minimalCfgForCSRF() *config.Config {
 	return &config.Config{
 		Username: "admin",
 		Password: "test",
 	}
+}
+
+// csrfAuthMiddleware builds the production authMiddleware over a test server
+// with an initialized auth stack.
+func csrfAuthMiddleware(t *testing.T, cfg *config.Config) func(http.Handler) http.Handler {
+	t.Helper()
+	s := newTestServer(t, cfg)
+	return authMiddleware(s)
 }
 
 // TestIsCSRFSafe covers the matrix of browser hints (Sec-Fetch-Site,
@@ -88,9 +97,7 @@ func TestIsCSRFSafe(t *testing.T) {
 // failure into a 403 JSON response *before* checking the session cookie —
 // otherwise a stolen cookie alone would be enough.
 func TestAuthMiddleware_CSRFRejected(t *testing.T) {
-	cfg := minimalCfgForCSRF()
-
-	mw := authMiddleware(cfg)
+	mw := csrfAuthMiddleware(t, minimalCfgForCSRF())
 	called := false
 	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		called = true
@@ -115,8 +122,7 @@ func TestAuthMiddleware_CSRFRejected(t *testing.T) {
 // same-origin POST should pass the CSRF gate (and then proceed to the
 // session check, which 401s when no cookie is set).
 func TestAuthMiddleware_CSRFAllowed(t *testing.T) {
-	cfg := minimalCfgForCSRF()
-	mw := authMiddleware(cfg)
+	mw := csrfAuthMiddleware(t, minimalCfgForCSRF())
 	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -149,15 +155,15 @@ func TestAuthMiddleware_CSRFAllowed(t *testing.T) {
 //
 // Validates: Requirements 12.5 (Property 25).
 func TestNewRoutes_CSRFGate(t *testing.T) {
-	resetAuthSessionsForTest()
-	// A real session token so the request would otherwise pass
+	// A real signed session token so the request would otherwise pass
 	// the auth check — the CSRF gate must still reject it.
-	authSessionsMu.Lock()
-	authSessions["csrf-sess"] = time.Now().Add(time.Hour)
-	authSessionsMu.Unlock()
+	s := newTestServer(t, minimalCfgForCSRF())
+	tok, _, err := s.authJWT.issue("admin", RoleAdmin, time.Hour)
+	if err != nil {
+		t.Fatalf("issue session token: %v", err)
+	}
 
-	cfg := minimalCfgForCSRF()
-	mw := authMiddleware(cfg)
+	mw := authMiddleware(s)
 
 	type mutatingRoute struct {
 		method string
@@ -190,10 +196,10 @@ func TestNewRoutes_CSRFGate(t *testing.T) {
 			req.Host = "x.local"
 			// Cross-site Origin → CSRF reject regardless of cookie.
 			req.Header.Set("Origin", "http://attacker.tld")
-			// Add a valid session cookie so the failure mode
+			// Add a valid signed session cookie so the failure mode
 			// is unambiguously the CSRF gate (and not the
 			// session gate).
-			req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: "csrf-sess"})
+			req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: tok})
 
 			rr := httptest.NewRecorder()
 			handler.ServeHTTP(rr, req)

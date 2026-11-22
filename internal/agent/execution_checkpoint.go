@@ -266,7 +266,7 @@ func (a *Agent) saveExecutionCheckpoint() error {
 
 func (a *Agent) checkpointOrStop() bool {
 	if err := a.saveExecutionCheckpoint(); err != nil {
-		a.stopForHook(HookResult{StopReason: "checkpoint_write_failed", EmitMessage: "Scan stopped: execution checkpoint could not be saved; existing findings are preserved."})
+		a.stopForHook(HookResult{StopReason: "checkpoint_write_failed", EmitMessage: a.op("Scan stopped: execution checkpoint could not be saved; existing findings are preserved.", "扫描已停止：执行检查点保存失败；已有发现不受影响。")})
 		return false
 	}
 	return true

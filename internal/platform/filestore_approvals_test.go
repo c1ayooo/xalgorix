@@ -245,10 +245,13 @@ func TestFileStoreGuidanceIdempotencyAndOrder(t *testing.T) {
 	}
 
 	g1, created, err := store.CreateGuidance(ctx, GuidanceInput{
-		TaskID: task.ID, Message: "focus on the staging host", RequestID: "req-1",
+		TaskID: task.ID, Message: "focus on the staging host", RequestID: "req-1", CreatedBy: "alice",
 	})
 	if err != nil || !created {
 		t.Fatalf("first create: created=%v err=%v", created, err)
+	}
+	if g1.CreatedBy != "alice" {
+		t.Fatalf("created_by = %q, want alice", g1.CreatedBy)
 	}
 	replay, created2, err := store.CreateGuidance(ctx, GuidanceInput{
 		TaskID: task.ID, Message: "focus on the staging host", RequestID: "req-1",

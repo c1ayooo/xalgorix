@@ -651,6 +651,21 @@ func (ls *LedgerStore) Len() int {
 	return len(ls.hyps)
 }
 
+// EvidenceCount returns the total number of evidence records across every
+// hypothesis. It is the cheap "did anything actually get recorded" probe the
+// finish gate uses; per-hypothesis caps do not affect the count's meaning.
+func (ls *LedgerStore) EvidenceCount() int {
+	ls.mu.RLock()
+	defer ls.mu.RUnlock()
+	n := 0
+	for _, id := range ls.order {
+		if h := ls.hyps[id]; h != nil {
+			n += len(h.Evidence)
+		}
+	}
+	return n
+}
+
 // Reset clears all hypotheses (used when a scan is explicitly reset).
 func (ls *LedgerStore) Reset() {
 	if err := ls.ResetAs(domainjournal.Actor{Kind: domainjournal.ActorSystem, Source: "ledger.reset"}); err != nil {

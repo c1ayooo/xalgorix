@@ -578,9 +578,9 @@ type chatRequest struct {
 	// MaxCompletionTokens is set per request (see buildChatRequest).
 	MaxCompletionTokens int    `json:"max_completion_tokens,omitempty"`
 	ReasoningEffort     string `json:"reasoning_effort,omitempty"`
-	// Tools carries the native tool definitions. Only populated when native
-	// tool calling is enabled (XALGORIX_NATIVE_TOOL_CALLS) and the endpoint
-	// speaks the OpenAI chat-completions protocol.
+	// Tools carries the native tool definitions. Only populated when the
+	// runtime selects native tool calling and the endpoint speaks the OpenAI
+	// chat-completions protocol.
 	Tools []chatTool `json:"tools,omitempty"`
 }
 
@@ -675,6 +675,26 @@ func choiceErrorMessage(raw json.RawMessage) string {
 func hasRawContent(raw json.RawMessage) bool {
 	trimmed := strings.TrimSpace(string(raw))
 	return trimmed != "" && trimmed != "null" && trimmed != `""` && trimmed != "[]"
+}
+
+// reasoningText extracts the model's raw reasoning text from the OpenAI-style
+// raw JSON fields (tolerates string or array-of-parts shapes), "" when absent.
+// First non-empty wins: providers populate reasoning_content (DeepSeek style)
+// or reasoning (OpenRouter style), never both.
+func reasoningText(raws ...json.RawMessage) string {
+	for _, raw := range raws {
+		if !hasRawContent(raw) {
+			continue
+		}
+		var cf contentField
+		if err := json.Unmarshal(raw, &cf); err != nil {
+			continue
+		}
+		if out := strings.TrimSpace(string(cf)); out != "" {
+			return out
+		}
+	}
+	return ""
 }
 
 // chatResponse is the OpenAI-compatible response.
@@ -904,21 +924,30 @@ func (c *Client) noteKeyRateLimited() {
 	}
 }
 
-// noteKeyQuotaExhausted cools the pooled key used by the request that just
-// failed with quota_exhausted using the longer quota cooldown, so the rotator
-// stops routing to a key whose usage window is drained until it very likely
-// resets, instead of thrashing requests back onto it every 90s.
-func (c *Client) noteKeyQuotaExhausted() {
+// noteKeyInvalidForKey drops from the pool the exact key the failed request
+// carried. Only called for authentication failures (401/403): those never
+// succeed on retry, and a round-robin pool would otherwise keep re-selecting
+// the dead key. An empty key (unknown attribution, e.g. OAuth endpoints)
+// falls back to the most recent pick, which is best-effort under concurrency.
+func (c *Client) noteKeyInvalidForKey(key string) {
 	if c.keyRotator != nil {
-		c.keyRotator.MarkLastQuotaExhausted()
+		c.keyRotator.MarkInvalidKey(key)
 	}
 }
 
-// noteKeyRateLimitedForError cools the pooled key used by a failed request,
-// choosing the long quota-exhausted cooldown when the error classifies as
-// quota_exhausted and the short transient cooldown otherwise.
-func (c *Client) noteKeyRateLimitedForError(errStr string) {
-	c.noteKeyRateLimitedForErrorForKey(errStr, "")
+// isAuthFailure reports whether an error string is an authentication or
+// authorization rejection (as opposed to a rate limit, which is retryable).
+func isAuthFailure(errStr string) bool {
+	if apiErrorHasStatus(errStr, http.StatusUnauthorized) || apiErrorHasStatus(errStr, http.StatusForbidden) {
+		return true
+	}
+	low := strings.ToLower(errStr)
+	return strings.Contains(low, "invalid api key") ||
+		strings.Contains(low, "invalid_api_key") ||
+		strings.Contains(low, "incorrect api key") ||
+		strings.Contains(low, "authentication fails") ||
+		strings.Contains(low, "unauthenticated") ||
+		strings.Contains(low, "invalid authentication credentials")
 }
 
 // noteKeyRateLimitedForErrorForKey cools the endpoint key that actually failed.
@@ -1225,7 +1254,7 @@ func (c *Client) Chat(messages []Message) (string, error) {
 
 // ChatWithUsage sends a non-streaming chat request and returns the full response along with per-request token usage.
 func (c *Client) ChatWithUsage(messages []Message) (string, *TokenUsage, error) {
-	return c.chatWithRetry(messages, nil, nil)
+	return c.chatWithRetry(messages, nil, nil, nil)
 }
 
 // ChatWithUsageToolCalls is ChatWithUsage plus the native tool-calling channel:
@@ -1238,8 +1267,19 @@ func (c *Client) ChatWithUsage(messages []Message) (string, *TokenUsage, error) 
 // leaves the XML parser in parser.go as the sole tool channel there.
 func (c *Client) ChatWithUsageToolCalls(messages []Message, tools []ToolDefinition) (string, []ToolCall, *TokenUsage, error) {
 	var calls []ToolCall
-	content, usage, err := c.chatWithRetry(messages, tools, &calls)
+	content, usage, err := c.chatWithRetry(messages, tools, &calls, nil)
 	return content, calls, usage, err
+}
+
+// ChatWithUsageToolCallsMeta is ChatWithUsageToolCalls plus the model's raw
+// reasoning text (OpenAI-style reasoning_content / reasoning), which the plain
+// call discards. Empty when the provider surfaced no reasoning for this
+// completion. Only the scan-loop chatmodel uses the meta variant; verifier and
+// side paths keep the reasoning-discarding call so nothing downstream changes
+// shape.
+func (c *Client) ChatWithUsageToolCallsMeta(messages []Message, tools []ToolDefinition) (content string, reasoning string, calls []ToolCall, usage *TokenUsage, err error) {
+	content, usage, err = c.chatWithRetry(messages, tools, &calls, &reasoning)
+	return content, reasoning, calls, usage, err
 }
 
 // NativeToolCallingSupported reports whether the resolved endpoint speaks the
@@ -1552,12 +1592,19 @@ func (c *Client) buildAnthropicSystem(systemPrompt string) any {
 // callsOut — when non-nil — receives the native tool calls produced by the
 // attempt that succeeded. Using an out-parameter instead of a fourth return
 // value keeps the fourteen error paths below untouched.
-func (c *Client) chatWithRetry(messages []Message, tools []ToolDefinition, callsOut *[]ToolCall) (string, *TokenUsage, error) {
+func (c *Client) chatWithRetry(messages []Message, tools []ToolDefinition, callsOut *[]ToolCall, reasoningOut *string) (string, *TokenUsage, error) {
 	maxRetries := c.cfg.LLMMaxRetries
 	if maxRetries < 3 {
 		maxRetries = 3
 	}
 	var lastErr error
+	// The API credential the current attempt actually used, reported by
+	// doChatWithUsage. Key-pool marking below attributes failures to this
+	// exact key: concurrent in-flight requests keep advancing the rotator,
+	// so "the most recent pick" can point at a different key by the time
+	// the failure is handled (a dead pooled key then survives every drop
+	// and 401s every other request for the rest of the scan).
+	var usedKey string
 
 	for attempt := range maxRetries {
 		if ctx := c.loadCtx(); ctx.Err() != nil {
@@ -1598,7 +1645,7 @@ func (c *Client) chatWithRetry(messages []Message, tools []ToolDefinition, calls
 			return "", nil, fmt.Errorf("LLM request canceled: %w", ctx.Err())
 		}
 
-		result, usage, err := c.doChatWithUsage(messages, tools, callsOut)
+		result, usage, err := c.doChatWithUsage(messages, tools, callsOut, reasoningOut, &usedKey)
 		if err == nil {
 			return result, usage, nil
 		}
@@ -1639,22 +1686,24 @@ func (c *Client) chatWithRetry(messages []Message, tools []ToolDefinition, calls
 			// of round-robining back onto this one. Quota exhaustion gets the
 			// long cooldown (the usage window stays drained far longer than a
 			// transient overload).
-			if classified.Class == ErrorClassQuotaExhausted {
-				c.noteKeyQuotaExhausted()
-			} else {
-				c.noteKeyRateLimited()
-			}
+			c.noteKeyRateLimitedForErrorForKey(errStr, usedKey)
 			return "", nil, fmt.Errorf("upstream unavailable: %w", err)
 		}
 
 		if isNonRetryableLLMError(errStr) {
+			// Authentication failures poison a round-robin pool: drop the dead
+			// key so the healthy ones carry the run instead of alternating
+			// 401s that abort the scan.
+			if isAuthFailure(errStr) {
+				c.noteKeyInvalidForKey(usedKey)
+			}
 			log.Printf("[llm] Non-retryable LLM error, returning immediately: %v", err)
 			return "", nil, fmt.Errorf("LLM request failed: %w", err)
 		}
 
 		// Track if last error was a rate limit for the post-loop wrapper
 		if isRateLimitError(errStr) {
-			c.noteKeyRateLimited()
+			c.noteKeyRateLimitedForErrorForKey(errStr, usedKey)
 			// A 429/usage-window response is not made more likely to succeed by
 			// replaying the same full context three to five times immediately.
 			// Return to the agent loop so its bounded, interruptible backoff owns
@@ -1932,7 +1981,7 @@ func (c *Client) ChatStream(messages []Message) <-chan StreamChunk {
 
 // doChat performs a single non-streaming API call.
 func (c *Client) doChat(messages []Message) (string, error) {
-	resp, _, err := c.doChatWithUsage(messages, nil, nil)
+	resp, _, err := c.doChatWithUsage(messages, nil, nil, nil, nil)
 	return resp, err
 }
 
@@ -1940,7 +1989,12 @@ func (c *Client) doChat(messages []Message) (string, error) {
 //
 // tools and callsOut enable the native tool-calling channel; both are nil on
 // the legacy XML path, where the request body must stay byte-identical.
-func (c *Client) doChatWithUsage(messages []Message, tools []ToolDefinition, callsOut *[]ToolCall) (out string, usage *TokenUsage, err error) {
+//
+// keyOut, when non-nil, receives the API credential the resolved endpoint
+// actually carried so the caller can attribute a provider rejection to that
+// exact key instead of guessing from shared rotator state (which concurrent
+// requests overwrite between the pick and the failure report).
+func (c *Client) doChatWithUsage(messages []Message, tools []ToolDefinition, callsOut *[]ToolCall, reasoningOut *string, keyOut *string) (out string, usage *TokenUsage, err error) {
 	// Panic boundary (R1.5): any panic in the LLM client (JSON
 	// marshaling, header construction, HTTP transport panic) is
 	// converted into a typed error so the caller can decide whether to
@@ -1970,6 +2024,12 @@ func (c *Client) doChatWithUsage(messages []Message, tools []ToolDefinition, cal
 	ep, err := c.resolveRequestEndpoint(reqCtx)
 	if err != nil {
 		return "", nil, err
+	}
+	if keyOut != nil {
+		*keyOut = ""
+		if ep.Auth == AuthAPIKey {
+			*keyOut = ep.APIKey
+		}
 	}
 	endpoint, model := ep.URL, ep.Model
 	log.Printf("[llm] Request → URL=%s model=%s apiModel=%s cfgLLM=%s cfgAPIBase=%s", endpoint, model, c.apiModel, c.cfg.LLM, c.cfg.APIBase)
@@ -2172,6 +2232,9 @@ func (c *Client) doChatWithUsage(messages []Message, tools []ToolDefinition, cal
 	calls := parseOpenAIToolCalls(choice.Message.ToolCalls)
 	if callsOut != nil {
 		*callsOut = calls
+	}
+	if reasoningOut != nil {
+		*reasoningOut = reasoningText(choice.Message.Reasoning, choice.Message.ReasoningContent)
 	}
 	content := string(choice.Message.Content)
 	if strings.TrimSpace(content) == "" && len(calls) == 0 {

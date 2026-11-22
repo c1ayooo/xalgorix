@@ -23,6 +23,10 @@ var reservedTopLevelNames = map[string]struct{}{
 	"_saved":     {},
 	// Platform repository snapshot (projects/tasks/runs, REDESIGN §3.3).
 	"_platform": {},
+	// Dashboard auth state (auth_jwt.go / auth_users.go): the random JWT
+	// signing key and the RBAC account store. Losing or deleting either
+	// invalidates sessions/accounts.
+	"auth": {},
 	// Uploaded scan-context artifacts (uploads.go) and extracted source
 	// archives (uploads_source.go). Scans and schedules reference them by
 	// path, so they must outlive any one scan.

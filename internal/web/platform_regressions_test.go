@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -23,6 +24,64 @@ func TestProjectFilterFailsClosedWithoutPlatformStore(t *testing.T) {
 		if rr.Code != http.StatusServiceUnavailable {
 			t.Errorf("%s = %d, want 503 fail-closed; body=%s", path, rr.Code, rr.Body.String())
 		}
+	}
+}
+
+// TestScanDetailCarriesRunLinkage pins the unified HITL channel's reverse
+// lookup: the scan-detail projection stamps the platform run mount (run_id +
+// task_id, response-only fields) so the legacy run page can reach
+// POST /api/tasks/{id}/guidance. An unmounted scan keeps both fields empty —
+// the composer hides itself instead of guessing a task.
+func TestScanDetailCarriesRunLinkage(t *testing.T) {
+	s := newPlatformTestServer(t)
+	ctx := context.Background()
+	store := s.currentPlatformStore()
+	project, err := store.CreateProject(ctx, "Linked", platform.Scope{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := store.CreateTask(ctx, project.ID, platform.TaskInput{Name: "Linked task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(ctx, task.ID, platform.RunMount{InstanceID: "inst-link", Mode: "single"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeScanFixture(t, s.dataDir, "linked.example", "2026-05-02", ScanRecord{
+		ID: "linked-scan", InstanceID: "inst-link", Target: "linked.example",
+		Status: "finished", StartedAt: "2026-05-02T10:00:00Z",
+	})
+	writeScanFixture(t, s.dataDir, "orphan.example", "2026-05-03", ScanRecord{
+		ID: "orphan-scan", Target: "orphan.example",
+		Status: "finished", StartedAt: "2026-05-03T10:00:00Z",
+	})
+
+	rr := httptest.NewRecorder()
+	s.handleGetScan(rr, httptest.NewRequest(http.MethodGet, "/api/scans/linked-scan", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("GET detail = %d; body=%s", rr.Code, rr.Body.String())
+	}
+	var rec ScanRecord
+	if err := json.Unmarshal(rr.Body.Bytes(), &rec); err != nil {
+		t.Fatal(err)
+	}
+	if rec.TaskID != task.ID || rec.RunID != run.ID {
+		t.Fatalf("detail linkage = task_id %q / run_id %q; want task %q / run %q",
+			rec.TaskID, rec.RunID, task.ID, run.ID)
+	}
+
+	rr = httptest.NewRecorder()
+	s.handleGetScan(rr, httptest.NewRequest(http.MethodGet, "/api/scans/orphan-scan", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("GET orphan detail = %d; body=%s", rr.Code, rr.Body.String())
+	}
+	var orphan ScanRecord
+	if err := json.Unmarshal(rr.Body.Bytes(), &orphan); err != nil {
+		t.Fatal(err)
+	}
+	if orphan.TaskID != "" || orphan.RunID != "" {
+		t.Fatalf("unmounted scan grew phantom linkage: task_id %q / run_id %q", orphan.TaskID, orphan.RunID)
 	}
 }
 

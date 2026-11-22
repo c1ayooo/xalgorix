@@ -1317,6 +1317,7 @@ func executeCommandWithContextIDContext(ctx context.Context, contextID string, a
 	// Run the command using the correct context's store
 	output, exitCode := runShellWithContextCtx(ctx, contextID, command)
 	if ctx.Err() != nil && exitCode != 0 {
+		observeSensitiveOutput(contextID, command, output)
 		return tools.Result{
 			Output: output,
 			Error:  fmt.Sprintf("terminal_execute canceled: %v", ctx.Err()),
@@ -1346,6 +1347,11 @@ func executeCommandWithContextIDContext(ctx context.Context, contextID string, a
 	if len(preInstalled) > 0 {
 		output = fmt.Sprintf("[pre-installed: %s]\n%s", strings.Join(preInstalled, ", "), output)
 	}
+
+	// Engine-side observation capture: if this output proves a sensitive
+	// artifact is served or leaks credential material, record it now instead
+	// of hoping the model calls add_hypothesis_evidence later.
+	observeSensitiveOutput(contextID, command, output)
 
 	return tools.Result{Output: output}, nil
 }
@@ -1511,8 +1517,8 @@ func commandEnv(homeDir, goPath, workDir string, rateRuntime requestRateRuntime)
 		"XALGORIX_USERNAME", "XALGORIX_PASSWORD", "XALGORIX_PASSWORD_HASH",
 		"XALGORIX_TARGET_AUTH", "XALGORIX_TARGET_AUTH_B",
 		"XALGORIX_DISCORD_WEBHOOK", "XALGORIX_TELEGRAM_BOT_TOKEN",
-		"XALGORIX_TELEGRAM_CHAT_ID", "GEMINI_API_KEY", "AGENTMAIL_API_KEY",
-		"AGENTMAIL_POD", "CAIDO_API_TOKEN", "INBOUND_EMAIL_SECRET",
+		"XALGORIX_TELEGRAM_CHAT_ID", "GEMINI_API_KEY",
+		"CAIDO_API_TOKEN",
 		"XALGORIX_OOB_API_KEY", "XALGORIX_OOB_HOST",
 	} {
 		replace[kv] = true

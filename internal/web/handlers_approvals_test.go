@@ -67,7 +67,7 @@ func seedApproval(t *testing.T, store platform.Repository, projectID, taskID, in
 // TestApprovalRoutesRegistered extends the lockstep invariant to the R2a
 // surface; guidance rides the existing "/api/tasks/" prefix (contract §3.1).
 func TestApprovalRoutesRegistered(t *testing.T) {
-	want := []string{"/api/approvals", "/api/approvals/", "/api/tasks/"}
+	want := []string{"/api/approvals", "/api/approvals/summary", "/api/approvals/", "/api/tasks/"}
 	counts := make(map[string]int, len(dashboardRoutes))
 	for _, route := range dashboardRoutes {
 		counts[route]++
@@ -152,6 +152,54 @@ func TestApprovalMethodGuards(t *testing.T) {
 		}
 	})
 	_ = store
+}
+
+// TestApprovalsSummaryRoute exercises the real mux dispatch (the same helper
+// Start mounts): "/api/approvals/summary" must not fall into the
+// "/api/approvals/" subtree, where GET is rejected with 405.
+func TestApprovalsSummaryRoute(t *testing.T) {
+	s, store := newApprovalsTestServer(t, nil)
+	mux := http.NewServeMux()
+	registerPlatformAPIRoutes(mux, s)
+
+	t.Run("GET summary → 200", func(t *testing.T) {
+		rr := httptest.NewRecorder()
+		mux.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/approvals/summary", nil))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("code = %d, want 200; body=%s", rr.Code, rr.Body.String())
+		}
+		var body struct {
+			PendingTotal int `json:"pending_total"`
+		}
+		if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode: %v; body=%s", err, rr.Body.String())
+		}
+		if body.PendingTotal != 0 {
+			t.Fatalf("pending_total = %d, want 0", body.PendingTotal)
+		}
+	})
+
+	t.Run("POST summary → 405", func(t *testing.T) {
+		rr := httptest.NewRecorder()
+		mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/approvals/summary", strings.NewReader(`{}`)))
+		if rr.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("code = %d, want 405; body=%s", rr.Code, rr.Body.String())
+		}
+	})
+
+	t.Run("POST decision still dispatches to detail", func(t *testing.T) {
+		proj, err := store.CreateProject(context.Background(), "Summary Route Project", platform.Scope{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		row := seedApproval(t, store, proj.ID, "", "", platform.ApprovalKindCommand, "")
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/approvals/"+row.ID+"/decision", strings.NewReader(`{"decision":"approved"}`))
+		mux.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("decision code = %d, want 200; body=%s", rr.Code, rr.Body.String())
+		}
+	})
 }
 
 // ── approvals list / decision contract (mock-backend.mjs:887-936 parity) ────
@@ -463,6 +511,7 @@ func TestGuidanceQueuedAndIdempotent(t *testing.T) {
 	rr := httptest.NewRecorder()
 	body := `{"message":"watch the staging host","request_id":"req-q1","instance_id":"inst-q"}`
 	req := httptest.NewRequest(http.MethodPost, "/api/tasks/"+task.ID+"/guidance", strings.NewReader(body))
+	req = req.WithContext(withSessionClaims(req.Context(), &sessionClaims{Username: "alice", Role: RoleOperator}))
 	s.handleTaskDetail(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("code = %d body=%s", rr.Code, rr.Body.String())
@@ -508,6 +557,9 @@ func TestGuidanceQueuedAndIdempotent(t *testing.T) {
 	}
 	if len(list.Items) != 1 || list.Items[0].Message != "watch the staging host" {
 		t.Fatalf("list = %+v, want the single queued row", list.Items)
+	}
+	if list.Items[0].CreatedBy != "alice" {
+		t.Fatalf("created_by = %q, want verified session user alice", list.Items[0].CreatedBy)
 	}
 }
 

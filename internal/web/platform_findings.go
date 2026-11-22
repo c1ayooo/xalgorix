@@ -85,6 +85,40 @@ func (s *Server) deletePlatformRunsForScan(instanceID, scanID string) {
 	}
 }
 
+// attachRunLinkage stamps RESPONSE-ONLY run/task linkage onto a scan-detail
+// projection (see ScanRecord.RunID): the unified HITL channel routes guidance
+// through POST /api/tasks/{id}/guidance, and the legacy run page resolves its
+// task from the run mount instead of the browser guessing. Best-effort — no
+// store, lookup error, or unmounted scan leaves both fields empty; empty is
+// honest "no task" (the composer hides itself), never an inferred identity.
+func (s *Server) attachRunLinkage(rec *ScanRecord) {
+	if rec == nil || rec.RunID != "" || rec.InstanceID == "" {
+		return
+	}
+	store := s.currentPlatformStore()
+	if store == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	runs, err := store.RunsByInstanceID(ctx, rec.InstanceID)
+	if err != nil || len(runs) == 0 {
+		return
+	}
+	run := runs[0]
+	// One instance can theoretically carry several mounts (the importer
+	// dedups, but stay deterministic): prefer the mount whose legacy scan id
+	// matches this record.
+	for _, r := range runs {
+		if rec.ID != "" && r.LegacyScanID == rec.ID {
+			run = r
+			break
+		}
+	}
+	rec.RunID = run.ID
+	rec.TaskID = run.TaskID
+}
+
 // queueRunFindingProjection writes the projection for one completed root
 // session. The write is detached from cleanup and bounded: cold-path failure
 // only logs and is repaired by the startup backfill.

@@ -244,7 +244,7 @@ Evidence 继续保留每假设 40 条、单字段 4096 字符及现有内存上�
 - per-scan 状态继续经 `scanctx` 路由。
 - 扫描生命周期继续由现有 Web 状态机和资源准入控制。
 - 文件写入继续使用 `storage.WriteAtomic`。
-- PG 不可用不得阻断推理、工具执行、finding 保存、现有报告或扫描收工。
+- PG 不可用不得阻断已启动 Run 的推理、工具执行、finding 保存、现有报告或扫描收工。调度入口在派发前无法读取项目 scope 时按 D7 授权边界 fail-closed（跳过本次排期），这是授权前置检查，不是冷路径对热路径的依赖；已在途 Run 不受影响。
 
 ### 6.2 冷路径范围
 
@@ -338,7 +338,7 @@ A* / MCTS / POMCP / DESPOT 作为研究项。若未来要引入，至少先证�
 
 人工输入是 `source=human` 的 InfoItem，经区域点亮进入视野，不新增顶层原语。
 
-Obligation 不得被 InfoItem 置信度或 VOI 绕过。删掉 Obligation 就无法表达“适用阶段没有 disposition 不许收工”等防烂尾约束。
+Obligation 不得被 InfoItem 置信度或 VOI 绕过。删掉 Obligation 就无法表达“适用阶段没有 disposition 不许收工”等防烂尾约束。goal 收工义务（R-goal，REDESIGN D10）是同一原语的操作者目标实例：required 判据未达成不许主动收工——它只能被物理上限（预算/操作者停止/进程关停）与有界阀终止，不能被“置信度高所以达成”绕过；判定用 `internal/objective` 确定性评估器，不引入 LLM。
 
 ---
 

@@ -21,11 +21,59 @@ export function fmtRelative(iso: string | undefined, t: Translate): string {
   return new Date(at).toLocaleDateString(undefined, { month: "numeric", day: "numeric" });
 }
 
+/** 列表行的绝对时间戳（参照会话项口径：M/D HH:mm）。 */
+export function fmtListDate(iso: string | undefined): string {
+  if (!iso) return "";
+  const at = Date.parse(iso);
+  if (Number.isNaN(at)) return "";
+  return new Date(at).toLocaleDateString("zh-CN", {
+    month: "numeric",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
 export function fmtBytes(n?: number): string {
   if (!n || n <= 0) return "0 B";
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
   return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
+/** 紧凑 token 计数（1234 → 1.2k，2_000_000 → 2M）。 */
+export function fmtTokens(n?: number): string {
+  if (!n || n <= 0) return "0";
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1)}M`;
+  if (n >= 1000) return `${(n / 1000).toFixed(n >= 10_000 ? 0 : 1)}k`;
+  return String(n);
+}
+
+/** 运行时长（毫秒跨度 → 1m30s / 2h05m）。 */
+export function fmtDuration(ms: number): string {
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m${String(s % 60).padStart(2, "0")}s`;
+  const h = Math.floor(m / 60);
+  return `${h}h${String(m % 60).padStart(2, "0")}m`;
+}
+
+/**
+ * agent_id → 泳道短名（去实例前缀；coordinator / 裸 instance id = 主循环）。
+ * 与 execution-trace 的 agentLabel 同一口径，抽出供会话页分组复用。
+ */
+export function agentLane(instanceId: string | undefined, agentId: string | undefined): string {
+  if (!agentId) return "";
+  const short = instanceId ? agentId.replace(`${instanceId}/`, "") : agentId;
+  const tail = short.replace(/^.*\//, "") || short;
+  return tail;
+}
+
+export function isMainAgentLane(instanceId: string | undefined, agentId: string | undefined): boolean {
+  if (!agentId) return true; // 无 agent_id 的行（人工/系统）归主会话
+  const lane = agentLane(instanceId, agentId);
+  return lane === "coordinator" || (!!instanceId && agentId === instanceId);
 }
 
 /**

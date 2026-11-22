@@ -10,12 +10,11 @@ func TestSecretEnvKey(t *testing.T) {
 	// tool subprocess environment. Includes the non-namespaced ones that a plain
 	// XALGORIX_* scrub would miss (the gap this closes for the terminal tool).
 	secret := []string{
-		"GEMINI_API_KEY", "AGENTMAIL_API_KEY", "AGENTMAIL_POD",
-		"CAIDO_API_TOKEN", "INBOUND_EMAIL_SECRET",
+		"GEMINI_API_KEY", "CAIDO_API_TOKEN",
 		"XALGORIX_API_KEY", "XALGORIX_API_KEYS", "XALGORIX_API_TOKEN",
 		"XALGORIX_USERNAME", "XALGORIX_PASSWORD", "XALGORIX_PASSWORD_HASH",
 		"XALGORIX_PROXY_URL", "XALGORIX_TARGET_AUTH", "XALGORIX_OOB_API_KEY",
-		"agentmail_api_key", "Caido_Api_Token", // case-insensitive
+		"gemini_api_key", "Caido_Api_Token", // case-insensitive
 	}
 	for _, k := range secret {
 		if !SecretEnvKey(k) {
@@ -45,7 +44,6 @@ func TestSanitizeEnviron(t *testing.T) {
 		"PATH=/usr/bin",
 		"XALGORIX_API_KEYS=k1,k2",
 		"GITHUB_TOKEN=ghp_keepme",
-		"AGENTMAIL_API_KEY=am_secret",
 		"GEMINI_API_KEY=gm_secret",
 		"MALFORMED_NO_EQUALS",
 		"XALGORIX_WORKSPACE=/work",
@@ -58,7 +56,7 @@ func TestSanitizeEnviron(t *testing.T) {
 			t.Errorf("SanitizeEnviron dropped %q; kept:\n%s", must, joined)
 		}
 	}
-	for _, gone := range []string{"XALGORIX_API_KEYS", "AGENTMAIL_API_KEY", "GEMINI_API_KEY"} {
+	for _, gone := range []string{"XALGORIX_API_KEYS", "GEMINI_API_KEY"} {
 		if strings.Contains(joined, gone+"=") {
 			t.Errorf("SanitizeEnviron leaked secret %q; kept:\n%s", gone, joined)
 		}

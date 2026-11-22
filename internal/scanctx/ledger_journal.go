@@ -63,23 +63,85 @@ func (ls *LedgerStore) EnableJournal(dir string) error {
 // and never participates in verdicts. Called from the trafficproxy sink
 // goroutine — never on the proxy request path.
 func (ls *LedgerStore) AppendTrafficObservation(item *infoitem.Item, summary string) error {
+	return ls.appendObservation(domainjournal.OpObserveTraffic, engineActor("trafficproxy"), item, summary)
+}
+
+// AppendToolObservation records one engine-detected observation taken from a
+// tool's own output (sensitive file served with 200, credential material in a
+// response, and the like). Like AppendTrafficObservation it is an audit entry
+// only — the hypothesis graph is untouched — but unlike a model-written
+// evidence record it cannot be skipped by the model: budget exhaustion or an
+// LLM error after the tool returned still leaves the observation in the
+// journal, and therefore in the cold-path projection.
+func (ls *LedgerStore) AppendToolObservation(item *infoitem.Item, summary string) error {
+	return ls.appendObservation(domainjournal.OpToolObservation, engineActor("tool-observation"), item, summary)
+}
+
+// AppendFindingObservation projects a persisted finding into the information
+// space. Called by the report gate after the finding is durable, so every
+// finding carries an InfoItem even when the model never linked a hypothesis.
+func (ls *LedgerStore) AppendFindingObservation(item *infoitem.Item, summary string) error {
+	return ls.appendObservation(domainjournal.OpFindingRecorded, engineActor("report-gate"), item, summary)
+}
+
+// appendObservation is the shared journal-only append used by observation
+// producers. It takes no ledger lock and never mutates hypothesis state.
+func (ls *LedgerStore) appendObservation(op domainjournal.Operation, actor domainjournal.Actor, item *infoitem.Item, summary string) error {
+	if item == nil {
+		return fmt.Errorf("scanctx: nil info item for %s", op)
+	}
+	ls.mu.RLock()
+	j := ls.journal
+	scanID := ls.scanID
+	ls.mu.RUnlock()
+	if j == nil {
+		return fmt.Errorf("scanctx: no journal for %s", op)
+	}
+	item.ScanID = scanID
+	rec := domainjournal.Record{
+		ScanID:    scanID,
+		Actor:     actor,
+		Operation: op,
+		Summary:   summary,
+		InfoItem:  item,
+	}
+	// Journal.Append serializes on its own mutex and assigns scan_id/seq, so
+	// this append neither contends the ledger mutex nor mutates state.
+	if _, err := j.Append(rec); err != nil {
+		return fmt.Errorf("scanctx: append %s: %w", op, err)
+	}
+	return nil
+}
+
+// AppendInvocationAudit records one integration invocation (skill load /
+// sub-agent delegation / MCP tool call) as an audit-only domain journal
+// entry. Like AppendTrafficObservation it never mutates the hypothesis graph
+// and never participates in verdicts — it is the per-scan authority for the
+// web layer's cross-scan invocation projection (charter §5.1: telemetry is
+// never an audit source). op must be one of the audit-only invocation
+// operations (OpSkillLoad / OpAgentDelegat / OpMcpCall); an unknown op is an
+// error, not a silent write.
+func (ls *LedgerStore) AppendInvocationAudit(op domainjournal.Operation, actor domainjournal.Actor, summary string) error {
+	switch op {
+	case domainjournal.OpSkillLoad, domainjournal.OpAgentDelegat, domainjournal.OpMcpCall:
+	default:
+		return fmt.Errorf("scanctx: operation %q is not an invocation-audit op", op)
+	}
 	ls.mu.RLock()
 	j := ls.journal
 	ls.mu.RUnlock()
 	if j == nil {
-		return fmt.Errorf("scanctx: no journal for traffic observation")
+		return fmt.Errorf("scanctx: no journal for invocation audit")
 	}
 	rec := domainjournal.Record{
 		ScanID:    ls.scanID,
-		Actor:     engineActor("trafficproxy"),
-		Operation: domainjournal.OpObserveTraffic,
+		Actor:     actor,
+		Operation: op,
 		Summary:   summary,
-		InfoItem:  item,
 	}
-	// Journal.Append serializes on its own mutex and assigns scan_id/seq,
-	// so this append neither contends the ledger mutex nor mutates state.
+	// Journal.Append serializes on its own mutex and assigns scan_id/seq.
 	if _, err := j.Append(rec); err != nil {
-		return fmt.Errorf("scanctx: append traffic observation: %w", err)
+		return fmt.Errorf("scanctx: append invocation audit: %w", err)
 	}
 	return nil
 }

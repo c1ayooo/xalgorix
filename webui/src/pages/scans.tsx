@@ -14,6 +14,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { ScanStatusPill } from "@/components/scan-status-pill";
+import { StopReasonBadge } from "@/components/stop-reason-badge";
 import { EmptyState, ErrorState } from "@/components/states";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
@@ -308,6 +309,7 @@ function ScanTable({
                   {t("scans.col.target")}{" "}
                   <ArrowUpDown className="ml-1 inline h-3 w-3 opacity-60" />
                 </Th>
+                <Th>{t("scans.col.task")}</Th>
                 <Th>{t("scans.col.status")}</Th>
                 <Th>{t("scans.col.findings")}</Th>
                 <Th>{t("scans.col.tokens")}</Th>
@@ -338,6 +340,7 @@ function ScanTable({
                       </div>
                       <div className="text-xs text-muted-foreground mono">
                         {shortId(s.id, 12)}
+                        {s.scan_mode ? ` · ${s.scan_mode}` : ""}
                       </div>
                       {!!s.sub_scan_total && (
                         <div className="mt-1 flex flex-wrap gap-1.5 text-[11px] text-muted-foreground">
@@ -357,7 +360,31 @@ function ScanTable({
                     </Link>
                   </Td>
                   <Td>
-                    <ScanStatusPill status={s.status} />
+                    {/* D11 挂载归属：任务名直达任务详情；未挂载 legacy 显示
+                        “—”——诚实缺席，不编造归属。 */}
+                    {s.task_id ? (
+                      <div>
+                        <Link
+                          to={`/tasks/${s.task_id}`}
+                          className="text-xs text-foreground hover:text-primary"
+                        >
+                          {s.task_name || s.task_id}
+                        </Link>
+                        {s.trigger && (
+                          <div className="mt-0.5 text-[11px] text-muted-foreground">
+                            {triggerLabel(s.trigger, t)}
+                          </div>
+                        )}
+                      </div>
+                    ) : (
+                      <span className="text-xs text-muted-foreground">—</span>
+                    )}
+                  </Td>
+                  <Td>
+                    <div className="flex flex-col items-start gap-1">
+                      <ScanStatusPill status={s.status} />
+                      <StopReasonBadge reason={s.stop_reason} />
+                    </div>
                   </Td>
                   <Td>
                     <div className="inline-flex items-center gap-1 mono text-xs">
@@ -444,6 +471,21 @@ function SelectCheckbox({
       className="h-4 w-4 rounded border-border bg-input accent-primary focus:outline-none focus:ring-1 focus:ring-ring"
     />
   );
+}
+
+// Known dispatch triggers localize; anything else (engine vocabulary may
+// grow) renders verbatim rather than echoing an i18n key.
+function triggerLabel(trigger: string, t: (key: string) => string): string {
+  switch (trigger) {
+    case "manual":
+      return t("scans.trigger.manual");
+    case "schedule":
+      return t("scans.trigger.schedule");
+    case "rerun":
+      return t("scans.trigger.rerun");
+    default:
+      return trigger;
+  }
 }
 
 function BulkActionMenu({

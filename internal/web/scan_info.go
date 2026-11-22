@@ -8,6 +8,11 @@ package web
 //                              across the project's scans (project-wide form)
 // GET /api/info/context      — fixed-dimension context slice within one scan
 //
+// Every endpoint accepts an optional task_id narrowing: the task must belong
+// to the project (404 otherwise) and the whitelist shrinks to that task's run
+// scan ids — it can only narrow, never widen. info_items has no task column;
+// the task dimension is the run scan set (REDESIGN D6/D11).
+//
 // Project isolation is enforced before any infoitem query: the requested
 // scan_id (when present) must belong to the project, and Region always receives
 // the project's scan_id set. The infoitem package stays platform-agnostic; no
@@ -179,12 +184,39 @@ func infoQueryEdgeTypes(r *http.Request) ([]infoitem.RelationType, error) {
 	return out, nil
 }
 
+// narrowInfoScans applies the optional task_id narrowing to the project scan
+// whitelist: the task must belong to the project (ErrNotFound → 404) and the
+// task's run scan ids are intersected with the whitelist, so isolation can
+// only shrink, never widen. Without the parameter the whitelist passes
+// through unchanged.
+func (s *Server) narrowInfoScans(w http.ResponseWriter, r *http.Request, store platform.Repository, projectID string, scanIDs []string) ([]string, bool) {
+	taskID := strings.TrimSpace(r.URL.Query().Get("task_id"))
+	if taskID == "" {
+		return scanIDs, true
+	}
+	taskScans, err := store.TaskScanIDs(r.Context(), projectID, taskID)
+	if err != nil {
+		writePlatformError(w, err)
+		return nil, false
+	}
+	out := make([]string, 0, len(taskScans))
+	for _, id := range taskScans {
+		if containsString(scanIDs, id) {
+			out = append(out, id)
+		}
+	}
+	return out, true
+}
+
 func (s *Server) handleInfoRegion(w http.ResponseWriter, r *http.Request) {
-	_, projectID, scanIDs, ok := s.infoProject(w, r)
+	store, projectID, scanIDs, ok := s.infoProject(w, r)
 	if !ok {
 		return
 	}
-	_ = projectID
+	scanIDs, ok = s.narrowInfoScans(w, r, store, projectID, scanIDs)
+	if !ok {
+		return
+	}
 	reader := s.currentInfoReader()
 	if reader == nil {
 		writeInfoDisabled(w)
@@ -282,7 +314,11 @@ func (s *Server) handleInfoContext(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleInfoAssociation(w http.ResponseWriter, r *http.Request) {
-	_, _, scanIDs, ok := s.infoProject(w, r)
+	store, projectID, scanIDs, ok := s.infoProject(w, r)
+	if !ok {
+		return
+	}
+	scanIDs, ok = s.narrowInfoScans(w, r, store, projectID, scanIDs)
 	if !ok {
 		return
 	}
@@ -291,7 +327,8 @@ func (s *Server) handleInfoAssociation(w http.ResponseWriter, r *http.Request) {
 	//                        scan (contract §3.3 single-scan form, unchanged);
 	//   scan_id absent     — project-wide form: the same bounded traversal
 	//                        aggregated over every whitelisted scan of the
-	//                        project, merged/deduped on the item id dimension.
+	//                        project (optionally narrowed by task_id),
+	//                        merged/deduped on the item id dimension.
 	// Cross-scan aggregation never widens the whitelist: the scan set comes
 	// from platform.ProjectScanIDs for the requested project only.
 	scanID := strings.TrimSpace(r.URL.Query().Get("scan_id"))

@@ -328,6 +328,26 @@ func TestProcessTrackingIsContextSpecific(t *testing.T) {
 	}
 }
 
+func TestCanceledTerminalReturnsFailureResult(t *testing.T) {
+	sc := scanctx.New("term-cancel", t.TempDir())
+	scanctx.Activate(sc)
+	cleanup := func() {
+		CleanupContext(sc.ID)
+		scanctx.Deactivate(sc.ID)
+	}
+	t.Cleanup(cleanup)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	res, err := executeCommandWithContextIDContext(ctx, sc.ID, map[string]string{"command": "sleep 5"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Error == "" {
+		t.Fatalf("canceled terminal returned success: %+v", res)
+	}
+}
+
 func TestWorkDirPrefersScanContext(t *testing.T) {
 	sc := scanctx.New("term-workdir", t.TempDir())
 	scanctx.Activate(sc)
@@ -386,14 +406,13 @@ func TestRunShellScopesHomeAndBlocksCdOutsideWorkspace(t *testing.T) {
 func TestCommandEnvStripsOperatorSecrets(t *testing.T) {
 	// Non-namespaced integration secrets previously leaked to terminal tools —
 	// only the Python tool scrubbed them. They must be gone from both now.
-	t.Setenv("AGENTMAIL_API_KEY", "am-secret")
 	t.Setenv("CAIDO_API_TOKEN", "caido-secret")
 	t.Setenv("XALGORIX_PASSWORD", "admin-secret")
 	// Third-party recon tool keys must still reach executed tools.
 	t.Setenv("GITHUB_TOKEN", "ghp-keepme")
 
 	joined := strings.Join(commandEnv("/home/tester", "/home/tester/go", "/tmp/work", requestRateRuntime{}), "\n")
-	for _, leaked := range []string{"AGENTMAIL_API_KEY=", "CAIDO_API_TOKEN=", "XALGORIX_PASSWORD="} {
+	for _, leaked := range []string{"CAIDO_API_TOKEN=", "XALGORIX_PASSWORD="} {
 		if strings.Contains(joined, leaked) {
 			t.Errorf("commandEnv leaked operator secret %q to the tool environment", leaked)
 		}

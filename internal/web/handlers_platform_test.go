@@ -686,6 +686,19 @@ func TestPlatformProjectFilterBackwardCompatible(t *testing.T) {
 	if len(scans) != 2 {
 		t.Fatalf("project scans = %d, want 2", len(scans))
 	}
+	// Run/task linkage (D11, response-only): list rows carry their mount's
+	// task and trigger. Empty would be honest "unmounted"; here both rows are
+	// mounted, so both must resolve — the legacy one via legacy_scan_id.
+	byID := map[string]map[string]any{}
+	for _, row := range scans {
+		byID[row["id"].(string)] = row
+	}
+	if row := byID["modern-scan"]; row["task_id"] != task.ID || row["task_name"] != "Filter task" {
+		t.Errorf("modern-scan linkage = %v/%v, want %s/Filter task", row["task_id"], row["task_name"], task.ID)
+	}
+	if row := byID["legacy-scan"]; row["task_id"] != legacyTask.ID || row["task_name"] != legacyTask.Name {
+		t.Errorf("legacy-scan linkage = %v/%v, want %s/%s", row["task_id"], row["task_name"], legacyTask.ID, legacyTask.Name)
+	}
 	rr = doJSON(t, s, http.MethodGet, "/api/scans", "")
 	if err := json.Unmarshal(rr.Body.Bytes(), &scans); err != nil {
 		t.Fatal(err)
@@ -701,6 +714,83 @@ func TestPlatformProjectFilterBackwardCompatible(t *testing.T) {
 	}
 	if len(findings) != 0 {
 		t.Errorf("unknown project findings = %d, want 0", len(findings))
+	}
+}
+
+// TestPlatformTaskRunStartOneShotGuard pins the one-active-run-per-task rule
+// (任务一次性的用户裁决): while a run of the task projects active
+// (running/paused — pending counts too via the dispatch snapshot), a second
+// POST /api/tasks/{id}/runs answers 409 carrying the active run identity and
+// mounts nothing; once the run turns terminal, the continuation path (finish
+// the goal, add a new one, run again) is open again.
+func TestPlatformTaskRunStartOneShotGuard(t *testing.T) {
+	s := newPlatformTestServer(t)
+	bestEffortDataDir(t, s)
+	store, err := platform.NewFileStore(s.dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.SetPlatformStore(store)
+	ctx := context.Background()
+
+	project, err := store.CreateProject(ctx, "OneShot", platform.Scope{Targets: []string{"example.com"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := store.CreateTask(ctx, project.ID, platform.TaskInput{Name: "One-shot task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateRun(ctx, task.ID, platform.RunMount{InstanceID: "oneshot-inst", Mode: "single"}); err != nil {
+		t.Fatal(err)
+	}
+	writeScanFixture(t, s.dataDir, "example.com", "2026-06-03", ScanRecord{
+		ID: "oneshot-scan-1", InstanceID: "oneshot-inst", Target: "example.com",
+		StartedAt: time.Now().Format(time.RFC3339), Status: "running", ScanMode: "single",
+	})
+	s.invalidateScanListCache()
+
+	refuse := func(label, wantInstance string) {
+		t.Helper()
+		rr := doJSON(t, s, http.MethodPost, "/api/tasks/"+task.ID+"/runs", `{"targets":["https://app.example.com"]}`)
+		if rr.Code != http.StatusConflict {
+			t.Fatalf("%s: dispatch code = %d, want 409; body=%s", label, rr.Code, rr.Body.String())
+		}
+		body := decodeBody(t, rr)
+		if body["run_id"] == "" || body["instance_id"] != wantInstance {
+			t.Errorf("%s: 409 must carry the active run identity: %+v", label, body)
+		}
+		_, total, err := store.ListRuns(ctx, task.ID, 1, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if total != 1 {
+			t.Fatalf("%s: refused dispatch mounted a run (%d total)", label, total)
+		}
+	}
+
+	refuse("while running", "oneshot-inst")
+
+	// Paused counts as active: a paused run still owns the task.
+	writeScanFixture(t, s.dataDir, "example.com", "2026-06-03", ScanRecord{
+		ID: "oneshot-scan-1", InstanceID: "oneshot-inst", Target: "example.com",
+		StartedAt: time.Now().Format(time.RFC3339), Status: "paused", ScanMode: "single",
+	})
+	s.invalidateScanListCache()
+	refuse("while paused", "oneshot-inst")
+
+	// Terminal run → the same request dispatches again (new goal continuation).
+	writeScanFixture(t, s.dataDir, "example.com", "2026-06-03", ScanRecord{
+		ID: "oneshot-scan-1", InstanceID: "oneshot-inst", Target: "example.com",
+		StartedAt: time.Now().Format(time.RFC3339), Status: "finished", ScanMode: "single",
+	})
+	s.invalidateScanListCache()
+	rr := doJSON(t, s, http.MethodPost, "/api/tasks/"+task.ID+"/runs", `{"targets":["https://app.example.com"]}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("dispatch after terminal run code = %d, want 200; body=%s", rr.Code, rr.Body.String())
+	}
+	if decodeBody(t, rr)["status"] != "pending" {
+		t.Error("continuation dispatch ack status != pending")
 	}
 }
 

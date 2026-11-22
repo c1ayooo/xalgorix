@@ -6,6 +6,7 @@ package web
 
 import (
 	"context"
+	"strings"
 
 	"github.com/xalgord/xalgorix/v4/internal/approval"
 	"github.com/xalgord/xalgorix/v4/internal/engine"
@@ -21,6 +22,20 @@ type einoApprovalBroker struct {
 	// bound after agent construction (scan_session.go), read at request time
 	// because the values register during Run's prepareScanEnvironment.
 	secrets func() []string
+	// mcpExempt snapshots this scan's MCP servers with require_approval=false
+	// (fetched once at broker construction). The policy classifies all
+	// mcp_* calls command-class; this set is the operator's explicit
+	// per-server exemption. nil = no exemptions.
+	mcpExempt map[string]bool
+}
+
+// mcpServerExempt reports whether the named server opted out of per-call
+// approvals (require_approval=false at definition time).
+func (b *einoApprovalBroker) mcpServerExempt(server string) bool {
+	if b == nil || b.mcpExempt == nil || strings.TrimSpace(server) == "" {
+		return false
+	}
+	return b.mcpExempt[server]
 }
 
 // BindSecrets wires the agent's secret-value registry into the broker so
@@ -42,12 +57,56 @@ func (s *Server) einoApprovalBroker(instanceID string, sctx *scanctx.ScanContext
 	if svc == nil || svc.policy.Mode != approval.ModeEnforce {
 		return nil
 	}
-	return &einoApprovalBroker{svc: svc, instanceID: instanceID, sctx: sctx}
+	return &einoApprovalBroker{svc: svc, instanceID: instanceID, sctx: sctx, mcpExempt: s.mcpApprovalExemptSet()}
+}
+
+// mcpApprovalExemptSet snapshots the names of enabled MCP servers whose
+// require_approval is false (best-effort: store unavailable = no exemptions).
+func (s *Server) mcpApprovalExemptSet() map[string]bool {
+	store := s.currentPlatformStore()
+	if store == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), integrationInputTimeout)
+	defer cancel()
+	servers, err := store.ListMcpServers(ctx)
+	if err != nil {
+		return nil
+	}
+	var out map[string]bool
+	for _, m := range servers {
+		if !m.Enabled || m.RequireApproval {
+			continue
+		}
+		if out == nil {
+			out = map[string]bool{}
+		}
+		out[m.Name] = true
+	}
+	return out
 }
 
 func (b *einoApprovalBroker) RequestApproval(_ context.Context, req engine.ApprovalRequest) (string, error) {
+	// Defensive: a typed-nil *einoApprovalBroker can still arrive as a non-nil
+	// interface. "No broker" means approvals are off, i.e. allow without a row.
+	if b == nil || b.svc == nil {
+		return "", nil
+	}
+	// Per-server MCP approval exemption ("require_approval=false"): the
+	// policy classifies every mcp_* call as command-class (it cannot know
+	// the server's flag — it stays store-free), so the broker resolves the
+	// operator's explicit exemption from the args' provenance.
+	if strings.HasPrefix(req.ToolName, "mcp_") && b.mcpServerExempt(req.Args["mcp_server"]) {
+		return "", nil
+	}
 	verdict := b.svc.policy.Evaluate(req.ToolName, req.Args)
 	if verdict.Decision == approval.Allow {
+		return "", nil
+	}
+	// Operator rule exemption ("approve & remember", contract §3.2): a
+	// remembered rule allows the call without an interrupt and without a row
+	// — matchRule broadcasts approval_rule_hit as the audit projection.
+	if rule := b.svc.matchRule(b.instanceID, verdict); rule != nil {
 		return "", nil
 	}
 	row, err := b.svc.createPendingRow(b.instanceID, b.sctx, verdict, b.secretValues())

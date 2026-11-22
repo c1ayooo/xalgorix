@@ -81,6 +81,11 @@ type Repository interface {
 	// cold path (info_items.scan_id), including legacy scans that have no
 	// dispatch instance.
 	ProjectScanIDs(ctx context.Context, projectID string) ([]string, error)
+	// TaskScanIDs returns the union of instance_id and legacy_scan_id for one
+	// task's runs — the task-scoped narrowing of ProjectScanIDs for the
+	// InfoItem cold path. The task must belong to projectID (D7 row-level
+	// isolation); any other task id is ErrNotFound, never a cross-project view.
+	TaskScanIDs(ctx context.Context, projectID, taskID string) ([]string, error)
 	// DeleteRunsByScanIdentity removes every mount record whose instance_id or
 	// legacy_scan_id matches. Retention uses it after deleting a scan
 	// directory; findings cascade with the run rows.

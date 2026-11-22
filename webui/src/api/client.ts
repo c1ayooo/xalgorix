@@ -52,6 +52,8 @@ import type {
   InfoAssociationParams,
   InfoAssociationResult,
   ColdPathSyncState,
+  ScanAuditView,
+  ExplorationView,
   InfoContextParams,
   InfoContextResult,
   InfoRegionParams,
@@ -789,9 +791,11 @@ export const api = {
   deleteApprovalRule: (id: string) =>
     http<{ ok: boolean }>(`/api/approval-rules/${id}`, { method: "DELETE" }),
 
-  // R5 信息空间（只读；契约 §5）。项目隔离由后端 project_id 强制。
+  // R5 信息空间（只读；契约 §5）。项目隔离由后端 project_id 强制；
+  // task_id 把白名单收窄到单个任务的 run 扫描集（跨项目任务 404）。
   infoRegion: (params: InfoRegionParams) => {
     const sp = new URLSearchParams({ project_id: params.projectId });
+    if (params.taskId) sp.set("task_id", params.taskId);
     if (params.subjectKind) sp.set("subject_kind", params.subjectKind);
     if (params.subject) sp.set("subject", params.subject);
     if (params.purpose) sp.set("purpose", params.purpose);
@@ -820,6 +824,7 @@ export const api = {
     });
     // scan_id 缺省即项目级聚合形态（后端按项目白名单归并）。
     if (params.scanId) sp.set("scan_id", params.scanId);
+    if (params.taskId) sp.set("task_id", params.taskId);
     if (params.edgeTypes?.length) sp.set("edge_types", params.edgeTypes.join(","));
     if (params.maxDepth) sp.set("max_depth", String(params.maxDepth));
     if (params.limit) sp.set("limit", String(params.limit));
@@ -830,6 +835,14 @@ export const api = {
   // 正常态，不是 failed。
   coldPathSync: (scanId: string) =>
     http<ColdPathSyncState>(`/api/scans/${encodeURIComponent(scanId)}/coldpath`),
+
+  // 领域审计投影（宪章 M2 只读投影）：认领历史 + 时间线 + 缺口检测。
+  scanAudit: (scanId: string) =>
+    http<ScanAuditView>(`/api/scans/${encodeURIComponent(scanId)}/audit`),
+
+  // 探索投影（4zreco 双图同源）：探索链路图 + 播报板共用的 node/edge 模型。
+  scanExploration: (scanId: string) =>
+    http<ExplorationView>(`/api/scans/${encodeURIComponent(scanId)}/exploration`),
 
   // ── 集成模块：MCP 服务器 / 用户技能 / Agent 档案（契约 §integration-*）──
   listMcpServers: () => http<{ servers: McpServer[] }>("/api/mcp-servers"),

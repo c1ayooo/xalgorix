@@ -3,9 +3,11 @@ package config
 import "strings"
 
 // DefaultLanguage is the fallback output language used when the operator has
-// not selected one (or selected an unsupported code). English stays the
-// default so existing installs are unaffected.
-const DefaultLanguage = "en"
+// not selected one (or selected an unsupported code). Simplified Chinese is
+// the default because the operator console ships zh-CN-first: the output
+// language directive activates for it while system prompts stay English
+// (see OutputLanguageDirective). XALGORIX_LANGUAGE=en restores English output.
+const DefaultLanguage = "zh-CN"
 
 // languageDisplayNames maps a supported BCP-47-ish language code to a
 // human-readable name shown in the dashboard and setup flows. Keys are the
@@ -75,7 +77,10 @@ func LanguageDisplayName(code string) string {
 // CVE/CWE IDs) verbatim so exploitation output stays correct.
 func OutputLanguageDirective(code string) string {
 	canonical := NormalizeLanguage(code)
-	if canonical == DefaultLanguage {
+	// Only English is exempt: it is the model's own default, so a directive
+	// would be dead weight. DefaultLanguage (zh-CN) MUST still get one —
+	// left alone the model would answer in English.
+	if canonical == "en" {
 		return ""
 	}
 	name := LanguageDisplayName(canonical)

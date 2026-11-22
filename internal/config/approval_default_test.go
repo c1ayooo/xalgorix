@@ -31,9 +31,9 @@ func TestApprovalDefaults(t *testing.T) {
 }
 
 // TestApprovalModeNormalization pins the fail-open-on-config-error posture:
-// unknown values fall back to off WITH a loud warning (L1, XALGORIX_ENGINE
-// precedent); "enforce" (any case/spacing) is the only way in. A typo must
-// never silently park headless scans.
+// unknown values fall back to off WITH a loud warning; "enforce" (any
+// case/spacing) is the only way in. A typo must never silently park headless
+// scans.
 func TestApprovalModeNormalization(t *testing.T) {
 	cases := map[string]string{
 		"enforce":   "enforce",
@@ -52,7 +52,7 @@ func TestApprovalModeNormalization(t *testing.T) {
 }
 
 // TestApprovalModeNormalizationWarnsOnUnknown pins L1: a non-empty unknown
-// value logs the same WARN shape as the XALGORIX_ENGINE downgrade; empty and
+// value logs the same WARN shape as other config downgrades; empty and
 // explicit "off" stay silent.
 func TestApprovalModeNormalizationWarnsOnUnknown(t *testing.T) {
 	var buf strings.Builder

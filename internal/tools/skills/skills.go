@@ -43,6 +43,12 @@ type agentSkillState struct {
 	mu           sync.Mutex
 	loadedSkills map[string]loadedSkillRecord // key: canonicalName
 	loadedLists  map[string]loadedListRecord  // key: filterCat
+	// Operator-authored skill set for THIS scan (immutable after Register;
+	// per-scan by construction so concurrent scans never see each other's
+	// sets). userByName/userIndex are the derived views.
+	userSkills []UserSkill
+	userByName map[string]UserSkill
+	userIndex  []skillMeta
 }
 
 func newAgentSkillState() *agentSkillState {
@@ -52,9 +58,11 @@ func newAgentSkillState() *agentSkillState {
 	}
 }
 
-// Register adds skill tools to the registry.
-func Register(r *tools.Registry, _ string) {
+// Register adds skill tools to the registry. userSkills is this scan's
+// operator-authored skill set (nil = corpus only).
+func Register(r *tools.Registry, _ string, userSkills []UserSkill) {
 	state := newAgentSkillState()
+	attachUserSkills(state, userSkills)
 	r.Register(&tools.Tool{
 		Name:        "read_skill",
 		Description: "Load a structured cybersecurity skill to get deep testing/defense methodology, tooling commands, and verification steps. Use this BEFORE attempting work in a specific domain (e.g., read_skill name=analyzing-active-directory-acl-abuse). The skill catalog is sourced from the agentskills.io standard and covers offensive testing, threat hunting, DFIR, cloud, mobile, OT/ICS, AI security, and more. Don't know the exact name? Use search_skills query='<concept>' to find the right skill, or list_skills to browse categories.",
@@ -82,7 +90,7 @@ func Register(r *tools.Registry, _ string) {
 			{Name: "category", Description: "Optional category filter (e.g., web-application-security, cloud-security).", Required: false},
 			{Name: "max", Description: "Max results to return (default 10, hard cap 25).", Required: false},
 		},
-		Execute: makeSearchSkills(embeddedSkillsDataFS),
+		Execute: makeSearchSkills(embeddedSkillsDataFS, state),
 	})
 }
 
@@ -102,13 +110,26 @@ var (
 	skillIndexCache = map[fs.FS][]skillMeta{}
 )
 
+// fsComparable probes whether fsys can serve as a map key. Interface values
+// whose dynamic type contains a map/slice (fstest.MapFS in tests) panic on
+// comparison — those filesystems get an uncached index build instead.
+func fsComparable(fsys fs.FS) (ok bool) {
+	defer func() { _ = recover() }()
+	probe := map[fs.FS]struct{}{fsys: {}}
+	delete(probe, fsys)
+	return true
+}
+
 // buildSkillIndex walks the skill tree of the given filesystem and parses
 // each SKILL.md's YAML frontmatter (name/description/tags/intent) into a
-// searchable record. Indexes are cached per fs.FS for the process lifetime;
-// the embedded FS in production and the on-disk FS in tests are each
-// immutable within a process, so a per-filesystem cache is safe and keeps
-// test fixtures isolated from the embedded index.
+// searchable record. Indexes are cached per comparable fs.FS for the process
+// lifetime; the embedded FS in production and the on-disk FS in tests are
+// each immutable within a process, so a per-filesystem cache is safe and
+// keeps test fixtures isolated from the embedded index.
 func buildSkillIndex(fsys fs.FS) []skillMeta {
+	if !fsComparable(fsys) {
+		return buildSkillIndexFor(fsys)
+	}
 	skillIndexMu.Lock()
 	defer skillIndexMu.Unlock()
 	if idx, ok := skillIndexCache[fsys]; ok {
@@ -233,7 +254,7 @@ func queryWantsDefensive(query string) bool {
 	return false
 }
 
-func makeSearchSkills(fsys fs.FS) func(args map[string]string) (tools.Result, error) {
+func makeSearchSkills(fsys fs.FS, state *agentSkillState) func(args map[string]string) (tools.Result, error) {
 	return func(args map[string]string) (tools.Result, error) {
 		query := strings.ToLower(strings.TrimSpace(args["query"]))
 		if query == "" {
@@ -269,7 +290,15 @@ func makeSearchSkills(fsys fs.FS) func(args map[string]string) (tools.Result, er
 			score int
 		}
 		var results []scored
-		for _, m := range buildSkillIndex(fsys) {
+		// Corpus index + operator-authored skills (category "user") score in
+		// the same loop: user methodology competes with the corpus on the
+		// same lexical terms, never ranked by origin alone.
+		var userMeta []skillMeta
+		if state != nil {
+			userMeta = state.userIndex
+		}
+		candidates := append(append([]skillMeta{}, buildSkillIndex(fsys)...), userMeta...)
+		for _, m := range candidates {
 			if filterCat != "" && m.category != filterCat {
 				continue
 			}
@@ -1567,6 +1596,14 @@ func makeReadSkillWithState(fsys fs.FS, r *tools.Registry, state *agentSkillStat
 		// Resolve canonical skill identity via alias map.
 		canonicalName := resolveAlias(name)
 
+		// Operator-authored skills shadow the embedded corpus: explicit
+		// operator configuration is the more specific intent. Aliases apply
+		// only to the corpus, so the match here is exact-name (already
+		// sanitized above).
+		if us, ok := stateUserSkillByName(state, name); ok {
+			return finalizeSkillLoad(state, r, us.Name, userSkillBody(us))
+		}
+
 		var (
 			rawContent    string
 			foundCategory string
@@ -1608,41 +1645,48 @@ func makeReadSkillWithState(fsys fs.FS, r *tools.Registry, state *agentSkillStat
 
 		fullOutput := noteIfCrossCategory(category, foundCategory, rawContent)
 
-		// If state or registry is nil, return full content (graceful fallback).
-		if state == nil || r == nil {
-			return tools.Result{Output: fullOutput}, nil
-		}
-
-		contentHash := fmt.Sprintf("%x", sha256.Sum256([]byte(fullOutput)))
-
-		state.mu.Lock()
-		existing, exists := state.loadedSkills[canonicalName]
-		if exists && existing.contentHash == contentHash && r.HasActiveContent(existing.fullContent) {
-			state.mu.Unlock()
-			suppressedMsg := fmt.Sprintf("Skill already loaded in the current active context: %s. The complete methodology remains available earlier in this conversation.", canonicalName)
-			// Tag the result so runtime accounting can distinguish a
-			// suppressed duplicate from a genuinely new canonical load.
-			return tools.Result{Output: suppressedMsg, Metadata: map[string]any{
-				"skill_name":      canonicalName,
-				"skill_duplicate": true,
-			}}, nil
-		}
-
-		// First load, content changed, or pruned from active context.
-		state.loadedSkills[canonicalName] = loadedSkillRecord{
-			canonicalName: canonicalName,
-			contentHash:   contentHash,
-			fullContent:   fullOutput,
-		}
-		state.mu.Unlock()
-
 		// Tag the canonical name so runtime skill accounting counts successful
 		// canonical loads (never failed lookups or duplicates) — the
 		// first-class signal for skill-usage telemetry and recommendations.
-		return tools.Result{Output: fullOutput, Metadata: map[string]any{
-			"skill_name": canonicalName,
+		return finalizeSkillLoad(state, r, canonicalName, fullOutput)
+	}
+}
+
+// finalizeSkillLoad applies the shared duplicate-suppression state machine
+// over the per-agent skill state (both the embedded corpus and user skills
+// flow through here). state/r nil = tests & fallbacks: return content as-is.
+func finalizeSkillLoad(state *agentSkillState, r *tools.Registry, canonicalName, fullOutput string) (tools.Result, error) {
+	// If state or registry is nil, return full content (graceful fallback).
+	if state == nil || r == nil {
+		return tools.Result{Output: fullOutput}, nil
+	}
+
+	contentHash := fmt.Sprintf("%x", sha256.Sum256([]byte(fullOutput)))
+
+	state.mu.Lock()
+	existing, exists := state.loadedSkills[canonicalName]
+	if exists && existing.contentHash == contentHash && r.HasActiveContent(existing.fullContent) {
+		state.mu.Unlock()
+		suppressedMsg := fmt.Sprintf("Skill already loaded in the current active context: %s. The complete methodology remains available earlier in this conversation.", canonicalName)
+		// Tag the result so runtime accounting can distinguish a
+		// suppressed duplicate from a genuinely new canonical load.
+		return tools.Result{Output: suppressedMsg, Metadata: map[string]any{
+			"skill_name":      canonicalName,
+			"skill_duplicate": true,
 		}}, nil
 	}
+
+	// First load, content changed, or pruned from active context.
+	state.loadedSkills[canonicalName] = loadedSkillRecord{
+		canonicalName: canonicalName,
+		contentHash:   contentHash,
+		fullContent:   fullOutput,
+	}
+	state.mu.Unlock()
+
+	return tools.Result{Output: fullOutput, Metadata: map[string]any{
+		"skill_name": canonicalName,
+	}}, nil
 }
 
 // ResolveSkillName resolves a concept query or shorthand alias to one
@@ -1849,6 +1893,28 @@ func makeListSkillsWithState(fsys fs.FS, r *tools.Registry, state *agentSkillSta
 				b.WriteString(fmt.Sprintf("  - %s\n", s))
 			}
 			b.WriteString("\n")
+		}
+
+		// Operator-authored skills under the fixed "user" category (shown
+		// for an unfiltered list or an explicit category=user request).
+		var userList []UserSkill
+		if state != nil {
+			userList = state.userSkills
+		}
+		if filterCat == "" || filterCat == UserCategory {
+			if len(userList) > 0 {
+				names := make([]string, 0, len(userList))
+				for _, s := range userList {
+					names = append(names, s.Name)
+				}
+				sort.Strings(names)
+				totalSkills += len(names)
+				b.WriteString(fmt.Sprintf("### %s (%d skills)\n", strings.ToUpper(UserCategory), len(names)))
+				for _, s := range userList {
+					b.WriteString(fmt.Sprintf("  - %s\n", s.Name))
+				}
+				b.WriteString("\n")
+			}
 		}
 
 		b.WriteString(fmt.Sprintf("Total: %d skills available\n", totalSkills))

@@ -39,7 +39,7 @@ func setupTestSkills(t *testing.T) string {
 func TestReadSkill_Basic(t *testing.T) {
 	dir := setupTestSkills(t)
 	reg := tools.NewRegistry()
-	Register(reg, "")
+	Register(reg, "", nil)
 
 	fn := makeReadSkill(os.DirFS(dir))
 
@@ -320,7 +320,7 @@ func TestSearchSkills_FindsByConcept(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fs.Sub: %v", err)
 	}
-	search := makeSearchSkills(subFS)
+	search := makeSearchSkills(subFS, nil)
 
 	cases := []struct {
 		query     string
@@ -345,7 +345,7 @@ func TestSearchSkills_FindsByConcept(t *testing.T) {
 
 func TestSearchSkills_EmptyQuery(t *testing.T) {
 	subFS, _ := fs.Sub(embeddedSkills, "data")
-	res, err := makeSearchSkills(subFS)(map[string]string{"query": "   "})
+	res, err := makeSearchSkills(subFS, nil)(map[string]string{"query": "   "})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -356,7 +356,7 @@ func TestSearchSkills_EmptyQuery(t *testing.T) {
 
 func TestSearchSkills_NoMatch(t *testing.T) {
 	subFS, _ := fs.Sub(embeddedSkills, "data")
-	res, _ := makeSearchSkills(subFS)(map[string]string{"query": "zzqqxx-nonexistent-topic"})
+	res, _ := makeSearchSkills(subFS, nil)(map[string]string{"query": "zzqqxx-nonexistent-topic"})
 	if !strings.Contains(res.Output, "No skills matched") {
 		t.Fatalf("expected no-match message, got: %s", res.Output)
 	}
@@ -400,7 +400,7 @@ Configure throttling controls and quotas.
 // defensive implementation skill.
 func TestSearchSkills_OffensiveRanksAboveDefensive(t *testing.T) {
 	dir := setupIntentTestSkills(t)
-	search := makeSearchSkills(os.DirFS(dir))
+	search := makeSearchSkills(os.DirFS(dir), nil)
 
 	res, err := search(map[string]string{"query": "rate limiting"})
 	if err != nil {
@@ -421,7 +421,7 @@ func TestSearchSkills_OffensiveRanksAboveDefensive(t *testing.T) {
 // explicitly asks for implementation guidance.
 func TestSearchSkills_DefensiveSearchableWhenRequested(t *testing.T) {
 	dir := setupIntentTestSkills(t)
-	search := makeSearchSkills(os.DirFS(dir))
+	search := makeSearchSkills(os.DirFS(dir), nil)
 
 	res, err := search(map[string]string{"query": "implement rate limiting"})
 	if err != nil {
@@ -468,7 +468,7 @@ func TestSearchSkills_APISkillDiscovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fs.Sub: %v", err)
 	}
-	search := makeSearchSkills(subFS)
+	search := makeSearchSkills(subFS, nil)
 
 	cases := []struct {
 		query     string
@@ -564,7 +564,7 @@ func TestSearchSkills_CloudOffensiveDiscovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fs.Sub: %v", err)
 	}
-	search := makeSearchSkills(subFS)
+	search := makeSearchSkills(subFS, nil)
 
 	cases := []struct {
 		query     string
@@ -602,7 +602,7 @@ func TestSearchSkills_CloudOffensiveDiscovery(t *testing.T) {
 // implementation and detection skills (which were moved out of cloud-security).
 func TestSearchSkills_CloudOffensiveRanksAboveDefensive(t *testing.T) {
 	subFS, _ := fs.Sub(embeddedSkills, "data")
-	search := makeSearchSkills(subFS)
+	search := makeSearchSkills(subFS, nil)
 
 	res, err := search(map[string]string{"query": "aws cloud security privilege escalation"})
 	if err != nil {
@@ -625,7 +625,7 @@ func TestSearchSkills_CloudOffensiveRanksAboveDefensive(t *testing.T) {
 // explicitly defensive queries and rank above offensive skills there.
 func TestSearchSkills_CloudDefensiveSearchableWhenRequested(t *testing.T) {
 	subFS, _ := fs.Sub(embeddedSkills, "data")
-	search := makeSearchSkills(subFS)
+	search := makeSearchSkills(subFS, nil)
 
 	res, err := search(map[string]string{"query": "implement cloud security posture management"})
 	if err != nil {
@@ -646,7 +646,7 @@ func TestSearchSkills_CloudDefensiveSearchableWhenRequested(t *testing.T) {
 // category (threat-hunting).
 func TestSearchSkills_CloudDetectionSkillsFindable(t *testing.T) {
 	subFS, _ := fs.Sub(embeddedSkills, "data")
-	search := makeSearchSkills(subFS)
+	search := makeSearchSkills(subFS, nil)
 
 	res, err := search(map[string]string{"query": "detect aws cloudtrail anomalies"})
 	if err != nil {
@@ -662,7 +662,7 @@ func TestSearchSkills_CloudDetectionSkillsFindable(t *testing.T) {
 // historical alias resolves to the modern GCP assessment methodology.
 func TestSearchSkills_ForsetiNotPromoted(t *testing.T) {
 	subFS, _ := fs.Sub(embeddedSkills, "data")
-	search := makeSearchSkills(subFS)
+	search := makeSearchSkills(subFS, nil)
 
 	res, _ := search(map[string]string{"query": "gcp security assessment forseti"})
 	if strings.Contains(res.Output, "performing-gcp-security-assessment-with-forseti") {
@@ -726,7 +726,7 @@ provider:
 Body.
 `), 0644)
 
-	search := makeSearchSkills(os.DirFS(dir))
+	search := makeSearchSkills(os.DirFS(dir), nil)
 	res, err := search(map[string]string{"query": "blackbox aws cloud"})
 	if err != nil {
 		t.Fatalf("search error: %v", err)
@@ -743,7 +743,7 @@ func TestSearchSkills_ApplicationSecurityDiscovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fs.Sub: %v", err)
 	}
-	search := makeSearchSkills(subFS)
+	search := makeSearchSkills(subFS, nil)
 
 	cases := []struct {
 		query     string
@@ -792,7 +792,7 @@ func TestSearchSkills_ApplicationSecurityRanking(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fs.Sub: %v", err)
 	}
-	search := makeSearchSkills(subFS)
+	search := makeSearchSkills(subFS, nil)
 
 	cases := []struct {
 		query    string
@@ -834,7 +834,7 @@ func TestSearchSkills_MovedSkillsInNewCategories(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fs.Sub: %v", err)
 	}
-	search := makeSearchSkills(subFS)
+	search := makeSearchSkills(subFS, nil)
 
 	cases := []struct {
 		query    string
@@ -988,7 +988,7 @@ func TestSearchSkills_CloudRetrievalPrecision(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fs.Sub: %v", err)
 	}
-	search := makeSearchSkills(subFS)
+	search := makeSearchSkills(subFS, nil)
 	first := func(q string) string {
 		res, err := search(map[string]string{"query": q})
 		if err != nil {

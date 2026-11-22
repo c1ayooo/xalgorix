@@ -906,7 +906,8 @@ func TestSingleAgent_SystemPromptHasNoCoordinatorSection(t *testing.T) {
 }
 
 func TestNoteDelegationDeferEmitsDetailOnceThenCompact(t *testing.T) {
-	a := &Agent{events: make(chan Event, 8), state: NewScanState()}
+	// 该测试锚定英文播报语义（首次全量、后续紧凑），显式固定英语输出。
+	a := &Agent{cfg: &config.Config{Language: "en"}, events: make(chan Event, 8), state: NewScanState()}
 
 	// First defer: full detail, once.
 	a.noteDelegationDefer("comprehensive recon not complete (missing: item A, item B)")
@@ -938,7 +939,7 @@ func TestNoteDelegationDeferEmitsDetailOnceThenCompact(t *testing.T) {
 
 	// A resumed agent (latch restored, as Run applies deferNoteSuppressed)
 	// never repeats the full-detail wall.
-	b := &Agent{events: make(chan Event, 8), state: NewScanState()}
+	b := &Agent{cfg: &config.Config{Language: "en"}, events: make(chan Event, 8), state: NewScanState()}
 	b.state.DelegationDeferDetailEmitted = true
 	b.noteDelegationDefer("comprehensive recon not complete (missing: item A)")
 	evt = <-b.events

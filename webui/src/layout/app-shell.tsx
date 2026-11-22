@@ -89,9 +89,15 @@ export function AppShell() {
         <ConnectionBanner />
         <LegacyImportBanner />
         <main className="min-h-0 flex-1 overflow-y-auto">
-          <div className="mx-auto max-w-7xl px-4 py-4 sm:px-6 sm:py-6">
+          {/* /chat 全出血（方案 §6.3）：页面自带 padding 与视口定高，不走
+              max-w-7xl 内容壳；其余页面维持既有容器。 */}
+          {location.pathname === "/chat" ? (
             <Outlet />
-          </div>
+          ) : (
+            <div className="mx-auto max-w-7xl px-4 py-4 sm:px-6 sm:py-6">
+              <Outlet />
+            </div>
+          )}
         </main>
       </div>
       <CommandPalette />

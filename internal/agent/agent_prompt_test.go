@@ -194,7 +194,6 @@ func TestProfessionalPromptDoesNotInventAuthenticationPrerequisites(t *testing.T
 	}
 	for _, forbidden := range []string{
 		"Test for default credentials: admin/admin",
-		"If the target requires email verification, ALWAYS use agentmail",
 	} {
 		if strings.Contains(prompt, forbidden) {
 			t.Fatalf("professional prompt retained unconditional credential workflow %q", forbidden)

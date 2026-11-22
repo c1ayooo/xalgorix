@@ -157,7 +157,7 @@ func TestSettingsImport_SkipsAndValidation(t *testing.T) {
 // machine-token denylist must reject automation credentials on both routes
 // while the same token works on ordinary API routes.
 func TestSettingsExportImport_OperatorOnlyForMachineTokens(t *testing.T) {
-	h := machineAuthHarness(apiTokenCfg("tok-a"))
+	h := machineAuthHarness(t, apiTokenCfg("tok-a"))
 	for _, path := range []string{"/api/settings/export", "/api/settings/import"} {
 		w := doReq(h, "GET", path, "Bearer tok-a")
 		if w.Code != http.StatusForbidden {

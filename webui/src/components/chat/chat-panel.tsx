@@ -1,17 +1,10 @@
 import { useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 import { toast } from "sonner";
-import {
-  Coins,
-  Eye,
-  MessageSquare,
-  Pause,
-  Pencil,
-  Play,
-  ShieldAlert,
-  Square,
-} from "lucide-react";
+import { Bot, ListTodo, MessageSquare, Pause, Pencil, Play, ShieldAlert, Square, Eye } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Label } from "@/components/ui/label";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   AlertDialog,
@@ -23,45 +16,41 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
-import { Label } from "@/components/ui/label";
 import { UserConversation } from "@/components/user-conversation";
 import { Transcript } from "@/components/chat/transcript";
 import { Composer } from "@/components/chat/composer";
-import { statusTone } from "@/components/chat/format";
+import { useLiveSessionKeys } from "@/components/session-item";
+import { ScanStatusPill } from "@/components/scan-status-pill";
+import { fmtTokens } from "@/components/chat/format";
 import { useI18n } from "@/i18n";
-import { useInstances, usePauseInstance, useResumeInstance, useSendTaskGuidance, useStopInstance } from "@/api/queries";
+import { usePauseInstance, useResumeInstance, useSendTaskGuidance, useStopInstance } from "@/api/queries";
 import { newRequestId } from "@/lib/guidance";
-import { cn } from "@/lib/utils";
-import type { Run } from "@/types/api";
+import type { ConversationRow } from "@/types/api";
 
 type ViewMode = "full" | "human";
 
 /**
- * Right pane: one conversation. The header carries identity and run controls,
- * the body is either the full transcript (human + agent + tools + findings) or
- * the charter-preserving human-only projection.
+ * ChatView（参照 ChatView）：选中会话的右栏。头部 = 标题 + 状态 + 实时章 +
+ * token/发现 meta；次行 = 关联任务 + full/human 双投影切换 + 运行控制；
+ * 主体 = 完整转录或仅人工投影；底部 = Composer（运行中变停止键）。
  */
 export function ChatPanel({
-  taskId,
   run,
   view,
   onViewChange,
   onRename,
 }: {
-  taskId?: string;
-  run?: Run;
+  run: ConversationRow;
   view: ViewMode;
   onViewChange: (view: ViewMode) => void;
-  onRename: (title: string) => void;
+  onRename: (title: string) => Promise<void> | void;
 }) {
   const { t } = useI18n();
-  const instanceId = run?.instance_id;
-  const { data: instances } = useInstances();
-  const live = instances?.instances.find((item) => item.id === instanceId);
-  const status = live?.status ?? run?.status ?? "";
+  const instanceId = run.instance_id;
+  const liveKeys = useLiveSessionKeys();
+  const status = run.status ?? "";
   const running = status === "running";
   const paused = status === "paused";
-  const tone = statusTone(status);
 
   const send = useSendTaskGuidance();
   const pause = usePauseInstance();
@@ -71,78 +60,90 @@ export function ChatPanel({
   const [stopOpen, setStopOpen] = useState(false);
   const [stopReason, setStopReason] = useState("");
   const [renaming, setRenaming] = useState(false);
-  const [title, setTitle] = useState(run?.title ?? "");
+  const [title, setTitle] = useState(run.title ?? "");
 
   useEffect(() => {
-    setTitle(run?.title ?? "");
+    setTitle(run.title ?? "");
     setRenaming(false);
-  }, [run?.id, run?.title]);
+  }, [run.id, run.title]);
 
   function commitTitle() {
     const next = title.trim();
     setRenaming(false);
-    if (next && next !== (run?.title ?? "")) onRename(next);
-    else setTitle(run?.title ?? "");
+    if (next && next !== (run.title ?? "")) void onRename(next);
+    else setTitle(run.title ?? "");
   }
 
-  if (!run || !instanceId) {
-    return (
-      <div className="grid h-full place-items-center rounded-lg border border-border bg-card p-8 text-center">
-        <div className="space-y-1">
-          <MessageSquare className="mx-auto size-5 text-muted-foreground" aria-hidden />
-          <p className="text-sm font-medium">{t("chat.pickOne")}</p>
-          <p className="text-xs text-muted-foreground">{t("chat.pickOneHint")}</p>
-        </div>
-      </div>
-    );
-  }
+  if (!instanceId) return null;
 
   return (
     <div className="flex min-h-0 min-w-0 flex-col overflow-hidden rounded-lg border border-border bg-card">
-      <div className="border-b border-border px-3 py-2">
-        <div className="flex min-w-0 items-center gap-2">
-          {renaming ? (
-            <input
-              autoFocus
-              value={title}
-              onChange={(e) => setTitle(e.target.value)}
-              onBlur={commitTitle}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") commitTitle();
-                if (e.key === "Escape") {
-                  setTitle(run.title ?? "");
-                  setRenaming(false);
-                }
-              }}
-              className="min-w-0 flex-1 rounded-md border border-input bg-background px-2 py-1 text-sm"
+      {/* 头部：标题 + 状态 + 实时 + meta（参照 px-4 py-2.5 语法）。 */}
+      <div className="flex min-w-0 flex-wrap items-center gap-2 border-b border-border px-4 py-2.5">
+        <Bot className="size-4 shrink-0 text-muted-foreground" aria-hidden />
+        {renaming ? (
+          <input
+            autoFocus
+            value={title}
+            onChange={(e) => setTitle(e.target.value)}
+            onBlur={commitTitle}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") commitTitle();
+              if (e.key === "Escape") {
+                setTitle(run.title ?? "");
+                setRenaming(false);
+              }
+            }}
+            className="min-w-0 max-w-48 flex-1 rounded-md border border-input bg-background px-2 py-1 text-sm"
+          />
+        ) : (
+          <button
+            type="button"
+            className="group flex min-w-0 items-center gap-1.5 text-left"
+            onDoubleClick={() => setRenaming(true)}
+            title={t("chat.doubleClickRename")}
+          >
+            <span className="min-w-0 max-w-48 truncate font-medium text-sm">{run.title || t("chat.untitled")}</span>
+            <Pencil
+              className="size-3 shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100"
+              aria-hidden
             />
-          ) : (
-            <button
-              type="button"
-              className="group flex min-w-0 items-center gap-1.5 text-left"
-              onDoubleClick={() => setRenaming(true)}
-              title={t("chat.doubleClickRename")}
-            >
-              <span className={cn("size-2 shrink-0 rounded-full", tone.dot)} aria-hidden />
-              <span className="truncate text-sm font-medium">{run.title || t("chat.untitled")}</span>
-              <Pencil className="size-3 shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100" aria-hidden />
-            </button>
-          )}
-          <Badge variant="muted" className="shrink-0 text-[10px]">
-            {tone.labelKey ? t(tone.labelKey) : status || "—"}
-          </Badge>
-          <div className="ml-auto flex shrink-0 items-center gap-2 text-[11px] text-muted-foreground">
-            <span className="flex items-center gap-1">
-              <Coins className="size-3" aria-hidden />
-              {formatTokens(run.total_tokens)}
-            </span>
-            <span className="flex items-center gap-1">
-              <ShieldAlert className="size-3" aria-hidden />
-              {run.vuln_count ?? 0}
-            </span>
-          </div>
+          </button>
+        )}
+        <span className="hidden shrink-0 font-mono text-muted-foreground text-xs sm:inline">
+          #{(run.instance_id ?? run.id).slice(0, 8)}
+        </span>
+        <ScanStatusPill status={status} />
+        {liveKeys.has(instanceId) && (
+          <span className="inline-flex items-center gap-1 rounded bg-emerald-500/10 px-1.5 py-0.5 font-medium text-xs text-emerald-600 dark:text-emerald-400">
+            <span className="size-1 animate-pulse rounded-full bg-emerald-500" aria-hidden />
+            {t("session.live")}
+          </span>
+        )}
+        <div className="ml-auto flex min-w-0 max-w-full items-center justify-end gap-x-3 gap-y-1 text-muted-foreground text-xs max-sm:w-full max-sm:flex-wrap">
+          <span className="flex items-center gap-1 tabular-nums" title={t("sessions.tokens")}>
+            {fmtTokens(run.total_tokens)}
+          </span>
+          <span className="flex items-center gap-1 tabular-nums" title={t("nav.findings")}>
+            <ShieldAlert className="size-3" aria-hidden />
+            {run.vuln_count ?? 0}
+          </span>
         </div>
-        <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+      </div>
+
+      {/* 次行：关联任务 + 双投影切换 + 运行控制。 */}
+      <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 border-b border-border px-4 pb-1.5 pt-1.5">
+        <span className="flex min-w-0 shrink-0 items-center gap-1 px-1 text-xs">
+          <ListTodo className="size-3 shrink-0 text-muted-foreground/70" aria-hidden />
+          <Link
+            to={`/tasks/${run.task_id}`}
+            className="min-w-0 truncate text-muted-foreground transition-colors hover:text-foreground"
+            title={run.task_name}
+          >
+            {run.task_name || run.task_id}
+          </Link>
+        </span>
+        <div className="ml-auto flex min-w-0 items-center gap-1.5">
           <Tabs value={view} onValueChange={(v) => onViewChange(v as ViewMode)}>
             <TabsList className="h-7">
               <TabsTrigger value="full" className="h-6 px-2 text-[11px]">
@@ -155,55 +156,61 @@ export function ChatPanel({
               </TabsTrigger>
             </TabsList>
           </Tabs>
-          <div className="ml-auto flex items-center gap-1.5">
-            {paused && (
-              <Button
-                size="sm"
-                variant="outline"
-                className="h-7 px-2 text-xs"
-                disabled={resume.isPending}
-                onClick={() => resume.mutate(instanceId, { onSuccess: () => toast.success(t("chat.resumed")) })}
-              >
-                <Play className="size-3.5" aria-hidden />
-                {t("chat.resume")}
-              </Button>
-            )}
-            {running && (
-              <Button
-                size="sm"
-                variant="outline"
-                className="h-7 px-2 text-xs"
-                disabled={pause.isPending}
-                onClick={() => pause.mutate(instanceId, { onSuccess: () => toast.success(t("chat.pausedToast")) })}
-              >
-                <Pause className="size-3.5" aria-hidden />
-                {t("chat.pause")}
-              </Button>
-            )}
-            {(running || paused) && (
-              <Button
-                size="sm"
-                variant="ghost"
-                className="h-7 px-2 text-xs text-red-600 hover:text-red-700 dark:text-red-400"
-                onClick={() => {
-                  setStopReason("");
-                  setStopOpen(true);
-                }}
-              >
-                <Square className="size-3.5" aria-hidden />
-                {t("chat.stop")}
-              </Button>
-            )}
-          </div>
+          {paused && (
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-7 px-2 text-xs"
+              disabled={resume.isPending}
+              onClick={() => resume.mutate(instanceId, { onSuccess: () => toast.success(t("chat.resumed")) })}
+            >
+              <Play className="size-3.5" aria-hidden />
+              {t("chat.resume")}
+            </Button>
+          )}
+          {running && (
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-7 px-2 text-xs"
+              disabled={pause.isPending}
+              onClick={() => pause.mutate(instanceId, { onSuccess: () => toast.success(t("chat.pausedToast")) })}
+            >
+              <Pause className="size-3.5" aria-hidden />
+              {t("chat.pause")}
+            </Button>
+          )}
+          {(running || paused) && (
+            <Button
+              size="sm"
+              variant="ghost"
+              className="h-7 px-2 text-xs text-red-600 hover:text-red-700 dark:text-red-400"
+              onClick={() => {
+                setStopReason("");
+                setStopOpen(true);
+              }}
+            >
+              <Square className="size-3.5" aria-hidden />
+              {t("chat.stop")}
+            </Button>
+          )}
         </div>
       </div>
 
       {view === "full" ? (
-        <Transcript instanceId={instanceId} running={running} />
+        <Transcript
+          instanceId={instanceId}
+          running={running}
+          empty={
+            <div className="py-10 text-center text-muted-foreground text-sm">
+              {t("chat.draftGreeting").replace("{name}", run.task_name || t("chat.untitled"))}
+            </div>
+          }
+        />
       ) : (
         <div className="min-h-0 flex-1 overflow-hidden">
           <UserConversation
-            taskId={taskId ?? run.task_id}
+            taskId={run.task_id}
             instanceId={instanceId}
             runId={run.id}
             className="h-full bg-muted/10"
@@ -214,17 +221,25 @@ export function ChatPanel({
       <Composer
         instanceId={instanceId}
         running={running}
-        onSend={(message) => {
-          send.mutate(
-            { id: taskId ?? run.task_id, message, requestId, instanceId },
-            {
-              onSuccess: (result) => {
-                toast.success(result.status === "injected" ? t("chat.guidanceInjected") : t("chat.guidanceQueued"));
-                setRequestId(newRequestId());
+        onSend={async (message) => {
+          await new Promise<void>((resolve, reject) => {
+            send.mutate(
+              { id: run.task_id, message, requestId, instanceId },
+              {
+                onSuccess: (result) => {
+                  toast.success(
+                    result.status === "injected" ? t("chat.guidanceInjected") : t("chat.guidanceQueued"),
+                  );
+                  setRequestId(newRequestId());
+                  resolve();
+                },
+                onError: (error: Error) => {
+                  toast.error(`${t("chat.sendFailed")}: ${error.message}`);
+                  reject(error);
+                },
               },
-              onError: (error: Error) => toast.error(`${t("chat.sendFailed")}: ${error.message}`),
-            },
-          );
+            );
+          });
         }}
         onStop={() => setStopOpen(true)}
       />
@@ -270,11 +285,4 @@ export function ChatPanel({
       </AlertDialog>
     </div>
   );
-}
-
-function formatTokens(n?: number): string {
-  if (!n) return "0";
-  if (n < 1000) return String(n);
-  if (n < 1_000_000) return `${(n / 1000).toFixed(1)}k`;
-  return `${(n / 1_000_000).toFixed(2)}M`;
 }

@@ -869,6 +869,53 @@ func (s *Store) ProjectScanIDs(ctx context.Context, projectID string) ([]string,
 	return out, rows.Err()
 }
 
+// TaskScanIDs implements Repository.TaskScanIDs.
+func (s *Store) TaskScanIDs(ctx context.Context, projectID, taskID string) ([]string, error) {
+	projectUUID, err := parseUUID(projectID)
+	if err != nil {
+		return nil, err
+	}
+	taskUUID, err := parseUUID(taskID)
+	if err != nil {
+		return nil, err
+	}
+	// Existence + ownership first: a task of another project is ErrNotFound,
+	// never an (empty) cross-project view.
+	var one int
+	if err := s.queryRow(ctx,
+		`SELECT 1 FROM tasks WHERE id = $1 AND project_id = $2`,
+		taskUUID, projectUUID).Scan(&one); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("%w: task %s not found", ErrNotFound, taskID)
+		}
+		return nil, fmt.Errorf("platform/postgres: task scan ids: %w", err)
+	}
+	rows, err := s.query(ctx, `
+		SELECT DISTINCT id FROM (
+			SELECT r.instance_id AS id
+			FROM runs r
+			WHERE r.task_id = $1 AND r.instance_id <> ''
+			UNION
+			SELECT r.legacy_scan_id AS id
+			FROM runs r
+			WHERE r.task_id = $1 AND r.legacy_scan_id IS NOT NULL AND r.legacy_scan_id <> ''
+		) ids
+		ORDER BY id`, taskUUID)
+	if err != nil {
+		return nil, fmt.Errorf("platform/postgres: task scan ids: %w", err)
+	}
+	defer rows.Close()
+	out := []string{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("platform/postgres: task scan id: %w", err)
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
 // InstanceIDsForProject implements Repository.InstanceIDsForProject.
 func (s *Store) InstanceIDsForProject(ctx context.Context, projectID string) ([]string, error) {
 	parsed, err := parseUUID(projectID)

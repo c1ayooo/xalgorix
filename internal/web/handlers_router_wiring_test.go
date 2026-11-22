@@ -135,7 +135,7 @@ func TestRouterWiringRouteListInvariants(t *testing.T) {
 	// auth-profile namespace.
 	preExisting := []string{
 		"/",
-		"/ws",
+		"/api/stream",
 		"/api/scan",
 		"/api/stop",
 		"/api/status",

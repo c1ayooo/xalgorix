@@ -3,6 +3,8 @@ import { api } from "./client";
 import type {
   ApprovalRuleRequest,
   ColdPathSyncState,
+  ScanAuditView,
+  ExplorationView,
   ConversationPatch,
   InfoAssociationParams,
   IntelTriageStatus,
@@ -77,6 +79,8 @@ export const qk = {
   infoAssociation: (params: InfoAssociationParams) =>
     ["info", "association", params] as const,
   coldPathSync: (scanId: string) => ["info", "coldpath", scanId] as const,
+  scanAudit: (scanId: string) => ["info", "audit", scanId] as const,
+  scanExploration: (scanId: string) => ["info", "exploration", scanId] as const,
   // 集成模块（MCP / Skills / Agents）：定义 + 调用记录。配置类无轮询，
   // mutation 失效刷新；调用记录 15s 轻轮询。
   mcpServers: ["mcp", "servers"] as const,
@@ -800,6 +804,34 @@ export function useTaskFindings(id?: string) {
 
 // Run 账本投影（任务详情「账本」tab）。运行中 8s 轮询跟随假设生命周期变化；
 // 终态 run 一次拉取即可，但仍给 30s 低频兜底（快照只在引擎写时变化）。
+// Run 全量事件（会话页角色分组的数据源：thought/decision/phase/plan 等
+// 转录七类之外的过程明细）。优先取实例内存缓冲（完整、含运行中增量）；
+// 缓冲不可用（引擎重启/实例逐出/404）时回落持久事件 journal
+// （GET /api/scans/{id}/events，events.jsonl 窗口读取，类型不过滤）。
+// 运行中 5s 轮询跟随（§9 instance events 节奏），SSE 增量由组件侧防抖 refetch 补充。
+export function useRunEvents(instanceId?: string, live?: boolean) {
+  return useQuery({
+    queryKey: ["run-events", instanceId ?? "none"],
+    queryFn: async () => {
+      try {
+        const events = await api.instanceEvents(instanceId!);
+        if (events.length > 0) return { source: "buffer" as const, events };
+      } catch {
+        // 缓冲缺席 → journal 兜底
+      }
+      // journal 只能 offset 从头读：先探 total，再取最新窗口（上限 1000，
+      // 与服务端 maxEventsWindow 对齐）。
+      const head = await api.scanEvents(instanceId!, 0, 1);
+      const total = head.total ?? 0;
+      const page = await api.scanEvents(instanceId!, Math.max(0, total - 1000), 1000);
+      return { source: "journal" as const, events: page.events };
+    },
+    enabled: !!instanceId,
+    refetchInterval: live ? 5000 : false,
+    placeholderData: (prev) => prev,
+  });
+}
+
 export function useScanLedger(scanId?: string, running?: boolean) {
   return useQuery({
     queryKey: ["scan", scanId ?? "none", "ledger"],
@@ -1023,6 +1055,35 @@ export function useColdPathSync(scanId: string, enabled = true) {
     queryFn: (): Promise<ColdPathSyncState> => api.coldPathSync(scanId),
     enabled: enabled && !!scanId,
     refetchInterval: 15000,
+    retry: false,
+  });
+}
+
+// Domain audit projection for one run (charter M2, read-only). Append-only
+// history: poll at the 15s cadence while the run is live; after the run
+// terminates the journal no longer grows, so a single fetch suffices. Errors
+// surface through `error` — the timeline section renders its own honest
+// failure instead of blocking the ledger tab.
+// Exploration projection (4zreco dual-graph source): one node/edge model
+// feeding both the topology graph (探索链路) and the stream board (播报板).
+// 15s poll while the run is live, single fetch after — same discipline as
+// the audit projection.
+export function useScanExploration(scanId: string, running = false) {
+  return useQuery({
+    queryKey: qk.scanExploration(scanId),
+    queryFn: (): Promise<ExplorationView> => api.scanExploration(scanId),
+    enabled: !!scanId,
+    refetchInterval: running ? 15000 : false,
+    retry: false,
+  });
+}
+
+export function useScanAudit(scanId: string, running = false) {
+  return useQuery({
+    queryKey: qk.scanAudit(scanId),
+    queryFn: (): Promise<ScanAuditView> => api.scanAudit(scanId),
+    enabled: !!scanId,
+    refetchInterval: running ? 15000 : false,
     retry: false,
   });
 }

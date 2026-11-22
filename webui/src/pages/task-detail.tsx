@@ -7,10 +7,13 @@ import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { EmptyState, ErrorState } from "@/components/states";
+import { ColdPathBadge } from "@/components/coldpath-badge";
 import { SeverityBadge } from "@/components/severity-badge";
 import { ScanStatusPill } from "@/components/scan-status-pill";
 import { SessionsTab } from "@/components/sessions-tab";
 import { LedgerTab } from "@/components/ledger-tab";
+import { ExplorationTab } from "@/components/exploration-graph";
+import { BroadcastTab } from "@/components/broadcast-board";
 import { IntelTab } from "@/components/intel-tab";
 import { TokenUsageTab } from "@/components/token-usage";
 import { ScanFilesBrowser } from "@/components/scan-files-browser";
@@ -20,6 +23,7 @@ import { TaskRunButton, taskRunState } from "@/components/task-run-button";
 import { TaskGoalDialog } from "@/components/task-goal-dialog";
 import {
   useApprovals,
+  useColdPathSync,
   useProjects,
   useTask,
   useTaskFindings,
@@ -41,6 +45,8 @@ type TaskDetailTab =
   | "intel"
   | "approvals"
   | "ledger"
+  | "explore"
+  | "board"
   | "files"
   | "runs"
   | "reports"
@@ -53,6 +59,8 @@ const TAB_VALUES: TaskDetailTab[] = [
   "intel",
   "approvals",
   "ledger",
+  "explore",
+  "board",
   "files",
   "runs",
   "reports",
@@ -68,10 +76,11 @@ function normalizeTab(raw: string | null): TaskDetailTab {
 
 /**
  * Task detail implements REDESIGN §7.2 with UI_DESIGN §4/§6 tokens and
- * composition: sticky task header, full-page tabs, Run-scoped projections,
- * and a human-only session view (CORE_PHILOSOPHY §3.2/§8). Operational event
- * details stay in Run/ledger/approval views rather than masquerading as chat.
- * `?run=&tab=` is the deep-link contract; legacy `pulse` maps to `overview`.
+ * composition: sticky task header, full-page tabs, Run-scoped projections.
+ * The sessions tab is the task-scoped ops view (1:1 plan §5: role-grouped
+ * rail + full transcript); the project-level chat page (/chat) is a separate
+ * page, not an alias of this tab. `?run=&agent=&tab=` is the deep-link
+ * contract; legacy `pulse` maps to `overview`.
  */
 export default function TaskDetailPage() {
   const { taskId } = useParams<{ taskId: string }>();
@@ -92,6 +101,11 @@ export default function TaskDetailPage() {
     });
 
   const runs = runsData?.items ?? [];
+  // 冷路径徽标只查最新 5 个 run（runs 列表已 newest first）。
+  const coldPathRuns = useMemo(
+    () => new Set(runs.slice(0, 5).map((r) => r.id)),
+    [runs],
+  );
 
   // 深链 ?run=&agent=&tab=：URL 是会话选择的唯一权威（与对话页同一 hook）。
   function writeParams(mutate: (sp: URLSearchParams) => void) {
@@ -109,6 +123,13 @@ export default function TaskDetailPage() {
         sp.delete("agent"); // 切换会话回到整段视角
       }),
   );
+  // 会话页泳道（?agent=system / 泳道短名）：run 内视图状态，深链可还原。
+  const agentLaneParam = searchParams.get("agent") ?? undefined;
+  const selectAgentLane = (lane: string | undefined) =>
+    writeParams((sp) => {
+      if (lane) sp.set("agent", lane);
+      else sp.delete("agent");
+    });
   const tab = normalizeTab(searchParams.get("tab"));
   // 一键「新目标」弹窗（无活跃 run 且已有 ≥1 次运行时入口可见）。
   const [goalOpen, setGoalOpen] = useState(false);
@@ -165,7 +186,7 @@ export default function TaskDetailPage() {
       <Tabs
         value={tab}
         onValueChange={(v) => writeParams((sp) => sp.set("tab", v))}
-        className="flex min-h-0 flex-1 flex-col gap-0 lg:h-[calc(100vh-8.75rem)]"
+        className="flex h-[calc(100vh-7.75rem)] min-h-0 flex-1 flex-col gap-0 sm:h-[calc(100vh-8.75rem)]"
       >
         {/* sticky 头部（4zreco 三行语法）。 */}
         <header className="sticky top-0 z-10 border-b border-border bg-background/95 backdrop-blur">
@@ -226,7 +247,7 @@ export default function TaskDetailPage() {
               {task.instruction}
             </p>
           )}
-          <TabsList className="w-full justify-start overflow-x-auto rounded-none border-b-0">
+          <TabsList className="w-full justify-start overflow-x-auto rounded-none border-b-0 [&>[role=tab]]:whitespace-nowrap">
             <TabsTrigger value="sessions">{t("taskDetail.tabSessions")}</TabsTrigger>
             <TabsTrigger value="overview">{t("taskDetail.tabOverview")}</TabsTrigger>
             <TabsTrigger value="findings">
@@ -235,6 +256,8 @@ export default function TaskDetailPage() {
             <TabsTrigger value="intel">{t("taskDetail.tabIntel")}</TabsTrigger>
             <TabsTrigger value="approvals">{t("taskDetail.tabApprovals")}</TabsTrigger>
             <TabsTrigger value="ledger">{t("taskDetail.tabLedger")}</TabsTrigger>
+            <TabsTrigger value="explore">{t("taskDetail.tabExplore")}</TabsTrigger>
+            <TabsTrigger value="board">{t("taskDetail.tabBoard")}</TabsTrigger>
             <TabsTrigger value="files">{t("taskDetail.tabFiles")}</TabsTrigger>
             <TabsTrigger value="runs">
               {t("taskDetail.tabRuns")} ({task.run_count ?? runs.length})
@@ -244,14 +267,18 @@ export default function TaskDetailPage() {
           </TabsList>
         </header>
 
-        {/* 内容区（4zreco：flex-1 p-4 lg:p-6；TabsContent mt-0）。 */}
+        {/* 内容区（4zreco：flex-1 p-4 lg:p-6；TabsContent mt-0）。会话 tab
+            需要高度传递（TabsContent h-full → SessionsTab h-full），否则
+            h-full 对 auto 父级失效、composer 随内容滚出视口。 */}
         <div className="min-h-0 flex-1 overflow-y-auto p-4 lg:p-6">
-          <TabsContent value="sessions" className="mt-0">
+          <TabsContent value="sessions" className="mt-0 h-full">
             <SessionsTab
               taskId={task.id}
               runs={runs}
               selectedInstanceId={selectedInstanceId}
               onSelectRun={selectRun}
+              agentLaneName={agentLaneParam}
+              onSelectAgentLane={selectAgentLane}
             />
           </TabsContent>
 
@@ -304,6 +331,9 @@ export default function TaskDetailPage() {
               </CardContent>
             </Card>
             <TaskObjectivePanel taskId={taskId} />
+            {/* 冷热分层可见性：最新 run 的冷路径同步健康（无 DSN = disabled 正常态）。
+                端点失败静默降级，不阻塞概览。 */}
+            <LatestRunColdPath run={runs.find((r) => r.instance_id)} />
             <Card>
               <CardHeader>
                 <CardTitle>{t("taskDetail.policyTitle")}</CardTitle>
@@ -361,9 +391,9 @@ export default function TaskDetailPage() {
             )}
           </TabsContent>
 
-          {/* 情报：凭据/线索/敏感数据 + 分诊。 */}
+          {/* 情报：信息项切片（冷路径）+ 凭据/线索/敏感数据 + 分诊。 */}
           <TabsContent value="intel" className="mt-0">
-            <IntelTab taskId={task.id} />
+            <IntelTab taskId={task.id} projectId={task.project_id} />
           </TabsContent>
 
           {/* 审批：本任务待决队列 + 已裁决历史。 */}
@@ -374,6 +404,16 @@ export default function TaskDetailPage() {
           {/* 账本：选中 run 的 hypothesis/evidence 快照。 */}
           <TabsContent value="ledger" className="mt-0">
             <LedgerTab scanId={scopedInstanceId} running={scopedRunning} />
+          </TabsContent>
+
+          {/* 探索链路：投影拓扑视角（起点→执行→假设→事实→发现），与播报板同源。 */}
+          <TabsContent value="explore" className="mt-0">
+            <ExplorationTab scanId={scopedInstanceId} running={scopedRunning} />
+          </TabsContent>
+
+          {/* 播报板：同源投影的流水视角（4zreco 直播位纪律）。 */}
+          <TabsContent value="board" className="mt-0">
+            <BroadcastTab scanId={scopedInstanceId} running={scopedRunning} />
           </TabsContent>
 
           {/* 文件：选中 run 的扫描目录只读浏览器（与 Run 详情页同一组件）。 */}
@@ -436,6 +476,11 @@ export default function TaskDetailPage() {
                             <span className="text-xs text-muted-foreground">
                               {r.started_at ? timeAgo(r.started_at) : "—"}
                             </span>
+                            {/* 冷路径同步徽标：仅最新 5 个 run 查询，避免全量扇出。 */}
+                            <RunColdPathBadge
+                              instanceId={r.instance_id}
+                              active={coldPathRuns.has(r.id)}
+                            />
                             <span className="ml-auto flex items-center gap-3 text-xs text-muted-foreground mono tabular-nums">
                               <span>
                                 {t("taskDetail.vulns")} {r.vuln_count}
@@ -524,6 +569,33 @@ function PolicyRow({ label, value }: { label: string; value: string }) {
       <span className="mono text-sm text-foreground">{value}</span>
     </div>
   );
+}
+
+/** 概览：最新 run 的冷路径同步状态行。无 instance（未跑过）不渲染。 */
+function LatestRunColdPath({ run }: { run?: Run }) {
+  const { t } = useI18n();
+  const coldpath = useColdPathSync(run?.instance_id ?? "", !!run?.instance_id);
+  if (!run || !coldpath.data || coldpath.error) return null;
+  return (
+    <div className="flex flex-wrap items-center gap-2 px-1 text-xs text-muted-foreground">
+      <span>{t("coldpath.latestRun")}</span>
+      <span className="font-mono text-[11px]">{run.id}</span>
+      <ColdPathBadge state={coldpath.data} />
+    </div>
+  );
+}
+
+/** 运行 tab 行内冷路径徽标；active=false 时不发请求（hooks 保持无条件）。 */
+function RunColdPathBadge({
+  instanceId,
+  active,
+}: {
+  instanceId?: string;
+  active: boolean;
+}) {
+  const coldpath = useColdPathSync(instanceId ?? "", active && !!instanceId);
+  if (!instanceId || !coldpath.data || coldpath.error) return null;
+  return <ColdPathBadge state={coldpath.data} />;
 }
 
 function cap(s: string) {

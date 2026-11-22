@@ -28,11 +28,8 @@ var operatorSecretEnvKeys = map[string]bool{
 	// Non-namespaced operator secrets — these are the ones a plain XALGORIX_*
 	// namespace scrub does NOT catch, so enumerating them here is what keeps
 	// every tool's environment free of them.
-	"GEMINI_API_KEY":       true,
-	"AGENTMAIL_API_KEY":    true,
-	"AGENTMAIL_POD":        true,
-	"CAIDO_API_TOKEN":      true,
-	"INBOUND_EMAIL_SECRET": true,
+	"GEMINI_API_KEY":  true,
+	"CAIDO_API_TOKEN": true,
 
 	// Namespaced credentials — redundant with a XALGORIX_* scrub, listed so the
 	// predicate (and SanitizeEnviron) is correct on its own.

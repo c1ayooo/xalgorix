@@ -88,6 +88,11 @@ type Task struct {
 	// complete on scan-level class evidence (VulnClassesTested) instead of
 	// the per-endpoint coverage matrix.
 	WholeTarget bool `json:"whole_target,omitempty"`
+	// ObjectiveRef links this task to the operator objective criterion it
+	// serves (finding-class criteria only). It is priority CONTEXT for the
+	// model: it never removes methodology work, never changes the coverage
+	// denominator and never affects the finish gate.
+	ObjectiveRef string `json:"objective_ref,omitempty"`
 }
 
 // Typed disposition values (Part 13). All map onto TaskSkipped for plan
@@ -1096,6 +1101,12 @@ func buildEnginePlan(state *ScanState, endpoints []string, detectedTechs map[str
 		appendTargetObligations(state, p, scope)
 	}
 
+	// The operator objective marks (never removes) the plan tasks whose
+	// vulnerability class an objective criterion names.
+	if state != nil {
+		applyObjectiveRefs(p, state.Objective)
+	}
+
 	if state != nil && state.DelegatedAgent {
 		lane := NewPlan()
 		for _, task := range p.Tasks {
@@ -1271,6 +1282,9 @@ func formatPlan(state *ScanState, p *Plan, gaps []CoverageGap) string {
 			if t.Notes != "" {
 				sb.WriteString(fmt.Sprintf("      %s\n", t.Notes))
 			}
+			if t.ObjectiveRef != "" {
+				sb.WriteString(fmt.Sprintf("      objective: serves acceptance criterion %s\n", t.ObjectiveRef))
+			}
 			// Task activation loads its methodology (Part 18): when the
 			// next ready task's class resolves to a skill that has not been
 			// loaded yet, the brief names it — the model no longer has to
@@ -1290,4 +1304,22 @@ func formatPlan(state *ScanState, p *Plan, gaps []CoverageGap) string {
 		sb.WriteString(g)
 	}
 	return sb.String()
+}
+
+// applyObjectiveRefs marks the plan tasks that serve an objective
+// criterion. It only ADDS a reference: no task is removed, reordered or
+// skipped, and with a nil objective the plan is byte-identical to the plan
+// built without an objective (the golden scheduling test depends on it).
+func applyObjectiveRefs(p *Plan, obj *ObjectiveSpec) {
+	if p == nil || obj == nil || len(obj.Criteria) == 0 {
+		return
+	}
+	for _, t := range p.Tasks {
+		if t == nil || t.ObjectiveRef != "" {
+			continue
+		}
+		if ref := objectiveClassRef(obj, t.VulnClass); ref != "" {
+			t.ObjectiveRef = ref
+		}
+	}
 }

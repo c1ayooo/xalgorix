@@ -245,13 +245,11 @@ ACTIONS:
   1. launch url=https://target.com/signup
   2. snapshot → identify form fields
   3. type selector=@e3 text=testuser123
-  4. type selector=@e5 text=user@agentmail.to (from agentmail create_inbox)
+  4. type selector=@e5 text=user@example.com (operator-provided test account)
   5. type selector=@e7 text=SecureP@ss123!
   6. click selector=@e9 (submit button)
   7. wait selector=".success" OR wait type=navigation
-  8. Use agentmail wait_for_email to get verification link
-  9. goto url=VERIFICATION_LINK
-  10. get_cookies → save session tokens for authenticated testing⟦/ex⟧`,
+  8. get_cookies → save session tokens for authenticated testing⟦/ex⟧`,
 		Parameters: []tools.Parameter{
 			{Name: "command", Description: "Browser action (see list above). Always provide it; only unambiguous omitted actions can be recovered.", Required: false},
 			{Name: "url", Description: "URL to navigate to (launch/goto/verify_xss), or the discovered route prefix for verify_path_template_xss", Required: false},

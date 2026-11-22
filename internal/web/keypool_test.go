@@ -129,7 +129,7 @@ func makeKeyPoolSlice(n int) []string {
 // route (not on the operator-only denylist), so a valid machine token
 // authorizes it end-to-end through the real middleware.
 func TestKeyPool_MachineTokenAllowed(t *testing.T) {
-	h := machineAuthHarness(apiTokenCfg("tok-a"))
+	h := machineAuthHarness(t, apiTokenCfg("tok-a"))
 	// A denylisted route rejects the same token (control).
 	if w := doReq(h, "GET", "/api/settings/environment", "Bearer tok-a"); w.Code != http.StatusForbidden {
 		t.Fatalf("settings route must stay operator-only, got %d", w.Code)

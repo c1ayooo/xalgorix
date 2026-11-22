@@ -137,11 +137,13 @@ let state = {
     },
     {
       id: "scan_02",
+      instance_id: "inst_02",
       name: "Globex weekly",
       target: "globex.io",
       started_at: nowIso(),
       finished_at: nowIso(),
       status: "finished",
+      stop_reason: "goal_achieved",
       scan_mode: "balanced",
       vuln_count: 2,
       iterations: 80,
@@ -671,6 +673,14 @@ function mockInstanceEvents(inst) {
     { type: "tool_call", tool_name: "httpx", content: `httpx -silent -status-code ${inst.targets}`, agent_id: `${inst.id}/spec-injection` },
     { type: "tool_result", content: "3 个端点返回 200", agent_id: `${inst.id}/spec-injection` },
     { type: "thought", content: "/admin 返回 401，存在横向越权测试价值，登记 authz 矩阵", agent_id: `${inst.id}/spec-injection` },
+    {
+      type: "tool_call",
+      tool_name: "record_hypothesis",
+      content: "record_hypothesis",
+      tool_args: { hypothesis_id: "H-1", title: "/api/v1/orders 存在 IDOR（角色 A 可见他人订单）", kind: "idor" },
+      agent_id: `${inst.id}/spec-injection`,
+    },
+    { type: "tool_result", tool_name: "record_hypothesis", content: "假设 H-1 已登记（testing）", agent_id: `${inst.id}/spec-injection` },
     { type: "decision", content: "认领假设：/api/v1/orders 存在 IDOR", agent_id: `${inst.id}/spec-injection` },
     { type: "tool_call", tool_name: "nmap", content: `nmap -sV -p 443 ${inst.targets}`, agent_id: inst.id },
     { type: "tool_result", content: "1 个服务：nginx 1.24.0", agent_id: inst.id },
@@ -995,17 +1005,36 @@ const server = http.createServer(async (req, res) => {
     // listScansPage (paginated table) expects { items, total }; bare-list
     // consumers (useScansList → overview/reports) expect the plain array.
     const qs = new URLSearchParams(req.url.split("?")[1] || "");
+    // 挂载投影（与真实后端 attachScanListRunLinkage 对齐）：run 挂载反查
+    // task 名与 trigger；未挂载 legacy 行字段留空，不编造归属。
+    const projectRuns = (scan) =>
+      state.runs.find(
+        (r) => r.instance_id === scan.instance_id || r.instance_id === scan.id,
+      );
+    const withLinkage = (scan) => {
+      const run = projectRuns(scan);
+      if (!run) return scan;
+      const task = state.tasks.find((tk) => tk.id === run.task_id);
+      return {
+        ...scan,
+        task_id: run.task_id,
+        task_name: task?.name,
+        trigger: run.trigger,
+      };
+    };
     // project_id isolation（与真实后端 handleListScans §3.2 对齐）：
     // scan.id == instance.id，经 run.instance_id → run.task_id → task.project_id 联查。
     const projectFilter = qs.get("project_id");
-    const scoped = projectFilter
-      ? state.scans.filter((scan) => {
-          const run = state.runs.find((r) => r.instance_id === scan.id);
-          if (!run) return false;
-          const task = state.tasks.find((tk) => tk.id === run.task_id);
-          return task?.project_id === projectFilter;
-        })
-      : state.scans;
+    const scoped = (
+      projectFilter
+        ? state.scans.filter((scan) => {
+            const run = projectRuns(scan);
+            if (!run) return false;
+            const task = state.tasks.find((tk) => tk.id === run.task_id);
+            return task?.project_id === projectFilter;
+          })
+        : state.scans
+    ).map(withLinkage);
     if (qs.get("page") != null) {
       const size = Math.max(1, Number(qs.get("size") ?? 50) || 50);
       const pg = Math.max(1, Number(qs.get("page")) || 1);
@@ -2217,6 +2246,87 @@ const server = http.createServer(async (req, res) => {
           updated_at: t0,
         },
       ],
+    });
+  }
+
+  // -------- 探索投影（4zreco 双图同源；契约同 scan_exploration.go）--------
+  // 已知 scan 返回同一份 node/edge 模型：起点→执行(主循环+specialist)→
+  // 假设(六态)→事实(observed/inferred+观测)→发现(severity)，四类边。
+  const explorationMatch = url.match(/^\/api\/scans\/([^/]+)\/exploration$/);
+  if (explorationMatch && method === "GET") {
+    const scanId = decodeURIComponent(explorationMatch[1]);
+    const known =
+      state.instances.some((inst) => inst.id === scanId) ||
+      state.scans.some((sc) => sc.id === scanId);
+    if (!known) return send(res, { error: "scan not found" }, 404);
+    const t = (minAgo) => new Date(Date.now() - minAgo * 60_000).toISOString();
+    const n = (id, kind, seq, minAgo, title, extra = {}) => ({
+      id, kind, seq, at: t(minAgo), title, up: 0, down: 0, ...extra,
+    });
+    const nodes = [
+      n("goal", "goal", 1, 62, "验证 api.example.com 登录与搜索面的注入类风险", {
+        summary: "任务目标:覆盖 sqli/xss 两类漏洞的可判定判据",
+      }),
+      n("main", "agent", 2, 60, "主循环 (Eino ChatModelAgent)", { actor: "chatmodel-agent" }),
+      n("agent:spec-1", "agent", 3, 58, "sqli specialist", {
+        actor: "agentsgraph",
+        summary: 'create_agent id=spec-1 role="sqli specialist" task="probe login"',
+      }),
+      n("hyp:H-2", "hypothesis", 4, 56, "Login form /username 允许布尔盲注", {
+        state: "testing", actor: "spec-1", up: 1, down: 2,
+      }),
+      n("hyp:H-1", "hypothesis", 5, 54, "/search 的 q 参数反射未编码输出", {
+        state: "proven", actor: "main", up: 1, down: 2,
+      }),
+      n("hyp:H-3", "hypothesis", 6, 52, "/admin 备份路径可未授权下载", {
+        state: "rejected", up: 0, down: 1,
+      }),
+      n("ev:EV-1", "evidence", 7, 40, "baseline", {
+        nature: "observed", summary: "正常请求 200/118ms,参数原样回显", up: 1,
+      }),
+      n("ev:EV-2", "evidence", 8, 32, "probe", {
+        nature: "observed", summary: "' OR 1=1-- 响应 500,日志出现 SQL 错误特征", up: 1,
+      }),
+      n("ev:EV-3", "evidence", 9, 26, "exploit", {
+        nature: "observed", summary: "反射 payload 未编码回显,可构造钓鱼链", up: 1, down: 1,
+      }),
+      n("ev:EV-4", "evidence", 10, 24, "finding_ref", {
+        nature: "observed", summary: "Reported as finding XALG-1042", up: 1, down: 1,
+      }),
+      n("obs:ii-traffic-1", "observation", 11, 45, "https://api.example.com/login", {
+        nature: "observed", actor: "trafficproxy", summary: "POST /login 401(代理观测)",
+      }),
+      n("finding:XALG-1042", "finding", 12, 20, "搜索页反射型 XSS", {
+        severity: "medium", state: "true", up: 1,
+      }),
+    ];
+    const edges = [
+      { src: "main", dst: "hyp:H-1", rel: "claim" },
+      { src: "agent:spec-1", dst: "hyp:H-2", rel: "claim" },
+      { src: "hyp:H-2", dst: "ev:EV-1", rel: "yields" },
+      { src: "hyp:H-2", dst: "ev:EV-2", rel: "yields" },
+      { src: "hyp:H-1", dst: "ev:EV-3", rel: "yields" },
+      { src: "hyp:H-1", dst: "ev:EV-4", rel: "yields" },
+      { src: "hyp:H-3", dst: "ev:EV-1", rel: "supports" },
+      { src: "ev:EV-4", dst: "finding:XALG-1042", rel: "proves" },
+    ];
+    const up = new Map(), down = new Map();
+    for (const e of edges) {
+      down.set(e.src, (down.get(e.src) ?? 0) + 1);
+      up.set(e.dst, (up.get(e.dst) ?? 0) + 1);
+    }
+    for (const node of nodes) {
+      node.up = up.get(node.id) ?? 0;
+      node.down = down.get(node.id) ?? 0;
+    }
+    return send(res, {
+      scan_id: scanId,
+      journal_present: true,
+      journal_damaged: false,
+      ledger_present: true,
+      incomplete: false,
+      nodes,
+      edges,
     });
   }
 

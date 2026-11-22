@@ -230,6 +230,7 @@ func (s *FileStore) CreateGuidance(_ context.Context, in GuidanceInput) (*Guidan
 		InstanceID: in.InstanceID,
 		Message:    in.Message,
 		Status:     GuidanceQueued,
+		CreatedBy:  in.CreatedBy,
 		CreatedAt:  time.Now().UTC(),
 		RequestID:  in.RequestID,
 	}

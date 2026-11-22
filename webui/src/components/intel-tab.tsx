@@ -11,14 +11,16 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { EmptyState, ErrorState } from "@/components/states";
+import { IntelInfoItems } from "@/components/intel-info-items";
 import { useIntelTriage, useTaskIntelligence } from "@/api/queries";
 import { useI18n } from "@/i18n";
 import { cn } from "@/lib/utils";
 import type { IntelItem, IntelKind, IntelTriageStatus } from "@/types/api";
 
 /**
- * 任务情报（契约 §3.7）——凭据/线索/敏感数据三分视图 + 操作者分诊。
- * 观测项由 agent 的 record_intelligence 工具写入各 Run（这里只读聚合），
+ * 任务情报（契约 §3.7）——上半区是冷路径信息项切片（InfoItem 区域/关联
+ * 点亮，IntelInfoItems），下半区是凭据/线索/敏感数据三分视图 + 操作者
+ * 分诊。二者是不同对象：intelligence.json 情报项 vs InfoItem 冷路径投影，
  * 分诊是独立的人类标注（overlay），不回写观测记录。
  */
 
@@ -168,7 +170,13 @@ function IntelRow({
   );
 }
 
-export function IntelTab({ taskId }: { taskId: string }) {
+export function IntelTab({
+  taskId,
+  projectId,
+}: {
+  taskId: string;
+  projectId?: string;
+}) {
   const { t } = useI18n();
   const { data, isLoading, error, refetch } = useTaskIntelligence(taskId);
   const [kindFilter, setKindFilter] = useState<IntelKind | "all">("all");
@@ -212,6 +220,10 @@ export function IntelTab({ taskId }: { taskId: string }) {
 
   return (
     <div className="space-y-3">
+      {/* 信息项切片：该任务全部 run 的冷路径 InfoItem（区域/关联点亮）。
+          project_id 用任务归属项目，不用活跃项目——后端按归属校验 task_id。 */}
+      <IntelInfoItems taskId={taskId} projectId={projectId} />
+
       {/* kind 过滤 chips（带计数）+ 分诊状态过滤。 */}
       <div className="flex flex-wrap items-center gap-2">
         <button

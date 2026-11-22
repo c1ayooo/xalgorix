@@ -40,6 +40,9 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { ScanStatusPill } from "@/components/scan-status-pill";
+import { StopReasonBadge } from "@/components/stop-reason-badge";
+import { RunObjectiveCard } from "@/components/run-objective-card";
+import { LedgerTab } from "@/components/ledger-tab";
 import { SeverityBadge } from "@/components/severity-badge";
 import { Markdown } from "@/components/markdown";
 import { VerificationBadge } from "@/components/verification-badge";
@@ -59,6 +62,8 @@ import {
   usePauseInstance,
   useResumeInstance,
   useStartSavedInstance,
+  useStartTaskRun,
+  useTask,
   useDeleteScan,
   useDeleteVuln,
   useSendTaskGuidance,
@@ -101,6 +106,7 @@ import {
   Send,
   Activity,
   FolderOpen,
+  BookOpen,
 } from "lucide-react";
 import { LiveFeed, type FeedFilter } from "@/components/live-feed";
 import { Pagination, DEFAULT_PAGE_SIZE } from "@/components/Pagination";
@@ -116,6 +122,10 @@ export default function ScanDetailPage() {
   const pause = usePauseInstance();
   const resume = useResumeInstance();
   const start = useStartSavedInstance();
+  const rerun = useStartTaskRun();
+  // D11 run/task mount linkage: mounted runs resolve their task (name for the
+  // header, re-dispatch target). useTask is enabled-guarded on the id.
+  const { data: task } = useTask(scan?.task_id);
   const del = useDeleteScan();
   const subscribe = useEventsStore((s) => s.subscribe);
   const unsubscribe = useEventsStore((s) => s.unsubscribe);
@@ -234,25 +244,49 @@ export default function ScanDetailPage() {
 
   return (
     <div className="space-y-6">
-      <div>
+      <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
         <Link
           to="/scans"
-          className="inline-flex items-center text-xs text-muted-foreground hover:text-foreground"
+          className="inline-flex items-center hover:text-foreground"
         >
           <ChevronLeft className="mr-1 h-3 w-3" />
           {t("scans.title")}
         </Link>
+        {scan.task_id && (
+          <>
+            <span aria-hidden>/</span>
+            <Link
+              to={`/tasks/${scan.task_id}`}
+              className="inline-flex items-center hover:text-foreground"
+            >
+              {task?.name || t("nav.tasks")}
+            </Link>
+          </>
+        )}
       </div>
 
       <header className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
         <div className="space-y-2 min-w-0 flex-1">
           <div className="flex items-center gap-3 min-w-0">
-            <h1 className="font-mono text-xl sm:text-2xl font-semibold tracking-tight text-foreground truncate min-w-0">
-              {scan.target}
+            {/* Run 详情以任务命名（D11 挂载语义）；未挂载的遗留扫描
+                退回 target 主标题——诚实降级，不编造归属。 */}
+            <h1
+              className={cn(
+                "text-xl sm:text-2xl font-semibold tracking-tight text-foreground truncate min-w-0",
+                !task?.name && "font-mono",
+              )}
+            >
+              {task?.name || scan.target}
             </h1>
             <CopyButton value={scan.target} />
           </div>
           <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
+            {task?.name && (
+              <>
+                <span className="mono truncate max-w-full">{scan.target}</span>
+                <span className="hidden sm:inline">·</span>
+              </>
+            )}
             <span className="mono truncate max-w-full">{scan.id}</span>
             <span className="hidden sm:inline">·</span>
             <span>{t("instances.startedPrefix")}{timeAgo(scan.started_at)}</span>
@@ -273,12 +307,44 @@ export default function ScanDetailPage() {
 
         <div className="flex flex-wrap items-center gap-2">
           <ScanStatusPill status={scan.status} />
+          {/* 终态原因常驻头部（原埋在配置 tab）：goal_achieved=emerald、
+              义务未清=amber、自由文本原样 mono——词表照引擎枚举，不造新状态。 */}
+          <StopReasonBadge reason={scan.stop_reason} />
           <Button variant="outline" size="sm" asChild>
             <a href={api.reportUrl(scan.id)} target="_blank" rel="noreferrer">
               <Download className="mr-1 h-4 w-4" /> {t("nav.reports")}
             </a>
           </Button>
-          {canStart && (
+          {canStart && scan.task_id && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                // D11: a mounted run re-dispatches through the unified
+                // task-run entry — same instance, notes/ledger/checkpoint
+                // stay continuous. The legacy instance start below remains
+                // only for unmounted saved scans.
+                const tid = scan.task_id;
+                if (!tid) return;
+                rerun.mutate(
+                  { id: tid },
+                  {
+                    onSuccess: (res) => {
+                      if (res.instance_id) {
+                        navigate(`/scans/${res.instance_id}`);
+                      } else {
+                        void refetch();
+                      }
+                    },
+                  },
+                );
+              }}
+              disabled={rerun.isPending}
+            >
+              <Play className="mr-1 h-4 w-4" /> {t("scanDetail.action.rerun")}
+            </Button>
+          )}
+          {canStart && !scan.task_id && (
             <Button
               variant="outline"
               size="sm"
@@ -436,6 +502,14 @@ export default function ScanDetailPage() {
         )}
       </div>
 
+      {/* 本 run 的目标判定投影（判定环）：只渲染 runs[] 里属于自己的行，
+          任务级 ring/缺口/VOI 池仍在任务详情概览，不在此复刻。 */}
+      <RunObjectiveCard
+        taskId={scan.task_id}
+        runId={scan.run_id}
+        scanId={scan.id}
+      />
+
       <Tabs defaultValue="findings">
         <TabsList>
           <TabsTrigger value="findings">
@@ -445,6 +519,10 @@ export default function ScanDetailPage() {
           <TabsTrigger value="events">
             <Terminal className="mr-1.5 h-3.5 w-3.5" />
             {t("scanDetail.tab.events")}
+          </TabsTrigger>
+          <TabsTrigger value="ledger">
+            <BookOpen className="mr-1.5 h-3.5 w-3.5" />
+            {t("scanDetail.tab.ledger")}
           </TabsTrigger>
           <TabsTrigger value="tokens">
             <Activity className="mr-1.5 h-3.5 w-3.5" />
@@ -482,6 +560,11 @@ export default function ScanDetailPage() {
             loadingOlder={loadingOlder}
             onLoadEarlier={loadEarlierEvents}
           />
+        </TabsContent>
+        <TabsContent value="ledger">
+          {/* 黑板双层（状态 ledger + 历史 audit）随 Run 走：per-run 数据归
+              Run 详情；id 用实例 id（与任务详情账本 tab 同一约定）。 */}
+          <LedgerTab scanId={eventInstanceId} running={isLiveScan} />
         </TabsContent>
         <TabsContent value="tokens">
           <TokenUsageTab scanId={scan.id} running={status === "running" || status === "paused"} />

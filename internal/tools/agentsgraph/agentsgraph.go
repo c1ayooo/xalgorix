@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/xalgord/xalgorix/v4/internal/domainjournal"
 	"github.com/xalgord/xalgorix/v4/internal/tools"
 )
 
@@ -25,6 +26,12 @@ const (
 // coordinator; event forwarders use it to attach partial results to the right
 // delegation. Implementations must stop when ctx is canceled.
 type AgentRunner func(ctx context.Context, agentID, name string, targets []string, task string) (string, error)
+
+// AuditSink receives best-effort delegation audit records. op is one of the
+// domainjournal invocation operations (OpAgentDelegat); nil sink = no audit
+// (tests, minimal setups). A sink failure must never break delegation — the
+// implementation logs, it does not propagate.
+type AuditSink func(op domainjournal.Operation, summary string)
 
 type subAgentState struct {
 	ID          string
@@ -63,6 +70,26 @@ type Graph struct {
 	wg           sync.WaitGroup
 	persistPath  string
 	persistErr   error
+	audit        AuditSink
+}
+
+// SetAuditSink installs the per-scan invocation audit sink (wired by the
+// agent layer to the scan's domain journal). Call once before Register.
+func (g *Graph) SetAuditSink(fn AuditSink) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.audit = fn
+}
+
+// auditDelegation emits one delegation lifecycle audit record. Fire-and-forget:
+// audit gaps are logged by the sink, never fatal to delegation.
+func (g *Graph) auditDelegation(op domainjournal.Operation, summary string) {
+	g.mu.Lock()
+	fn := g.audit
+	g.mu.Unlock()
+	if fn != nil {
+		fn(op, summary)
+	}
 }
 
 // EffectiveMaxConcurrentAgents returns the configured maximum number of subagents
@@ -295,6 +322,8 @@ func (g *Graph) createAgent(args map[string]string) (tools.Result, error) {
 	}
 	g.mu.Unlock()
 
+	g.auditDelegation(domainjournal.OpAgentDelegat, fmt.Sprintf("create_agent id=%s role=%q task=%q", agentID, name, truncTask(task, 200)))
+
 	select {
 	case <-state.done:
 	case <-g.ctx.Done():
@@ -369,6 +398,8 @@ func (g *Graph) spawnAgent(args map[string]string) (tools.Result, error) {
 	}
 	g.mu.Unlock()
 
+	g.auditDelegation(domainjournal.OpAgentDelegat, fmt.Sprintf("spawn_agent id=%s role=%q task=%q", agentID, name, truncTask(task, 200)))
+
 	target := ""
 	if len(targets) > 0 {
 		target = targets[0]
@@ -405,6 +436,17 @@ func (g *Graph) complete(agentID, summary string, runErr error) {
 	}
 	state.doneOnce.Do(func() { close(state.done) })
 	_ = g.persistLocked()
+	// Delegation completion audit: the sink serializes on the journal's own
+	// mutex and never calls back into the graph, so calling it under g.mu is
+	// deadlock-free (auditDelegation must NOT be used here — it re-locks).
+	if g.audit != nil {
+		elapsed := state.CompletedAt.Sub(state.StartedAt).Round(time.Second)
+		if state.Error != "" {
+			g.audit(domainjournal.OpAgentDelegat, fmt.Sprintf("delegate_result id=%s role=%q status=failed after=%s error=%q", state.ID, state.Name, elapsed, truncTask(state.Error, 200)))
+		} else {
+			g.audit(domainjournal.OpAgentDelegat, fmt.Sprintf("delegate_result id=%s role=%q status=completed in=%s", state.ID, state.Name, elapsed))
+		}
+	}
 }
 
 type agentSnapshot struct {

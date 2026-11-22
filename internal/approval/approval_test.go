@@ -33,6 +33,7 @@ func TestClassify(t *testing.T) {
 		{"unknown tool is none", "notes_write", map[string]string{"content": "x"}, KindNone},
 		{"unknown tool with args is none", "spawn_agent", map[string]string{"role": "recon"}, KindNone},
 		{"terminal without command arg", "terminal_execute", map[string]string{}, KindCommand},
+		{"mcp bridged tool is command", "mcp_recon_lookup", map[string]string{"query": "x"}, KindCommand},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -193,6 +194,11 @@ func TestAssessHTTP(t *testing.T) {
 		{"wp-admin", "POST", "http://example.com/wp-admin/options.php", "", true, "admin"},
 		{"admin host label", "POST", "http://admin.example.com/settings", "", true, "admin"},
 		{"destructive SQL", "POST", "http://example.com/search", "q='; DROP TABLE users;--", true, "drop table"},
+		{"destructive SQL database", "POST", "http://example.com/admin/db", "sql=DROP DATABASE production", true, "drop database"},
+		{"destructive SQL schema", "POST", "http://example.com/admin/db", "sql=DROP SCHEMA public CASCADE", true, "drop schema"},
+		{"destructive DDL", "POST", "http://example.com/console", "sql=ALTER TABLE users DROP COLUMN pw", true, "alter table"},
+		{"destructive mongo", "POST", "http://example.com/api/db", "eval=db.dropDatabase()", true, "dropdatabase"},
+		{"destructive redis", "POST", "http://example.com/redis", "cmd=FLUSHALL", true, "flushall"},
 		{"destructive shell", "POST", "http://example.com/run", "cmd=rm -rf /", true, "rm -rf"},
 		{"destructive via query", "PUT", "http://example.com/x?cmd=shutdown%20now", "", true, "shutdown"},
 		{"auth payload field", "POST", "http://example.com/api/profile", "username=a&password=b", true, "auth"},

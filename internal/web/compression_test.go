@@ -69,23 +69,23 @@ func TestGzipMiddleware_SkipsWhenClientDoesNotAccept(t *testing.T) {
 	}
 }
 
-func TestGzipMiddleware_SkipsWebSocketPath(t *testing.T) {
+func TestGzipMiddleware_SkipsEventStreamPath(t *testing.T) {
 	called := false
 	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		called = true
-		// The real /ws handler hijacks the connection; assert we handed it the
-		// raw ResponseWriter, not our wrapper (which is not a Hijacker).
+		// The real /api/stream handler flushes per SSE frame; assert we handed
+		// it the raw ResponseWriter, not our wrapper (which would buffer).
 		if _, ok := w.(*gzipResponseWriter); ok {
-			t.Fatalf("/ws must not be wrapped by gzipResponseWriter")
+			t.Fatalf("/api/stream must not be wrapped by gzipResponseWriter")
 		}
 	})
 	h := gzipMiddleware(inner)
 
-	req := httptest.NewRequest(http.MethodGet, "/ws", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/stream", nil)
 	req.Header.Set("Accept-Encoding", "gzip")
 	h.ServeHTTP(httptest.NewRecorder(), req)
 	if !called {
-		t.Fatal("inner handler was not invoked for /ws")
+		t.Fatal("inner handler was not invoked for /api/stream")
 	}
 }
 

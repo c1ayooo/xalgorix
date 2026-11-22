@@ -176,6 +176,16 @@ func TestPostgresProjectTaskRunCRUDAndIsolation(t *testing.T) {
 	if err != nil || len(scanIDsB) != 0 {
 		t.Errorf("ProjectScanIDs(B) = %v, %v; want empty", scanIDsB, err)
 	}
+	taskScanIDs, err := repo.TaskScanIDs(ctx, projA.ID, taskA.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(taskScanIDs) != 1 || taskScanIDs[0] != fmt.Sprintf("pg-inst-%d", stamp) {
+		t.Errorf("TaskScanIDs(A, taskA) = %v", taskScanIDs)
+	}
+	if _, err := repo.TaskScanIDs(ctx, projB.ID, taskA.ID); !errors.Is(err, ErrNotFound) {
+		t.Errorf("TaskScanIDs(B, taskA) = %v, want ErrNotFound", err)
+	}
 
 	// Project delete cascades tasks and runs.
 	if _, err := repo.CreateRun(ctx, taskA.ID, RunMount{InstanceID: fmt.Sprintf("pg-del-%d", stamp)}); err != nil {
@@ -595,6 +605,7 @@ func TestPostgresGuidanceIdempotentConcurrent(t *testing.T) {
 		TaskID:    task.ID,
 		Message:   "concentrate on the auth bypass first",
 		RequestID: fmt.Sprintf("pg-guidance-%d", time.Now().UnixNano()),
+		CreatedBy: "alice",
 	}
 	const racers = 8
 	var wg sync.WaitGroup
@@ -649,6 +660,9 @@ func TestPostgresGuidanceIdempotentConcurrent(t *testing.T) {
 	if created || replay.ID != ids[0] || replay.Message != in.Message {
 		t.Errorf("replay created=%v row=%v message=%q; want false/%s/%q", created, replay.ID, replay.Message, ids[0], in.Message)
 	}
+	if replay.CreatedBy != "alice" {
+		t.Errorf("created_by = %q, want alice", replay.CreatedBy)
+	}
 }
 
 // TestPostgresTaskByLegacyScheduleID mirrors the file-store reverse-lookup
@@ -690,5 +704,39 @@ func TestPostgresTaskByLegacyScheduleID(t *testing.T) {
 	}
 	if _, err := repo.TaskByLegacyScheduleID(ctx, projectB.ID, fmt.Sprintf("pg-sched-lookup-%d", stamp)); !errors.Is(err, ErrNotFound) {
 		t.Errorf("cross-project lookup = %v, want ErrNotFound", err)
+	}
+}
+
+// Same non-ASCII-name contract as the file store, against real PostgreSQL:
+// a Chinese display name creates the project/task, the slug falls back to the
+// generated id, and the name is preserved verbatim.
+func TestPostgresStoreCreateProjectNonASCIINameFallsBackToID(t *testing.T) {
+	repo, pool := integrationRepo(t)
+	ctx := context.Background()
+
+	p, err := repo.CreateProject(ctx, "红队评估", Scope{Targets: []string{"acme.example"}})
+	if err != nil {
+		t.Fatalf("non-ASCII project name must be creatable: %v", err)
+	}
+	cleanupProject(t, pool, p.ID)
+	if p.Name != "红队评估" {
+		t.Errorf("display name must be preserved verbatim, got %q", p.Name)
+	}
+	if p.Slug == "" || p.Slug != p.ID {
+		t.Errorf("slug %q must be the id fallback %q", p.Slug, p.ID)
+	}
+	for _, r := range p.Slug {
+		if r > 127 {
+			t.Fatalf("slug %q must be ASCII", p.Slug)
+		}
+	}
+
+	task, err := repo.CreateTask(ctx, p.ID, TaskInput{Name: "内网横向", Goal: "lateral"})
+	if err != nil {
+		t.Fatalf("non-ASCII task name must be creatable: %v", err)
+	}
+	slug, _ := task.Context["slug"].(string)
+	if slug == "" || slug != task.ID {
+		t.Errorf("task context slug %q must be the task id fallback %q", slug, task.ID)
 	}
 }

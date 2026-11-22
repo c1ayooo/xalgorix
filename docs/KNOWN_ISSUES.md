@@ -30,16 +30,22 @@
 | M-1 | ✅已修（2026-11-21） | `settingsMu` 改 RWMutex；`configSnapshot()` 覆盖 status/version/rate-limit/agentmail/auth/LLM settings/provider discovery/scan-session/notify/retention/report；剩余 `s.cfg` 读仅为启动期、持锁 keypool 与 `sess.cfg` 副本 | `internal/web/settings_env.go`、`server.go`、`ws_hub.go`、`scheduler.go`、`keypool.go`、`scan_session.go` | 已闭合 |
 | M-2 | ✅已修（2026-11-21） | QueueState 持久化/恢复 Model、ProviderProfile、CodeScan、SourceRepo、ScanContext/Paths | `internal/web/server.go`、`queue_state.go`；回归 `TestQueueState_PreservesAllConfig` | 已闭合 |
 | M-3 | ✅已修（2026-11-21） | `markQueueStatePaused` 改用 `storage.WriteAtomic` | `internal/web/queue_state.go` | 已闭合 |
-| M-4 | ✅已修（2026-11-21） | narration 仍非阻塞，但丢弃计数进入终态遥测（`dropped_narration`）；tool/claim 事件继续阻塞发送 | `internal/agent/agent.go`、`liveness.go`；`TelemetryStats()` | 已按审计边界收口；narration 不作为完整审计记录 |
+| M-4 | ✅已修（范围：正常完成/auto-finalize，2026-11-21） | narration 仍非阻塞，丢弃计数进入正常完成路径的终态遥测（`dropped_narration`）；tool/claim 事件继续阻塞发送；停止、取消、hook 终止和 Eino 初始化失败不保证附带该统计 | `internal/agent/agent.go`、`liveness.go`；`TelemetryStats()` | 已按审计边界收口；不得把该统计表述为覆盖所有终态 |
 | M-5 | ✅已修（2026-11-21） | scan cleanup 调用 `httpclient.ClearSessionAuth`，同时清理 role A/B | `internal/tools/httpclient/sessionauth.go`、`internal/web/server.go`；回归 `TestClearSessionAuthRemovesBothRoles` | 已闭合 |
 | M-6 | ✅已修（2026-11-21） | 429/quota 路径按实际 endpoint key 冷却；兼容旧 `last` 回退 | `internal/llm/client.go`、`keyrotator.go`；回归 `TestMarkRateLimitedKeyCoolsExactKeyNotLastPick` | 已闭合 |
 | M-7 | ✅已修（2026-11-21） | flow 完成后清空内存 Profile/device_code，持久化 Store 仍是凭据源 | `internal/auth/driver_device.go`；`driver_device_test.go` | 已闭合 |
 | M-8 | ✅已修（2026-11-21） | 写入 clone map，持久化成功后才提交；唯一临时文件 + rename | `internal/llm/keystore.go`；回归 `TestKeyStoreSetRollsBackOnWriteFailure` | 已闭合 |
 | M-9 | ✅已修（2026-11-21） | 响应读取上限 32MB；预览文件改用唯一 `CreateTemp` | `internal/tools/proxy/proxy.go` | 已闭合 |
 | M-10 | ✅已修（2026-11-21） | selector/value 经 JSON 编码注入；检查 Eval 返回值 | `internal/tools/browser/browser.go` | 已闭合 |
-| M-11 | ✅已修（2026-11-21） | `ExecuteContext` 覆盖 terminal/Python/httpclient/proxy；browser 使用 rod `Page.Context`，`actionMu` 内绑定/清理每次调用的 ctx，不关闭 Chromium；未适配工具继续硬超时并计数 | `internal/tools/registry.go`、`internal/agent/agent.go`、`internal/tools/browser/{browser,transport}.go`；`context_cancel_test.go` | 已闭合 |
-| M-12 | ✅已修（2026-11-21） | fileedit 读写改走 `internal/safefile`：openat 逐段 O_NOFOLLOW、fd 基线写临时文件、renameat 原子替换 | `internal/safefile/*`、`internal/tools/fileedit/fileedit.go`；`safefile_test.go` | 已闭合 |
-| M-13 | ✅已修（2026-11-21） | Linux `enforce`：专用 UID/GID + 独立 nftables 表，仅放行 loopback trafficproxy 端口，其余 DROP；terminal/Python 降权并注入代理；browser 在 enforce 下 fail-closed；非 Linux 明确 unmanaged | `internal/egress/{egress,egress_linux,egress_other}.go`、`internal/tools/{terminal,python,browser}`、`internal/trafficproxy/manager.go` | 已闭合 |
+| M-11 | ✅已修（2026-11-21） | `ExecuteContext` 覆盖 terminal/Python/httpclient/proxy；terminal 的 venv/自动安装继承取消上下文，取消/超时返回失败结果；browser 使用原始 `rod.Page.Context`，`actionMu` 内绑定/清理每次调用的 ctx，不关闭 Chromium；Eino Runtime 对不协作工具强制硬超时并计数 | `internal/tools/registry.go`、`internal/agent/{agent,eino_runtime}.go`、`internal/engine/tools.go`、`internal/tools/browser/{browser,transport}.go`、`context_cancel_test.go`、`internal/engine/tools_test.go` | 已闭合 |
+| M-12 | ✅已修（2026-11-21） | fileedit 读写改走 `internal/safefile`：openat 逐段 O_NOFOLLOW、fd 基线写临时文件、renameat 原子替换；目录 fsync 通过独立只读 fd 完成且错误不再忽略 | `internal/safefile/*`、`internal/tools/fileedit/fileedit.go`；`safefile_test.go` | 已闭合 |
+| M-13 | ✅已修（2026-11-21；root/nft E2E 未执行） | Linux `enforce`：egress 键统一为 `ScanContext.ID`；专用 UID/GID + 独立 nftables 表；启动前把扫描工作区交给该 UID/GID，curl/wget/Python 使用工作区 CA 副本；browser fail-closed；proxy 模式不宣称 Enforced；非 Linux unmanaged | `internal/egress/{egress,egress_linux,egress_other}.go`、`internal/web/scan_session.go`、`internal/tools/{terminal,python,browser}`；`egress_linux_test.go` | 代码与单元回归闭合；真实 root/nftables 降权执行仍需环境验证 |
+
+| M-14 | ✅已修（2026-11-21） | `GET /api/approvals/summary` 经真实 mux 不可达：`/api/approvals/` 前缀先匹配 `handleApprovalDetail`，GET 返 405；`handleApprovals` 内 summary 分支仅被直调 handler 的测试覆盖 | `internal/web/server.go`（`registerPlatformAPIRoutes`）、`internal/web/handlers_approvals.go`；回归 `TestApprovalsSummaryRoute`（走真实 mux，含 200/405/decision 分发） | 已闭合：精确模式先于子树匹配 |
+
+| M-15 | 已知限制（2026-11-21 随目标功能落地） | 任务目标的**达成度只观测不阻断**：未达成不改变完成状态/停止原因/收工闸门 | `internal/objective`、`internal/web/objective_service.go` | 目标未达成可能来自环境、授权或方法论覆盖不足，强行阻断会制造假失败与死锁；如实呈现"未达成"是当前取舍 |
+| M-16 | 已知限制（2026-11-21 随目标功能落地） | `capability` 类判据（如 shell）依赖 finding 的 `exploitation_proof` 与漏洞类别名匹配（`shell`→rce/cmdi 等），无具体利用证据时判为未达成/不可判定 | `internal/objective/evaluate.go` | 能力类判据比漏洞类更依赖证据形态；别名表是显式小表，未知能力名退回严格 token 匹配，避免误判 |
+| M-17 | 已知限制（2026-11-21 随目标功能落地） | 目标标记（`Task.ObjectiveRef`）在模型调用 `build_plan` 重建计划后会被重新标记，但**不属于覆盖分母**，也不参与排序；模型自建计划不会携带引擎的覆盖底线任务 | `internal/agent/plan_tools.go`、`internal/agent/planner.go` | 目标只提供优先级上下文，不改变方法论义务；由 `build_plan` 的覆盖底线逻辑单独保证覆盖 |
 
 ## 前端
 
@@ -54,6 +60,9 @@
 | F-7 | ✅已修（2026-11-21，R5） | 补 `aria-expanded/aria-controls/useId`、阶段条 aria/tabIndex | `live-feed.tsx`、`phase-progress.tsx` | 已闭合 |
 | F-8 | ✅已修（2026-11-21，R5） | 存量高频 mutation 接 sonner；R3 新页已覆盖 | `webui/src/main.tsx`、各页面 | 已闭合主要入口 |
 | F-9 | ✅已修（2026-11-21，R5） | 删除 login 页硬编码统计 | `pages/login.tsx` | 已闭合 |
+| F-10 | ✅已修（2026-11-21；typecheck 验证） | 执行轨迹只采纳成功的 `build_plan/update_plan`；结果缺失工具名时禁止跨 agent 配对；分页/截断规划显示 `incomplete`；历史 Run 的无结果步骤显示 `无结果` 而非永久运行中 | `webui/src/lib/execution-trace.ts`、`components/{execution-trace,plan-rail}.tsx`、`run-console.tsx`、`i18n/translations.ts` | 已闭合；前端仍无自动化测试运行器，当前证据为 `npm run typecheck` |
+
+| F-11 | ✅已修（2026-11-21） | OpsPulse 未实现 REDESIGN §7.1 的 token 消耗展示 | `webui/src/components/ops-pulse.tsx`（活跃 Run `total_tokens` 求和）、`i18n/translations.ts` `pulse.tokens`；`npm run typecheck` 通过 | 已闭合 |
 
 ## 测试与构建
 
@@ -66,6 +75,19 @@
 | T-5 | ✅已按边界收口（2026-11-21） | PR 保留 `docker compose config`、`helm lint/template`、hadolint、WebUI build stage；完整 Kali 镜像仍只在发布 workflow | `.github/workflows/ci.yml`、`docker-compose.yml`、`deploy/chart` | 已按用户确认的轻量边界闭合 |
 | T-6 | ✅已修（2026-11-21） | release build 前执行 `npm ci && npm run build`，干净树断言继续兜底 | `scripts/release.py` | 已闭合 |
 | T-7 | ✅已修（2026-11-21） | Helm `appVersion` 同步至 `4.6.133` | `deploy/chart/Chart.yaml` | 已闭合 |
+
+## 信息层闭环（2026-11-22 实测修复）
+
+| ID | 状态 | 问题 | 证据位置 | 影响 |
+|---|---|---|---|---|
+| I-1 | ✅已修 | `einoApprovalBroker` 返回 typed nil 却被装进 `engine.ApprovalBroker` 接口，`ApprovalTool` 的 `broker == nil` 兜底失效；真实扫描第一次触发审批类工具即 `nil pointer dereference`，扫描标 `eino_runtime_error` | `internal/web/scan_session.go`（接口层不装 typed nil）、`internal/web/eino_approval.go`（方法层 nil 兜底）；E2E：同一靶标两次运行 0 panic | 已闭合 |
+| I-2 | ✅已修 | finding 与信息层无连接：`report_vulnerability` 只写 findings/scan.json，InfoItem 仅由 `add_hypothesis_evidence` 产生；模型直接报告时 info_items 恒为 0 | `internal/tools/reporting/reporting.go` 的 `projectFindingInfoItem` / `ensureFindingLedgerEvidence`；`domainjournal.OpFindingRecorded`；实测 XSS 靶标产出 `purpose=finding` 的 InfoItem | 已闭合 |
+| I-3 | ✅已修 | 纯工具观测无兜底：预算耗尽/断流时模型未调用台账工具，观测直接丢失 | `internal/tools/terminal/observation.go`（引擎侧模式匹配，密钥掩码）、`scanctx.AppendToolObservation`、`OpToolObservation`；实测一次 dirbust 产出 4 条 observed InfoItem | 已闭合 |
+| I-4 | ✅已修 | 平台 run 与扫描数据身份不通：`runs.legacy_scan_id` 为空，`ProjectScanIDs` 拿不到 `info_items.scan_id`，`/api/info/region` 恒空 | `platform.Repository.SetRunLegacyScanID`（PG/File 双实现）+ `internal/web/scan_session.go` 启动时回写；实测 region 返回 finding 与观测条目 | 已闭合 |
+| I-5 | ✅已修 | `incomplete()` 把「没有水位行的 id」也算未应用，项目里混入 instance_id 时永远 `incomplete=true` | `internal/infoitem/postgres/store.go`（改为 JOIN 已知水位行、只判非 applied）；实测 `incomplete=false` | 已闭合 |
+| I-6 | ✅已修 | 迁移测试假设每个迁移都 `CREATE TABLE`，0010 是 `ALTER TABLE` 导致 CI 假红 | `internal/infoitem/postgres/migrate_test.go`（接受 CREATE TABLE/ALTER TABLE/CREATE INDEX） | 已闭合 |
+
+**验收判据**：同一本地靶标一次运行后，`info_items` 同时含 `sensitive_artifact_served`（引擎观测）与 `purpose=finding`（报告投影），`/api/info/region` 返回二者且 `incomplete=false`。
 
 ## 处理原则
 

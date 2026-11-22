@@ -32,6 +32,22 @@ import (
 // use their module version when no build-time override is provided.
 var version string
 
+// updateRepoSlug is the release channel the self-update consults (GitHub
+// releases/tags API + asset download + every printed install hint). It must
+// point at the repository that publishes the binaries this deployment
+// trusts — the operator's fork, never an upstream channel that would
+// overwrite local builds with foreign code.
+const updateRepoSlug = "c1ayooo/xalgorix"
+
+// updateModulePath is the module reference used by the go-install fallback.
+// A fork that keeps the upstream module path cannot be resolved by module
+// path — go fetches github.com/xalgord/... from upstream — so this constant
+// MUST match the fork's own go.mod module declaration. With the upstream
+// path kept, the fallback fails LOUDLY (module-path mismatch) instead of
+// silently installing upstream code; publish release assets named
+// xalgorix-<goos>-<goarch> so the binary-download path is used instead.
+const updateModulePath = "github.com/c1ayooo/xalgorix/v4"
+
 const defaultWebPort = 9137
 
 func resolvedVersion(override, moduleVersion string) string {
@@ -143,7 +159,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "❌ Failed to fetch latest version from GitHub\n")
 			fmt.Fprintf(os.Stderr, "   This is usually caused by GitHub API rate limiting (60 req/hour for unauthenticated users).\n")
 			fmt.Fprintf(os.Stderr, "   Try again in a few minutes, or update manually:\n")
-			fmt.Fprintf(os.Stderr, "   wget -O $(which xalgorix) https://github.com/xalgorix/xalgorix/releases/latest/download/xalgorix-linux-amd64\n")
+			fmt.Fprintf(os.Stderr, "   wget -O $(which xalgorix) https://github.com/"+updateRepoSlug+"/releases/latest/download/xalgorix-linux-amd64\n")
 			os.Exit(1)
 		}
 
@@ -175,13 +191,13 @@ func main() {
 	goInstallFallback:
 		// Fallback: use go install with explicit version
 		fmt.Printf("Installing v%s via go install...\n", latestVer)
-		cmd := exec.Command("go", "install", "-v", "-ldflags", "-X main.version="+latestVer, "github.com/xalgord/xalgorix/v4/cmd/xalgorix@v"+latestVer)
+		cmd := exec.Command("go", "install", "-v", "-ldflags", "-X main.version="+latestVer, updateModulePath+"/cmd/xalgorix@v"+latestVer)
 		// GOPRIVATE makes the toolchain skip the public proxy and checksum DB
 		// for our module path; GOSUMDB=off avoids hitting sum.golang.org for
 		// this private module. (GONOSUMCHECK / GONOSUMDB are not real env vars.)
 		cmd.Env = append(os.Environ(),
 			"GOPROXY=direct",
-			"GOPRIVATE=github.com/xalgord/*",
+			"GOPRIVATE=github.com/c1ayooo/*",
 			"GOSUMDB=off",
 		)
 		cmd.Stdout = os.Stdout
@@ -189,7 +205,7 @@ func main() {
 		if err := cmd.Run(); err != nil {
 			fmt.Fprintf(os.Stderr, "❌ Update failed: %v\n", err)
 			fmt.Fprintf(os.Stderr, "\nManual install:\n")
-			fmt.Fprintf(os.Stderr, "  GOPROXY=direct GOPRIVATE=github.com/xalgord/* GOSUMDB=off go install -v github.com/xalgord/xalgorix/v4/cmd/xalgorix@v%s\n", latestVer)
+			fmt.Fprintf(os.Stderr, "  GOPROXY=direct GOPRIVATE=github.com/c1ayooo/* GOSUMDB=off go install -v %s/cmd/xalgorix@v%s\n", updateModulePath, latestVer)
 			os.Exit(1)
 		}
 
@@ -999,10 +1015,10 @@ func autoUpdate() {
 	} else {
 		// Fallback to go install
 		fmt.Println("   Installing update via go install...")
-		cmd := exec.Command("go", "install", "-v", "-ldflags", "-X main.version="+latestVer, "github.com/xalgord/xalgorix/v4/cmd/xalgorix@v"+latestVer)
+		cmd := exec.Command("go", "install", "-v", "-ldflags", "-X main.version="+latestVer, updateModulePath+"/cmd/xalgorix@v"+latestVer)
 		cmd.Env = append(os.Environ(),
 			"GOPROXY=direct",
-			"GOPRIVATE=github.com/xalgord/*",
+			"GOPRIVATE=github.com/c1ayooo/*",
 			"GOSUMDB=off",
 		)
 		cmd.Stdout = os.Stdout
@@ -1089,7 +1105,7 @@ func execRestart(path string, argv, env []string) error {
 func fetchLatestRelease() (version string, downloadURL string) {
 	client := &http.Client{Timeout: 15 * time.Second}
 
-	req, err := http.NewRequest("GET", "https://api.github.com/repos/xalgorix/xalgorix/releases/latest", nil)
+	req, err := http.NewRequest("GET", "https://api.github.com/repos/"+updateRepoSlug+"/releases/latest", nil)
 	if err != nil {
 		return "", ""
 	}
@@ -1141,7 +1157,7 @@ func fetchLatestRelease() (version string, downloadURL string) {
 
 // fetchLatestTag uses the git tags API as a fallback when releases API is rate-limited.
 func fetchLatestTag(client *http.Client) (string, string) {
-	req, err := http.NewRequest("GET", "https://api.github.com/repos/xalgorix/xalgorix/tags?per_page=1", nil)
+	req, err := http.NewRequest("GET", "https://api.github.com/repos/"+updateRepoSlug+"/tags?per_page=1", nil)
 	if err != nil {
 		return "", ""
 	}
@@ -1170,7 +1186,7 @@ func fetchLatestTag(client *http.Client) (string, string) {
 	}
 
 	wantName := fmt.Sprintf("xalgorix-%s-%s", runtime.GOOS, runtime.GOARCH)
-	downloadURL := fmt.Sprintf("https://github.com/xalgorix/xalgorix/releases/download/v%s/%s", ver, wantName)
+	downloadURL := fmt.Sprintf("https://github.com/%s/releases/download/v%s/%s", updateRepoSlug, ver, wantName)
 	return ver, downloadURL
 }
 

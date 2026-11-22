@@ -140,7 +140,6 @@ func allEnvSettingDefinitions() []envSettingDefinition {
 		{Key: "XALGORIX_MAX_OUTPUT_TOKENS", Label: "Max output tokens", Category: "LLM", Description: "Per-call completion cap (max_tokens). Reasoning models spend part of this on hidden thinking before a tool call, so a small provider default can truncate large calls. Clamped to a 1024 floor.", DefaultValue: "8192", InputType: "number"},
 		{Key: "XALGORIX_LLM_CONTEXT_WINDOW", Label: "LLM context window (tokens)", Category: "LLM", Description: "Total context window of your model, in tokens. Auto-compaction fires at a fraction of this (see compaction ratio) so the running context is only compacted when the window is genuinely filling up. Set to your model's real window (e.g. 1000000 for a 1M-token model). Default 128000.", DefaultValue: "128000", InputType: "number"},
 		{Key: "XALGORIX_LLM_TIMEOUT_SECONDS", Label: "LLM request timeout (seconds)", Category: "LLM", Description: "Hard limit for a single LLM request, in seconds. Default 600 (10 minutes), which suits hosted APIs. Raise it for slow local backends: a llama.cpp server on CPU can need 20+ minutes just to prefill a large prompt, and every request dies with a timeout before it can answer. Applies to LLM clients created after the change — restart to be sure.", DefaultValue: "600", InputType: "number"},
-		{Key: "XALGORIX_NATIVE_TOOL_CALLS", Label: "Native tool calling (OpenAI-compatible backends)", Category: "LLM", Description: "Send tool definitions as an OpenAI-style `tools` array and read calls from `tool_calls`, instead of requiring the model to emit XML tags inside its text. llama-server derives a grammar from the schema, so a malformed call becomes impossible, and models that were never trained on the XML dialect can still drive tools. Only affects OpenAI-compatible endpoints (llama.cpp, Ollama, vLLM, OpenAI); Anthropic, Gemini and the Responses API keep using XML. Default false.", DefaultValue: "false", InputType: "boolean"},
 		{Key: "XALGORIX_CONTEXT_COMPACT_RATIO", Label: "Context compaction ratio", Category: "LLM", Description: "Fraction of the context window at which to auto-compact (0.5–0.9). Default 0.75 = compact at ~75% full. Compacting earlier discards useful working context and hurts output quality; going higher risks hitting the provider's hard limit first.", DefaultValue: "0.75", InputType: "number"},
 		{Key: "XALGORIX_CONTEXT_COMPACT_TOKENS", Label: "Context compaction budget (tokens, override)", Category: "LLM", Description: "Optional ABSOLUTE override for the compaction trigger. Leave at -1 (auto) to derive the trigger from the context window × ratio above. Set a positive token count to force a fixed budget instead. 0 disables auto-compaction. Default -1 (auto).", DefaultValue: "-1", InputType: "number"},
 		{Key: "XALGORIX_MEMORY_COMPRESSOR_TIMEOUT", Label: "Memory compressor timeout", Category: "LLM", Description: "Timeout in seconds for context compression.", DefaultValue: "30", InputType: "number"},
@@ -162,6 +161,10 @@ func allEnvSettingDefinitions() []envSettingDefinition {
 		{Key: "XALGORIX_MAX_TOOL_CALLS", Label: "Max tool calls (budget)", Category: "Runtime", Description: "Per-scan tool-call cap; the scan stops cleanly when reached (findings preserved). 0 = unlimited.", DefaultValue: "0", InputType: "number", RequiresRestart: true},
 		{Key: "XALGORIX_MAX_DURATION", Label: "Max duration seconds (budget)", Category: "Runtime", Description: "Per-scan wall-clock cap in seconds; the scan stops cleanly when reached. 0 = unlimited.", DefaultValue: "0", InputType: "number", RequiresRestart: true},
 		{Key: "XALGORIX_MAX_TOKENS", Label: "Max LLM tokens (budget)", Category: "Runtime", Description: "Per-scan total-token cap; the scan stops cleanly when reached. 0 = unlimited.", DefaultValue: "0", InputType: "number", RequiresRestart: true},
+		{Key: "XALGORIX_APPROVAL_MODE", Label: "HITL approval mode", Category: "HITL", Description: "enforce routes command executions and high-risk HTTP through the operator approval queue (timeout = rejection); off (default) runs without approvals. Per-call exemptions are managed as approval rules on the Approvals page — they narrow what enforce asks about. Takes effect on restart.", DefaultValue: "off", InputType: "select", Options: []string{"off", "enforce"}, RequiresRestart: true},
+		{Key: "XALGORIX_APPROVAL_TIMEOUT", Label: "Approval timeout (seconds)", Category: "HITL", Description: "How long a pending approval waits before timeout = rejection. Default 600s; must stay under the smallest gated tool's hard ceiling (browser_action 10m) or the tool timeout fires first and abandons the verdict. Takes effect on restart.", DefaultValue: "600", InputType: "number", RequiresRestart: true},
+		{Key: "XALGORIX_APPROVAL_MAX_PENDING", Label: "Approval max pending per run", Category: "HITL", Description: "Concurrent pending approvals allowed per run (default 1); overflow queues FIFO for a free slot. Higher values let autonomous scans keep working while several requests wait, at the cost of a longer operator queue. Takes effect on restart.", DefaultValue: "1", InputType: "number", RequiresRestart: true},
+		{Key: "XALGORIX_APPROVAL_ALLOWLIST", Label: "Approval allowlist (programs)", Category: "HITL", Description: "Comma-separated read-only program names appended to the built-in passive-recon allowlist (subfinder/httpx/nmap -sV/curl GET are pre-allowed). Deny shapes (command substitution, redirection, PATH= shadowing) stay refused even for listed programs. Prefer approval rules (per-target, expiring) over blanket entries. Takes effect on restart.", Placeholder: "traceroute,openssl", InputType: "text", RequiresRestart: true},
 		{Key: "XALGORIX_TARGET_AUTH", Label: "Target auth (authenticated scanning)", Category: "Runtime", Description: "Authenticated-session credentials for the target so the agent tests post-auth surface (IDOR/BOLA, privilege escalation, business logic). One 'Header-Name: value' per line or separated by ';'. e.g. 'Cookie: session=abc; Authorization: Bearer xyz'. Auto-applied to http_request.", Placeholder: "Cookie: session=...; Authorization: Bearer ...", InputType: "text", Sensitive: true, RequiresRestart: true},
 		{Key: "XALGORIX_SCAN_HEADERS", Label: "Scan headers (attribution)", Category: "Runtime", Description: "Identifying header(s) added to ALL target-facing scan traffic (agent HTTP client + httpx/nuclei via -H) so an authorized Xalgorix run is attributable in the target's logs and can be allow-listed by its WAF/SOC. Bug-bounty programs often require one, e.g. 'X-Bug-Bounty: <handle>'. One 'Header-Name: value' per entry, separated by ';'. Never attached to LLM APIs, notifications, or the dashboard.", Placeholder: "X-Bug-Bounty: ulises2k; X-Scan-ID: engagement-42", InputType: "text", RequiresRestart: true},
 		{Key: "XALGORIX_SCAN_HEADERS_FILE", Label: "Scan headers file", Category: "Runtime", Description: "Path to a file of scan/attribution headers, one 'Name: value' per line ('#' comments and blank lines ignored). Merged with XALGORIX_SCAN_HEADERS; the inline value wins on a name clash.", Placeholder: "/path/to/scan-headers.txt", InputType: "path", RequiresRestart: true},
@@ -178,9 +181,6 @@ func allEnvSettingDefinitions() []envSettingDefinition {
 		{Key: "XALGORIX_TELEGRAM_CHAT_ID", Label: "Telegram chat ID", Category: "Notifications", Description: "Target chat/channel ID. Numeric ID (e.g. -1001234567890) or @channelusername.", Placeholder: "-1001234567890", InputType: "text"},
 		{Key: "XALGORIX_TELEGRAM_MIN_SEVERITY", Label: "Telegram minimum severity", Category: "Notifications", Description: "Minimum severity sent to Telegram.", InputType: "select", Options: []string{"", "info", "low", "medium", "high", "critical"}},
 		{Key: "XALGORIX_NOTIFY_SCAN_COMPLETE", Label: "Notify on scan completion", Category: "Notifications", Description: "Send the \"Scan Finished\" summary (report ready / clean scan) to the configured channels after every scan. Off by default so only per-vulnerability alerts are sent.", DefaultValue: "false", InputType: "boolean"},
-
-		{Key: "AGENTMAIL_POD", Label: "AgentMail pod", Category: "AgentMail", Description: "AgentMail pod identifier.", Placeholder: "am_us_pod_47", InputType: "text"},
-		{Key: "AGENTMAIL_API_KEY", Label: "AgentMail API key", Category: "AgentMail", Description: "AgentMail API key for inbound email triage.", Placeholder: "ak_...", InputType: "secret", Sensitive: true},
 
 		{Key: "XALGORIX_RATE_LIMIT_REQUESTS", Label: "Rate-limit requests", Category: "Rate limits", Description: "Requests allowed per dashboard rate-limit window.", DefaultValue: "60", InputType: "number"},
 		{Key: "XALGORIX_RATE_LIMIT_WINDOW", Label: "Rate-limit window", Category: "Rate limits", Description: "Rate-limit window in seconds.", DefaultValue: "60", InputType: "number"},
@@ -816,8 +816,6 @@ func (s *Server) applyEnvironmentToRuntimeConfig(values map[string]string) {
 			s.cfg.LLMContextWindow = parseIntSetting(value, 128000)
 		case "XALGORIX_LLM_TIMEOUT_SECONDS":
 			s.cfg.LLMTimeoutSeconds = parseIntSetting(value, 600)
-		case "XALGORIX_NATIVE_TOOL_CALLS":
-			s.cfg.NativeToolCalls = parseBoolSetting(value, false)
 		case "XALGORIX_CONTEXT_COMPACT_RATIO":
 			s.cfg.ContextCompactRatio = parseFloatSetting(value, 0.75)
 		case "XALGORIX_BOUNDED_CONTEXT":
@@ -886,10 +884,6 @@ func (s *Server) applyEnvironmentToRuntimeConfig(values map[string]string) {
 			s.cfg.OTelEndpoint = value
 		case "GEMINI_API_KEY":
 			s.cfg.GeminiAPIKey = value
-		case "AGENTMAIL_API_KEY":
-			s.cfg.AgentMailAPIKey = value
-		case "AGENTMAIL_POD":
-			s.cfg.AgentMailPod = value
 		case "XALGORIX_DISCORD_WEBHOOK":
 			s.cfg.DiscordWebhook = value
 			s.discordWebhook = value
@@ -986,8 +980,6 @@ func (s *Server) envSettingValue(key string) string {
 		return strconv.FormatBool(cfg.BoundedContext)
 	case "XALGORIX_EPOCH_COVERAGE":
 		return strconv.FormatBool(cfg.EpochCoverage)
-	case "XALGORIX_NATIVE_TOOL_CALLS":
-		return strconv.FormatBool(cfg.NativeToolCalls)
 	case "XALGORIX_TOOL_ARCHIVE_MIN_BYTES":
 		return strconv.Itoa(cfg.ToolArchiveMinBytes)
 	case "XALGORIX_TOOL_ARCHIVE_ACTIVE_WINDOW":
@@ -1038,10 +1030,6 @@ func (s *Server) envSettingValue(key string) string {
 		return cfg.OTelEndpoint
 	case "GEMINI_API_KEY":
 		return cfg.GeminiAPIKey
-	case "AGENTMAIL_API_KEY":
-		return cfg.AgentMailAPIKey
-	case "AGENTMAIL_POD":
-		return cfg.AgentMailPod
 	case "XALGORIX_DISCORD_WEBHOOK":
 		return cfg.DiscordWebhook
 	case "XALGORIX_DISCORD_MIN_SEVERITY":

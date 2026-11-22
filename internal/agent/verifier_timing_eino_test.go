@@ -196,8 +196,6 @@ func newEinoVerifierAgent(t *testing.T, srvURL string) (*Agent, *scanctx.ScanCon
 		APIKey:              "sk-test",
 		MaxIterations:       6,
 		MinIterations:       1,
-		NativeToolCalls:     true,
-		Engine:              "eino",
 		DisableAutoDelegate: true,
 	}
 	events := make(chan Event, 256)
@@ -207,7 +205,7 @@ func newEinoVerifierAgent(t *testing.T, srvURL string) (*Agent, *scanctx.ScanCon
 	}
 	guard := scopeguard.Config{BindAddr: "127.0.0.1", Port: 0, AllowLocalTargets: true}
 	ag := NewAgent(cfg, "eino-verifier", events, guard, sc,
-		WithLLMClient(llm.NewClient(cfg)), WithEinoRuntime(store, nil))
+		WithLLMClient(llm.NewClient(cfg)), WithRuntime(store, nil))
 	t.Cleanup(ag.Stop)
 	ag.state = goldenSeedState(t, sc)
 	return ag, sc, events

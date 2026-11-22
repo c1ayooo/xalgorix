@@ -1,15 +1,16 @@
 package engine
 
-// Runtime is the ADK execution seam. It is built only when the operator
-// explicitly selects the eino engine; the legacy agent.Run path does not import
-// this file. The runner is configured with a durable checkpoint store so an
-// approval interrupt can resume the same run after a restart.
+// Runtime is the ADK execution seam. It is the only scan runtime. The runner
+// is configured with a durable checkpoint store so an approval interrupt can
+// resume the same run after a restart.
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cloudwego/eino/adk"
@@ -22,11 +23,15 @@ import (
 )
 
 // GuardVerdict is the application-level pre-tool decision. Allowed=false
-// short-circuits with Output as the tool result (never a Go error), preserving
-// the legacy "expected rejection is not a tool failure" rule.
+// short-circuits with Output as the tool result (never a Go error): an
+// expected rejection is not a tool failure.
 type GuardVerdict struct {
 	Allowed bool
 	Output  string
+	// Args optionally replaces the arguments sent to the tool endpoint. The
+	// scan uses it for pre-gate terminal command normalization, so the guard
+	// and the executed command see byte-identical input.
+	Args map[string]string
 }
 
 // ToolGuard is the six-ring scope/safety seam. The engine calls it before every
@@ -55,8 +60,7 @@ type RuntimeConfig struct {
 	Approvals       ApprovalBroker
 	InstanceID      string
 	ScanContextID   string
-	// ToolTimeout is the per-tool hard ceiling. It mirrors the legacy
-	// executeToolAsync safety net and is applied with a 30s grace.
+	// ToolTimeout is the per-tool hard ceiling, applied with a 30s grace.
 	ToolTimeout func(string) time.Duration
 	// OnToolTimeout is invoked when that hard ceiling fires, so the agent can
 	// record uncooperative-timeout telemetry.
@@ -66,6 +70,20 @@ type RuntimeConfig struct {
 	// a completed finish: the ADK's tool-node completion and the next model
 	// turn can overlap, so a context cancellation alone races that hand-off.
 	StopCheck func() bool
+	// ModelRecovery owns provider retry/backoff, empty-response recovery and
+	// token accounting. It runs in the ChatModel adapter, before the ADK sees
+	// a failed or non-executable turn.
+	ModelRecovery ModelRecovery
+	// Compactor applies the scan's bounded-context policy to the ADK message
+	// state before the provider request is serialized.
+	Compactor func([]*schema.Message) []*schema.Message
+	// NativeTools selects the provider wire protocol. false keeps the XML
+	// fallback for Anthropic/Gemini/Responses endpoints.
+	NativeTools bool
+	// OnReasoning receives the reasoning model's raw thinking text for each
+	// accepted provider response (fire-and-forget observability sink for the
+	// sessions-page thinking role). Nil-safe; never gates or retries.
+	OnReasoning func(string)
 }
 
 // Runtime owns one ADK agent + runner for an explicit eino scan.
@@ -77,9 +95,9 @@ type Runtime struct {
 	toolsNode compose.ToolsNodeConfig
 }
 
-// NewRuntime constructs the Eino path. It fails closed when required
-// dependencies are missing; the caller can then keep the legacy path or report
-// a configuration error. It never silently falls back after construction.
+// NewRuntime constructs the runtime. It fails closed when required
+// dependencies are missing; the caller reports a typed configuration error.
+// It never silently falls back after construction.
 func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 	if cfg.Client == nil {
 		return nil, errors.New("engine: runtime requires a chat client")
@@ -124,7 +142,13 @@ func NewRuntime(ctx context.Context, cfg RuntimeConfig) (*Runtime, error) {
 	if maxIterations <= 0 {
 		maxIterations = 20
 	}
-	chatModel := NewChatModel(cfg.Client)
+	chatModel := NewChatModel(cfg.Client).
+		WithNativeTools(cfg.NativeTools).
+		WithModelRecovery(cfg.ModelRecovery).
+		WithCompactor(cfg.Compactor)
+	if cfg.OnReasoning != nil {
+		chatModel = chatModel.WithOnReasoning(cfg.OnReasoning)
+	}
 	if cfg.StopCheck != nil {
 		chatModel = chatModel.WithStopCheck(cfg.StopCheck)
 	}
@@ -216,27 +240,38 @@ func (m *toolGuardMiddleware) WrapInvokableToolCall(_ context.Context, endpoint 
 			if !verdict.Allowed {
 				return denyOutput(verdict, "the application safety guard denied this call"), nil
 			}
+			if verdict.Args != nil {
+				args = verdict.Args
+			}
 		}
 		if m.observer != nil {
 			verdict := m.observer.BeforeTool(callCtx, tCtx.Name, args)
 			if !verdict.Allowed {
 				return denyOutput(verdict, "the engine obligation denied this call"), nil
 			}
+			if verdict.Args != nil {
+				args = verdict.Args
+			}
 		}
-		output, callErr := endpoint(callCtx, argumentsInJSON, opts...)
+		normalizedJSON, err := encodeRegistryArgs(args)
+		if err != nil {
+			return "", err
+		}
+		meta := &toolExecutionMeta{}
+		callCtx = context.WithValue(callCtx, toolExecutionMetaKey{}, meta)
+		output, callErr := endpoint(callCtx, normalizedJSON, opts...)
 		// Approval interrupts are control flow, not failures: they must reach
-		// the graph verbatim or ResumeWithParams loses its target, and they
-		// must not be converted into tool results below.
+		// the graph verbatim or ResumeWithParams loses its target.
 		isInterrupt := interruptError(callErr)
 		if m.observer != nil {
-			m.observer.AfterTool(callCtx, tCtx.Name, args, output, callErr)
+			if !isInterrupt {
+				output = m.observer.TransformToolOutput(callCtx, tCtx.Name, args, output, meta.metadata(), callErr)
+			}
+			m.observer.AfterTool(callCtx, tCtx.Name, args, output, meta.metadata(), callErr)
 		}
 		if callErr != nil && !isInterrupt {
-			// Legacy surfaces execution failures as tool results the model can
-			// recover from (result.Error flows into the conversation and the
-			// loop continues) — never as a graph-killing error. Mirror that: a
-			// failed execution is a tool result, the same rule the GuardVerdict
-			// contract applies to denials.
+			// Expected execution failures are tool results the model can
+			// recover from, never graph-killing errors.
 			if strings.TrimSpace(output) == "" {
 				output = "⛔ TOOL EXECUTION FAILED — " + callErr.Error()
 			}
@@ -244,6 +279,53 @@ func (m *toolGuardMiddleware) WrapInvokableToolCall(_ context.Context, endpoint 
 		}
 		return output, callErr
 	}, nil
+}
+
+type toolExecutionMetaKey struct{}
+
+type toolExecutionMeta struct {
+	mu     sync.Mutex
+	result tools.Result
+	set    bool
+}
+
+func (m *toolExecutionMeta) record(result tools.Result) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.result = result
+	m.set = true
+}
+
+func (m *toolExecutionMeta) metadata() map[string]any {
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.set {
+		return nil
+	}
+	return m.result.Metadata
+}
+
+func recordToolExecutionResult(ctx context.Context, result tools.Result) {
+	if meta, ok := ctx.Value(toolExecutionMetaKey{}).(*toolExecutionMeta); ok {
+		meta.record(result)
+	}
+}
+
+func encodeRegistryArgs(args map[string]string) (string, error) {
+	if len(args) == 0 {
+		return "{}", nil
+	}
+	encoded, err := json.Marshal(args)
+	if err != nil {
+		return "", fmt.Errorf("engine: encode tool args: %w", err)
+	}
+	return string(encoded), nil
 }
 
 // interruptError recognizes both the first interrupt signal and the rerun

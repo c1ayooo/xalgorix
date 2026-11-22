@@ -170,6 +170,10 @@ func (a *Agent) buildPlanTool(args map[string]string) (tools.Result, error) {
 
 	a.state.Plan = plan
 	a.state.PlanBuilt = true
+	// A model-built plan replaces the engine plan, so the objective
+	// markers are re-applied here (marking only - no task is added,
+	// removed or reordered).
+	applyObjectiveRefs(plan, a.state.Objective)
 	// Ground the new plan in the discovered endpoints so coverage-gap detection
 	// works against it immediately.
 	a.state.DiscoveredEndpoints = extractEndpointsFromNotes(a.state)

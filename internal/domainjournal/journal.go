@@ -132,13 +132,43 @@ const (
 	// trafficproxy) as an observed InfoItem. It carries no hypothesis
 	// mutation — the ledger is only the InfoItem's journal host.
 	OpObserveTraffic Operation = "observe_traffic"
+	// OpRecordObjective records the operator-stated task objective as an
+	// observed (human-sourced) InfoItem. Like OpObserveTraffic it carries no
+	// hypothesis mutation: the objective is context for the loop, never a
+	// verdict and never a finding.
+	OpRecordObjective Operation = "record_objective"
+	// OpSkillLoad is the integration invocation audit for one completed skill
+	// load. Audit-only (no hypothesis mutation) — together with
+	// OpAgentDelegate and OpMcpCall it is the per-scan authority for the
+	// integration invocation records the web layer projects cross-scan into
+	// <dataDir>/_invocations/*.jsonl; the telemetry events.jsonl is never an
+	// audit source (charter §5.1).
+	OpSkillLoad Operation = "skill_load"
+	// OpAgentDelegate is the audit record for one sub-agent delegation
+	// lifecycle event (spawn/create and completion), audit-only.
+	OpAgentDelegat Operation = "agent_delegate"
+	// OpMcpCall is the audit record for one completed MCP tool call
+	// (ok or error), audit-only.
+	OpMcpCall Operation = "mcp_call"
+	// OpFindingRecorded projects a persisted finding into the information
+	// space as an observed InfoItem (subject=endpoint, purpose=finding). It is
+	// appended by the report gate after the finding survives every gate and is
+	// durable, so a finding can never exist without a corresponding InfoItem —
+	// the model is not asked to remember a second call.
+	OpFindingRecorded Operation = "finding_recorded"
+	// OpToolObservation records one engine-detected observation from a tool's
+	// output (for example a sensitive file served with 200). The engine, not
+	// the model, decides that the observation is worth keeping, so budget
+	// exhaustion cannot drop it.
+	OpToolObservation Operation = "tool_observation"
 )
 
 func (o Operation) Valid() bool {
 	switch o {
 	case OpSeedHypothesis, OpRecordHypothesis, OpClaimHypothesis, OpAssignHypothesis,
 		OpSetStatus, OpAddEvidence, OpRecordAttempt, OpSetVOI, OpMergeLedger, OpResetLedger,
-		OpInfoItemEnriched, OpInfoItemProjected, OpObserveTraffic:
+		OpInfoItemEnriched, OpInfoItemProjected, OpObserveTraffic, OpRecordObjective,
+		OpSkillLoad, OpAgentDelegat, OpMcpCall, OpFindingRecorded, OpToolObservation:
 		return true
 	default:
 		return false

@@ -19,8 +19,8 @@ import (
 // enables constrained decoding: the server derives a GBNF grammar from the
 // schema, so a malformed call becomes impossible rather than merely repaired.
 //
-// Everything here is inert unless the operator opts in via
-// XALGORIX_NATIVE_TOOL_CALLS and the endpoint speaks the OpenAI protocol.
+// These helpers are inert unless the runtime selects the native channel and
+// the endpoint speaks the OpenAI protocol.
 
 // ToolDefinition is the provider-neutral description of one tool offered to the
 // model through the native channel.

@@ -557,6 +557,53 @@ func TestFileStoreProjectScanIDsUnionsInstanceAndLegacyIDs(t *testing.T) {
 	}
 }
 
+func TestFileStoreTaskScanIDsNarrowsToTaskRunsAndRejectsForeignProject(t *testing.T) {
+	store := newTestFileStore(t)
+	ctx := context.Background()
+	project, err := store.CreateProject(ctx, "Task Scope", Scope{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskOne, err := store.CreateTask(ctx, project.ID, TaskInput{Name: "One"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskTwo, err := store.CreateTask(ctx, project.ID, TaskInput{Name: "Two"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateRun(ctx, taskOne.ID, RunMount{InstanceID: "inst-one", LegacyScanID: "legacy-one"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateRun(ctx, taskTwo.ID, RunMount{InstanceID: "inst-two"}); err != nil {
+		t.Fatal(err)
+	}
+	ids, err := store.TaskScanIDs(ctx, project.ID, taskOne.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]bool{"inst-one": true, "legacy-one": true}
+	if len(ids) != len(want) {
+		t.Fatalf("TaskScanIDs = %v, want %d ids", ids, len(want))
+	}
+	for _, id := range ids {
+		if !want[id] {
+			t.Fatalf("unexpected scan id %q in %v", id, ids)
+		}
+	}
+	// A task of another project is ErrNotFound, never an (empty) view.
+	other, err := store.CreateProject(ctx, "Other", Scope{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.TaskScanIDs(ctx, other.ID, taskOne.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("cross-project task = %v, want ErrNotFound", err)
+	}
+	if _, err := store.TaskScanIDs(ctx, project.ID, "missing-task"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown task = %v, want ErrNotFound", err)
+	}
+}
+
 func TestFileStoreTaskContextFieldsAndRunCleanup(t *testing.T) {
 	store := newTestFileStore(t)
 	ctx := context.Background()
@@ -673,4 +720,57 @@ func TestFileStoreTaskByLegacyScheduleID(t *testing.T) {
 	if _, err := store.TaskByLegacyScheduleID(ctx, projectB.ID, "sched-lookup-1"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("cross-project lookup = %v, want ErrNotFound", err)
 	}
+}
+
+// A display name with no ASCII slug characters (the dashboard defaults to
+// zh-CN, so Chinese names are the common case) must still create the project:
+// slug falls back to the generated id, and the name itself is preserved
+// verbatim — matching the mock-backend contract (mock: `slug ... || id`).
+func TestFileStoreCreateProjectNonASCIINameFallsBackToID(t *testing.T) {
+	store := newTestFileStore(t)
+	ctx := context.Background()
+
+	p, err := store.CreateProject(ctx, "红队评估", Scope{Targets: []string{"acme.example"}})
+	if err != nil {
+		t.Fatalf("non-ASCII project name must be creatable: %v", err)
+	}
+	if p.Name != "红队评估" {
+		t.Errorf("display name must be preserved verbatim, got %q", p.Name)
+	}
+	if p.Slug == "" || p.Slug != slugify("", p.ID) && !isASCII(p.Slug) {
+		t.Errorf("slug %q must be a non-empty ASCII fallback", p.Slug)
+	}
+	if p.Slug != p.ID {
+		// Either the uuid fallback or an ASCII slug derived from the name; both
+		// are contract-valid, but it must never be empty or non-ASCII.
+		if slugify(p.Name, "") != p.Slug {
+			t.Errorf("slug %q is neither an ASCII derivation nor the id fallback %q", p.Slug, p.ID)
+		}
+	}
+	if !isASCII(p.Slug) {
+		t.Errorf("slug %q must be ASCII", p.Slug)
+	}
+
+	// Same contract for tasks under the project: the context slug is a
+	// non-empty ASCII fallback, the task name stays verbatim.
+	task, err := store.CreateTask(ctx, p.ID, TaskInput{Name: "内网横向", Goal: " lateral"})
+	if err != nil {
+		t.Fatalf("non-ASCII task name must be creatable: %v", err)
+	}
+	if task.Name != "内网横向" {
+		t.Errorf("task display name must be preserved, got %q", task.Name)
+	}
+	slug, _ := task.Context["slug"].(string)
+	if !isASCII(slug) || slug == "" {
+		t.Errorf("task context slug %q must be a non-empty ASCII fallback", slug)
+	}
+}
+
+func isASCII(s string) bool {
+	for _, r := range s {
+		if r > 127 {
+			return false
+		}
+	}
+	return true
 }

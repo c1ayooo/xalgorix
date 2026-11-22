@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"sort"
@@ -35,12 +36,19 @@ type scanListItem struct {
 	StartedAt        string `json:"started_at"`
 	Status           string `json:"status"`
 	ScanMode         string `json:"scan_mode,omitempty"`
+	StopReason       string `json:"stop_reason,omitempty"`
 	VulnCount        int    `json:"vuln_count"`
 	TotalTokens      int    `json:"total_tokens"`
 	SubScanTotal     int    `json:"sub_scan_total,omitempty"`
 	SubScanCompleted int    `json:"sub_scan_completed,omitempty"`
 	SubScanRunning   int    `json:"sub_scan_running,omitempty"`
 	SubScanRemaining int    `json:"sub_scan_remaining,omitempty"`
+	// Run/task mount linkage (D11, response-only): stamped from the platform
+	// store at cache rebuild. Empty = unmounted legacy scan — honest "no
+	// task", never an inferred identity (attachScanListRunLinkage).
+	TaskID   string `json:"task_id,omitempty"`
+	TaskName string `json:"task_name,omitempty"`
+	Trigger  string `json:"trigger,omitempty"`
 	// InstanceID carries the record's dispatch instance for the §3.2
 	// project_id filter. json:"-": the wire shape is unchanged.
 	InstanceID string `json:"-"`
@@ -98,6 +106,7 @@ func (s *Server) cachedScanList() []scanListItem {
 			StartedAt:        rec.StartedAt,
 			Status:           rec.Status,
 			ScanMode:         rec.ScanMode,
+			StopReason:       rec.StopReason,
 			VulnCount:        len(rec.Vulns),
 			TotalTokens:      rec.TotalTokens,
 			SubScanTotal:     rec.SubScanTotal,
@@ -111,9 +120,59 @@ func (s *Server) cachedScanList() []scanListItem {
 	sort.Slice(scans, func(i, j int) bool {
 		return scans[i].StartedAt > scans[j].StartedAt
 	})
+	s.attachScanListRunLinkage(scans)
 	s.scanListCache = scans
 	s.scanListCacheAt = time.Now()
 	return scans
+}
+
+// attachScanListRunLinkage stamps response-only run/task linkage onto the
+// list rows (attachRunLinkage is the scan-detail counterpart). Best-effort:
+// no store, lookup error, or unmounted legacy scan leaves the fields empty —
+// empty is honest "not mounted", never an inferred identity. Runs only on
+// cache rebuild (bounded by scanListCacheTTL); task names are memoized per
+// rebuild so schedule fan-out (many runs, one task) stays one lookup.
+func (s *Server) attachScanListRunLinkage(scans []scanListItem) {
+	store := s.currentPlatformStore()
+	if store == nil || len(scans) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	taskNames := make(map[string]string)
+	for i := range scans {
+		sc := &scans[i]
+		if sc.InstanceID == "" {
+			continue
+		}
+		runs, err := store.RunsByInstanceID(ctx, sc.InstanceID)
+		if err != nil || len(runs) == 0 {
+			continue
+		}
+		// One instance can theoretically carry several mounts (the importer
+		// dedups, but stay deterministic): prefer the mount whose legacy scan
+		// id matches this record — same rule as attachRunLinkage.
+		run := runs[0]
+		for _, r := range runs {
+			if sc.ID != "" && r.LegacyScanID == sc.ID {
+				run = r
+				break
+			}
+		}
+		sc.TaskID = run.TaskID
+		sc.Trigger = run.Trigger
+		if run.TaskID == "" {
+			continue
+		}
+		name, ok := taskNames[run.TaskID]
+		if !ok {
+			if task, err := store.GetTask(ctx, run.TaskID); err == nil && task != nil {
+				name = task.Name
+			}
+			taskNames[run.TaskID] = name
+		}
+		sc.TaskName = name
+	}
 }
 
 // invalidateScanListCache forces the next GET /api/scans to rebuild from disk.

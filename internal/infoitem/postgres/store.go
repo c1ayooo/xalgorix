@@ -592,10 +592,8 @@ func (s *Store) incomplete(ctx context.Context, scanIDs []string) (bool, string,
 	err := s.pool.QueryRow(ctx, `
 		SELECT count(*)
 		FROM unnest($1::text[]) AS sid(scan_id)
-		WHERE NOT EXISTS (
-			SELECT 1 FROM info_sync_watermarks w
-			WHERE w.scan_id = sid.scan_id AND w.status = 'applied'
-		)`, scanIDs).Scan(&broken)
+		JOIN info_sync_watermarks w ON w.scan_id = sid.scan_id
+		WHERE w.status <> 'applied'`, scanIDs).Scan(&broken)
 	if err != nil {
 		return false, "", fmt.Errorf("infoitem/postgres: check sync state: %w", err)
 	}

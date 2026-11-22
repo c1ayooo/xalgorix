@@ -162,7 +162,10 @@ func init() {
 // language, falling back to the English source when no translation exists.
 func reportTr(language, english string) string {
 	code := config.NormalizeLanguage(language)
-	if code == config.DefaultLanguage {
+	// Only English passes through untranslated (it is the source language).
+	// DefaultLanguage (zh-CN) must resolve the zh table — left to pass through
+	// the whole report would render English despite the zh-CN default.
+	if code == "en" {
 		return english
 	}
 	if dict, ok := reportTranslations[code]; ok {

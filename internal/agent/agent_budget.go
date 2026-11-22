@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"context"
 	"math"
 	"sync"
 	"sync/atomic"
@@ -68,14 +67,6 @@ func (a *Agent) scanDeadline() (time.Time, bool) {
 		return time.Time{}, false
 	}
 	return started.Add(time.Duration(a.cfg.MaxDurationSec) * time.Second), true
-}
-
-func (a *Agent) toolWaitContext(timeout time.Duration) (context.Context, context.CancelFunc) {
-	deadline := time.Now().Add(timeout)
-	if scanDeadline, ok := a.scanDeadline(); ok && scanDeadline.Before(deadline) {
-		deadline = scanDeadline
-	}
-	return context.WithDeadline(a.ctx, deadline)
 }
 
 // reserveToolCalls atomically reserves up to requested calls beneath cap and

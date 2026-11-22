@@ -114,7 +114,7 @@ func TestLoadEnvFile_NonExistent(t *testing.T) {
 	loadEnvFile("/nonexistent/path/.env")
 }
 
-func TestLoad_ReadsDashboardProviderProxyAndAgentMailSettings(t *testing.T) {
+func TestLoad_ReadsDashboardProviderProxySettings(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("SUDO_USER", "")
@@ -143,8 +143,6 @@ func TestLoad_ReadsDashboardProviderProxyAndAgentMailSettings(t *testing.T) {
 		"XALGORIX_TELEMETRY=false",
 		"XALGORIX_OTEL_ENDPOINT=http://otel.test",
 		"GEMINI_API_KEY=search-key",
-		"AGENTMAIL_API_KEY=agentmail-key",
-		"AGENTMAIL_POD=am_test_pod",
 		"XALGORIX_DISCORD_WEBHOOK=https://discord.example/webhook",
 		"XALGORIX_DISCORD_MIN_SEVERITY=high",
 		"XALGORIX_TELEGRAM_BOT_TOKEN=123456:ABC-DEF",
@@ -180,7 +178,7 @@ func TestLoad_ReadsDashboardProviderProxyAndAgentMailSettings(t *testing.T) {
 	if cfg.Telemetry || cfg.OTelEndpoint != "http://otel.test" {
 		t.Fatalf("telemetry settings not loaded: %#v", cfg)
 	}
-	if cfg.GeminiAPIKey != "search-key" || cfg.AgentMailAPIKey != "agentmail-key" || cfg.AgentMailPod != "am_test_pod" {
+	if cfg.GeminiAPIKey != "search-key" {
 		t.Fatalf("integration settings not loaded: %#v", cfg)
 	}
 	if cfg.DiscordWebhook != "https://discord.example/webhook" || cfg.DiscordMinSeverity != "high" {

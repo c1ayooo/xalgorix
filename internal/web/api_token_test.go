@@ -12,30 +12,40 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/xalgord/xalgorix/v4/internal/config"
 )
 
-// resetAuthStateForTest clears the package-global session and login-limiter
-// state so assertions about "no sessions/failures exist" are not polluted by
-// other tests in the package.
+// resetAuthStateForTest clears the package-global login-limiter state so
+// assertions about "no failures exist" are not polluted by other tests in
+// the package. (Session state moved to per-Server JWT stacks in auth_jwt.go;
+// there is no package-global session store anymore.)
 func resetAuthStateForTest() {
-	authSessionsMu.Lock()
-	authSessions = make(map[string]time.Time)
-	authSessionsMu.Unlock()
 	loginAttemptsMu.Lock()
 	loginAttempts = make(map[string]*loginAttempt)
 	loginAttemptsMu.Unlock()
 }
 
-// machineAuthHarness wraps a minimal handler with authMiddleware and the
-// given configuration.
-func machineAuthHarness(cfg *config.Config) http.Handler {
+// machineAuthHarness builds a Server with an initialized auth stack (JWT +
+// user store; the env-configured operator is seeded as admin) and wraps a
+// minimal handler with the production authMiddleware.
+func machineAuthHarness(t *testing.T, cfg *config.Config) http.Handler {
+	t.Helper()
+	s := newTestServer(t, cfg)
+	if s.authJWT == nil || s.authUsers == nil {
+		t.Fatal("auth stack must initialize on a test server with a temp data dir")
+	}
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("ok"))
 	})
-	return authMiddleware(cfg)(h)
+	return authMiddleware(s)(h)
+}
+
+// revokedCountLocked returns the size of the server's jti revocation list.
+func revokedCountLocked(s *Server) int {
+	s.authJWT.mu.Lock()
+	defer s.authJWT.mu.Unlock()
+	return len(s.authJWT.revoked)
 }
 
 func apiTokenCfg(tokens ...string) *config.Config {
@@ -54,7 +64,7 @@ func doReq(h http.Handler, method, path, auth string) *httptest.ResponseRecorder
 
 // Spec 3: a valid scanner API token authenticates an API route.
 func TestMachineToken_ValidTokenAccepted(t *testing.T) {
-	h := machineAuthHarness(apiTokenCfg("tok-a"))
+	h := machineAuthHarness(t, apiTokenCfg("tok-a"))
 	if w := doReq(h, "GET", "/api/version", "Bearer tok-a"); w.Code != http.StatusOK {
 		t.Fatalf("valid machine token must authenticate API routes, got %d: %s", w.Code, w.Body.String())
 	}
@@ -67,7 +77,7 @@ func TestMachineToken_ValidTokenAccepted(t *testing.T) {
 // Spec 4: an invalid scanner API token is rejected — never a cookie fallback.
 func TestMachineToken_InvalidTokenRejected(t *testing.T) {
 	cfg := apiTokenCfg("tok-a")
-	h := machineAuthHarness(cfg)
+	h := machineAuthHarness(t, cfg)
 	for _, auth := range []string{"Bearer wrong", "Bearer ", "Bearer", "Basic tok-a", "wrong-token-directly"} {
 		if w := doReq(h, "GET", "/api/version", auth); w.Code != http.StatusUnauthorized {
 			t.Fatalf("invalid presentation %q must be rejected with 401, got %d", auth, w.Code)
@@ -79,7 +89,7 @@ func TestMachineToken_InvalidTokenRejected(t *testing.T) {
 		t.Fatalf("extra whitespace after the scheme is RFC-permitted, got %d", w.Code)
 	}
 	// Empty-token edge: a configured empty token must never match.
-	h2 := machineAuthHarness(apiTokenCfg(""))
+	h2 := machineAuthHarness(t, apiTokenCfg(""))
 	if w := doReq(h2, "GET", "/api/version", "Bearer "); w.Code != http.StatusUnauthorized {
 		t.Fatalf("an empty configured token must authenticate nothing, got %d", w.Code)
 	}
@@ -90,7 +100,7 @@ func TestMachineToken_InvalidTokenRejected(t *testing.T) {
 func TestMachineToken_DoesNotTouchLoginLimiter(t *testing.T) {
 	resetAuthStateForTest()
 	cfg := apiTokenCfg("tok-a")
-	h := machineAuthHarness(cfg)
+	h := machineAuthHarness(t, cfg)
 	for i := 0; i < 25; i++ {
 		if w := doReq(h, "GET", "/api/version", "Bearer wrong"); w.Code != http.StatusUnauthorized {
 			t.Fatalf("invalid token attempt %d: expected 401, got %d", i, w.Code)
@@ -118,7 +128,7 @@ func TestMachineToken_NoSessionCookieIssued(t *testing.T) {
 	mux.HandleFunc("/api/version", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("ok"))
 	})
-	h := authMiddleware(cfg)(mux)
+	h := authMiddleware(s)(mux)
 	w := doReq(h, "GET", "/api/version", "Bearer tok-a")
 	if w.Code != http.StatusOK {
 		t.Fatalf("valid token must reach the API, got %d", w.Code)
@@ -126,11 +136,8 @@ func TestMachineToken_NoSessionCookieIssued(t *testing.T) {
 	if set := w.Header().Get("Set-Cookie"); set != "" {
 		t.Fatalf("machine authentication must not issue session cookies, got %q", set)
 	}
-	authSessionsMu.Lock()
-	n := len(authSessions)
-	authSessionsMu.Unlock()
-	if n != 0 {
-		t.Fatalf("machine authentication must not create sessions, created %d", n)
+	if n := revokedCountLocked(s); n != 0 {
+		t.Fatalf("machine authentication must not create session state, created %d revocation entries", n)
 	}
 }
 
@@ -138,7 +145,7 @@ func TestMachineToken_NoSessionCookieIssued(t *testing.T) {
 // (a POST with no Origin/Referer and no Sec-Fetch-Site is allowed).
 func TestMachineToken_BearerRequestsSkipCSRFButCookiesKeepIt(t *testing.T) {
 	cfg := apiTokenCfg("tok-a")
-	h := machineAuthHarness(cfg)
+	h := machineAuthHarness(t, cfg)
 
 	// Bearer-authenticated POST with no origin metadata: allowed.
 	if w := doReq(h, "POST", "/api/scan", "Bearer tok-a"); w.Code != http.StatusOK {
@@ -189,13 +196,16 @@ func TestMachineToken_BearerRequestsSkipCSRFButCookiesKeepIt(t *testing.T) {
 // clients never misread a working token as rejected (a 401 here was
 // indistinguishable from an invalid token).
 func TestMachineToken_OperatorRoutesDenied(t *testing.T) {
-	h := machineAuthHarness(apiTokenCfg("tok-a"))
+	h := machineAuthHarness(t, apiTokenCfg("tok-a"))
 	for _, path := range []string{
 		"/api/settings/llm",
 		"/api/settings/environment",
 		"/api/auth/profiles",
 		"/api/auth/profiles/api-key",
 		"/api/chat",
+		"/api/users",
+		"/api/auth/setup",
+		"/api/auth/password",
 	} {
 		w := doReq(h, "GET", path, "Bearer tok-a")
 		if w.Code != http.StatusForbidden {
@@ -215,7 +225,9 @@ func TestMachineToken_OperatorRoutesDenied(t *testing.T) {
 // check nor creates one.
 func TestMachineToken_DoesNotAuthorizeDashboardPages(t *testing.T) {
 	resetAuthStateForTest()
-	h := machineAuthHarness(apiTokenCfg("tok-a"))
+	cfg := apiTokenCfg("tok-a")
+	s := newTestServer(t, cfg)
+	h := machineAuthHarness(t, cfg)
 	withToken := doReq(h, "GET", "/admin", "Bearer tok-a")
 	withoutToken := doReq(h, "GET", "/admin", "")
 	if withToken.Code != withoutToken.Code || withToken.Body.String() != withoutToken.Body.String() {
@@ -224,11 +236,8 @@ func TestMachineToken_DoesNotAuthorizeDashboardPages(t *testing.T) {
 			withToken.Code, withToken.Body.String(), withoutToken.Code, withoutToken.Body.String(),
 		)
 	}
-	authSessionsMu.Lock()
-	n := len(authSessions)
-	authSessionsMu.Unlock()
-	if n != 0 {
-		t.Fatalf("a page-route token must not create a session, created %d", n)
+	if n := revokedCountLocked(s); n != 0 {
+		t.Fatalf("a page-route token must not create a session, created %d revocation entries", n)
 	}
 	// Contrast: on an authorized API route the token DOES authenticate.
 	if w := doReq(h, "GET", "/api/version", "Bearer tok-a"); w.Code != http.StatusOK {
@@ -236,17 +245,9 @@ func TestMachineToken_DoesNotAuthorizeDashboardPages(t *testing.T) {
 	}
 }
 
-// The WebSocket endpoint accepts machine tokens like other API routes.
-func TestMachineToken_WebSocketAllowed(t *testing.T) {
-	h := machineAuthHarness(apiTokenCfg("tok-a"))
-	if w := doReq(h, "GET", "/ws", "Bearer tok-a"); w.Code != http.StatusOK {
-		t.Fatalf("machine token must authenticate the scan-event WebSocket, got %d", w.Code)
-	}
-}
-
 // Multiple tokens (rotation): every configured token authenticates.
 func TestMachineToken_MultipleTokensAccepted(t *testing.T) {
-	h := machineAuthHarness(apiTokenCfg("tok-old", "tok-new"))
+	h := machineAuthHarness(t, apiTokenCfg("tok-old", "tok-new"))
 	for _, tok := range []string{"tok-old", "tok-new"} {
 		if w := doReq(h, "GET", "/api/version", "Bearer "+tok); w.Code != http.StatusOK {
 			t.Fatalf("rotated token %q must authenticate", tok)
@@ -257,7 +258,7 @@ func TestMachineToken_MultipleTokensAccepted(t *testing.T) {
 // Spec 16: with no machine tokens configured, a bearer request never
 // authenticates (backward-compatible local installs keep exact old behavior).
 func TestMachineToken_UnconfiguredBearerRejected(t *testing.T) {
-	h := machineAuthHarness(apiTokenCfg())
+	h := machineAuthHarness(t, apiTokenCfg())
 	if w := doReq(h, "GET", "/api/version", "Bearer anything"); w.Code != http.StatusUnauthorized {
 		t.Fatalf("with no tokens configured a bearer header must be rejected, got %d", w.Code)
 	}
@@ -275,7 +276,7 @@ func TestMachineToken_BrowserFlowUnchanged(t *testing.T) {
 	mux.HandleFunc("/api/version", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("ok"))
 	})
-	h := authMiddleware(cfg)(mux)
+	h := authMiddleware(s)(mux)
 
 	// Bad dashboard password -> 401 (and the limiter still records it).
 	r := httptest.NewRequest("POST", "/api/auth/login", strings.NewReader(`{"username":"admin","password":"nope"}`))
@@ -320,20 +321,26 @@ func TestMachineToken_BrowserFlowUnchanged(t *testing.T) {
 }
 
 // authConfigured: token-only configuration counts as authentication (headless
-// API-only deployments can bind non-loopback), while nothing configured does
-// not.
+// API-only deployments can bind non-loopback); a seeded dashboard account
+// counts too; nothing configured does not.
 func TestAuthConfigured_TokenOnlyDeployment(t *testing.T) {
-	if authConfigured(&config.Config{}) {
+	s1 := newTestServer(t, &config.Config{})
+	if s1.authConfigured() {
 		t.Fatal("no credentials must mean auth not configured")
 	}
-	if !authConfigured(&config.Config{APITokens: []string{"tok"}}) {
+	s2 := newTestServer(t, &config.Config{APITokens: []string{"tok"}})
+	if !s2.authConfigured() {
 		t.Fatal("a machine token alone must count as configured authentication")
 	}
-	if !authConfigured(&config.Config{Username: "u", PasswordHash: "h"}) {
-		t.Fatal("dashboard credentials must count as configured authentication")
+	// Username+Password seeds an admin into the user store at construction,
+	// so the legacy env-configured deployment still counts as configured.
+	s3 := newTestServer(t, &config.Config{Username: "u", PasswordHash: "h"})
+	if !s3.authConfigured() {
+		t.Fatal("dashboard credentials (seeded admin) must count as configured authentication")
 	}
 	// Empty strings must never authenticate.
-	if authConfigured(&config.Config{APITokens: []string{"", "  "}}) {
+	s4 := newTestServer(t, &config.Config{APITokens: []string{"", "  "}})
+	if s4.authConfigured() {
 		t.Fatal("blank tokens must not count as configured authentication")
 	}
 }
@@ -371,7 +378,7 @@ func TestBearerTokenFromRequest_Parsing(t *testing.T) {
 // A 401 from invalid machine auth must carry a GENERIC error message and no
 // token material.
 func TestMachineToken_RejectionBodyIsGeneric(t *testing.T) {
-	h := machineAuthHarness(apiTokenCfg("tok-a"))
+	h := machineAuthHarness(t, apiTokenCfg("tok-a"))
 	w := doReq(h, "GET", "/api/version", "Bearer secret-token-value")
 	body := w.Body.String()
 	if strings.Contains(body, "secret-token-value") {
@@ -390,7 +397,7 @@ func TestMachineToken_RejectionBodyIsGeneric(t *testing.T) {
 // a generic 401 that a client cannot distinguish from a bad credential.
 func TestMachineToken_DenylistedRouteIsForbiddenNotUnauthorized(t *testing.T) {
 	resetAuthStateForTest()
-	h := machineAuthHarness(apiTokenCfg("tok-a"))
+	h := machineAuthHarness(t, apiTokenCfg("tok-a"))
 	for _, path := range []string{"/api/settings/environment", "/api/auth/profiles", "/api/chat"} {
 		w := doReq(h, "GET", path, "Bearer tok-a")
 		if w.Code != http.StatusForbidden {

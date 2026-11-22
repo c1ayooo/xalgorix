@@ -89,10 +89,13 @@ func bestEffortDataDir(t *testing.T, s *Server) {
 	s.dataDir = dir
 }
 
+// resetAuthSessionsForTest clears the remaining package-global auth state —
+// the per-IP login limiter. Session state itself moved into per-Server JWT
+// stacks (auth_jwt.go); there is no package-global session map anymore.
 func resetAuthSessionsForTest() {
-	authSessionsMu.Lock()
-	defer authSessionsMu.Unlock()
-	authSessions = make(map[string]time.Time)
+	loginAttemptsMu.Lock()
+	defer loginAttemptsMu.Unlock()
+	loginAttempts = make(map[string]*loginAttempt)
 }
 
 func TestGenerateReportResolvesUploadedLogoPath(t *testing.T) {
@@ -164,6 +167,22 @@ func writeTestPNG(t *testing.T, path string) {
 	}
 }
 
+// sseFrameEvent extracts the data: JSON payload from one queued SSE frame.
+func sseFrameEvent(t *testing.T, raw []byte) WSEvent {
+	t.Helper()
+	for _, line := range strings.Split(string(raw), "\n") {
+		if payload, ok := strings.CutPrefix(line, "data: "); ok {
+			var evt WSEvent
+			if err := json.Unmarshal([]byte(payload), &evt); err != nil {
+				t.Fatalf("invalid data payload: %v", err)
+			}
+			return evt
+		}
+	}
+	t.Fatalf("frame has no data line: %q", raw)
+	return WSEvent{}
+}
+
 func TestBroadcastToInstanceReachesDashboardAndSubscribedClients(t *testing.T) {
 	s := newTestServer(t, nil)
 	inst := &ScanInstance{ID: "inst-1", Targets: "https://example.com", Status: "running"}
@@ -171,9 +190,9 @@ func TestBroadcastToInstanceReachesDashboardAndSubscribedClients(t *testing.T) {
 	s.instances[inst.ID] = inst
 	s.instancesMu.Unlock()
 
-	dashboard := &wsClient{send: make(chan []byte, 1)}
-	subscribed := &wsClient{send: make(chan []byte, 1), instanceID: inst.ID}
-	other := &wsClient{send: make(chan []byte, 1), instanceID: "other"}
+	dashboard := &sseClient{send: make(chan []byte, 1)}
+	subscribed := &sseClient{send: make(chan []byte, 1), instanceID: inst.ID}
+	other := &sseClient{send: make(chan []byte, 1), instanceID: "other"}
 	s.mu.Lock()
 	s.clients[dashboard] = true
 	s.clients[subscribed] = true
@@ -181,6 +200,9 @@ func TestBroadcastToInstanceReachesDashboardAndSubscribedClients(t *testing.T) {
 	s.mu.Unlock()
 
 	s.broadcastToInstance(inst.ID, WSEvent{Type: "message", Content: "hello"})
+	if s.evtSeq.Load() == 0 {
+		t.Fatal("broadcast did not stamp the stream seq")
+	}
 
 	for name, ch := range map[string]<-chan []byte{
 		"dashboard":  dashboard.send,
@@ -188,15 +210,15 @@ func TestBroadcastToInstanceReachesDashboardAndSubscribedClients(t *testing.T) {
 	} {
 		select {
 		case raw := <-ch:
-			var evt WSEvent
-			if err := json.Unmarshal(raw, &evt); err != nil {
-				t.Fatalf("%s received invalid event: %v", name, err)
-			}
+			evt := sseFrameEvent(t, raw)
 			if evt.InstanceID != inst.ID {
 				t.Fatalf("%s event instance_id = %q, want %q", name, evt.InstanceID, inst.ID)
 			}
 			if evt.Content != "hello" {
 				t.Fatalf("%s event content = %q, want hello", name, evt.Content)
+			}
+			if evt.Seq == 0 {
+				t.Fatalf("%s event missing stream seq", name)
 			}
 		default:
 			t.Fatalf("%s client did not receive instance event", name)
@@ -215,7 +237,7 @@ func TestBroadcastToInstanceReachesDashboardAndSubscribedClients(t *testing.T) {
 	}
 }
 
-func TestRateLimitMiddleware_EnforcesLimitAndBypassesStaticAndWS(t *testing.T) {
+func TestRateLimitMiddleware_EnforcesLimitAndBypassesStaticAndStream(t *testing.T) {
 	rl := NewRateLimiter(1, time.Minute)
 	defer rl.Stop()
 
@@ -242,7 +264,7 @@ func TestRateLimitMiddleware_EnforcesLimitAndBypassesStaticAndWS(t *testing.T) {
 	}
 
 	staticBypassPaths := []string{
-		"/ws",
+		"/api/stream",
 		"/static/app.js",
 		"/assets/logo.png",
 		"/app.js",
@@ -275,7 +297,7 @@ func TestRateLimitMiddleware_EnforcesLimitAndBypassesStaticAndWS(t *testing.T) {
 
 func TestAuthMiddleware_AllowsReactShellAndAssetsBeforeSession(t *testing.T) {
 	resetAuthSessionsForTest()
-	mw := authMiddleware(&config.Config{Username: "admin", Password: "secret"})
+	mw := authMiddleware(newTestServer(t, &config.Config{Username: "admin", Password: "secret"}))
 	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
@@ -315,7 +337,7 @@ func TestIsStaticWebAssetPath_DoesNotClassifyDottedScanRoutes(t *testing.T) {
 		}
 	}
 
-	appRoutes := []string{"/scans/pentest-ground.com_4280_9286f18f", "/api/scans/pentest-ground.com_4280_9286f18f", "/ws"}
+	appRoutes := []string{"/scans/pentest-ground.com_4280_9286f18f", "/api/scans/pentest-ground.com_4280_9286f18f", "/api/stream"}
 	for _, path := range appRoutes {
 		if isStaticWebAssetPath(path) {
 			t.Fatalf("%s was incorrectly classified as a static asset", path)
@@ -377,12 +399,19 @@ func TestAuthHandlers_LoginStatusLogout(t *testing.T) {
 		RateLimitWindow:   60,
 	})
 
+	// Unauthenticated: auth enabled (the env-configured operator was seeded
+	// as an admin account), no session, no setup needed.
 	rr := httptest.NewRecorder()
 	s.handleAuthStatus(rr, httptest.NewRequest(http.MethodGet, "/api/auth/status", nil))
-	if !strings.Contains(rr.Body.String(), `"auth_enabled":true`) || !strings.Contains(rr.Body.String(), `"authenticated":false`) {
-		t.Fatalf("unexpected unauthenticated status body: %s", rr.Body.String())
+	body := rr.Body.String()
+	if !strings.Contains(body, `"auth_enabled":true`) || !strings.Contains(body, `"authenticated":false`) {
+		t.Fatalf("unexpected unauthenticated status body: %s", body)
+	}
+	if !strings.Contains(body, `"needs_setup":false`) || strings.Contains(body, `"user":{}`) {
+		t.Fatalf("seeded deployment must not advertise needs_setup or a user: %s", body)
 	}
 
+	// Login: success mints a signed JWT session cookie.
 	rr = httptest.NewRecorder()
 	loginBody := strings.NewReader(`{"username":"admin","password":"secret"}`)
 	s.handleLogin(rr, httptest.NewRequest(http.MethodPost, "/api/auth/login", loginBody))
@@ -397,15 +426,23 @@ func TestAuthHandlers_LoginStatusLogout(t *testing.T) {
 	if cookie.Name != sessionCookieName || !cookie.HttpOnly || cookie.SameSite != http.SameSiteStrictMode || cookie.MaxAge <= 0 {
 		t.Fatalf("unexpected session cookie: %#v", cookie)
 	}
+	if segs := strings.Count(cookie.Value, "."); segs != 2 {
+		t.Fatalf("session cookie must carry a three-segment JWT, got %d dots", segs)
+	}
 
+	// Authenticated status carries the identity.
 	req := httptest.NewRequest(http.MethodGet, "/api/auth/status", nil)
 	req.AddCookie(cookie)
 	rr = httptest.NewRecorder()
 	s.handleAuthStatus(rr, req)
-	if !strings.Contains(rr.Body.String(), `"authenticated":true`) {
-		t.Fatalf("authenticated status body: %s", rr.Body.String())
+	body = rr.Body.String()
+	if !strings.Contains(body, `"authenticated":true`) ||
+		!strings.Contains(body, `"username":"admin"`) ||
+		!strings.Contains(body, `"role":"admin"`) {
+		t.Fatalf("authenticated status body: %s", body)
 	}
 
+	// Logout revokes the jti: the same cookie is dead immediately.
 	req = httptest.NewRequest(http.MethodPost, "/api/auth/logout", nil)
 	req.AddCookie(cookie)
 	rr = httptest.NewRecorder()
@@ -413,7 +450,11 @@ func TestAuthHandlers_LoginStatusLogout(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("logout status = %d", rr.Code)
 	}
-	if isValidSession(cookie.Value) {
+	if _, ok := s.authenticateSession(func() *http.Request {
+		r := httptest.NewRequest(http.MethodGet, "/api/auth/status", nil)
+		r.AddCookie(cookie)
+		return r
+	}()); ok {
 		t.Fatal("session remained valid after logout")
 	}
 }
@@ -1880,72 +1921,6 @@ func TestHandleRateLimitSettings_ClampsAndReplacesLimiter(t *testing.T) {
 	}
 	if s.rateLimiter == nil {
 		t.Fatal("rate limiter was not replaced")
-	}
-}
-
-func TestAgentMailSettings_MasksAndPreservesExistingKey(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	envFile := filepath.Join(home, ".xalgorix.env")
-	oldKey := "old-secret-12345678"
-	if err := os.WriteFile(envFile, []byte("XALGORIX_LLM=test\nAGENTMAIL_POD=oldpod\nAGENTMAIL_API_KEY="+oldKey+"\n"), 0o644); err != nil {
-		t.Fatalf("write env file: %v", err)
-	}
-
-	s := newTestServer(t, &config.Config{
-		AgentMailPod:      "oldpod",
-		AgentMailAPIKey:   oldKey,
-		RateLimitRequests: 60,
-		RateLimitWindow:   60,
-	})
-
-	rr := httptest.NewRecorder()
-	s.handleAgentMailSettings(rr, httptest.NewRequest(http.MethodGet, "/api/settings/agentmail", nil))
-	var getResp map[string]any
-	if err := json.Unmarshal(rr.Body.Bytes(), &getResp); err != nil {
-		t.Fatalf("decode get response: %v", err)
-	}
-	if getResp["apiKey"] != "****12345678" || getResp["hasApiKey"] != true {
-		t.Fatalf("unexpected masked GET response: %#v", getResp)
-	}
-
-	rr = httptest.NewRecorder()
-	body := strings.NewReader(`{"pod":"newpod","apiKey":"****12345678"}`)
-	s.handleAgentMailSettings(rr, httptest.NewRequest(http.MethodPost, "/api/settings/agentmail", body))
-	if rr.Code != http.StatusOK {
-		t.Fatalf("preserve POST code = %d body=%s", rr.Code, rr.Body.String())
-	}
-	if s.cfg.AgentMailAPIKey != oldKey {
-		t.Fatalf("masked POST overwrote key: %q", s.cfg.AgentMailAPIKey)
-	}
-	data, err := os.ReadFile(envFile)
-	if err != nil {
-		t.Fatalf("read env file: %v", err)
-	}
-	if !strings.Contains(string(data), "AGENTMAIL_API_KEY="+oldKey) || !strings.Contains(string(data), "AGENTMAIL_POD=newpod") {
-		t.Fatalf("env file did not preserve old key and update pod:\n%s", string(data))
-	}
-	if info, err := os.Stat(envFile); err != nil {
-		t.Fatalf("stat env file: %v", err)
-	} else if info.Mode().Perm() != 0o600 {
-		t.Fatalf("env file mode = %#o, want 0600", info.Mode().Perm())
-	}
-
-	rr = httptest.NewRecorder()
-	body = strings.NewReader(`{"pod":"newpod","apiKey":"new-secret-abcdef12"}`)
-	s.handleAgentMailSettings(rr, httptest.NewRequest(http.MethodPost, "/api/settings/agentmail", body))
-	if rr.Code != http.StatusOK {
-		t.Fatalf("new key POST code = %d body=%s", rr.Code, rr.Body.String())
-	}
-	if s.cfg.AgentMailAPIKey != "new-secret-abcdef12" {
-		t.Fatalf("new POST did not update config key: %q", s.cfg.AgentMailAPIKey)
-	}
-	data, err = os.ReadFile(envFile)
-	if err != nil {
-		t.Fatalf("read env file after new key: %v", err)
-	}
-	if !strings.Contains(string(data), "AGENTMAIL_API_KEY=new-secret-abcdef12") {
-		t.Fatalf("env file did not contain new key:\n%s", string(data))
 	}
 }
 

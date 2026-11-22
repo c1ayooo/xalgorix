@@ -40,6 +40,10 @@ var roleToolScope = map[string][]string{
 // DELEGATED agent's system prompt when XALGORIX_ROLE_SCOPED_TOOLS is enabled.
 // Only called for delegated specialists — the root coordinator and the
 // independent verifier keep their full schemas unconditionally.
+//
+// Resolution order: an exact operator-authored profile match (name = role)
+// wins with its own ToolScopeHidden list; otherwise the canonical agent-type
+// map applies.
 func (a *Agent) applyRoleToolScope() {
 	if a == nil || a.cfg == nil || !a.cfg.RoleScopedTools {
 		return
@@ -47,9 +51,18 @@ func (a *Agent) applyRoleToolScope() {
 	if a.delegatedAgentID == "" {
 		return // root coordinator: full schema always
 	}
-	role := determineAgentType(a.Name, true)
-	hidden, ok := roleToolScope[role]
-	if !ok || len(hidden) == 0 {
+	var hidden []string
+	if profile, ok := a.lookupUserProfile(a.Name); ok {
+		hidden = profile.ToolScopeHidden
+	} else {
+		role := determineAgentType(a.Name, true)
+		var ok bool
+		hidden, ok = roleToolScope[role]
+		if !ok || len(hidden) == 0 {
+			hidden = roleToolScope[scanctx.AgentTypeOther]
+		}
+	}
+	if len(hidden) == 0 {
 		hidden = roleToolScope[scanctx.AgentTypeOther]
 	}
 	if a.registry != nil {

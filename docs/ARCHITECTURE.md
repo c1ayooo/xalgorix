@@ -40,7 +40,8 @@ Cross-cutting: `internal/scanctx` (per-scan isolation), `internal/reporting`
 
 ## Web Platform — `internal/web`
 
-The local server exposes a REST API + WebSocket telemetry and serves the React
+The local server exposes a REST API + an SSE event stream (`/api/stream`, the
+former WebSocket hub) and serves the React
 dashboard, which is compiled from `webui/` and embedded into the binary via
 `//go:embed static/*`. It also owns scan orchestration and persistence.
 
@@ -52,7 +53,7 @@ After the v4.5.44 decomposition this package is split into cohesive files
 | `server.go` | `Server` struct, `NewServer`/`Start`, lifecycle, small handlers |
 | `handlers_router.go` | route table / mux wiring |
 | `auth_session.go` | dashboard auth: sessions, login backoff, CSRF, middleware |
-| `ws_hub.go` | WebSocket client pumps + event broadcast |
+| `sse_hub.go` | SSE event-stream hub: fan-out, ring buffer, Last-Event-ID replay |
 | `orchestrator.go` | scan orchestration: single / DAST / wildcard / multi + subdomain collection |
 | `scan_session.go` | run one scan session + event processing + phase inference |
 | `scan_audit.go` | read-only domain audit projection and cold-path sync state APIs |
@@ -77,19 +78,21 @@ independently-locked caches. Each scan runs in its own goroutine and its own
 
 ## Agent Core — `internal/agent`
 
-The autonomous loop. It builds a system prompt encoding the 22-phase
-methodology, sends the conversation to the configured LLM, executes the tool
-calls the model requests, feeds results back, and repeats until the objective
-is met or a budget (iterations / duration / tokens) is hit.
+The autonomous runtime binding. `Agent.Run` builds the system prompt encoding
+the 22-phase methodology plus all scan state and budget/checkpoint preludes,
+then hands the model/tool loop to the Eino ADK runtime until the objective is
+met or a budget (iterations / duration / tokens) is hit.
 
 | File | Responsibility |
 | --- | --- |
-| `agent.go` | the loop, tool dispatch, watchdog, lifecycle (`Run`/`Stop`) |
+| `agent.go` | scan prelude, lifecycle (`Run`/`Stop`), tool assembly, budget/watchdog |
+| `eino_runtime.go` | starts the ADK runner, maps events/interrupts, terminal outcomes |
+| `eino_observer.go` | obligations, model/provider recovery, tool gates/results, compaction |
 | `agent_guard.go` | scope guard, phase-restriction guard, passive-recon guard, host/URL extraction |
 | `agent_prompt.go` | system-prompt / closing-instruction / whitebox-guidance construction |
-| `agent_messages.go` | tool-result formatting + conversation pruning/compaction |
+| `agent_messages.go` | tool-result formatting + conversation pruning/compaction helpers |
 | `agent_ratepolicy.go` | request-rate policy parsing (from the instruction) |
-| `hooks.go` | loop hooks incl. stuck/loop detection (repeated identical calls) |
+| `hooks.go` | obligation hooks incl. stuck/loop detection (repeated identical calls) |
 | `verifier.go` | the independent Verifier agent that re-tests candidate findings |
 
 Guards keep the agent inside the authorized scope and the selected phases, and
@@ -180,8 +183,17 @@ capability:
 - `search_info` (registered by `internal/agent`) — read-only region/association/
   context activation over the optional InfoItem cold path; no verdict role
 - `reporting` — the `report_vulnerability` tool + findings store (see below)
-- `agentmail`, `agentsgraph` — email/OOB interaction and sub-agent graphs
+- `agentsgraph` — sub-agent graphs
 - `proxy`, `oob`, `finish`, `iolimit`, `skills` — proxying, out-of-band callbacks, termination, IO limits, methodology corpus
+- `mcp` — operator-registered MCP servers (stdio + streamable HTTP) bridged as
+  ordinary registry tools named `mcp_<server>_<tool>`: they inherit the full
+  execution chain (circuit breaker, approval gate, guards) and never bypass
+  the scope dial/request checks; the verifier registry stays MCP-free. The
+  per-scan `Manager` owns the sessions (no package globals); user skills ride
+  the per-scan skill state (`skills.Register`), operator-authored delegation
+  profiles merge behind the builtin specialists, and every invocation is
+  audited to the domain journal (`skill_load` / `agent_delegate` / `mcp_call`)
+  with a best-effort cross-scan JSONL projection under `<dataDir>/_invocations/`.
 
 ## Findings & verification — `internal/tools/reporting` + `internal/reporting`
 
@@ -219,7 +231,7 @@ replace scan state or the report/verifier authority chain.
   the three activation queries and never participates in verdicts.
 - `internal/jobs` — pinned River v0.51.2 client/workers. Jobs only carry bounded
   cold-path journal ranges; they do not own scan lifecycle, HITL, agentsgraph,
-  or WebSocket work.
+  or event-stream (SSE) work.
 - `internal/coldpath` — composes PostgreSQL, River, the low-latency journal
   observer, and a periodic reconciler that compares local journals with the
   applied watermark and re-enqueues missing ranges.
@@ -341,7 +353,37 @@ for *organization*, never a second scan-state authority.
   before the dispatch goroutine, so the mount is visible without racing the
   scan. `schedulesMu` covers only the due-snapshot + `LastRun`/`NextRun`
   advance; validation, mount and dispatch all run on the lock-free snapshot
-  — a PG-backed mount can never stall `/api/schedules`.
+  — a PG-backed mount can never stall `/api/schedules`. This authorization
+  preflight never interrupts an in-flight Run: a store outage only defers new
+  scheduled dispatches whose project scope cannot be verified (charter §6.1).
+
+### Task objective — `internal/objective`, `internal/platform.Objective`
+
+- `platform.Objective` (`{kind, statement, criteria[]}`) is the platform-level
+  structured goal attached to a Task. In PostgreSQL it lives in the 1:1
+  extension table `task_objectives` (migration `0007_task_objective.sql`,
+  `LEFT JOIN`ed on every task read); the no-DSN file store persists the same
+  struct inside the task snapshot. An absent objective means **"not
+  structured"** — never inferred.
+- `internal/objective` is a **pure evaluator**: it reads a signal snapshot
+  (accepted findings + ledger hypotheses + plan counters) and returns per
+  criterion `met / unmet / undetermined / manual_pending` plus a display-only
+  attainment. It never writes back, never relabels a finding and never
+  blocks a scan (charter §3.5 / §9 — the report pipeline stays the only exit
+  for finding acceptance).
+- Runtime wiring (`internal/web/objective_service.go`,
+  `internal/web/scan_session.go`): the objective travels as its **own prompt
+  section** (`## OBJECTIVE (operator-stated)`), as a **human-sourced observed
+  InfoItem** in the scan's domain journal (`domainjournal.OpRecordObjective`),
+  and as `agent.ObjectiveSpec` for the engine, where it only **marks** the
+  plan tasks that serve a finding-class criterion (`Task.ObjectiveRef`).
+  Marking never adds, removes or reorders a task and never changes the
+  coverage denominator, so the golden scheduling parity is unaffected.
+- `GET /api/tasks/{id}/objective` renders the objective state honestly:
+  criterion states with their evidence reference, the loop position of the
+  latest run **with its derivation basis**, the open gaps and the VOI-weighted
+  schedulable pool. "Unknown" is returned when the persisted facts do not
+  support a position.
 
 ## HITL approvals & guidance — `internal/approval`, `internal/web/approvals_gate.go`
 
@@ -354,12 +396,12 @@ for *organization*, never a second scan-state authority.
   / auth-mutation signatures pend; GET/HEAD/OPTIONS pass with an audit trail
   in the existing tool_call events — no approval row). R2b's trafficproxy
   reuses `AssessHTTP` as its second consumer.
-- The gate lives in `tools.Registry` (`SetApprovalGate`, modeled after
-  `RequestGuard`): consulted after the circuit-breaker/parameter checks and
-  before `tool.Execute` — the last pre-execution ring. A denial returns
-  `Result{Success:false}` and never touches `RecordFailure` (expected
-  rejections are not tool failures); a nil gate keeps legacy behavior
-  byte-identical. The **verifier registry is exempt** (documented): an
+- Production scan approvals use Eino's interrupt/resume wrapper
+  (`engine.ApprovalTool`) before the tool endpoint. `tools.Registry` also
+  exposes `SetApprovalGate` as a defense-in-depth seam for direct registry
+  consumers: it is consulted after circuit-breaker/parameter checks and before
+  `tool.Execute`. A denial returns `Result{Success:false}` and never touches
+  `RecordFailure`. The **verifier registry is exempt** (documented): an
   approval stall inside the report gate would race the 15-minute watchdog,
   and the gate's synchronous blocking preserves the verifier timing
   invariant rather than breaking it.
@@ -407,10 +449,18 @@ The single-process shared loopback MITM proxy (REDESIGN §4/D4), default ON
   (observed as `upgrade_passthrough` metadata only).
 - Attribution: `web.executeScanSession` mints a per-session run token
   (`trafficproxy.RegisterRun`, unregistered in cleanup). The proxy resolves
-  `Proxy-Authorization: Bearer` BEFORE the hop-by-hop strip; attributed
-  traffic overrides the process dial-guard base with the scan's scopeguard
-  config (per-scan provisioned loopback ports still work; Chromium bypasses
-  the proxy for those ports).
+  `Proxy-Authorization` BEFORE the hop-by-hop strip on two channels: `Bearer`
+  from Go tool transports, and `Basic` from curl/wget/python (proxy URL
+  userinfo or workspace `.curlrc`/`.wgetrc`). Basic registry misses stay
+  unattributed rather than impersonating a Run. Attributed traffic overrides
+  the process dial-guard base with the scan's scopeguard config (per-scan
+  provisioned loopback ports still work; Chromium bypasses the proxy for those
+  ports). Browser traffic remains system-level because rod has no token channel.
+- Subprocess approval: Basic-attributed requests never passed the tool-layer
+  gate, so the proxy may adjudicate a high-risk HTTP request through
+  `web.proxyHighRiskGate` / `trafficproxy.SetHighRiskGate`. It reuses the same
+  `ApprovalService` slot queue, timeout=reject, WS events and redaction; Bearer
+  traffic and unattributed traffic are never re-gated.
 - Observation: request/response summaries become observed InfoItems in the
   owning run's `domainjournal` via `OpObserveTraffic` (new operation),
   written by a bounded single-writer sink off the request path (overflow is
@@ -424,30 +474,41 @@ The single-process shared loopback MITM proxy (REDESIGN §4/D4), default ON
 
 ## Tool execution, safe files and egress
 
-- `tools.Registry.ExecuteContext` is the single execution path for both the
-  legacy loop and Eino. `Execute` remains a `context.Background()` wrapper.
-  `Tool.ExecuteContext` is optional; tools without it keep the historical hard
-  timeout. `internal/agent` passes the per-call deadline into the registry, so
-  terminal, Python, HTTP and proxy tools observe cancellation. `browser_action`
-  binds `rod.Page.Context` for the duration of one action under the existing
-  `actionMu`; cancellation aborts that CDP operation without closing Chromium or
-  losing page state.
+- `tools.Registry.ExecuteContext` is the single execution path. `Execute`
+  remains a `context.Background()` wrapper. `Tool.ExecuteContext` is optional.
+  Eino's `RegistryTool` runs the registry call in a bounded goroutine with the
+  per-tool hard ceiling plus 30s grace and force-returns on expiry, so a
+  non-cooperative tool cannot block the ADK tool node.
+  Terminal pre-launch work (venv/install) inherits the call context, and
+  terminal/Python cancellation or timeout returns a failed tool result rather
+  than `Success=true`. `browser_action` binds `rod.Page.Context` for one action
+  under `actionMu`; cancellation aborts that CDP operation without closing
+  Chromium or losing page state.
 - `internal/safefile` replaces "check path, then reopen path" in fileedit.
   On Linux each component is opened with `openat(O_NOFOLLOW)` from a directory
   fd, writes use a same-directory temp file plus `renameat`, and exclusive
-  create uses `linkat`. Non-Linux returns `ErrNotSupported` instead of silently
-  falling back to an unsafe reopen.
-- `internal/egress` records the per-scan boundary. The default `proxy` mode
-  relies on `trafficproxy` as the only egress path; terminal/Python receive
-  `XALGORIX_EGRESS_MODE`/`XALGORIX_EGRESS_ENFORCED` markers. Linux `enforce`
-  mode requires root + `nft`, derives the loopback proxy port from
-  `trafficproxy.LocalPort`, installs an isolated `inet xalgorix_egress_<pid>`
-  table (allow only the dedicated UID to the proxy port over IPv4/IPv6, then
-  DROP), and drops terminal/Python children to that UID/GID via
-  `SysProcAttr.Credential`. Browser cannot be launched under a different UID
-  with rod's launcher, so it fails closed in enforce mode. Rules are
-  refcounted per scan and removed when the last enforced scan ends; non-Linux
-  reports unmanaged. `scan_session` prepares and forgets the status per run.
+  create uses `linkat`. The directory entry is fsynced through a separately
+  opened read-only fd and fsync failure is returned. Non-Linux returns
+  `ErrNotSupported` instead of silently falling back to an unsafe reopen.
+- `internal/egress` records the per-scan boundary keyed by **`ScanContext.ID`**
+  (the same key held by `Registry.GetScanContextID`). The default `proxy` mode
+  is a routing posture, not a proven OS boundary: `Status.Enforced` stays false
+  and children receive `XALGORIX_EGRESS_ENFORCED=0`. It configures browser and
+  subprocess proxy variables only as far as those clients cooperate. With
+  `XALGORIX_TRAFFICPROXY=off`, no egress markers are injected, preserving the
+  legacy child environment.
+- Linux `enforce` mode requires root + `nft`, derives the loopback proxy port
+  from `trafficproxy.LocalPort`, and installs an isolated
+  `inet xalgorix_egress_<pid>` table (allow only the dedicated UID to the proxy
+  port over IPv4/IPv6, then DROP). Before launch, `PrepareChildAccess` transfers
+  the scan workspace to the dedicated UID/GID and normalizes modes
+  (dirs 0750, files 0640/0750); curl/wget and Python receive workspace-local
+  copies of the public CA/bundle rather than the root-only CA directory.
+  Terminal/Python then drop to that UID/GID via `SysProcAttr.Credential`.
+  Browser cannot be launched under a different UID with rod's launcher, so it
+  fails closed in enforce mode. Rules are refcounted per scan and removed when
+  the last enforced scan ends; non-Linux reports unmanaged.
+  `scan_session` prepares and forgets the status under `sctx.ID`.
 
 ## Platform capabilities — `internal/platformutil`
 
@@ -463,78 +524,61 @@ The single-process shared loopback MITM proxy (REDESIGN §4/D4), default ON
   `web/server.go`, `web/queue_state.go`, `auth/store.go`, and
   `resources.readDiskFree`. This is what makes the Windows build target work.
 
-## Engine — `internal/engine` (R4 core)
+## Engine — `internal/engine` (Eino ADK)
 
-`internal/engine` contains the Eino v0.9.23 ADK primitives. `XALGORIX_ENGINE`
-is parsed in `internal/config`; the configured default is **eino**, while
-`XALGORIX_ENGINE=legacy` is the immediate rollback. Unknown values fall back
-loudly to legacy.
+`internal/engine` is the only scan runtime. `internal/agent.Agent.Run` builds
+the prompt/state/checkpoint prelude and then hands the model/tool loop to an
+Eino ADK `ChatModelAgent` + `Runner`; there is no second loop and no engine
+selection variable.
 
-- `mode.go` defines `legacy` / `eino` parsing. `config.Engine` exposes
-  `XALGORIX_ENGINE`; `scan_session` selects the runtime only for explicit eino
-  (legacy stays byte-for-byte available).
-- `chatmodel.go` implements Eino's `ToolCallingChatModel` over the existing
-  `internal/llm.Client` (`ChatWithUsageToolCalls`), so retries, KeyRotator,
-  provider protocols and token accounting stay centralized. The ADK binds the
-  tool surface per call via `model.Options`; `Generate` reads that surface on
-  every call (without it the provider never receives a `tools` array). A
-  `StopCheck` refuses model requests once the scan is complete. `WithTools`
-  returns a copy; streaming is explicitly disabled.
-- `tools.go` wraps `tools.Registry` as Eino `InvokableTool`. Every invocation
-  goes through `Registry.ExecuteContext`, preserving the six-ring security
-  chain, circuit breaker and the R2 approval gate; the adapter never calls a
-  tool closure directly. Execution failures surface to the model as a tool
-  result ("⛔ TOOL EXECUTION FAILED — …"), mirroring the legacy
-  error-into-conversation contract, so a failed call costs a retry turn
-  instead of killing the graph.
-- Native tool calling is REQUIRED on the eino path: the ADK has no XML tool
-  parser, and the llm client attaches `tools` only on the OpenAI-compatible
-  chat-completions branch. `Agent.Run` forces native prompt semantics for
-  engine=eino regardless of `XALGORIX_NATIVE_TOOL_CALLS`, and `runEinoLoop`
-  fails closed (`eino_init_failed`, rollback named) when the endpoint protocol
-  cannot carry tools. **Anthropic, Gemini and Responses endpoints stay
-  legacy-only until `internal/llm` sends tools on those protocols.** Known
-  parity gaps around the dispatch loop (OnStuckCheck, pre-gate terminal
-  command normalization, AfterTool result metadata, per-role temperature
-  switching) are tracked in REDESIGN.md §6「已知对等缺口」.
 - `runtime.go` builds `adk.ChatModelAgent` + `adk.Runner`, forces
   `ExecuteSequentially` (report/verifier calls cannot overlap), and installs a
-  construction-time tool guard middleware for scope/safety decisions.
+  construction-time tool guard middleware for scope/safety decisions. Guard
+  denials and expected tool failures become normal tool results, never
+  graph-killing errors. The guard may return normalized arguments (used for
+  terminal command normalization before execution).
+- `chatmodel.go` implements Eino's `ToolCallingChatModel` over the existing
+  `internal/llm.Client`. Native `tools`/`tool_calls` is the primary channel.
+  For Anthropic, Gemini and Responses endpoints, which do not yet receive a
+  native tools array, the same adapter renders tool calls/results into the XML
+  dialect and parses the response back into `schema.ToolCalls`; the ADK still
+  sees one native tool protocol. Streaming is explicitly disabled.
+- `model_recovery.go` is the scan-owned provider policy seam. The adapter
+  requests a retry after a failed provider call; the agent decides backoff,
+  bounded provider-wait budget, context-overflow compaction, empty-response
+  retry and no-tool recovery. This keeps transport retries inside one ADK turn
+  instead of replaying tool side effects.
+- `tools.go` wraps each registry tool as an Eino `InvokableTool`. Every call
+  goes through `Registry.ExecuteContext`, preserving the security chain,
+  circuit breaker and approval boundary. A per-invocation context value carries
+  tool `Result.Metadata` back to the agent adapter so result hooks can observe
+  fields such as skill-name/duplicate markers.
 - `approval.go` wraps each tool with `tool.StatefulInterrupt`: the first call
   creates a pending approval through the broker, and
-  `Runner.ResumeWithParams` delivers `ApprovalDecision`. Denials return a normal
-  tool result; approval rows/REST/WS remain the R2 contract.
-- `obligation.go` defines the per-turn/tool observer seam. ADK middleware applies
-  nudges before each model call and lets the observer block `finish`/other tools.
-  `internal/agent/eino_observer.go` fills it from the existing hook registry,
-  budget, liveness and finish gate.
-- `internal/agent/eino_runtime.go` runs the ADK runner from `Agent.Run` after
-  the shared legacy prelude (prompt/state/checkpoint/budget). An interrupt is
-  resolved by the web `einoApprovalBroker`, which creates the ordinary R2
-  approval row and polls `WaitApproval` until REST/WS decision, timeout, or
-  cancel; the same scan goroutine then calls `Runner.ResumeWithParams`.
-- `scan_session` opens the checkpoint backend per run and installs the broker
-  only in eino mode, so registry and callback approval never double-park a
-  call. `XALGORIX_ENGINE=legacy` restores the old loop and registry gate.
+  `Runner.ResumeWithParams` delivers the operator decision. Denials return a
+  normal tool result. The approval REST/WS contract is unchanged.
+- `obligation.go` defines the per-turn/tool observer seam. ADK middleware
+  applies nudges before each model call and lets the observer block
+  `finish`/other tools. `internal/agent/eino_observer.go` fills it from the
+  hook registry, branch budget, liveness, finish gate, bounded-context
+  compactor, stuck-call policy, terminal normalization and tool-result
+  archive.
+- `internal/agent/eino_runtime.go` runs the ADK runner after the shared
+  prelude. Interrupts are resolved by the web `einoApprovalBroker`, which
+  creates the ordinary approval row and polls `WaitApproval` until a REST/WS
+  decision, timeout, or cancellation; the same scan goroutine then resumes.
+  Construction or execution failure is terminal and visible.
 - `checkpoint.go`, `checkpoint_file.go`, `checkpoint_pg.go` implement Eino's
   `CheckPointStore` with PostgreSQL (`engine_checkpoints`, migration 0005) or
   atomic files under `<dataDir>/_engine/checkpoints` when no DSN exists.
-- R4 gates are closed (2026-11-21): golden scheduling parity
-  (`TestGoldenSchedulingParityAcrossEngines` — one ledger.json snapshot and one
-  scripted LLM sequence drive both engines to identical claim order, tool_call
-  sequences, finish semantics and turn counts; the factory-default form —
-  `XALGORIX_NATIVE_TOOL_CALLS` unset plus eino — is pinned by
-  `TestGoldenSchedulingParityFactoryDefaultEino` with a tools-array-on-the-wire
-  check) and Verifier timing evidence
-  (`TestGate45VerifierChainStaysSerialInsideToolNode` plus the agent-package
-  eino-path tests keep the whole report→verify chain serial with
-  maxInFlight==1; `TestRuntimeToolsNodeConfigPinsVerifierSerialExecution`
-  pins `ExecuteSequentially=true`). The eino observer's BeforeTool replays the
-  legacy block-gate sequence (activity → phase → auth → out-of-scope → target
-  scope) with legacy denial text; a finish whose gate accepts but whose tool
-  execution fails disarms the stop probe so the model can retry
-  (`TestEinoFinishAcceptedThenToolFailureAllowsRetry`). `XALGORIX_ENGINE=legacy`
-  remains the documented rollback.
+  `scan_session` always opens the store; a caller that omits it gets a
+  per-scan file/memory store at run time.
+- Runtime gates: `TestGoldenSchedulingParity` drives a ledger snapshot through
+  the single runtime and asserts the M5 claim order, tool sequence, finish
+  semantics, turn count and on-wire tools array.
+  `TestRuntimeToolsNodeConfigPinsVerifierSerialExecution` pins
+  `ExecuteSequentially=true`; the verifier timing tests keep the entire
+  report→verify chain serial with `maxInFlight==1`.
 
 ## Providers, LLM & auth — `internal/llm`, `internal/providers`, `internal/auth`
 

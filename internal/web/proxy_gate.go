@@ -66,6 +66,14 @@ func (g *proxyHighRiskGate) Adjudicate(attr trafficproxy.Attribution, verdict ap
 		log.Printf("[approval] proxy gate: scan context %s gone — failing open", attr.ScanCtxID)
 		return true, "", nil
 	}
+	// Operator rule exemption (contract §3.2): the same remembered rules the
+	// command gate consults cover the wire layer — one operator decision
+	// stops asking about this intent at either granularity. This also lets a
+	// host-scoped HTTP rule cover verifier curl retests that ride the
+	// subprocess channel (REDESIGN §5.2's accepted degradation, narrowed).
+	if rule := g.svc.matchRule(attr.InstanceID, verdict); rule != nil {
+		return true, "", nil
+	}
 	outcome := g.svc.submit(attr.InstanceID, sctx, verdict, g.svc.srv.secretValuesForInstance(attr.InstanceID))
 	if outcome.Approved {
 		return true, "", nil

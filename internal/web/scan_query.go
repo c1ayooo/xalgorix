@@ -447,6 +447,12 @@ func (s *Server) resolveScanDirByIDFrom(scanID string, summaries func() []scanEn
 	}
 
 	entries := summaries()
+	// Exact forms bind by record id or directory basename only. The instance
+	// id is deliberately NOT an exact key: an instance is a run identity that
+	// one run can stamp on several top-level scan records (multi-target queue
+	// dispatches, D11 re-dispatches), so treating it as an exact match made
+	// every run-scoped endpoint 404 the moment a dispatch owned two scans.
+	// Instance identity resolves through the newest-session fallback below.
 	resolveUniqueDir := func(topLevelOnly bool) (string, bool, bool) {
 		var matchedDir string
 		found := false
@@ -454,7 +460,7 @@ func (s *Server) resolveScanDirByIDFrom(scanID string, summaries func() []scanEn
 			if topLevelOnly && entry.rec.ParentTarget != "" {
 				continue
 			}
-			if entry.rec.ID != scanID && entry.rec.InstanceID != scanID && filepath.Base(entry.dir) != scanID {
+			if entry.rec.ID != scanID && filepath.Base(entry.dir) != scanID {
 				continue
 			}
 			if found {
@@ -481,6 +487,33 @@ func (s *Server) resolveScanDirByIDFrom(scanID string, summaries func() []scanEn
 	direct := filepath.Join(s.dataDir, scanID, "scan.json")
 	if _, err := os.Stat(direct); err == nil {
 		return filepath.Join(s.dataDir, scanID), true
+	}
+
+	// Instance-id form (D11): an instance is a run identity, and one run can
+	// own several top-level scan records (multi-target queue dispatches,
+	// 1:1 re-dispatches). Exact record-id/dir forms above still refuse
+	// ambiguity; the instance form binds to the NEWEST session so run-scoped
+	// projections (ledger/files/usage/transcripts/exploration) read the most
+	// recent target's chain, matching the run projection resolver
+	// (scanDirRecordForRun, REDESIGN D11).
+	var bestDir string
+	var bestStarted string
+	claims := 0
+	for _, entry := range entries {
+		if entry.rec.ParentTarget != "" || entry.rec.InstanceID != scanID {
+			continue
+		}
+		claims++
+		if bestDir == "" || entry.rec.StartedAt > bestStarted {
+			bestDir = entry.dir
+			bestStarted = entry.rec.StartedAt
+		}
+	}
+	if claims > 0 {
+		if claims > 1 {
+			log.Printf("[scan] instance id %q spans %d scans; binding run-scoped reads to the newest session", scanID, claims)
+		}
+		return bestDir, true
 	}
 	return "", false
 }

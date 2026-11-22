@@ -77,8 +77,7 @@ func (t *RegistryTool) Info(context.Context) (*schema.ToolInfo, error) {
 
 // InvokableRun decodes Eino's JSON argument string into the registry's
 // string-valued argument map and executes through Registry.ExecuteContext.
-// A configured hard ceiling force-returns even for tools that ignore ctx,
-// mirroring the legacy executeToolAsync safety net.
+// A configured hard ceiling force-returns even for tools that ignore ctx.
 func (t *RegistryTool) InvokableRun(ctx context.Context, argumentsInJSON string, _ ...einoTool.Option) (string, error) {
 	args, err := decodeRegistryArgs(argumentsInJSON)
 	if err != nil {
@@ -86,11 +85,13 @@ func (t *RegistryTool) InvokableRun(ctx context.Context, argumentsInJSON string,
 	}
 	if t.hardTimeout == nil {
 		result, runErr := t.registry.ExecuteContext(ctx, t.name, args)
+		recordToolExecutionResult(ctx, result)
 		return registryToolOutput(t.name, result, runErr)
 	}
 	limit := t.hardTimeout(t.name)
 	if limit <= 0 {
 		result, runErr := t.registry.ExecuteContext(ctx, t.name, args)
+		recordToolExecutionResult(ctx, result)
 		return registryToolOutput(t.name, result, runErr)
 	}
 	toolCtx, cancel := context.WithTimeout(ctx, limit+toolTimeoutGrace)
@@ -113,6 +114,7 @@ func (t *RegistryTool) InvokableRun(ctx context.Context, argumentsInJSON string,
 
 	select {
 	case out := <-done:
+		recordToolExecutionResult(ctx, out.result)
 		return registryToolOutput(t.name, out.result, out.err)
 	case <-toolCtx.Done():
 		if errors.Is(toolCtx.Err(), context.DeadlineExceeded) {

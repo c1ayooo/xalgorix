@@ -1,9 +1,8 @@
 package engine
 
-// Obligation bridge. The legacy scan loop already owns phase obligations,
-// finish gates, coverage/liveness, budgets and ledger hooks. Instead of
-// reimplementing those rules here, the runtime exposes a narrow observer seam
-// that the legacy Agent adapter can fill from the same pure functions.
+// Obligation bridge. The scan owns phase obligations, finish gates,
+// coverage/liveness, budgets and ledger hooks. The runtime exposes a narrow
+// observer seam that the agent adapter fills from those pure functions.
 
 import (
 	"context"
@@ -20,11 +19,14 @@ type TurnDecision struct {
 	StopReason  string
 }
 
-// TurnObserver bridges legacy engine-owned obligations into the ADK loop.
+// TurnObserver bridges engine-owned obligations into the ADK loop.
 type TurnObserver interface {
 	BeforeTurn(ctx context.Context, turn int) TurnDecision
 	BeforeTool(ctx context.Context, name string, args map[string]string) GuardVerdict
-	AfterTool(ctx context.Context, name string, args map[string]string, output string, callErr error)
+	AfterTool(ctx context.Context, name string, args map[string]string, output string, metadata map[string]any, callErr error)
+	// TransformToolOutput applies the scan's result formatting and bounded
+	// archive policy before the ADK writes the tool message into state.
+	TransformToolOutput(ctx context.Context, name string, args map[string]string, output string, metadata map[string]any, callErr error) string
 }
 
 // ErrTurnStopped marks a clean engine obligation stop (budget, liveness,

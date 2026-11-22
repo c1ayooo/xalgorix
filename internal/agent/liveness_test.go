@@ -3,7 +3,6 @@ package agent
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,7 +16,6 @@ import (
 	"github.com/xalgord/xalgorix/v4/internal/config"
 	"github.com/xalgord/xalgorix/v4/internal/scanctx"
 	"github.com/xalgord/xalgorix/v4/internal/scopeguard"
-	"github.com/xalgord/xalgorix/v4/internal/tools"
 )
 
 func TestSaturatedResultGuardTerminatesWithTypedPartialOutcome(t *testing.T) {
@@ -238,30 +236,6 @@ func TestDelegatedPlanHasOnlyAssignedCoverage(t *testing.T) {
 	}
 }
 
-func TestToolWaitHonorsRemainingDurationBudget(t *testing.T) {
-	sctx := scanctx.New("duration-test", t.TempDir())
-	t.Cleanup(sctx.Close)
-	registry := tools.NewRegistry()
-	release := make(chan struct{})
-	t.Cleanup(func() { close(release) })
-	registry.Register(&tools.Tool{Name: "slow", Execute: func(map[string]string) (tools.Result, error) {
-		<-release
-		return tools.Result{Output: "late"}, nil
-	}})
-	budget := newScanBudget()
-	budget.start()
-	budget.startedAt = time.Now().Add(-950 * time.Millisecond)
-	a := &Agent{cfg: &config.Config{MaxDurationSec: 1}, ctx: context.Background(), scanCtx: sctx, registry: registry, scanBudget: budget}
-	start := time.Now()
-	result, err := a.executeToolAsync("slow", nil)
-	if !errors.Is(err, context.DeadlineExceeded) || result.Error == "" || time.Since(start) > time.Second {
-		t.Fatalf("tool wait exceeded remaining scan duration: %+v %v after %s", result, err, time.Since(start))
-	}
-	if sctx.Ctx.Err() == nil {
-		t.Fatal("duration expiry did not cancel scan-owned work")
-	}
-}
-
 func TestSemanticLivenessBoundsChangingSuccessfulCalls(t *testing.T) {
 	a := &Agent{state: NewScanState(), scanBudget: newScanBudget()}
 	for i := 0; i < semanticNonProgressLimit; i++ {
@@ -288,5 +262,18 @@ func TestSemanticLivenessBoundsChangingSuccessfulCalls(t *testing.T) {
 	}
 	if a.AssessmentProgress() != 1 || a.state.ProgressIdleIterations != 10 {
 		t.Fatal("replayed evidence or state regression was counted as new work")
+	}
+}
+
+func TestExecChannelBreakerDegradesHardTimeout(t *testing.T) {
+	a := &Agent{}
+	full := a.hardTimeoutFor("terminal_execute")
+	a.execTimeoutStreak.Store(execChannelBreakerThreshold)
+	degraded := a.hardTimeoutFor("terminal_execute")
+	if full <= degraded || degraded != execChannelDegradedTimeout {
+		t.Fatalf("breaker did not degrade exec timeout: full=%s degraded=%s", full, degraded)
+	}
+	if got := a.hardTimeoutFor("http_request"); got != defaultToolHardTimeout {
+		t.Fatalf("non-exec tool timeout changed: %s", got)
 	}
 }

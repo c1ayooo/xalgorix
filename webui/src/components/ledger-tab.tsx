@@ -5,7 +5,9 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { EmptyState } from "@/components/states";
 import { ErrorState } from "@/components/states";
-import { useScanLedger } from "@/api/queries";
+import { ColdPathBadge } from "@/components/coldpath-badge";
+import { AuditTimeline } from "@/components/audit-timeline";
+import { useColdPathSync, useScanLedger } from "@/api/queries";
 import { useI18n } from "@/i18n";
 import { cn } from "@/lib/utils";
 import type {
@@ -193,6 +195,9 @@ export function LedgerTab({
 }) {
   const { t } = useI18n();
   const { data, isLoading, error, refetch } = useScanLedger(scanId, running);
+  // 冷热分层:热路径 = 本视图(ledger.json 权威);冷路径 = PG 副本同步健康。
+  // 端点失败静默降级——徽标不渲染,不阻塞账本。
+  const coldpath = useColdPathSync(scanId ?? "", !!scanId);
 
   if (!scanId) {
     return (
@@ -227,7 +232,7 @@ export function LedgerTab({
   const hypotheses = data.hypotheses ?? [];
   return (
     <div className="space-y-3">
-      {/* 运行中标志 + 状态计数（六桶零填充，后端契约保证）。 */}
+      {/* 运行中标志 + 状态计数（六桶零填充，后端契约保证）+ 冷路径同步健康。 */}
       <div className="flex flex-wrap items-center gap-2">
         <span className="font-mono text-[11px] text-muted-foreground">
           {data.scan_id}
@@ -240,6 +245,7 @@ export function LedgerTab({
             </span>
           </Badge>
         ))}
+        {coldpath.data && !coldpath.error && <ColdPathBadge state={coldpath.data} />}
       </div>
 
       {(data.ledger_damaged || data.incomplete) && (
@@ -268,6 +274,9 @@ export function LedgerTab({
           </CardContent>
         </Card>
       )}
+
+      {/* 黑板的历史面：领域审计投影（认领历史 + 时间线），只读、不参与判定。 */}
+      <AuditTimeline scanId={scanId} running={running} />
     </div>
   );
 }

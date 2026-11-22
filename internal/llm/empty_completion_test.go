@@ -113,7 +113,7 @@ func TestDoChat_ToolCallOnlyCompletionIsNotEmpty(t *testing.T) {
 	c := newEmptyCompletionClient(t, `{"choices":[{"index":0,"finish_reason":"tool_calls","message":{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"terminal","arguments":"{\"command\":\"id\"}"}}]}}]}`)
 
 	var calls []ToolCall
-	got, _, err := c.chatWithRetry([]Message{{Role: "user", Content: "hi"}}, nil, &calls)
+	got, _, err := c.chatWithRetry([]Message{{Role: "user", Content: "hi"}}, nil, &calls, nil)
 	if err != nil || got != "" || len(calls) != 1 {
 		t.Fatalf("chatWithRetry = %q, %d calls, %v; want \"\", 1 call, nil", got, len(calls), err)
 	}

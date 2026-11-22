@@ -171,7 +171,7 @@ Need merge gating or a full exploit-verified pentest of the running app? Start a
 
 ## 🔎 Overview
 
-Xalgorix is a self-hosted AI penetration testing platform for authorized security testing, vulnerability assessment, and bug bounty workflows. It combines an LLM-driven autonomous agent, browser automation, terminal tooling, a comprehensive 22-phase testing methodology, live WebSocket telemetry, finding management with CVSS scoring, branded PDF report generation, and integrations for AgentMail, Discord, and Telegram.
+Xalgorix is a self-hosted AI penetration testing platform for authorized security testing, vulnerability assessment, and bug bounty workflows. It combines an LLM-driven autonomous agent, browser automation, terminal tooling, a comprehensive 22-phase testing methodology, live WebSocket telemetry, finding management with CVSS scoring, branded PDF report generation, and integrations for Discord and Telegram.
 
 Unlike cloud-only DAST scanners, Xalgorix runs entirely on your machine. You bring your own LLM provider (OpenAI, Anthropic, DeepSeek, Gemini, Groq, Ollama, MiniMax) and control the model, reasoning effort, rate limits, and proxy configuration. Nothing is sent to Xalgorix: scan context goes only to the LLM provider you configure (or stays local with Ollama), and blind-vulnerability callbacks use public Interactsh servers unless you set `XALGORIX_INTERACTSH_SERVER` to your own.
 
@@ -250,8 +250,8 @@ If Xalgorix saves you a triage cycle, please **[⭐ star the repo](https://githu
 | 📡 Live telemetry | Tool calls, agent messages, findings, errors, HTTP activity, and LLM activity over WebSockets.                              |
 | 🐞 Findings       | Scan detail pages, severity filters, CVSS details, finding index, and verified finding workflows.                           |
 | 📄 Reporting      | Branded PDF reports with target/company name, uploaded logo, report list, open/download/delete actions.                     |
-| 🔔 Integrations   | AgentMail test inboxes, verification emails, OTP flows, email triage events, Discord and Telegram notifications.            |
-| ⚙️ Configuration  | Dashboard settings for LLM, AgentMail, Discord, Telegram, proxy, runtime, browser, auth, rate limits, and resources.       |
+| 🔔 Integrations   | Discord and Telegram notifications.                                                                                          |
+| ⚙️ Configuration  | Dashboard settings for LLM, Discord, Telegram, proxy, runtime, browser, auth, rate limits, and resources.                   |
 | 🛡️ Runtime safety | Resource-aware instance limits and loopback-only binding unless external access is explicitly configured with auth.         |
 
 ## 📥 Installation
@@ -428,8 +428,6 @@ uses the standard OpenAI request shape that LiteLLM expects.
 
 ```bash
 GEMINI_API_KEY=AIza...
-AGENTMAIL_POD=am_us_pod_47
-AGENTMAIL_API_KEY=ak_...
 XALGORIX_DISCORD_WEBHOOK=https://discord.com/api/webhooks/...
 XALGORIX_DISCORD_MIN_SEVERITY=high
 ```
@@ -687,7 +685,6 @@ Most operational settings can be changed from the Web UI under Settings.
 | ------------- | ------------------------------------------------------------------- |
 | 🤝 Engagement    | Dashboard request rate limits                                       |
 | 🧠 LLM           | Model, API key, API base, reasoning effort, retries, max iterations |
-| 📬 AgentMail     | Pod and API key                                                     |
 | 🔔 Notifications | Discord webhook and minimum severity, Telegram bot token, chat ID, minimum severity, and opt-in scan-completion summaries |
 | 🕵️ Proxy         | Proxy URL, proxy file, rotation, TLS verification                   |
 | 🧱 Runtime       | Workspace, browser path, auto-install controls                      |
@@ -713,9 +710,8 @@ Some settings require a restart because they affect process startup or server bi
 | `XALGORIX_LLM_MAX_RETRIES`           | `5`              | Retry count for transient LLM failures.                |
 | `XALGORIX_MEMORY_COMPRESSOR_TIMEOUT` | `30`             | Timeout in seconds for context compression.            |
 | `XALGORIX_MAX_ITERATIONS`            | `0`              | Agent iteration cap. `0` means unlimited.              |
-| `XALGORIX_ENGINE`                    | `eino`           | Scan loop engine: `eino` (ADK, default) or `legacy` (immediate rollback). |
-| `XALGORIX_EGRESS_MODE`               | `proxy`          | `proxy` (loopback traffic proxy) or `enforce` (Linux nftables + dedicated UID; fails closed if unavailable). |
-| `XALGORIX_EGRESS_UID`                | `65534`          | Dedicated UID for terminal/Python child processes in enforce mode. |
+| `XALGORIX_EGRESS_MODE`               | `proxy`          | `proxy` routes cooperative clients through the loopback traffic proxy but is **not** an OS boundary (`egress_enforced=false`). `enforce` adds Linux nftables + dedicated UID; it requires root/`nft`, makes browser actions fail closed, and rejects the scan if setup is unavailable. |
+| `XALGORIX_EGRESS_UID`                | `65534`          | Dedicated UID for terminal/Python child processes in enforce mode; the scan workspace is transferred to this UID before launch. |
 | `XALGORIX_EGRESS_GID`                | `65534`          | Dedicated GID for terminal/Python child processes in enforce mode. |
 | `XALGORIX_PPROF_ADDR`                | none             | Opt-in Go profiler. When set (e.g. `127.0.0.1:6060`), starts a standalone pprof server at `/debug/pprof/` on that address for CPU/heap diagnosis. Disabled by default. Exposes process internals — bind loopback and reach it via an SSH tunnel; never expose publicly. |
 | `GEMINI_API_KEY`                     | none             | Optional Gemini key for web-search enrichment.         |
@@ -737,8 +733,6 @@ Some settings require a restart because they affect process startup or server bi
 
 | Variable                        | Default | Description                              |
 | ------------------------------- | ------- | ---------------------------------------- |
-| `AGENTMAIL_POD`                 | none    | AgentMail pod identifier.                |
-| `AGENTMAIL_API_KEY`             | none    | AgentMail API key.                       |
 | `XALGORIX_DISCORD_WEBHOOK`      | none    | Global Discord webhook.                  |
 | `XALGORIX_DISCORD_MIN_SEVERITY` | none    | Minimum severity sent to Discord.        |
 | `XALGORIX_TELEGRAM_BOT_TOKEN`   | none    | Telegram bot token from @BotFather.      |
@@ -828,8 +822,6 @@ Model names are not hard-coded to this list. The Settings page accepts typed mod
 | `POST`   | `/api/settings/environment`  | Save environment settings.                    |
 | `GET`    | `/api/settings/llm`          | Get LLM settings.                             |
 | `POST`   | `/api/settings/llm`          | Save LLM settings.                            |
-| `GET`    | `/api/settings/agentmail`    | Get AgentMail settings.                       |
-| `POST`   | `/api/settings/agentmail`    | Save AgentMail settings.                      |
 | `GET`    | `/ws`                        | WebSocket live event stream.                  |
 
 ## 💾 Data Storage

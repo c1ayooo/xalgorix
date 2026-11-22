@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/xalgord/xalgorix/v4/internal/infoitem"
 	oobsrv "github.com/xalgord/xalgorix/v4/internal/oob"
 	"github.com/xalgord/xalgorix/v4/internal/scanctx"
 	"github.com/xalgord/xalgorix/v4/internal/tools"
@@ -967,6 +968,15 @@ If you cannot exploit it, downgrade severity to 'info' and report as information
 			ledgerNote = autoNote
 		}
 	}
+	// Guarantee the finding has ledger evidence even when no hypothesis was in
+	// testing yet (budget ended during recon, or the model skipped the ledger).
+	if ledgerNote == "" {
+		ledgerNote = ensureFindingLedgerEvidence(contextID, vuln, cls)
+	}
+	// Project the durable finding into the information space (cold-path
+	// InfoItem). Deterministic: it does not depend on a model tool call, so a
+	// finding can never be invisible to /api/info/*.
+	projectFindingInfoItem(contextID, vuln)
 
 	msg := fmt.Sprintf("✅ Vulnerability reported: [%s] %s (%s | CVSS %.1f) — Verified: %v", vuln.ID, vuln.Title, strings.ToUpper(vuln.Severity), vuln.CVSS, vuln.Verified)
 	if upgraded {
@@ -1152,6 +1162,160 @@ func autoLinkFindingToLedgerHypotheses(contextID string, vuln Vulnerability, cls
 		return ""
 	}
 	return fmt.Sprintf("🔗 Auto-linked ledger hypotheses %s to finding %s (proven).", strings.Join(linked, ", "), vuln.ID)
+}
+
+// ensureFindingLedgerEvidence guarantees that a persisted finding leaves an
+// evidence record behind. autoLinkFindingToLedgerHypotheses only links
+// hypotheses that are already proven/testing; a finding discovered before the
+// matching hypothesis entered testing (the common case when the budget ends
+// during reconnaissance) would otherwise leave the ledger empty and the
+// information space blank. This closes that hole deterministically:
+//
+//  1. link any same-endpoint hypothesis in the class family (any status),
+//  2. else link the single endpoint-less family candidate,
+//  3. else create a proven hypothesis from the finding itself.
+//
+// It never fabricates an unsupported claim: the evidence it writes is a
+// finding reference (kind=finding_ref) carrying the finding id, and the
+// finding already passed every report gate.
+func ensureFindingLedgerEvidence(contextID string, vuln Vulnerability, cls string) string {
+	sc := scanctx.Get(contextID)
+	if sc == nil || sc.Ledger == nil {
+		return ""
+	}
+	family := hypothesisClassesForReportClass[cls]
+	if len(family) == 0 {
+		if strings.TrimSpace(cls) == "" {
+			return ""
+		}
+		family = []string{strings.ToLower(strings.TrimSpace(cls))}
+	}
+	findingKey := strings.ToLower(dedupEndpointKeyForTarget(vuln.Target, vuln.Endpoint))
+	link := func(h scanctx.Hypothesis) string {
+		sc.Ledger.AddEvidence(h.ID, scanctx.Evidence{
+			Kind:      scanctx.EvidenceFindingRef,
+			FindingID: vuln.ID,
+			Summary:   "Reported finding " + vuln.ID + " (report gate projection)",
+			Source:    "report_gate",
+			Nature:    scanctx.EvidenceObserved,
+		})
+		sc.Ledger.SetStatus(h.ID, scanctx.HypothesisProven, "Reported as "+vuln.ID)
+		return h.ID
+	}
+	var endpointless []scanctx.Hypothesis
+	for _, h := range sc.Ledger.All() {
+		if hypothesisHasFindingLink(h) {
+			continue
+		}
+		if !containsFold(family, h.VulnClass) {
+			continue
+		}
+		if strings.TrimSpace(h.Endpoint) == "" {
+			endpointless = append(endpointless, h)
+			continue
+		}
+		if findingKey != "" && strings.ToLower(dedupEndpointKeyForTarget(vuln.Target, h.Endpoint)) == findingKey {
+			return "🔗 Linked finding " + vuln.ID + " to ledger hypothesis " + link(h) + " (proven)."
+		}
+	}
+	if len(endpointless) == 1 {
+		return "🔗 Linked finding " + vuln.ID + " to ledger hypothesis " + link(endpointless[0]) + " (proven)."
+	}
+	// No hypothesis covers this finding yet: create one from the finding's own
+	// identity so the evidence has a durable home. The class is the family's
+	// canonical member, which keeps later dedup/link passes consistent.
+	created := sc.Ledger.Upsert(scanctx.Hypothesis{
+		Title:      vuln.Title,
+		VulnClass:  family[0],
+		Target:     vuln.Target,
+		Endpoint:   vuln.Endpoint,
+		Status:     scanctx.HypothesisProven,
+		Confidence: 1,
+		Origin:     "report_gate",
+	})
+	if created.ID == "" {
+		return ""
+	}
+	sc.Ledger.AddEvidence(created.ID, scanctx.Evidence{
+		Kind:      scanctx.EvidenceFindingRef,
+		FindingID: vuln.ID,
+		Summary:   "Reported finding " + vuln.ID + " (report gate projection)",
+		Source:    "report_gate",
+		Nature:    scanctx.EvidenceObserved,
+	})
+	sc.Ledger.SetStatus(created.ID, scanctx.HypothesisProven, "Reported as "+vuln.ID)
+	return "🔗 Created ledger hypothesis " + created.ID + " for finding " + vuln.ID + " (proven)."
+}
+
+// projectFindingInfoItem writes the accepted finding into the information
+// space as an observed InfoItem. It runs after the finding is durable, so the
+// information space can never disagree with the finding list: no model call,
+// no hypothesis link, and no remaining budget are required.
+func projectFindingInfoItem(contextID string, vuln Vulnerability) {
+	sc := scanctx.Get(contextID)
+	if sc == nil || sc.Ledger == nil {
+		return
+	}
+	id, err := infoitem.NewID()
+	if err != nil {
+		id = "finding-" + vuln.ID
+	}
+	now := time.Now().UTC()
+	item := &infoitem.Item{
+		ID:               id,
+		Nature:           infoitem.NatureObserved,
+		CoordinateStatus: infoitem.CoordinatesComplete,
+		Confidence:       1,
+		Coordinates: infoitem.Coordinates{
+			Content: infoitem.Content{
+				Text:      findingInfoText(vuln),
+				MediaType: "text/plain",
+			},
+			Source: infoitem.Source{
+				Kind: "report_gate",
+				Name: "report_vulnerability",
+			},
+			ObservedAt: now,
+			Subject: infoitem.Subject{
+				Kind:       "endpoint",
+				Identifier: firstNonEmpty(vuln.Endpoint, vuln.Target),
+			},
+			Purpose: "finding",
+			Context: map[string]string{
+				"finding_id": vuln.ID,
+				"severity":   vuln.Severity,
+				"cwe":        vuln.CWE,
+				"cve":        vuln.CVE,
+				"verified":   strconv.FormatBool(vuln.Verified),
+				"finding":    vuln.Title,
+			},
+		},
+		CreatedAt: now,
+	}
+	if err := sc.Ledger.AppendFindingObservation(item, "finding "+vuln.ID+": "+vuln.Title); err != nil {
+		log.Printf("[reporting] finding projection failed for %s: %v", vuln.ID, err)
+	}
+}
+
+func findingInfoText(vuln Vulnerability) string {
+	head := fmt.Sprintf("%s at %s (severity %s, CVSS %.1f)", vuln.Title, firstNonEmpty(vuln.Endpoint, vuln.Target), vuln.Severity, vuln.CVSS)
+	body := strings.TrimSpace(vuln.Description)
+	if body == "" {
+		return head
+	}
+	if len(body) > 2000 {
+		body = body[:2000]
+	}
+	return head + "\n\n" + body
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func containsFold(values []string, want string) bool {

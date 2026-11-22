@@ -206,25 +206,6 @@ type Config struct {
 	// values mean "use the built-in default".
 	LLMTimeoutSeconds int
 
-	// NativeToolCalls enables OpenAI-style native tool calling on the
-	// OpenAI-compatible path (llama.cpp/llama-server, Ollama, vLLM, OpenAI)
-	// instead of the XML-in-text protocol. When enabled, tool definitions are
-	// sent as a `tools` array and tool calls are read from `tool_calls`, which
-	// lets llama-server constrain the output with a grammar derived from the
-	// schema — a malformed call becomes impossible, and models that were never
-	// trained on the XML dialect still produce executable calls. Requires a
-	// backend that speaks the OpenAI chat-completions tool protocol; Anthropic,
-	// Gemini and the Responses API keep using the XML path regardless.
-	// XALGORIX_NATIVE_TOOL_CALLS, default false.
-	//
-	// Engine contract (REDESIGN §6): the Eino engine speaks ONLY the native
-	// channel (the ADK has no XML tool parser), so with XALGORIX_ENGINE=eino
-	// this flag is ignored — native semantics and the tools-array prompt are
-	// forced, and endpoints whose protocol cannot carry tools fail closed at
-	// scan start. Anthropic/Gemini/Responses endpoints need
-	// XALGORIX_ENGINE=legacy until internal/llm sends tools on those protocols.
-	NativeToolCalls bool
-
 	// Runtime settings
 	RuntimeBackend string // XALGORIX_RUNTIME_BACKEND — always "native"
 	Workspace      string // XALGORIX_WORKSPACE — workspace root dir
@@ -233,12 +214,6 @@ type Config struct {
 	// DatabaseURL enables the optional PostgreSQL InfoItem cold path. Empty
 	// means pure file mode; scanning must never require a database.
 	DatabaseURL string // XALGORIX_DATABASE_URL
-	// Engine selects the scan loop implementation: eino (default) or legacy.
-	// Unknown values are logged and fall back to legacy so a typo cannot
-	// silently change execution semantics. Set XALGORIX_ENGINE=legacy to roll
-	// back; the new engine is guarded by the checkpoint/approval wiring and the
-	// legacy path remains available byte-for-byte.
-	Engine string
 	// ColdPathReconcileSeconds controls how often the reconciler scans local
 	// domain journals for sequences that have not reached PostgreSQL.
 	ColdPathReconcileSeconds int // XALGORIX_COLDPATH_RECONCILE_SECONDS, default 30
@@ -405,10 +380,6 @@ type Config struct {
 	// Web Search API
 	GeminiAPIKey string // GEMINI_API_KEY - for web search using Gemini
 
-	// AgentMail - temp email for sign-up verification
-	AgentMailAPIKey string // AGENTMAIL_API_KEY - AgentMail API key
-	AgentMailPod    string // AGENTMAIL_POD - AgentMail pod (e.g., "am_us_pod_47")
-
 	// Discord notifications
 	DiscordWebhook     string // XALGORIX_DISCORD_WEBHOOK - notification webhook URL
 	DiscordMinSeverity string // XALGORIX_DISCORD_MIN_SEVERITY - minimum severity to notify
@@ -468,6 +439,13 @@ type Config struct {
 	// Traffic proxy (R2b, REDESIGN §4/D4)
 	TrafficProxy bool   // XALGORIX_TRAFFICPROXY — single-process loopback MITM proxy, default ON; "0"/"false"/"yes"-negatives turn it off
 	CADir        string // XALGORIX_CA_DIR — traffic-proxy CA directory (default ~/.xalgorix/ca)
+
+	// Goal analysis (REDESIGN §3.1, R-goal): the round-0 intent analysis that
+	// turns a task's unstructured goal into a decidable objective before the
+	// agent starts. Default ON; "0"/"false" turn only the AUTOMATIC path off —
+	// the explicit POST /api/projects/{id}/analyze-goal preview endpoint stays
+	// available regardless, because the operator clicking it already opted in.
+	GoalAnalysis bool // XALGORIX_GOAL_ANALYSIS
 
 	// Paths
 	HomeDir     string // ~/.xalgorix
@@ -585,7 +563,6 @@ func load() *Config {
 		LLMContextWindow:         envOrInt("XALGORIX_LLM_CONTEXT_WINDOW", 128000),
 		ContextCompactRatio:      envOrFloat("XALGORIX_CONTEXT_COMPACT_RATIO", 0.75),
 		LLMTimeoutSeconds:        envOrInt("XALGORIX_LLM_TIMEOUT_SECONDS", 600),
-		NativeToolCalls:          envOrBool("XALGORIX_NATIVE_TOOL_CALLS", false),
 		MemCompTimeout:           envOrInt("XALGORIX_MEMORY_COMPRESSOR_TIMEOUT", 30),
 
 		// Gemini content-filter posture (native Gemini API path only). Default
@@ -600,7 +577,6 @@ func load() *Config {
 		WorkspaceRoot:            dataDir,
 		DatabaseURL:              envOr("XALGORIX_DATABASE_URL", ""),
 		ColdPathReconcileSeconds: envOrInt("XALGORIX_COLDPATH_RECONCILE_SECONDS", 30),
-		Engine:                   normalizeEngineMode(envOr("XALGORIX_ENGINE", "eino")),
 
 		// HITL approval pipeline (REDESIGN §5 / D5). Mode default "off":
 		// enforce requires an explicit operator choice (see struct comment).
@@ -653,9 +629,7 @@ func load() *Config {
 		OTelEndpoint: envOr("XALGORIX_OTEL_ENDPOINT", ""),
 
 		// Web Search API
-		GeminiAPIKey:    envOr("GEMINI_API_KEY", ""),
-		AgentMailAPIKey: envOr("AGENTMAIL_API_KEY", ""),
-		AgentMailPod:    envOr("AGENTMAIL_POD", ""),
+		GeminiAPIKey: envOr("GEMINI_API_KEY", ""),
 
 		// Discord notifications
 		DiscordWebhook:     envOr("XALGORIX_DISCORD_WEBHOOK", ""),
@@ -699,6 +673,10 @@ func load() *Config {
 		// behavior byte-for-byte.
 		TrafficProxy: envOrBool("XALGORIX_TRAFFICPROXY", true),
 		CADir:        envOr("XALGORIX_CA_DIR", filepath.Join(xalgorixHome, "ca")),
+
+		// Goal analysis (R-goal): automatic round-0 analysis at task run
+		// start, default ON (see field comment).
+		GoalAnalysis: envOrBool("XALGORIX_GOAL_ANALYSIS", true),
 
 		// Paths
 		HomeDir:     xalgorixHome,
@@ -923,22 +901,6 @@ func envOr(key, fallback string) string {
 // Unknown values fall back to off — approval is fail-open by configuration
 // mistake (REDESIGN §5: mode is an operator choice; a typo must not silently
 // park headless scans), while enforce semantics stay opt-in and explicit.
-// normalizeEngineMode clamps XALGORIX_ENGINE onto eino|legacy. The configured
-// default is eino; an unknown value is loudly downgraded to legacy so a typo
-// cannot activate the new engine silently. Operators can force the old path
-// with XALGORIX_ENGINE=legacy.
-func normalizeEngineMode(v string) string {
-	switch strings.ToLower(strings.TrimSpace(v)) {
-	case "eino":
-		return "eino"
-	case "", "legacy":
-		return "legacy"
-	default:
-		log.Printf("[config] WARN unknown XALGORIX_ENGINE=%q; falling back to legacy", v)
-		return "legacy"
-	}
-}
-
 func normalizeApprovalMode(v string) string {
 	switch strings.ToLower(strings.TrimSpace(v)) {
 	case "enforce":

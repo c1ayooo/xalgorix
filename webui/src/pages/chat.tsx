@@ -1,42 +1,22 @@
-import { useEffect, useMemo, useState } from "react";
-import { Link, useSearchParams } from "react-router-dom";
+import { useMemo, useState } from "react";
+import { useSearchParams } from "react-router-dom";
+import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import { Button } from "@/components/ui/button";
 import { ConversationSidebar } from "@/components/chat/conversation-sidebar";
 import { ChatPanel } from "@/components/chat/chat-panel";
-import {
-  useProjectConversations,
-  useStartTaskRun,
-  useTasks,
-  useUpdateConversation,
-} from "@/api/queries";
+import { DraftChat } from "@/components/chat/draft-chat";
+import { useProjectConversations, useSendTaskGuidance, useStartTaskRun, useTasks, useUpdateConversation } from "@/api/queries";
 import { useActiveProjectId } from "@/lib/use-active-project";
 import { useI18n } from "@/i18n";
-import type { ConversationRow, Task } from "@/types/api";
+import { newRequestId } from "@/lib/guidance";
+import type { ConversationRow } from "@/types/api";
 
 /**
- * Chat — 项目级会话中心（docs/CHAT_PAGE_REDESIGN.md）。
+ * Chat — 项目级会话中心（1:1 复刻，docs/SESSIONS_CHAT_1TO1_PLAN.md §6）。
  *
- * 左栏：搜索 + 置顶 + 按任务分组的会话列表；会话有标题，可置顶、可归档。
- * 右栏：完整转录（人工 + agent + 工具 + finding）或「仅人工」视图，底部
- * composer 既可补指令也可停掉本次运行。
- *
- * URL 是唯一权威：/chat?run=&view=full|human&archived=1。
+ * 左栏：新建对话 + 任务筛选 + 计数/多选 + 置顶 + 按任务分组（折叠持久化）
+ * 右栏：无 ?run= 时 DraftChat（首条消息才创建 Run）；选中后 ChatView。
+ * URL 是唯一权威：/chat?run=&view=full|human&archived=1；不再自动选第一条。
  */
 export default function ChatPage() {
   const { t } = useI18n();
@@ -46,13 +26,19 @@ export default function ChatPage() {
   const view = searchParams.get("view") === "human" ? "human" : "full";
 
   const { data: tasksData } = useTasks(projectId ?? undefined);
-  const tasks = tasksData?.tasks ?? [];
+  const tasks = useMemo(() => tasksData?.tasks ?? [], [tasksData]);
   const { data: convData, isLoading } = useProjectConversations(projectId ?? undefined, archived);
   const rows = useMemo<ConversationRow[]>(() => convData?.items ?? [], [convData]);
   const update = useUpdateConversation();
+  const startRun = useStartTaskRun();
+  const send = useSendTaskGuidance();
 
   const runParam = searchParams.get("run") ?? undefined;
-  const selected = rows.find((row) => row.instance_id === runParam) ?? rows[0];
+  const selected = runParam ? (rows.find((row) => row.instance_id === runParam) ?? null) : null;
+  const [bulkPending, setBulkPending] = useState(false);
+  const [starting, setStarting] = useState(false);
+  const [requestId, setRequestId] = useState(newRequestId);
+  const queryClient = useQueryClient();
 
   function writeParams(mutate: (sp: URLSearchParams) => void) {
     const sp = new URLSearchParams(searchParams);
@@ -60,148 +46,119 @@ export default function ChatPage() {
     setSearchParams(sp, { replace: true });
   }
 
-  // Keep the URL pointing at a real conversation so a reload restores it.
-  useEffect(() => {
-    if (!selected?.instance_id || selected.instance_id === runParam) return;
-    writeParams((sp) => sp.set("run", selected.instance_id!));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selected?.instance_id, runParam]);
+  function selectRun(instanceId: string) {
+    writeParams((sp) => sp.set("run", instanceId));
+  }
 
-  const [newChatOpen, setNewChatOpen] = useState(false);
+  function newDraft() {
+    writeParams((sp) => sp.delete("run"));
+  }
 
   function patchConversation(instanceId: string, patch: { title?: string; pinned?: boolean; archived?: boolean }) {
-    update.mutate(
-      { instanceId, patch },
-      {
-        onError: (error: Error) => toast.error(`${t("chat.updateFailed")}: ${error.message}`),
-      },
-    );
-  }
-
-  return (
-    <div className="grid items-stretch gap-4 lg:h-[calc(100vh-11.5rem)] lg:grid-cols-[20rem_minmax(0,1fr)] lg:grid-rows-[minmax(0,1fr)]">
-      <ConversationSidebar
-        rows={rows}
-        loading={isLoading}
-        selectedInstanceId={selected?.instance_id}
-        includeArchived={archived}
-        onSelect={(instanceId) =>
-          writeParams((sp) => {
-            sp.set("run", instanceId);
-          })
-        }
-        onRename={(instanceId, title) => patchConversation(instanceId, { title })}
-        onTogglePin={(row) =>
-          row.instance_id && patchConversation(row.instance_id, { pinned: !row.pinned })
-        }
-        onToggleArchive={(row) =>
-          row.instance_id &&
-          patchConversation(row.instance_id, { archived: !row.archived })
-        }
-        onToggleArchived={() =>
-          writeParams((sp) => {
-            if (archived) sp.delete("archived");
-            else sp.set("archived", "1");
-          })
-        }
-        onNew={() => setNewChatOpen(true)}
-      />
-
-      <ChatPanel
-        taskId={selected?.task_id}
-        run={selected}
-        view={view}
-        onViewChange={(next) =>
-          writeParams((sp) => {
-            sp.set("view", next);
-          })
-        }
-        onRename={(title) => selected?.instance_id && patchConversation(selected.instance_id, { title })}
-      />
-
-      <NewConversationDialog
-        open={newChatOpen}
-        onOpenChange={setNewChatOpen}
-        tasks={tasks}
-        onStarted={(instanceId) => {
-          writeParams((sp) => {
-            sp.set("run", instanceId);
-          });
-        }}
-      />
-    </div>
-  );
-}
-
-/** 发起对话：选任务 → 发起新 Run。对话的宿主是 Run，弹窗不做扫描配置。 */
-function NewConversationDialog({
-  open,
-  onOpenChange,
-  tasks,
-  onStarted,
-}: {
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-  tasks: Task[];
-  onStarted: (instanceId: string) => void;
-}) {
-  const { t } = useI18n();
-  const startRun = useStartTaskRun();
-  const [picked, setPicked] = useState<string>(tasks[0]?.id ?? "");
-  const value = tasks.some((task) => task.id === picked) ? picked : tasks[0]?.id ?? "";
-
-  function start() {
-    if (!value || startRun.isPending) return;
-    startRun.mutate(
-      { id: value },
-      {
-        onSuccess: (res) => {
-          toast.success(t("chat.chatStarted"));
-          onStarted(res.instance_id);
-          onOpenChange(false);
+    return new Promise<void>((resolve, reject) => {
+      update.mutate(
+        { instanceId, patch },
+        {
+          onSuccess: () => resolve(),
+          onError: (error: Error) => {
+            toast.error(`${t("chat.updateFailed")}: ${error.message}`);
+            reject(error);
+          },
         },
-        onError: (err: Error) => toast.error(`${t("chat.startChatFailed")}: ${err.message}`),
-      },
-    );
+      );
+    });
+  }
+
+  async function archiveMany(ids: string[]) {
+    if (ids.length === 0) return;
+    setBulkPending(true);
+    const results = await Promise.allSettled(ids.map((id) => patchConversation(id, { archived: true })));
+    setBulkPending(false);
+    const failed = results.filter((r) => r.status === "rejected").length;
+    if (failed === 0) toast.success(t("chat.archivedMany").replace("{n}", String(ids.length)));
+    else
+      toast.error(
+        t("chat.archivedPartial").replace("{failed}", String(failed)).replace("{total}", String(ids.length)),
+      );
+  }
+
+  /** 草稿首条消息：选任务 → 创建 Run → 发 guidance → 刷新列表 → 写 ?run= 切详情。 */
+  async function startDraft(taskId: string, message: string) {
+    setStarting(true);
+    try {
+      const res = await startRun.mutateAsync({ id: taskId });
+      const instanceId = res.instance_id;
+      if (!instanceId) throw new Error(t("chat.startFailed"));
+      await new Promise<void>((resolve, reject) => {
+        send.mutate(
+          { id: taskId, message, requestId, instanceId },
+          {
+            onSuccess: (result) => {
+              toast.success(result.status === "injected" ? t("chat.guidanceInjected") : t("chat.guidanceQueued"));
+              setRequestId(newRequestId());
+              resolve();
+            },
+            onError: (error: Error) => {
+              toast.error(`${t("chat.sendFailed")}: ${error.message}`);
+              reject(error);
+            },
+          },
+        );
+      });
+      // 先让列表拿到新 Run 再写 ?run=：否则 selected 解析不到、页面停在草稿态
+      // 干等 8s 轮询（参照的乐观插入语义，用缓存失效等价实现）。
+      await queryClient.invalidateQueries({ queryKey: ["conversation"] });
+      selectRun(instanceId);
+    } finally {
+      setStarting(false);
+    }
   }
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-sm">
-        <DialogHeader>
-          <DialogTitle>{t("chat.newConversation")}</DialogTitle>
-          <DialogDescription>{t("chat.newChatHint")}</DialogDescription>
-        </DialogHeader>
-        {tasks.length === 0 ? (
-          <p className="text-sm text-muted-foreground">
-            {t("chat.noTasks")}{" "}
-            <Link to="/tasks" className="text-primary hover:underline">
-              {t("chat.createTask")}
-            </Link>
-          </p>
-        ) : (
-          <Select value={value} onValueChange={setPicked}>
-            <SelectTrigger aria-label={t("chat.pickTask")}>
-              <SelectValue placeholder={t("chat.pickTask")} />
-            </SelectTrigger>
-            <SelectContent>
-              {tasks.map((task) => (
-                <SelectItem key={task.id} value={task.id}>
-                  {task.name}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        )}
-        <DialogFooter>
-          <Button variant="outline" onClick={() => onOpenChange(false)}>
-            {t("common.cancel")}
-          </Button>
-          <Button onClick={start} disabled={tasks.length === 0 || !value || startRun.isPending}>
-            {startRun.isPending ? t("chat.startingChat") : t("chat.startChat")}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
+    // 视口定高（全断点）：面板内部滚动、composer 钉底，页面级不滚。
+    // 高度预算 = 100svh − topbar 3.5 − OpsPulse 2.25；内边距随断点（参照 p-3/sm:p-4/md:p-6）。
+    <div className="flex h-[calc(100svh-5.75rem)] min-w-0 flex-col overflow-hidden p-3 sm:p-4 md:p-6">
+      <div className="grid min-h-0 min-w-0 flex-1 grid-cols-1 grid-rows-[minmax(10rem,15rem)_minmax(0,1fr)] gap-3 md:grid-cols-[18rem_minmax(0,1fr)] md:grid-rows-[minmax(0,1fr)] md:gap-4">
+        <ConversationSidebar
+          rows={rows}
+          loading={isLoading}
+          selectedInstanceId={selected?.instance_id}
+          includeArchived={archived}
+          bulkPending={bulkPending}
+          onSelect={selectRun}
+          onNew={newDraft}
+          onRename={(instanceId, title) => void patchConversation(instanceId, { title })}
+          onTogglePinned={(row) =>
+            row.instance_id && void patchConversation(row.instance_id, { pinned: !row.pinned })
+          }
+          onToggleArchive={(row) =>
+            row.instance_id && void patchConversation(row.instance_id, { archived: !row.archived })
+          }
+          onArchiveMany={archiveMany}
+          onToggleArchived={() =>
+            writeParams((sp) => {
+              if (archived) sp.delete("archived");
+              else sp.set("archived", "1");
+            })
+          }
+        />
+
+        <div className="flex min-h-0 min-w-0 flex-col overflow-hidden rounded-lg border border-border bg-card">
+          {selected ? (
+            <ChatPanel
+              key={selected.instance_id}
+              run={selected}
+              view={view}
+              onViewChange={(next) => writeParams((sp) => sp.set("view", next))}
+              onRename={(title) =>
+                selected.instance_id ? patchConversation(selected.instance_id, { title }) : Promise.resolve()
+              }
+            />
+          ) : (
+            <DraftChat tasks={tasks} starting={starting} onSend={startDraft} />
+          )}
+        </div>
+      </div>
+    </div>
   );
 }

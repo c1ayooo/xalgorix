@@ -7,7 +7,7 @@ import (
 
 func TestNormalizeLanguage(t *testing.T) {
 	cases := map[string]string{
-		"":                   "en",
+		"":                   "zh-CN", // default output language
 		"en":                 "en",
 		"EN":                 "en",
 		"en-US":              "en",
@@ -18,7 +18,7 @@ func TestNormalizeLanguage(t *testing.T) {
 		"zh_cn":              "zh-CN",
 		"zh-Hans":            "zh-CN",
 		"Simplified Chinese": "zh-CN",
-		"fr":                 "en", // unsupported falls back
+		"fr":                 "zh-CN", // unsupported falls back to the default
 	}
 	for in, want := range cases {
 		if got := NormalizeLanguage(in); got != want {
@@ -31,19 +31,24 @@ func TestOutputLanguageDirective(t *testing.T) {
 	if d := OutputLanguageDirective("en"); d != "" {
 		t.Errorf("English directive should be empty, got %q", d)
 	}
-	if d := OutputLanguageDirective(""); d != "" {
-		t.Errorf("empty/default directive should be empty, got %q", d)
+	// 默认输出语言也必须带指令：模型的自身默认是英文，不指令就会答英文。
+	d := OutputLanguageDirective("")
+	if d == "" {
+		t.Fatal("default (zh-CN) directive should be non-empty")
 	}
-	d := OutputLanguageDirective("zh-CN")
+	if !strings.Contains(d, "简体中文") {
+		t.Errorf("default directive should name the language, got %q", d)
+	}
+	d = OutputLanguageDirective("zh-CN")
 	if d == "" {
 		t.Fatal("zh-CN directive should be non-empty")
 	}
 	if !strings.Contains(d, "简体中文") {
 		t.Errorf("zh-CN directive should name the language, got %q", d)
 	}
-	// Unsupported codes fall back to English (no directive).
-	if d := OutputLanguageDirective("fr"); d != "" {
-		t.Errorf("unsupported language should produce no directive, got %q", d)
+	// Unsupported codes fall back to the default language (zh-CN, with directive).
+	if d := OutputLanguageDirective("fr"); d == "" {
+		t.Error("unsupported language falls back to the zh-CN default, which carries a directive")
 	}
 }
 

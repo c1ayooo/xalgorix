@@ -140,6 +140,19 @@ func classifyCall(toolName string, args map[string]string) (string, callMaterial
 			body:    args["body"],
 		}
 	default:
+		// MCP-bridged tools (mcp_<server>_<tool>) execute on an external
+		// operator-registered server: command-class by default. The command
+		// field carries the bridged name so a remembered command rule can
+		// exempt a specific tool ("approve & remember" composes unchanged).
+		// Per-server require_approval=false exemptions are resolved by the
+		// broker (which owns the per-scan server snapshot), not here — the
+		// policy stays store-free.
+		if strings.HasPrefix(toolName, "mcp_") {
+			return KindCommand, callMaterial{
+				reason:  "MCP tool call requires approval (external server)",
+				command: toolName,
+			}
+		}
 		return KindNone, callMaterial{}
 	}
 }
@@ -252,9 +265,14 @@ var adminPathSegments = map[string]struct{}{
 }
 
 // destructivePayloadFeatures are destructive operation markers assessed in the
-// write body and URL query (case-insensitive substring).
+// write body and URL query (case-insensitive substring). SQL DROP of a whole
+// database/schema, DDL (ALTER TABLE), Mongo db.dropDatabase() and Redis
+// FLUSHALL/FLUSHDB sit beside the original table truncate/delete shapes — a
+// pentest payload that destroys data lands the request on the operator queue.
 var destructivePayloadFeatures = []string{
-	"drop table", "delete from", "truncate table", "xp_cmdshell",
+	"drop table", "drop database", "dropdatabase", "drop schema",
+	"alter table", "delete from", "truncate table", "xp_cmdshell",
+	"flushall", "flushdb",
 	"rm -rf", "rm -fr", "mkfs", "shutdown", "reboot", "poweroff",
 	":(){ :|:& };:",
 }

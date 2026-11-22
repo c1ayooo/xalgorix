@@ -70,6 +70,13 @@ type specialistProfile struct {
 	VulnClasses      []string
 	EvidenceContract string
 	StoppingRule     string
+	// ToolScopeHidden overrides the role's tool-scope hide list (empty =
+	// roleToolScope default for the resolved agent type). Operator-authored
+	// profiles set it; builtins leave it empty and fall through to the map.
+	ToolScopeHidden []string
+	// Builtin marks the code-defined specialists — the API surface treats
+	// them as read-only and the reserved role names cannot be reused.
+	Builtin bool
 }
 
 var defaultSpecialistProfiles = []specialistProfile{
@@ -79,8 +86,9 @@ var defaultSpecialistProfiles = []specialistProfile{
 		// testing wave. Deep enumeration beyond the root's bounded baseline is
 		// the highest-leverage coverage lever: undiscovered surface is silently
 		// untested surface (missed debug consoles, backup files, source maps).
-		Role:  "recon-discovery",
-		Focus: "Deep surface enumeration: crawling, content/file discovery, fingerprinting depth, hidden paths, parameter mining",
+		Role:    "recon-discovery",
+		Builtin: true,
+		Focus:   "Deep surface enumeration: crawling, content/file discovery, fingerprinting depth, hidden paths, parameter mining",
 		VulnClasses: []string{
 			"dirbusting", "parameter_mining", "file_disclosure", "subdomain-takeover",
 			"email-security", "cms-fingerprinting", "cloud-config",
@@ -90,6 +98,7 @@ var defaultSpecialistProfiles = []specialistProfile{
 	},
 	{
 		Role:             "authz-logic",
+		Builtin:          true,
 		Focus:            "Authorization and access control across identity boundaries",
 		VulnClasses:      []string{"idor", "bola", "bfla", "privilege-escalation", "auth-bypass"},
 		EvidenceContract: "only enter this lane when live reconnaissance provides the required account/session roles or an operator-supplied credential path; use a baseline request as the legitimate role AND the same request as another/lower-privileged role, showing a concrete cross-role difference (cross-user/cross-tenant data or a state-changing action) — the authz_matrix tool produces this differential automatically across role A / role B / anonymous. For EVERY user-scoped state-changing endpoint, test ownership AND uniqueness enforcement with two distinct identities (act as user A on user B\u2019s object or repeat user A\u2019s submission as user B — cross-user bookings/reservations/records must fail). For authentication flows, test token identity (two different users logging in must NOT receive identical or interchangeable tokens) and expiry enforcement (an expired token must be rejected), plus a bounded failed-login burst to check authentication rate limiting (stop early once the counter proves unlimited attempts; do not lock out real accounts). Do not substitute default-password spraying, account creation on a disabled signup flow, or offline hash cracking for missing role prerequisites",
@@ -104,6 +113,7 @@ var defaultSpecialistProfiles = []specialistProfile{
 		// races are all provable with one identity against the workflow's
 		// own invariants.
 		Role:             "business-logic",
+		Builtin:          true,
 		Focus:            "Business logic, workflow abuse, and race conditions",
 		VulnClasses:      []string{"business-logic", "race-conditions", "mass-assignment"},
 		EvidenceContract: "for every state-changing workflow endpoint (checkout, coupon, booking, order, transfer, vote, refund, subscription), test the business invariants: replay/double-submit the same action and prove a duplicate effect; manipulate price/quantity/discount/limit values in both directions (negative quantity, zero cost, over-limit) and prove the server accepts or misprices; abuse the state machine (skip steps, revisit completed steps, submit out of order); for race-prone actions fire 5-20 concurrent identical requests (single identity is sufficient) and prove an invariant break such as a multi-use coupon, overdrawn balance, or duplicate booking. For writable-object endpoints (PUT/PATCH with JSON), test mass assignment of privileged properties (role, is_admin, price, owner_id) with one identity. A proven differential (baseline request vs. manipulated request) is required for each claim; a refused manipulation is a rejected hypothesis with its control",
@@ -111,6 +121,7 @@ var defaultSpecialistProfiles = []specialistProfile{
 	},
 	{
 		Role:             "injection-serverside",
+		Builtin:          true,
 		Focus:            "Injection and server-side behavior",
 		VulnClasses:      []string{"rce", "remote-code-execution", "code-injection", "expression-injection", "jndi-injection", "jdbc-injection", "sqli", "blind-sqli", "nosqli", "ssti", "cmdi", "ssrf", "xxe", "lfi", "path_traversal", "deserialization", "file-upload", "websocket"},
 		EvidenceContract: "own remote/code-execution hypotheses as well as injection primitives, including version-matched public-advisory leads on a reachable route. For an exact product/version or CVE lead, use web_search/exploit_search and cve_search once, recover the authoritative request byte-for-byte, and replay that exact request before adapting it; preserve nested JSON, escaped Unicode/newlines, quoting, and Content-Type instead of reconstructing a multi-line payload ad hoc. Require a concrete exploitation outcome — extracted data, command/template output, a target-attributable out-of-band (interactsh/OAST) callback emitted by the claimed primitive, or verify_timing's repeated control/probe differential for an unambiguous safe delay primitive — not a version banner, reflected payload, scanner-origin callback, single slow response, or timing hunch. For RCE/CMDi, a RUNSCRIPT/URL/XML/webhook/database fetch proves only that fetch primitive; the callback must be emitted by an injected OS/runtime/template execution expression. For blind JVM/native-runtime exploits prefer a server-native safe primitive such as Thread.sleep over assuming curl/wget exists. Once one exact root cause is proven, report its strongest safe impact and move to the next distinct class/endpoint; do not repeatedly read more files or crack recovered hashes merely to inflate the same finding",
@@ -118,6 +129,7 @@ var defaultSpecialistProfiles = []specialistProfile{
 	},
 	{
 		Role:             "client-source",
+		Builtin:          true,
 		Focus:            "Client/API surface, including discovered dynamic URL routes, and source-to-sink data flow when source is available",
 		VulnClasses:      []string{"xss", "dom-xss", "csrf", "open-redirect", "cors", "secret-exposure", "api-auth", "content-spoofing", "broken-link-hijacking"},
 		EvidenceContract: "use the first-class discover_client_routes on the live root/login page before manually downloading or grepping bundles, then inventory its dynamic path segments; it automatically browser-checks a bounded set of the highest-priority public prefixes when AngularJS signals are returned, and any AUTOMATED PATH-XSS CONFIRMED result must be reported immediately. Use browser_action command=verify_path_template_xss only for additional candidates. For other XSS/DOM contexts use command=verify_xss. Require browser-confirmed script execution, not reflection; for source review require an attacker-input→sensitive-sink path plus a live request that exercises it",
@@ -126,13 +138,28 @@ var defaultSpecialistProfiles = []specialistProfile{
 }
 
 // renderSpecialistProfiles formats the profiles as a numbered contract list.
-func renderSpecialistProfiles() string {
+func renderSpecialistProfiles(profiles []specialistProfile) string {
 	var b strings.Builder
-	for i, p := range defaultSpecialistProfiles {
+	for i, p := range profiles {
 		fmt.Fprintf(&b, "%d. %s (role \"%s\") — classes: %s.\n   Required proof: %s.\n   Stop rule: %s.\n",
 			i+1, p.Focus, p.Role, strings.Join(p.VulnClasses, ", "), p.EvidenceContract, p.StoppingRule)
 	}
 	return b.String()
+}
+
+// SpecialistProfile is the exported view of a delegation profile: the web
+// layer uses it to inject operator-authored lanes (WithAgentProfiles) and
+// the reserved builtin role names guard duplicate registration.
+type SpecialistProfile = specialistProfile
+
+// BuiltinSpecialistRoles returns the reserved builtin role names — the web
+// layer rejects operator profiles that collide with them (ErrConflict).
+func BuiltinSpecialistRoles() []string {
+	out := make([]string, 0, len(defaultSpecialistProfiles))
+	for _, p := range defaultSpecialistProfiles {
+		out = append(out, p.Role)
+	}
+	return out
 }
 
 // buildDelegationNudge builds the coordinator's one-time multi-agent
@@ -144,9 +171,15 @@ func buildDelegationNudge(state *ScanState) string {
 	var b strings.Builder
 	b.WriteString(`🧭 MULTI-AGENT DECOMPOSITION: Recon is mature enough to split the assessment. Act as coordinator now: launch only the 1–3 NON-OVERLAPPING specialists whose prerequisites exist on the observed surface, each owning a bounded set of hypotheses from the shared ledger. Do not launch an authorization specialist when no usable accounts/sessions or signup path exists.
 
-Specialist roles (use these exact roles and hold each to its evidence contract):
+	Specialist roles (use these exact roles and hold each to its evidence contract):
 `)
-	b.WriteString(renderSpecialistProfiles())
+	// The merged profile set (builtin + this scan's operator-authored
+	// profiles) rides ScanState — hooks see ScanState, not the Agent.
+	profiles := defaultSpecialistProfiles
+	if state != nil && len(state.SpecialistProfiles) > 0 {
+		profiles = state.SpecialistProfiles
+	}
+	b.WriteString(renderSpecialistProfiles(profiles))
 	b.WriteString(`
 Drive the work from the shared hypothesis ledger so specialists never overlap:
 - Call read_ledger(filter=schedulable) to see the open hypotheses.

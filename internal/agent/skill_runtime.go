@@ -9,9 +9,12 @@ package agent
 
 import (
 	"fmt"
+	"log"
 	"sort"
 	"strings"
 
+	"github.com/xalgord/xalgorix/v4/internal/domainjournal"
+	"github.com/xalgord/xalgorix/v4/internal/scanctx"
 	"github.com/xalgord/xalgorix/v4/internal/tools/skills"
 )
 
@@ -72,6 +75,7 @@ func hookSkillLoadTracker(state *ScanState, args map[string]string) HookResult {
 		}
 		// Any way you slice it, this is not a NEW skill.
 		state.SkillsLoaded = len(state.LoadedSkills)
+		auditSkillLoad(state, name, "reload after context prune")
 		return HookResult{}
 	}
 	state.LoadedSkills[name] = &LoadedSkillInfo{
@@ -81,6 +85,66 @@ func hookSkillLoadTracker(state *ScanState, args map[string]string) HookResult {
 		Iteration:     state.Iteration,
 	}
 	state.SkillsLoaded = len(state.LoadedSkills)
+	auditSkillLoad(state, name, "model-requested")
+	return HookResult{}
+}
+
+// auditSkillLoad appends a best-effort per-scan domain audit record for one
+// completed skill load (charter §5: the domain journal is the audit
+// authority; events.jsonl is telemetry). A journal-less context (tests,
+// minimal setups) simply never records — the load itself is never blocked.
+func auditSkillLoad(state *ScanState, name, reason string) {
+	if state == nil || state.ScanContextID == "" {
+		return
+	}
+	sc := scanctx.Get(state.ScanContextID)
+	if sc == nil || sc.Ledger == nil {
+		return
+	}
+	agentID := state.DelegatedAgentID
+	if agentID == "" {
+		agentID = "root"
+	}
+	actor := domainjournal.Actor{Kind: domainjournal.ActorAgent, ID: agentID, Source: "skills"}
+	summary := fmt.Sprintf("skill load: %s (%s)", name, reason)
+	if err := sc.Ledger.AppendInvocationAudit(domainjournal.OpSkillLoad, actor, summary); err != nil {
+		log.Printf("[audit] skill load record skipped: %v", err)
+	}
+}
+
+// ── hookMcpCallAuditor ───────────────────────────────────────────────────────
+// OnToolResult: appends one best-effort mcp_call audit record per completed
+// MCP tool call (ok or error). Same posture as auditSkillLoad — the journal
+// is the per-scan authority; the web layer projects cross-scan records.
+func hookMcpCallAuditor(state *ScanState, args map[string]string) HookResult {
+	if state == nil || !strings.HasPrefix(args["tool_name"], "mcp_") {
+		return HookResult{}
+	}
+	if state.ScanContextID == "" {
+		return HookResult{}
+	}
+	sc := scanctx.Get(state.ScanContextID)
+	if sc == nil || sc.Ledger == nil {
+		return HookResult{}
+	}
+	agentID := state.DelegatedAgentID
+	if agentID == "" {
+		agentID = "root"
+	}
+	actor := domainjournal.Actor{Kind: domainjournal.ActorAgent, ID: agentID, Source: "mcp"}
+	tool := strings.TrimSpace(args["tool_name"])
+	server := strings.TrimSpace(args["mcp_server"])
+	remote := strings.TrimSpace(args["mcp_tool"])
+	summary := fmt.Sprintf("mcp call: %s", tool)
+	if server != "" || remote != "" {
+		summary = fmt.Sprintf("mcp call: %s (server %q, remote tool %q)", tool, server, remote)
+	}
+	if args["error"] != "" {
+		summary += " — error: " + truncStr(args["error"], 200)
+	}
+	if err := sc.Ledger.AppendInvocationAudit(domainjournal.OpMcpCall, actor, summary); err != nil {
+		log.Printf("[audit] mcp call record skipped: %v", err)
+	}
 	return HookResult{}
 }
 

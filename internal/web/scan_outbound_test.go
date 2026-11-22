@@ -2,7 +2,6 @@ package web
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -11,8 +10,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/gorilla/websocket"
 
 	"github.com/xalgord/xalgorix/v4/internal/auth"
 	"github.com/xalgord/xalgorix/v4/internal/config"
@@ -545,53 +542,5 @@ func TestHandleScanRejectsAPIBaseOverrideWithoutKey(t *testing.T) {
 	}
 	if strings.Contains(rr.Body.String(), "stored-key") {
 		t.Fatal("error body leaks the stored key")
-	}
-}
-
-// TestWebSocketScanAppliesDestinationChecks: the WebSocket scan message is a
-// second way to start a scan and must refuse the same requests as /api/scan.
-func TestWebSocketScanAppliesDestinationChecks(t *testing.T) {
-	s := newWebhookTestServer(t, &config.Config{
-		LLM:     "custom/test-model",
-		APIBase: "https://llm.internal.example/v1",
-		APIKey:  "stored-key",
-	})
-	bestEffortDataDir(t, s)
-	srv := httptest.NewServer(http.HandlerFunc(s.handleWebSocket))
-	t.Cleanup(srv.Close)
-
-	for _, msg := range []string{
-		`{"targets":["https://example.com"],"api_base":"https://collector.example/v1"}`,
-		`{"targets":["https://example.com"],"discord_webhook":"http://127.0.0.1:8888/x"}`,
-	} {
-		conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv.URL, "http"), nil)
-		if err != nil {
-			t.Fatalf("dial: %v", err)
-		}
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(msg)); err != nil {
-			t.Fatalf("write: %v", err)
-		}
-		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-		refused := false
-		for !refused {
-			_, data, err := conn.ReadMessage()
-			if err != nil {
-				t.Fatalf("no refusal for %s: %v", msg, err)
-			}
-			var evt WSEvent
-			if json.Unmarshal(data, &evt) == nil && evt.Type == "error" && strings.Contains(evt.Content, "Scan request refused") {
-				refused = true
-				if strings.Contains(evt.Content, "stored-key") {
-					t.Fatal("refusal leaks the stored key")
-				}
-			}
-		}
-		conn.Close()
-	}
-	s.instancesMu.RLock()
-	n := len(s.instances)
-	s.instancesMu.RUnlock()
-	if n != 0 {
-		t.Fatalf("%d scan instance(s) started from refused WebSocket requests", n)
 	}
 }

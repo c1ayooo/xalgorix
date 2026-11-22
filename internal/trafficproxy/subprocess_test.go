@@ -206,15 +206,28 @@ func TestMITMObservesSubprocessBasicAttribution(t *testing.T) {
 		t.Fatalf("sensitive query value not masked in %q", attributed.URL)
 	}
 
-	// Observation payload carries no token material.
-	raw, err := json.Marshal(attributed)
+	// The observation SUMMARY carries no token material; the raw exchange
+	// (2026-11-22 amendment) is where fidelity lives.
+	summaryObs := *attributed
+	summaryObs.Raw = nil
+	summary, err := json.Marshal(summaryObs)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, leaked := range []string{secret, token, "Basic", "role=admin"} {
-		if strings.Contains(string(raw), leaked) {
-			t.Fatalf("observation leaked %q: %s", leaked, raw)
+		if strings.Contains(string(summary), leaked) {
+			t.Fatalf("observation summary leaked %q: %s", leaked, summary)
 		}
+	}
+	if attributed.Raw == nil {
+		t.Fatal("subprocess-attributed exchange carried no raw capture")
+	}
+	if attributed.Raw.Channel != "subprocess" {
+		t.Fatalf("raw channel = %q, want subprocess", attributed.Raw.Channel)
+	}
+	if !strings.Contains(attributed.Raw.RequestRaw, "X-Probe: "+secret) ||
+		!strings.Contains(attributed.Raw.RequestRaw, "role=admin") {
+		t.Fatalf("raw request lost header value or body: %q", attributed.Raw.RequestRaw)
 	}
 
 	// The domain journal carries the observed InfoItem for the subprocess

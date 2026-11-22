@@ -1,9 +1,9 @@
 package agent
 
-// Eino execution bridge for Agent.Run. The legacy prelude (prompt, state,
-// checkpoint restore, budgets, target scope) is shared; only the model/tool
-// loop switches. A construction or resume failure is terminal and visible — it
-// never silently falls back to legacy.
+// Eino execution bridge for Agent.Run. The common prelude (prompt, state,
+// checkpoint restore, budgets, target scope) runs once; the ADK owns the
+// model/tool loop, checkpointing and approval interrupts. There is no second
+// runtime and no fallback path.
 
 import (
 	"context"
@@ -18,55 +18,69 @@ import (
 	"github.com/xalgord/xalgorix/v4/internal/engine"
 )
 
-// WithEinoRuntime injects the durable checkpoint store and the interrupt-aware
-// approval broker. Both are required when XALGORIX_ENGINE=eino.
-func WithEinoRuntime(checkpoint adk.CheckPointStore, broker engine.ApprovalBroker) AgentOption {
+// WithRuntime injects the durable checkpoint store and the interrupt-aware
+// approval broker. Production wires this from scan_session; tests and CLI
+// callers that omit it get a per-scan file/memory store at run time.
+func WithRuntime(checkpoint adk.CheckPointStore, broker engine.ApprovalBroker) AgentOption {
 	return func(a *Agent) {
-		a.einoCheckpointStore = checkpoint
-		a.einoApprovalBroker = broker
+		a.checkpointStore = checkpoint
+		a.approvalBroker = broker
 	}
 }
 
-func (a *Agent) runEinoLoop(systemPrompt string, tokenCount func() int) {
-	a.einoFinished.Store(false)
-	if a.einoCheckpointStore == nil {
-		a.emit(Event{Type: "finished", Content: "Scan stopped: Eino checkpoint store is unavailable.", Aborted: true, AbortReason: "eino_init_failed", TotalTokens: tokenCount()})
-		return
-	}
+func (a *Agent) runLoop(systemPrompt string, tokenCount func() int) {
+	a.scanFinished.Store(false)
 	if a.scanCtx == nil || a.scanCtx.ID == "" {
-		a.emit(Event{Type: "finished", Content: "Scan stopped: scan context is unavailable for Eino.", Aborted: true, AbortReason: "eino_init_failed", TotalTokens: tokenCount()})
+		a.emit(Event{Type: "finished", Content: a.op("Scan stopped: scan context is unavailable.", "扫描已停止：扫描上下文不可用。"), Aborted: true, AbortReason: "eino_init_failed", TotalTokens: tokenCount()})
 		return
 	}
-	// Fail closed on protocol capability: the ADK speaks only the native
-	// tool-calling channel and the llm client attaches the tools array on the
-	// OpenAI-compatible branch only. Anthropic, Gemini and Responses endpoints
-	// would run a deterministic one-turn empty scan here; legacy remains their
-	// engine until internal/llm sends tools on those protocols.
-	if a.client != nil && !a.client.NativeToolCallingSupported() {
-		a.emit(Event{Type: "finished", Content: "Scan stopped: the configured provider protocol does not support native tool calling, which the Eino engine requires. Set XALGORIX_ENGINE=legacy for this endpoint.", Aborted: true, AbortReason: "eino_init_failed", TotalTokens: tokenCount()})
-		return
+
+	store := a.checkpointStore
+	if store == nil {
+		var err error
+		if a.scanCtx.ScanDir != "" {
+			store, err = engine.NewFileCheckpointStore(a.scanCtx.ScanDir)
+		} else {
+			store = engine.NewMemoryCheckpointStore()
+		}
+		if err != nil {
+			a.emit(Event{Type: "finished", Content: a.op("Scan stopped: checkpoint store is unavailable: ", "扫描已停止：检查点存储不可用：") + err.Error(), Aborted: true, AbortReason: "eino_init_failed", TotalTokens: tokenCount()})
+			return
+		}
 	}
+
+	observer := &einoObserver{agent: a}
 	rt, err := engine.NewRuntime(a.ctx, engine.RuntimeConfig{
 		Client:          a.client,
 		Registry:        a.registry,
-		CheckpointStore: a.einoCheckpointStore,
+		CheckpointStore: store,
 		Instruction:     systemPrompt,
 		MaxIterations:   a.maxIter,
-		Obligations:     a.EngineObserver(),
-		Approvals:       a.einoApprovalBroker,
+		Obligations:     observer,
+		ModelRecovery:   observer,
+		Compactor:       observer.CompactMessages,
+		NativeTools:     a.nativeToolCalling,
+		Approvals:       a.approvalBroker,
 		InstanceID:      a.scanCtx.ID,
 		ScanContextID:   a.scanCtx.ID,
 		ToolTimeout:     a.hardTimeoutFor,
 		OnToolTimeout: func(name string) {
+			if isExecChannelTool(name) {
+				streak := int(a.execTimeoutStreak.Add(1))
+				if streak == execChannelBreakerThreshold {
+					a.emit(Event{Type: "error", Content: fmt.Sprintf("⛔ EXEC-CHANNEL CIRCUIT BREAKER OPEN: %d consecutive exec tools hit the hard timeout — the execution backend is not returning results. terminal_execute/python_action calls are capped at %s per call until one succeeds. If quick commands also fail, record a typed disposition for the remaining lane work and finish instead of queuing more commands.", streak, execChannelDegradedTimeout)})
+				}
+				return
+			}
 			if !a.registry.SupportsContext(name) {
 				a.uncooperativeTimeouts.Add(1)
 			}
 		},
-		StopCheck: func() bool { return a.einoFinished.Load() || a.einoFinishAccepted.Load() },
+		StopCheck: func() bool { return a.scanFinished.Load() || a.finishAccepted.Load() },
 	})
 	if err != nil {
 		log.Printf("[eino] runtime construction failed for %s: %v", a.scanCtx.ID, err)
-		a.emit(Event{Type: "finished", Content: "Scan stopped: Eino runtime could not be constructed: " + err.Error(), Aborted: true, AbortReason: "eino_init_failed", TotalTokens: tokenCount()})
+		a.emit(Event{Type: "finished", Content: a.op("Scan stopped: runtime could not be constructed: ", "扫描已停止：运行时构建失败：") + err.Error(), Aborted: true, AbortReason: "eino_init_failed", TotalTokens: tokenCount()})
 		return
 	}
 	checkpointID := a.scanCtx.ID
@@ -79,38 +93,46 @@ func (a *Agent) runEinoLoop(systemPrompt string, tokenCount func() int) {
 	defer cancelRun()
 	// Publish the run cancel so completeWithFinish can stop the ADK graph the
 	// moment the scan is complete; the graph otherwise runs ahead of the event
-	// consumer and issues one extra model call whose result is discarded.
-	cancelFunc := context.CancelFunc(cancelRun)
-	a.einoRunCancel.Store(&cancelFunc)
+	// consumer and issues one extra discarded model call.
+	a.runCancel.Store(&cancelRun)
 	iter := rt.Run(runCtx, a.einoMessages(), checkpointID)
 	for {
 		ev, ok := iter.Next()
 		if !ok {
 			break
 		}
-		if a.einoFinished.Load() {
-			// finish already emitted the terminal summary; cancelling the child
-			// context stops the ADK loop from issuing another model turn.
+		if a.scanFinished.Load() {
 			return
 		}
 		if a.stopped.Load() || (a.ctx != nil && a.ctx.Err() != nil) {
 			break
 		}
 		if ev.Err != nil {
+			var abort *engine.ErrScanAborted
+			if errors.As(ev.Err, &abort) {
+				a.emit(Event{Type: "finished", Content: abort.Content, Aborted: true, AbortReason: abort.Reason, TotalTokens: tokenCount()})
+				return
+			}
+			var paused *engine.ErrProviderPaused
+			if errors.As(ev.Err, &paused) {
+				// The pause event was already emitted by the provider-wait
+				// policy; pause is resumable and is not a terminal assessment.
+				return
+			}
 			var turnStop *engine.ErrTurnStopped
 			if errors.As(ev.Err, &turnStop) {
-				a.stopForHook(HookResult{StopReason: turnStop.Reason, EmitMessage: "Scan stopped: " + turnStop.Reason + "; saved findings are preserved."})
+				a.stopForHook(HookResult{StopReason: turnStop.Reason, EmitMessage: a.op("Scan stopped: ", "扫描已停止：") + turnStop.Reason + a.op("; saved findings are preserved.", "；已保存的发现不受影响。")})
 				return
 			}
 			log.Printf("[eino] runtime event error for %s: %v", a.scanCtx.ID, ev.Err)
-			a.emit(Event{Type: "finished", Content: "Scan stopped: Eino runtime error: " + ev.Err.Error(), Aborted: true, AbortReason: "eino_runtime_error", TotalTokens: tokenCount()})
+			a.emit(Event{Type: "finished", Content: a.op("Scan stopped: runtime error: ", "扫描已停止：运行时错误：") + ev.Err.Error(), Aborted: true, AbortReason: "eino_runtime_error", TotalTokens: tokenCount()})
 			return
 		}
 		if ev.Action != nil && ev.Action.Interrupted != nil {
 			next, resumeErr := a.resumeEinoInterrupt(rt, checkpointID, ev)
 			if resumeErr != nil {
 				log.Printf("[eino] approval resume failed for %s: %v", a.scanCtx.ID, resumeErr)
-				a.emit(Event{Type: "finished", Content: "Scan stopped: approval resume failed: " + resumeErr.Error(), Aborted: true, AbortReason: "eino_approval_resume_failed", TotalTokens: tokenCount()})
+				a.emit(Event{Type: "finished", Content: a.op("Scan stopped: approval resume failed: ", "扫描已停止：审批恢复失败：") + resumeErr.Error(), Aborted: true, AbortReason: "eino_approval_resume_failed", TotalTokens: tokenCount()})
 				return
 			}
 			iter = next
@@ -123,18 +145,26 @@ func (a *Agent) runEinoLoop(systemPrompt string, tokenCount func() int) {
 			}
 		}
 	}
-	if a.einoFinished.Load() {
+	if a.scanFinished.Load() {
 		return
 	}
 	switch {
 	case a.ctx != nil && a.ctx.Err() == context.DeadlineExceeded:
-		a.emit(Event{Type: "finished", Content: "Scan stopped: duration budget exhausted; saved findings are preserved.", Aborted: true, AbortReason: "resource_budget", TotalTokens: tokenCount()})
+		a.emit(Event{Type: "finished", Content: a.op("Scan stopped: duration budget exhausted; saved findings are preserved.", "扫描已停止：时长预算耗尽；已保存的发现不受影响。"), Aborted: true, AbortReason: "resource_budget", TotalTokens: tokenCount()})
 	case a.stopped.Load():
-		a.emit(Event{Type: "finished", Content: "Scan stopped", TotalTokens: tokenCount()})
+		a.emit(Event{Type: "finished", Content: a.op("Scan stopped", "扫描已停止"), TotalTokens: tokenCount()})
 	case a.ctx != nil && a.ctx.Err() != nil:
-		a.emit(Event{Type: "finished", Content: "Scan canceled: " + a.ctx.Err().Error(), TotalTokens: tokenCount()})
+		// The semantic watchdog cancels the context on a liveness expiry. That
+		// is an engine-owned partial terminal outcome, not an external pause.
+		if a.livenessExpired.Load() || a.semanticIdleRemaining() <= 0 {
+			a.emitContextStop()
+			return
+		}
+		// External shutdown/cancellation is resumable: persisted plan,
+		// coverage and checkpoints remain executable on the next start.
+		a.emit(Event{Type: "finished", Content: a.op("Scan canceled: ", "扫描已取消：") + a.ctx.Err().Error(), TotalTokens: tokenCount(), Resumable: true})
 	default:
-		a.emit(Event{Type: "finished", Content: "Scan ended", TotalTokens: tokenCount()})
+		a.emit(Event{Type: "finished", Content: a.op("Scan ended", "扫描结束"), TotalTokens: tokenCount()})
 	}
 }
 
@@ -143,7 +173,7 @@ func (a *Agent) resumeEinoInterrupt(rt *engine.Runtime, checkpointID string, ev 
 	if !ok {
 		return nil, errors.New("interrupt did not carry an approval context")
 	}
-	waiter, ok := a.einoApprovalBroker.(engine.ApprovalWaiter)
+	waiter, ok := a.approvalBroker.(engine.ApprovalWaiter)
 	if !ok {
 		return nil, errors.New("approval broker does not support interrupt/resume")
 	}

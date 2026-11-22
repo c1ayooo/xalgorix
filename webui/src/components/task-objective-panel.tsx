@@ -23,6 +23,14 @@ const stateStyles: Record<ObjectiveCriterionState, string> = {
   manual_pending: "bg-sky-500/10 text-sky-700 dark:text-sky-300",
 };
 
+// Shared with the run-level objective card (run-objective-card.tsx) so both
+// surfaces render criterion states with one set of semantics.
+export const criterionStateStyles = stateStyles;
+
+export function criterionStateKey(state: ObjectiveCriterionState): string {
+  return stateKey(state);
+}
+
 export function TaskObjectivePanel({ taskId }: { taskId?: string }) {
   const { t } = useI18n();
   const { data, isLoading } = useTaskObjective(taskId);

@@ -111,6 +111,12 @@ func executePythonForContextCtx(parent context.Context, contextID string, args m
 		if errors.Is(err, resources.ErrToolLeaseWaitTimeout) {
 			return tools.Result{Output: fmt.Sprintf("[THROTTLE] python_action could not start within %s: %v. The tool launch queue stayed saturated — a previous command may still hold resources. Retry with a shorter script; if this keeps happening the exec channel is wedged: record a typed disposition instead of queuing more work.", resources.DefaultToolLeaseMaxWait, err)}, nil
 		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return tools.Result{
+				Output: fmt.Sprintf("[CANCELED] python_action launch canceled before starting: %v", err),
+				Error:  fmt.Sprintf("python_action canceled before start: %v", err),
+			}, nil
+		}
 		return tools.Result{Output: fmt.Sprintf("[CANCELED] python_action launch canceled before starting: %v", err)}, nil
 	}
 	defer lease.Release()

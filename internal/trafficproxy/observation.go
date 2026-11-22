@@ -1,19 +1,25 @@
 package trafficproxy
 
-// Observed-traffic sink (REDESIGN §4, R2b decisions 7-8): every proxied
-// request/response becomes an observed InfoItem in the owning Run's domain
-// journal — off the request path. The proxy handler only performs a
-// non-blocking enqueue into a bounded queue drained by a single writer
-// goroutine; overflow is dropped and counted (never allowed to slow the
-// proxy or the scan).
+// Observed-traffic sink (REDESIGN §4, R2b decisions 7-8 + 2026-11-22 raw
+// amendment): every proxied request/response becomes an observed InfoItem in
+// the owning Run's domain journal, and attributed exchanges additionally
+// persist their RAW wire packets into the per-scan traffic archive — off the
+// request path. The proxy handler only performs a non-blocking enqueue into a
+// bounded queue drained by a single writer goroutine; overflow is dropped and
+// counted (never allowed to slow the proxy or the scan).
 //
-// Red lines implemented here:
-//   - header VALUES never enter an observation: only header names are
-//     recorded, so credentials, cookies and tokens cannot leak into the
-//     InfoItem/journal/PG replica;
-//   - URL query values of credential-bearing parameter names are masked;
-//   - the run token itself (read for attribution) is never recorded;
-//   - system-level traffic (no run token) produces no InfoItem at all;
+// Red lines implemented here (2026-11-22 operator decision amends the two
+// marked ones):
+//   - [AMENDED] the compact observation summary still records only header
+//     NAMES and masked query values — the 4 KiB audit line rides the journal
+//     and the PG replica — BUT attributed exchanges now also persist the
+//     full raw packets (header VALUES, bodies, unmasked URL) into
+//     <ScanDir>/traffic/ (scanctx.TrafficArchive). The operator explicitly
+//     chose raw fidelity for findings display; the archive lives inside the
+//     scan isolation boundary;
+//   - the observation summary itself stays masked as before;
+//   - system-level traffic (no run token) produces no InfoItem and no raw
+//     record at all (nothing to attribute the packet to);
 //   - high-risk verdicts come from internal/approval.AssessHTTP and are
 //     recorded ONLY as observation metadata — the proxy never creates an
 //     approval row and never takes over scope decisions.
@@ -38,19 +44,23 @@ import (
 // instead of blocking the proxy request path.
 const observationQueueSize = 1024
 
-// assessBodyLimit bounds how much of a write-method request body is previewed
-// for the high-risk assessment. The preview is re-streamed to the upstream —
-// the body itself is never recorded.
-const assessBodyLimit = 64 << 10
+// rawCaptureLimit bounds how much of a request/response body is captured into
+// the per-scan raw archive (per side) and doubles as the high-risk assessment
+// preview bound: one body buffer serves both consumers. Unredacted per the
+// 2026-11-22 operator decision; beyond the limit the remainder streams
+// through untouched and the exchange is flagged truncated.
+const rawCaptureLimit = 128 << 10
 
-// TrafficObservation is one proxied request/response summary. All strings are
-// pre-redacted: no header values, no credentials, no token.
+// TrafficObservation is one proxied request/response summary. The summary
+// fields are pre-redacted (no header values, masked query values); Raw, when
+// non-nil, carries the unredacted wire packets destined for the per-scan
+// traffic archive.
 type TrafficObservation struct {
 	At                  time.Time
 	InstanceID          string // owning Run ("" for system-level traffic)
 	ScanCtxID           string // owning scan context ("" for system-level traffic)
 	Method              string
-	URL                 string // redacted: userinfo stripped, sensitive query values masked
+	URL                 string // summary form: userinfo stripped, sensitive query values masked
 	Status              int
 	Upstream            string // upstream proxy (masked) or "direct"
 	ReqHeaderNames      []string
@@ -60,6 +70,10 @@ type TrafficObservation struct {
 	Failed              bool   // upstream request failed (502 returned to the client)
 	TargetTLSUnverified bool   // target certificate failed verification; retried without it
 	UpgradePassthrough  bool   // protocol-upgrade request relayed as raw bytes (no inner split)
+	// Raw is the unredacted exchange for the per-scan traffic archive. It is
+	// built only for attributed, non-upgrade requests; the sink persists it
+	// and stamps the archive sequence into the InfoItem context.
+	Raw *scanctx.TrafficExchange
 }
 
 // Sink consumes one observation. Called from the single writer goroutine.
@@ -149,9 +163,11 @@ func (b *BufferedSink) Close() {
 }
 
 // observeTraffic is the production sink: attributed observations become
-// observed InfoItems in the owning Run's domain journal. Without a DSN the
-// journal is still written (hot-path JSON authority unchanged); the
-// PostgreSQL projection simply does not happen.
+// observed InfoItems in the owning Run's domain journal, and a carried raw
+// exchange is persisted into the scan's traffic archive first (the InfoItem
+// context then references the archive sequence). Without a DSN the journal is
+// still written (hot-path JSON authority unchanged); the PostgreSQL
+// projection simply does not happen.
 func observeTraffic(obs TrafficObservation) {
 	if strings.TrimSpace(obs.ScanCtxID) == "" {
 		return // system-level traffic: observable, but never an InfoItem
@@ -161,6 +177,14 @@ func observeTraffic(obs TrafficObservation) {
 		// The scan context is gone (finished/teared down) — drop silently:
 		// late-arriving observations for a dead Run carry no decision value.
 		return
+	}
+	if obs.Raw != nil {
+		if seq, err := sc.Traffic.Append(obs.Raw); err != nil {
+			// A lost raw packet must not lose the audit line: log and continue.
+			log.Printf("[trafficproxy] raw exchange for %s not archived: %v", obs.ScanCtxID, err)
+		} else {
+			obs.Raw.Seq = seq
+		}
 	}
 	if err := sc.Ledger.AppendTrafficObservation(buildTrafficInfoItem(obs), trafficSummary(obs)); err != nil {
 		log.Printf("[trafficproxy] traffic observation for %s not journaled: %v", obs.ScanCtxID, err)
@@ -262,6 +286,13 @@ func buildTrafficInfoItem(obs TrafficObservation) *infoitem.Item {
 	}
 	if len(obs.RespHeaderNames) > 0 {
 		context["response_headers"] = strings.Join(obs.RespHeaderNames, ",")
+	}
+	if obs.Raw != nil && obs.Raw.Seq > 0 {
+		context["traffic_seq"] = strconv.FormatInt(obs.Raw.Seq, 10)
+		context["raw_archive"] = scanctx.TrafficExchangeFile(obs.Raw.Seq)
+	}
+	if obs.Raw != nil && obs.Raw.Channel != "" {
+		context["channel"] = obs.Raw.Channel
 	}
 	return &infoitem.Item{
 		ID:               id,

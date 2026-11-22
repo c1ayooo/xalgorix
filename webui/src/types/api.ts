@@ -248,6 +248,12 @@ export interface ScanListItem {
   started_at: string;
   status: string;
   scan_mode?: string;
+  stop_reason?: string;
+  // RESPONSE-ONLY run/task mount linkage (D11; stamped from the platform
+  // store at read time). Empty = unmounted legacy scan — honest "no task".
+  task_id?: string;
+  task_name?: string;
+  trigger?: string;
   vuln_count: number;
   total_tokens: number;
   sub_scan_total?: number;
@@ -1097,6 +1103,8 @@ export interface InfoAssociationResult {
 
 export interface InfoRegionParams {
   projectId: string;
+  /** 可选：收窄到单个任务的 run 扫描集（后端校验归属，404 拒绝跨项目）。 */
+  taskId?: string;
   subjectKind?: string;
   subject?: string;
   purpose?: string;
@@ -1120,6 +1128,8 @@ export interface InfoAssociationParams {
   projectId: string;
   /** 单扫描形态必填；省略时走项目级聚合（无 scan_id 参数）。 */
   scanId?: string;
+  /** 可选：项目级聚合收窄到单个任务的 run 扫描集。 */
+  taskId?: string;
   ids: string;
   edgeTypes?: string[];
   maxDepth?: number;
@@ -1137,6 +1147,152 @@ export interface ColdPathSyncState {
   state: ColdPathState;
   last_error?: string;
   updated_at?: string;
+}
+
+// ---------------------------------------------------------------------------
+// 领域审计投影（宪章 M2 只读投影；GET /api/scans/{id}/audit）
+// 投影不参与判定；incomplete/gap 必须如实显示。
+// ---------------------------------------------------------------------------
+
+export type DomainAuditActorKind = "agent" | "engine" | "human" | "system";
+
+export interface DomainAuditActor {
+  kind: DomainAuditActorKind;
+  id?: string;
+  source?: string;
+}
+
+/** 审计记录携带的假设状态子集（不含证据正文）。 */
+export interface DomainAuditState {
+  status?: string;
+  assigned_to?: string;
+  confidence?: number;
+  voi?: number;
+  voi_estimated?: boolean;
+  attempts?: number;
+}
+
+export type DomainAuditOperation =
+  | "seed_hypothesis"
+  | "record_hypothesis"
+  | "claim_hypothesis"
+  | "assign_hypothesis"
+  | "set_status"
+  | "add_evidence"
+  | "record_attempt"
+  | "set_voi"
+  | "merge_ledger"
+  | "reset_ledger"
+  | "info_item_enriched"
+  | "info_item_projected"
+  | "observe_traffic"
+  | "record_objective"
+  | "skill_load"
+  | "agent_delegate"
+  | "mcp_call"
+  | "finding_recorded"
+  | "tool_observation";
+
+export interface DomainAuditRecord {
+  scan_id: string;
+  seq: number;
+  at: string;
+  actor: DomainAuditActor;
+  operation: DomainAuditOperation;
+  hypothesis_id?: string;
+  evidence_id?: string;
+  summary?: string;
+  before?: DomainAuditState;
+  after?: DomainAuditState;
+}
+
+export interface DomainAuditClaim {
+  hypothesis_id: string;
+  actor: DomainAuditActor;
+  at: string;
+  seq: number;
+  summary?: string;
+}
+
+export interface DomainAuditGap {
+  from: number;
+  to: number;
+}
+
+/** domainjournal.Projection — 只读重建，带显式重复/乱序/缺口报告。 */
+export interface DomainAuditProjection {
+  scan_id: string;
+  status: "" | "complete" | "incomplete";
+  incomplete: boolean;
+  disordered: boolean;
+  duplicate_seqs?: number[];
+  gaps?: DomainAuditGap[];
+  last_seq: number;
+  timeline: DomainAuditRecord[];
+  claims?: DomainAuditClaim[];
+  hypothesis_final?: Record<string, DomainAuditState>;
+}
+
+/** GET /api/scans/{id}/audit — 带诚实标志的审计投影视图。 */
+export interface ScanAuditView {
+  scan_id: string;
+  journal_present: boolean;
+  journal_damaged: boolean;
+  incomplete: boolean;
+  note?: string;
+  projection?: DomainAuditProjection;
+}
+
+// ---------------------------------------------------------------------------
+// 探索投影（4zreco 双图同源：拓扑图 + 播报板读同一份 node/edge 模型；
+// GET /api/scans/{id}/exploration — journal+ledger 的只读归约）
+// ---------------------------------------------------------------------------
+
+export type ExplorationKind =
+  | "goal"
+  | "agent"
+  | "hypothesis"
+  | "evidence"
+  | "finding"
+  | "observation";
+
+export type ExplorationRel = "claim" | "yields" | "proves" | "supports";
+
+export interface ExplorationNode {
+  id: string;
+  kind: ExplorationKind;
+  /** journal 首现 seq（板 = 按 seq 降序的播报流）。 */
+  seq: number;
+  /** RFC3339 首现时间。 */
+  at: string;
+  title: string;
+  summary?: string;
+  /** 假设六态 / finding 的 verified 布尔串。 */
+  state?: string;
+  /** evidence: observed|inferred。 */
+  nature?: string;
+  severity?: string;
+  /** agent id / engine source。 */
+  actor?: string;
+  up: number;
+  down: number;
+}
+
+export interface ExplorationEdge {
+  src: string;
+  dst: string;
+  rel: ExplorationRel;
+}
+
+export interface ExplorationView {
+  scan_id: string;
+  journal_present: boolean;
+  journal_damaged: boolean;
+  ledger_present: boolean;
+  incomplete: boolean;
+  note?: string;
+  nodes: ExplorationNode[];
+  edges: ExplorationEdge[];
 }
 
 // ── 集成模块：MCP 服务器 / 用户技能 / Agent 档案（契约 §integration-*） ──

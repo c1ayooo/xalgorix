@@ -1,10 +1,10 @@
 package web
 
 import (
-	cryptorand "crypto/rand"
-	"crypto/subtle"
-	"encoding/hex"
+	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -16,26 +16,18 @@ import (
 	"sync"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/config"
-	"golang.org/x/crypto/bcrypt"
-)
-
-// authSessions stores valid session tokens (token → expiry)
-var (
-	authSessions      = make(map[string]time.Time)
-	authSessionsMu    sync.RWMutex
-	sessionReaperOnce sync.Once
+	cryptorand "crypto/rand"
+	"encoding/hex"
 )
 
 const sessionCookieName = "xalgorix_session"
-const sessionDuration = 24 * time.Hour
-const sessionReaperInterval = 15 * time.Minute
 
 // generateSessionToken creates a cryptographically random session token.
 // 32 bytes of crypto/rand is already overwhelmingly sufficient entropy —
 // hashing it wouldn't add security and only obscured the source.
 // Returns an error if the system entropy source is unavailable instead of
 // terminating the whole process — callers should surface a 500 to the user.
+// Used for JWT jti values and user ids as well.
 func generateSessionToken() (string, error) {
 	b := make([]byte, 32)
 	if _, err := cryptorand.Read(b); err != nil {
@@ -184,43 +176,6 @@ func clientIP(r *http.Request) string {
 	return host
 }
 
-// isValidSession checks if a session token is valid and not expired
-func isValidSession(token string) bool {
-	authSessionsMu.Lock()
-	defer authSessionsMu.Unlock()
-	expiry, ok := authSessions[token]
-	if !ok {
-		return false
-	}
-	if time.Now().After(expiry) {
-		delete(authSessions, token)
-		return false
-	}
-	return true
-}
-
-// startSessionReaper sweeps expired session tokens on a fixed interval so the
-// authSessions map cannot grow unbounded from abandoned cookies. Runs once
-// per process.
-func startSessionReaper() {
-	sessionReaperOnce.Do(func() {
-		go func() {
-			ticker := time.NewTicker(sessionReaperInterval)
-			defer ticker.Stop()
-			for range ticker.C {
-				now := time.Now()
-				authSessionsMu.Lock()
-				for tok, expiry := range authSessions {
-					if now.After(expiry) {
-						delete(authSessions, tok)
-					}
-				}
-				authSessionsMu.Unlock()
-			}
-		}()
-	})
-}
-
 // isCSRFSafe returns true when a state-changing request is verifiably
 // originated from this site. We use Origin (and Referer as a fallback)
 // because every modern browser sends one of them on POST/PUT/PATCH/DELETE.
@@ -283,39 +238,167 @@ func isCSRFSafe(r *http.Request) bool {
 	return true
 }
 
-// authConfigured returns true when the server has any authentication
-// configured: dashboard credentials (username + password/hash) for human
-// logins, OR at least one machine API token. A token-only configuration is a
-// valid headless deployment (API access via Bearer; the dashboard cannot be
-// logged into because no human credentials exist). When nothing is
-// configured, the authMiddleware short-circuits and serves all routes — used
-// by the bind-time safety check to refuse external interfaces without auth.
-func authConfigured(cfg *config.Config) bool {
-	if cfg.Username != "" && (cfg.Password != "" || cfg.PasswordHash != "") {
+// ── Session identity plumbing ──────────────────────────────────────────────
+
+// sessionClaimsKey is the request-context key carrying the verified session
+// claims (auth_jwt.go) for downstream handlers (RBAC decisions in
+// handlers_users.go, self-service password change).
+type sessionCtxKey int
+
+const sessionClaimsKey sessionCtxKey = 0
+
+// withSessionClaims attaches verified claims to a request context.
+func withSessionClaims(ctx context.Context, c *sessionClaims) context.Context {
+	return context.WithValue(ctx, sessionClaimsKey, c)
+}
+
+// sessionClaimsFrom returns the verified claims of an authenticated human
+// session, or ok=false for machine-token/open routes.
+func sessionClaimsFrom(r *http.Request) (*sessionClaims, bool) {
+	c, ok := r.Context().Value(sessionClaimsKey).(*sessionClaims)
+	return c, c != nil && ok
+}
+
+// authConfigured returns true when the server can authenticate anyone:
+// at least one stored dashboard account (users.json; the env-configured
+// operator is seeded into it at startup), OR at least one machine API token
+// (a valid headless deployment — API access via Bearer, no human login).
+// When nothing is configured the authMiddleware short-circuits and serves
+// all routes — used by the bind-time safety check to refuse external
+// interfaces without auth.
+func (s *Server) authConfigured() bool {
+	if s.authUsers != nil && s.authUsers.hasUsers() {
 		return true
 	}
+	cfg := s.cfg
+	if cfg == nil {
+		return false
+	}
 	return len(apiTokenHashes(cfg.APITokens)) > 0
+}
+
+// needsSetup reports whether the operator still has to create the first
+// admin account: no users exist AND no env credentials are configured to
+// seed one. Only then does POST /api/auth/setup accept a bootstrap admin.
+func (s *Server) needsSetup() bool {
+	if s.authUsers == nil {
+		return false
+	}
+	if !s.authUsers.empty() {
+		return false
+	}
+	cfg := s.cfg
+	if cfg == nil {
+		return true
+	}
+	// Env credentials configured → the startup seed owns the first admin.
+	return strings.TrimSpace(cfg.Username) == "" ||
+		(cfg.Password == "" && cfg.PasswordHash == "")
+}
+
+// initAuthStack loads the JWT secret + user store at construction. Failures
+// are non-fatal to the scanner (charter §6.6 posture): the affected auth
+// handler surfaces "auth unavailable" (503) and machine-token auth keeps
+// working; the operator repairs the file without losing the dashboard.
+func (s *Server) initAuthStack() {
+	secret, err := loadOrCreateJWTSecret(s.dataDir)
+	if err != nil {
+		log.Printf("%v (dashboard login disabled)", err)
+		return
+	}
+	users, err := openUserStore(s.dataDir)
+	if err != nil {
+		log.Printf("%v (dashboard login disabled)", err)
+		return
+	}
+	s.authJWT = newJWTSessions(secret)
+	s.authUsers = users
+	seedEnvAdmin(users, s.cfg)
+}
+
+// authenticateSession validates the session cookie and returns the claims.
+func (s *Server) authenticateSession(r *http.Request) (*sessionClaims, bool) {
+	if s.authJWT == nil {
+		return nil, false
+	}
+	cookie, err := r.Cookie(sessionCookieName)
+	if err != nil || cookie.Value == "" {
+		return nil, false
+	}
+	claims, err := s.authJWT.verify(cookie.Value)
+	if err != nil {
+		return nil, false
+	}
+	return claims, true
+}
+
+// setSessionCookie issues a fresh JWT and writes it as the session cookie.
+// Cookie attributes are identical to the previous opaque-token cookie —
+// HttpOnly, SameSite=Strict, Secure under TLS, 24h — so the SPA, SSE stream
+// (EventSource) and direct file links keep working unchanged.
+func (s *Server) setSessionCookie(w http.ResponseWriter, r *http.Request, username, role string) error {
+	token, _, err := s.authJWT.issue(username, role, sessionDuration)
+	if err != nil {
+		return err
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    token,
+		Path:     "/",
+		MaxAge:   int(sessionDuration.Seconds()),
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+		Secure:   isSecureRequest(r),
+	})
+	return nil
+}
+
+// clearSessionCookie revokes the presented token's jti and expires the
+// cookie with the exact attributes used at issue time (mismatched attributes
+// make some browsers treat the deletion cookie as a different cookie).
+func (s *Server) clearSessionCookie(w http.ResponseWriter, r *http.Request) {
+	if s.authJWT != nil {
+		if cookie, err := r.Cookie(sessionCookieName); err == nil && cookie.Value != "" {
+			if claims, err := s.authJWT.verify(cookie.Value); err == nil {
+				s.authJWT.revoke(claims.JTI, claims.ExpiresAt)
+			}
+		}
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+		Secure:   isSecureRequest(r),
+	})
 }
 
 // authMiddleware protects routes when auth is configured. Two independent
 // authentication flows pass through here:
 //
-//   - human: POST /api/auth/login + username/password -> xalgorix_session
-//     cookie, with browser CSRF checks and the per-IP login rate limiter;
+//   - human: POST /api/auth/login + username/password -> signed JWT in the
+//     xalgorix_session cookie, with browser CSRF checks and the per-IP login
+//     rate limiter. After authentication the request is role-checked
+//     (auth_rbac.go) and carries its claims in the request context.
 //   - machine: Authorization: Bearer <API token> -> direct API access with no
 //     session, no CSRF requirement (browsers never auto-attach bearer
 //     headers, so a forged cross-site request cannot carry one), no
-//     dashboard-page authorization, and no interaction with the login
-//     limiter.
+//     dashboard-page authorization, no RBAC, and no interaction with the
+//     login limiter.
 //
 // The flows do not fall back into each other: a presented-but-invalid bearer
 // token is machine traffic (browsers never send Authorization), so it gets a
 // clean 401 instead of silently continuing through the cookie path.
-func authMiddleware(cfg *config.Config) func(http.Handler) http.Handler {
+func authMiddleware(s *Server) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
-		// Machine tokens are immutable for the process lifetime — hash them
-		// once at middleware creation, never per request.
-		tokenHashes := apiTokenHashes(cfg.APITokens)
+		// Machine tokens are hashed once at middleware creation, never per
+		// request (same as the previous middleware generation).
+		var tokenHashes [][sha256.Size]byte
+		if s.cfg != nil {
+			tokenHashes = apiTokenHashes(s.cfg.APITokens)
+		}
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			path := r.URL.Path
 
@@ -378,82 +461,94 @@ func authMiddleware(cfg *config.Config) func(http.Handler) http.Handler {
 				}
 			}
 
-			// Skip auth if no credentials configured
-			if !authConfigured(cfg) {
+			// Skip auth if no credentials configured (zero-config loopback
+			// mode; unchanged behavior until the first admin account exists).
+			if !s.authConfigured() {
 				next.ServeHTTP(w, r)
 				return
 			}
 
 			// Public routes that don't need auth. The React SPA owns the
 			// operator login screen, so its static assets must be reachable
-			// before a session exists.
-			if path == "/api/auth/login" || path == "/api/auth/status" ||
+			// before a session exists; /api/auth/setup is the first-run
+			// bootstrap (guarded server-side by the empty-store check).
+			if path == "/api/auth/login" || path == "/api/auth/status" || path == "/api/auth/setup" ||
 				isStaticWebAssetPath(path) || strings.HasPrefix(path, "/uploads/") {
 				next.ServeHTTP(w, r)
 				return
 			}
 
-			// Check for session cookie
-			cookie, err := r.Cookie(sessionCookieName)
-			if err == nil && isValidSession(cookie.Value) {
+			// Human session: verify the signed cookie.
+			claims, ok := s.authenticateSession(r)
+			if !ok {
+				// For API requests, return 401 JSON
+				if strings.HasPrefix(path, "/api/") {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusUnauthorized)
+					_ = json.NewEncoder(w).Encode(map[string]string{
+						"error": "Authentication required",
+					})
+					return
+				}
+				// For page requests, serve the SPA shell. The client-side
+				// router will show the React login page after
+				// /api/auth/status reports that there is no active session.
 				next.ServeHTTP(w, r)
 				return
 			}
 
-			// For API requests, return 401 JSON
-			if strings.HasPrefix(path, "/api/") || path == "/ws" {
+			// RBAC: role × method × path policy for human sessions
+			// (auth_rbac.go). Machine tokens never reach this point.
+			if strings.HasPrefix(path, "/api/") && !authorizePath(claims.Role, r.Method, path) {
 				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusUnauthorized)
+				w.WriteHeader(http.StatusForbidden)
 				_ = json.NewEncoder(w).Encode(map[string]string{
-					"error": "Authentication required",
+					"error": "Forbidden: your role (" + claims.Role + ") does not permit this action",
 				})
 				return
 			}
 
-			// For page requests, serve the SPA shell. The client-side router
-			// will show the React login page after /api/auth/status reports
-			// that there is no active session.
-			next.ServeHTTP(w, r)
+			next.ServeHTTP(w, r.WithContext(withSessionClaims(r.Context(), claims)))
 		})
 	}
 }
 
-// verifyPassword checks a presented password against the configured credential.
-// Prefers a bcrypt hash (PasswordHash) when set; falls back to a constant-time
-// plaintext comparison for backwards compatibility. The plaintext path logs a
-// one-time deprecation warning so operators know to migrate.
-var plaintextPasswordWarnOnce sync.Once
-
-func (s *Server) verifyPassword(presented string) bool {
-	cfg := s.configSnapshot()
-	if cfg == nil {
-		return false
+// isSecureRequest returns true if the request is over TLS. Used to decide
+// whether to set the Secure flag on cookies — required for HTTPS deploys,
+// must be off for localhost HTTP development.
+func isSecureRequest(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
 	}
-	if cfg.PasswordHash != "" {
-		// bcrypt.CompareHashAndPassword is constant-time wrt password length
-		// for matching hashes and is the recommended verification path.
-		err := bcrypt.CompareHashAndPassword([]byte(cfg.PasswordHash), []byte(presented))
-		return err == nil
-	}
-	if cfg.Password == "" {
-		return false
-	}
-	plaintextPasswordWarnOnce.Do(func() {
-		log.Printf("[auth] WARNING: XALGORIX_PASSWORD is set in plaintext. Migrate to XALGORIX_PASSWORD_HASH (bcrypt) — see README.")
-	})
-	return subtle.ConstantTimeCompare([]byte(presented), []byte(cfg.Password)) == 1
+	// Honor an X-Forwarded-Proto header only when running behind a trusted
+	// proxy; we keep it simple here and trust nothing by default. Operators
+	// behind a TLS-terminating proxy should set the cookie's Secure flag
+	// elsewhere if they need it.
+	return false
 }
 
-// handleLogin handles POST /api/auth/login
+// publicUserShape is the identity projection returned by auth endpoints.
+type publicUserShape struct {
+	Username string `json:"username"`
+	Role     string `json:"role"`
+}
+
+// handleLogin handles POST /api/auth/login. Credentials are checked against
+// the user store (auth_users.go); success mints a signed JWT session cookie.
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-
 	w.Header().Set("Content-Type", "application/json")
-	ip := clientIP(r)
 
+	if s.authUsers == nil || s.authJWT == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Auth store unavailable"})
+		return
+	}
+
+	ip := clientIP(r)
 	// Per-IP lockout — replaces the old unconditional 1s sleep so we don't
 	// occupy goroutines on attacker traffic.
 	if locked, retryAfter := loginIsLocked(ip); locked {
@@ -475,99 +570,159 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Constant-time username comparison; bcrypt for password. We always
-	// run the password compare even on a username miss so the work
-	// performed is independent of which side is wrong (timing-equalized).
-	username := ""
-	if cfg := s.configSnapshot(); cfg != nil {
-		username = cfg.Username
-	}
-	userMatch := subtle.ConstantTimeCompare([]byte(creds.Username), []byte(username)) == 1
-	passMatch := s.verifyPassword(creds.Password)
-	if !userMatch || !passMatch {
+	user, ok := s.authUsers.authenticate(creds.Username, creds.Password)
+	if !ok {
 		loginRecordFailure(ip)
 		w.WriteHeader(http.StatusUnauthorized)
 		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Invalid credentials"})
 		return
 	}
-
 	loginRecordSuccess(ip)
 
-	// Create session
-	token, err := generateSessionToken()
-	if err != nil {
-		log.Printf("[auth] session token generation failed: %v", err)
+	if err := s.setSessionCookie(w, r, user.Username, user.Role); err != nil {
+		log.Printf("[auth] session issue failed: %v", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Internal error generating session"})
 		return
 	}
-	authSessionsMu.Lock()
-	authSessions[token] = time.Now().Add(sessionDuration)
-	authSessionsMu.Unlock()
-
-	http.SetCookie(w, &http.Cookie{
-		Name:     sessionCookieName,
-		Value:    token,
-		Path:     "/",
-		MaxAge:   int(sessionDuration.Seconds()),
-		HttpOnly: true,
-		SameSite: http.SameSiteStrictMode,
-		Secure:   isSecureRequest(r),
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status": "ok",
+		"user":   publicUserShape{Username: user.Username, Role: user.Role},
 	})
+}
 
+// handleAuthSetup handles POST /api/auth/setup — first-run bootstrap. It
+// accepts a bootstrap admin ONLY while no account exists and no env
+// credentials are configured to seed one; afterwards the endpoint is dead
+// (403) for the lifetime of the store. Rate limiting reuses the login
+// limiter: setup authenticates a credential pair just like a login would.
+func (s *Server) handleAuthSetup(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+
+	if s.authUsers == nil || s.authJWT == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Auth store unavailable"})
+		return
+	}
+	if !s.needsSetup() {
+		w.WriteHeader(http.StatusForbidden)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Setup already completed"})
+		return
+	}
+
+	ip := clientIP(r)
+	if locked, retryAfter := loginIsLocked(ip); locked {
+		w.Header().Set("Retry-After", fmt.Sprintf("%d", retryAfter))
+		w.WriteHeader(http.StatusTooManyRequests)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": fmt.Sprintf("Too many failed attempts. Try again in %ds.", retryAfter),
+		})
+		return
+	}
+
+	var req struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Invalid request"})
+		return
+	}
+
+	user, err := s.authUsers.create(strings.TrimSpace(req.Username), req.Password, RoleAdmin)
+	if err != nil {
+		switch {
+		case errors.Is(err, errUserValidation):
+			w.WriteHeader(http.StatusBadRequest)
+		case errors.Is(err, errUserConflict):
+			w.WriteHeader(http.StatusConflict)
+		default:
+			log.Printf("[auth] setup create failed: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	loginRecordSuccess(ip)
+	if err := s.setSessionCookie(w, r, user.Username, user.Role); err != nil {
+		log.Printf("[auth] session issue failed: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Internal error generating session"})
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status": "ok",
+		"user":   publicUserShape{Username: user.Username, Role: user.Role},
+	})
+}
+
+// handleAuthPassword handles POST /api/auth/password — self-service password
+// change for any authenticated role. The current password must be presented.
+func (s *Server) handleAuthPassword(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+
+	claims, ok := sessionClaimsFrom(r)
+	if !ok {
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Authentication required"})
+		return
+	}
+	if s.authUsers == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Auth store unavailable"})
+		return
+	}
+
+	var req struct {
+		CurrentPassword string `json:"current_password"`
+		NewPassword     string `json:"new_password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Invalid request"})
+		return
+	}
+	if err := s.authUsers.changePassword(claims.Username, req.CurrentPassword, req.NewPassword); err != nil {
+		if errors.Is(err, errUserValidation) {
+			w.WriteHeader(http.StatusBadRequest)
+		} else {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
-// isSecureRequest returns true if the request is over TLS. Used to decide
-// whether to set the Secure flag on cookies — required for HTTPS deploys,
-// must be off for localhost HTTP development.
-func isSecureRequest(r *http.Request) bool {
-	if r.TLS != nil {
-		return true
-	}
-	// Honor an X-Forwarded-Proto header only when running behind a trusted
-	// proxy; we keep it simple here and trust nothing by default. Operators
-	// behind a TLS-terminating proxy should set the cookie's Secure flag
-	// elsewhere if they need it.
-	return false
-}
-
-// handleLogout handles POST /api/auth/logout
+// handleLogout handles POST /api/auth/logout — revokes the presented token's
+// jti and clears the cookie.
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
-	cookie, err := r.Cookie(sessionCookieName)
-	if err == nil {
-		authSessionsMu.Lock()
-		delete(authSessions, cookie.Value)
-		authSessionsMu.Unlock()
-	}
-
-	// Match the attributes of the cookie we set on login so browsers
-	// consistently replace/clear it. Without SameSite and Secure here,
-	// some browsers treat the deletion cookie as a different cookie and
-	// the original stays in the jar.
-	http.SetCookie(w, &http.Cookie{
-		Name:     sessionCookieName,
-		Value:    "",
-		Path:     "/",
-		MaxAge:   -1,
-		HttpOnly: true,
-		SameSite: http.SameSiteStrictMode,
-		Secure:   isSecureRequest(r),
-	})
-
+	s.clearSessionCookie(w, r)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "logged_out"})
 }
 
-// handleAuthStatus handles GET /api/auth/status
+// handleAuthStatus handles GET /api/auth/status. Extends the legacy
+// {auth_enabled, authenticated} shape with needs_setup (first-run bootstrap
+// state) and the authenticated identity, so the SPA can gate UI by role.
 func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
-	authEnabled := authConfigured(s.cfg)
+	authEnabled := s.authConfigured()
 
 	authenticated := false
+	var user *publicUserShape
 	if authEnabled {
-		cookie, err := r.Cookie(sessionCookieName)
-		if err == nil && isValidSession(cookie.Value) {
+		if claims, ok := s.authenticateSession(r); ok {
 			authenticated = true
+			user = &publicUserShape{Username: claims.Username, Role: claims.Role}
 		}
 	} else {
 		authenticated = true // No auth configured = always authenticated
@@ -577,5 +732,7 @@ func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"auth_enabled":  authEnabled,
 		"authenticated": authenticated,
+		"needs_setup":   s.needsSetup(),
+		"user":          user,
 	})
 }

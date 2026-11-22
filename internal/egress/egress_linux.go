@@ -24,6 +24,10 @@ var (
 	installed  bool
 	tableName  string
 
+	// accessTrees remembers workspaces already transferred to the egress UID
+	// so each command does not recursively chown an entire scan tree.
+	accessTrees sync.Map
+
 	// nftRunner is injectable so tests can verify rule generation without
 	// touching the host firewall.
 	nftRunner = func(ctx context.Context, script string) error {
@@ -107,21 +111,25 @@ func PrepareChildAccess(scanID, root string, files ...string) error {
 	if !info.IsDir() {
 		return fmt.Errorf("egress: workspace %s is not a directory", root)
 	}
-	err = filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if entry.Type()&os.ModeSymlink != 0 {
-			return nil
-		}
-		entryInfo, err := entry.Info()
+	key := scanID + "\x00" + root
+	if _, loaded := accessTrees.LoadOrStore(key, struct{}{}); !loaded {
+		err = filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			if entry.Type()&os.ModeSymlink != 0 {
+				return nil
+			}
+			entryInfo, err := entry.Info()
+			if err != nil {
+				return err
+			}
+			return grantChildPath(path, entryInfo, uid, gid)
+		})
 		if err != nil {
-			return err
+			accessTrees.Delete(key)
+			return fmt.Errorf("egress: prepare workspace %s: %w", root, err)
 		}
-		return grantChildPath(path, entryInfo, uid, gid)
-	})
-	if err != nil {
-		return fmt.Errorf("egress: prepare workspace %s: %w", root, err)
 	}
 	for _, path := range files {
 		fileInfo, err := os.Lstat(path)

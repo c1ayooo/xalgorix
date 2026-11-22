@@ -8,6 +8,7 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -1345,5 +1346,39 @@ func TestMaxOutputTokens(t *testing.T) {
 				t.Fatalf("maxOutputTokens() = %d, want %d", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestChatWithUsageToolCallsMeta_CapturesReasoning: the meta variant surfaces
+// the model's raw reasoning (reasoning_content) that the plain call discards;
+// content and tool-calls keep their existing shapes.
+func TestChatWithUsageToolCallsMeta_CapturesReasoning(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"计划先侦察。","reasoning_content":"先侦察再注入，避免打草惊蛇。"}}],"usage":{"prompt_tokens":5,"completion_tokens":9}}`))
+	}))
+	defer srv.Close()
+	c := NewClient(&config.Config{
+		LLM:     "openai/gpt-test",
+		APIBase: srv.URL + "/v1",
+		APIKey:  "sk-test",
+	})
+	content, reasoning, _, usage, err := c.ChatWithUsageToolCallsMeta([]Message{{Role: "user", Content: "go"}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if content != "计划先侦察。" {
+		t.Errorf("content = %q", content)
+	}
+	if reasoning != "先侦察再注入，避免打草惊蛇。" {
+		t.Errorf("reasoning = %q", reasoning)
+	}
+	if usage == nil || usage.CompletionTokens != 9 {
+		t.Errorf("usage = %+v, want completion=9", usage)
+	}
+	// 普通调用不受影响：reasoning 依旧被丢弃（下游形状不变）。
+	plain, _, err := c.ChatWithUsage([]Message{{Role: "user", Content: "go"}})
+	if err != nil || plain != "计划先侦察。" {
+		t.Errorf("plain call = %q, err %v", plain, err)
 	}
 }

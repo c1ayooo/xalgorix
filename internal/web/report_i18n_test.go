@@ -9,8 +9,9 @@ func TestReportTr_EnglishPassThrough(t *testing.T) {
 	if got := reportTr("en", "Executive Summary"); got != "Executive Summary" {
 		t.Errorf("English should pass through, got %q", got)
 	}
-	if got := reportTr("", "Executive Summary"); got != "Executive Summary" {
-		t.Errorf("default should pass through, got %q", got)
+	// 默认输出语言是 zh-CN：空语言必须走 zh 表，不再英文直通。
+	if got := reportTr("", "Executive Summary"); got != "摘要总览" {
+		t.Errorf("default (zh-CN) should resolve the zh table, got %q", got)
 	}
 }
 

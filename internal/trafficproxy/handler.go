@@ -32,6 +32,7 @@ import (
 	xproxy "golang.org/x/net/proxy"
 
 	"github.com/xalgord/xalgorix/v4/internal/proxy"
+	"github.com/xalgord/xalgorix/v4/internal/scanctx"
 )
 
 // hopByHopHeaders lists headers that must not be forwarded by a proxy
@@ -109,6 +110,9 @@ func (h *proxyHandler) forward(w http.ResponseWriter, r *http.Request, scheme st
 	if attr.ScanCtxID == "" && attr.InstanceID == "" {
 		attr, _ = extractAttribution(r)
 	}
+	// Raw capture is attribution-gated (rawcapture.go): system-level traffic
+	// has no scan archive to persist into.
+	captureRaw := attr.ScanCtxID != ""
 	obs := &TrafficObservation{
 		At:         time.Now().UTC(),
 		InstanceID: attr.InstanceID,
@@ -122,30 +126,41 @@ func (h *proxyHandler) forward(w http.ResponseWriter, r *http.Request, scheme st
 		target.Host = r.Host
 	}
 	obs.URL = redactURL(target.String())
-
-	// High-risk assessment on write methods: preview a bounded slice of the
-	// body, then re-stream it to the upstream. GET/HEAD/OPTIONS never need a
-	// body preview (AssessHTTP allows them outright). Whatever was previewed
-	// is always re-streamed, even on a read error, so the body the upstream
-	// sees is byte-identical to what the client sent.
-	var bodyPreview []byte
-	if !isReadMethod(r.Method) {
-		preview, _ := io.ReadAll(io.LimitReader(r.Body, assessBodyLimit+1))
-		if len(preview) > assessBodyLimit {
-			preview = preview[:assessBodyLimit]
+	if captureRaw {
+		obs.Raw = &scanctx.TrafficExchange{
+			At:      obs.At,
+			Method:  r.Method,
+			URL:     target.String(), // archive keeps the raw URL unmasked
+			Channel: channelName(attr.Channel),
 		}
-		bodyPreview = preview
+	}
+
+	// The body is buffered ONCE up to the raw capture limit and serves both
+	// consumers: the high-risk assessment and the raw request rendering.
+	// Whatever was buffered is always re-streamed, even on a read error, so
+	// the body the upstream sees is byte-identical to what the client sent;
+	// beyond the limit the remainder streams through untouched.
+	bodyBytes, _ := io.ReadAll(io.LimitReader(r.Body, rawCaptureLimit+1))
+	reqTruncated := false
+	if len(bodyBytes) > rawCaptureLimit {
+		bodyBytes = bodyBytes[:rawCaptureLimit]
+		reqTruncated = true
 	}
 
 	out := r.Clone(r.Context())
 	out.RequestURI = ""
 	out.Header = r.Header.Clone()
-	if len(bodyPreview) > 0 {
-		out.Body = io.NopCloser(io.MultiReader(bytes.NewReader(bodyPreview), r.Body))
+	if len(bodyBytes) > 0 {
+		out.Body = io.NopCloser(io.MultiReader(bytes.NewReader(bodyBytes), r.Body))
 	}
 	removeHopByHopHeaders(out.Header) // strips Proxy-Authorization AFTER attribution
 	obs.ReqHeaderNames = headerNames(out.Header)
-	obs.HighRisk = assessHighRisk(obs.Method, obs.URL, string(bodyPreview))
+	obs.HighRisk = assessHighRisk(obs.Method, obs.URL, string(bodyBytes))
+	if captureRaw && obs.Raw != nil {
+		obs.Raw.RequestRaw = renderRequestRaw(out, bodyBytes)
+		obs.Raw.ReqTruncated = reqTruncated
+		obs.Raw.HighRisk = obs.HighRisk
+	}
 
 	// Approval closed loop (R2b, gate.go): subprocess-channel high-risk
 	// requests are the only traffic adjudicated at the proxy. Bearer traffic
@@ -156,8 +171,13 @@ func (h *proxyHandler) forward(w http.ResponseWriter, r *http.Request, scheme st
 	// the approval reference. Writing the 403 through http.Error tolerates a
 	// disconnected client (write errors dropped, no panic); the observation
 	// still records the outcome either way.
-	if approved, denial := adjudicateSubprocessHighRisk(attr, obs, string(bodyPreview)); !approved {
+	if approved, denial := adjudicateSubprocessHighRisk(attr, obs, string(bodyBytes)); !approved {
 		obs.Status = http.StatusForbidden
+		if obs.Raw != nil {
+			obs.Raw.Status = http.StatusForbidden
+			obs.Raw.Denied = true
+			obs.Raw.Upstream = "proxy-gate"
+		}
 		m.observe(obs)
 		http.Error(w, denial, http.StatusForbidden)
 		return
@@ -166,6 +186,9 @@ func (h *proxyHandler) forward(w http.ResponseWriter, r *http.Request, scheme st
 	resp, err := m.roundTrip(obs, out)
 	if err != nil {
 		obs.Failed = true
+		if obs.Raw != nil {
+			obs.Raw.Upstream = obs.Upstream
+		}
 		m.observe(obs)
 		http.Error(w, "upstream proxy request failed", http.StatusBadGateway)
 		return
@@ -174,7 +197,15 @@ func (h *proxyHandler) forward(w http.ResponseWriter, r *http.Request, scheme st
 
 	obs.Status = resp.StatusCode
 	obs.RespHeaderNames = headerNames(resp.Header)
-	m.observe(obs)
+
+	// The response body is tee-captured while it streams to the client: the
+	// first rawCaptureLimit bytes are copied into the archive buffer, every
+	// byte still reaches the client immediately (no extra latency, no
+	// buffering delay for large or streaming responses).
+	var respCapture *boundedCapture
+	if captureRaw {
+		respCapture = newBoundedCapture(rawCaptureLimit)
+	}
 
 	removeHopByHopHeaders(resp.Header)
 	for key, values := range resp.Header {
@@ -183,15 +214,19 @@ func (h *proxyHandler) forward(w http.ResponseWriter, r *http.Request, scheme st
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
-}
-
-func isReadMethod(method string) bool {
-	switch strings.ToUpper(method) {
-	case http.MethodGet, http.MethodHead, http.MethodOptions:
-		return true
+	if respCapture != nil {
+		_, _ = io.Copy(w, io.TeeReader(resp.Body, respCapture))
+	} else {
+		_, _ = io.Copy(w, resp.Body)
 	}
-	return false
+
+	if obs.Raw != nil {
+		obs.Raw.Status = resp.StatusCode
+		obs.Raw.Upstream = obs.Upstream
+		obs.Raw.ResponseRaw = renderResponseRaw(resp, respCapture.bytes())
+		obs.Raw.RespTruncated = respCapture.truncated()
+	}
+	m.observe(obs)
 }
 
 // isUpgradeRequest reports whether the request intends to switch protocols
@@ -274,10 +309,7 @@ func (h *proxyHandler) forwardUpgrade(w http.ResponseWriter, r *http.Request, sc
 	// the raw connection because the request is written by hand here.
 	// The request is written with Upgrade/Connection intact.
 	p := proxy.GetProxy()
-	absoluteForm := false
-	if p != nil && r.URL.IsAbs() && scheme == "http" && p.Type != proxy.ProxyTypeSOCKS5 {
-		absoluteForm = true
-	}
+	absoluteForm := p != nil && r.URL.IsAbs() && scheme == "http" && p.Type != proxy.ProxyTypeSOCKS5
 	openOutbound := func(insecure bool) (net.Conn, error) {
 		if absoluteForm {
 			return m.dialUpstreamProxyAddr(p)

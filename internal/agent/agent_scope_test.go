@@ -1296,13 +1296,6 @@ func preservationRows() []preservationRow {
 			tool:  "list_skills",
 			args:  map[string]string{},
 		},
-		{
-			cell:  "non-gated",
-			name:  "agentmail",
-			scope: []string{"https://pentest-ground.com"},
-			tool:  "agentmail",
-			args:  map[string]string{"to": "ops@evil.example", "subject": "x"},
-		},
 
 		// ── Cell 7: report_vulnerability on local target ──────────
 		// Both eras reject. blocked bool matches.

@@ -97,6 +97,12 @@ type ScanContext struct {
 	// aged tool-result messages can be replaced by retrieval stubs without
 	// losing any information (bounded working context backing store).
 	ToolOutputs *ToolArchive
+	// Traffic archives the raw proxied HTTP exchanges (request/response
+	// packets, unredacted per the 2026-11-22 operator decision) the traffic
+	// proxy observed for this scan, so findings can display the exact wire
+	// packets. The trafficproxy sink appends; the web layer reads the files
+	// back after the context is gone (ReadTrafficExchanges).
+	Traffic *TrafficArchive
 
 	// ctx/cancel for the scan's lifecycle
 	Ctx    context.Context
@@ -136,6 +142,7 @@ func New(id, scanDir string) *ScanContext {
 		Coverage:    NewCoverageStore(),
 		Tokens:      tokens,
 		ToolOutputs: NewToolArchive(scanDir),
+		Traffic:     NewTrafficArchive(scanDir),
 		Ctx:         ctx,
 		Cancel:      cancel,
 	}

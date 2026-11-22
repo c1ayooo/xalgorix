@@ -249,15 +249,45 @@ func TestMITMObservesAttributedTrafficIntoJournal(t *testing.T) {
 		t.Fatal("target did not receive the request header")
 	}
 
-	// The observation payload must never carry header VALUES or the token.
-	raw, err := json.Marshal(attributed)
+	// The observation SUMMARY must never carry header VALUES or the token
+	// (the compact audit line rides the journal and the PG replica). The raw
+	// exchange — 2026-11-22 operator amendment — is exactly where they MUST
+	// live: wire fidelity for findings display.
+	summaryObs := *attributed
+	summaryObs.Raw = nil
+	summary, err := json.Marshal(summaryObs)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, leaked := range []string{secret, token, "Bearer", "payload-body"} {
-		if strings.Contains(string(raw), leaked) {
-			t.Fatalf("observation leaked %q: %s", leaked, raw)
+		if strings.Contains(string(summary), leaked) {
+			t.Fatalf("observation summary leaked %q: %s", leaked, summary)
 		}
+	}
+	if attributed.Raw == nil {
+		t.Fatal("attributed exchange carried no raw capture")
+	}
+	rawJSON, err := json.Marshal(attributed.Raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The run token deliberately stays OUT of the raw packet: it rides
+	// Proxy-Authorization, is consumed for attribution, and is stripped
+	// hop-by-hop — the wire packet the target received never carried it.
+	for _, want := range []string{secret, "payload-body"} {
+		if !strings.Contains(string(rawJSON), want) {
+			t.Fatalf("raw capture lost %q: %s", want, rawJSON)
+		}
+	}
+	if strings.Contains(string(rawJSON), token) {
+		t.Fatalf("run token leaked into the wire packet: %s", rawJSON)
+	}
+	if !strings.Contains(attributed.Raw.RequestRaw, "X-Probe: "+secret) ||
+		!strings.Contains(attributed.Raw.RequestRaw, "payload-body") {
+		t.Fatalf("request raw lost header value or body: %q", attributed.Raw.RequestRaw)
+	}
+	if !strings.Contains(attributed.Raw.ResponseRaw, "200") {
+		t.Fatalf("response raw lost the status line: %q", attributed.Raw.ResponseRaw)
 	}
 
 	// The domain journal carries the observed InfoItem.
@@ -280,6 +310,34 @@ func TestMITMObservesAttributedTrafficIntoJournal(t *testing.T) {
 	}
 	if strings.Contains(journal, secret) || strings.Contains(journal, token) {
 		t.Fatal("journal leaked a header value or the run token")
+	}
+	// The InfoItem references the raw archive record.
+	if !strings.Contains(journal, `"raw_archive":"traffic/tr_`) {
+		t.Fatal("InfoItem context lacks the raw archive reference")
+	}
+
+	// The per-scan traffic archive holds the unredacted exchange.
+	exchanges, err := scanctx.ReadTrafficExchanges(scanDir)
+	if err != nil {
+		t.Fatalf("read traffic archive: %v", err)
+	}
+	if len(exchanges) == 0 {
+		t.Fatal("traffic archive is empty after an attributed exchange")
+	}
+	var archived *scanctx.TrafficExchange
+	for i := range exchanges {
+		if exchanges[i].Method == http.MethodPost && exchanges[i].Channel == "bearer" {
+			archived = &exchanges[i]
+		}
+	}
+	if archived == nil {
+		t.Fatalf("no bearer POST in the archive: %+v", exchanges)
+	}
+	if !strings.Contains(archived.RequestRaw, "X-Probe: "+secret) || archived.ResponseRaw == "" {
+		t.Fatalf("archived exchange lost fidelity: %+v", archived)
+	}
+	if archived.Seq == 0 || archived.Status != 200 {
+		t.Fatalf("archived exchange metadata incomplete: %+v", archived)
 	}
 }
 
@@ -308,6 +366,9 @@ func TestMITMSystemTrafficProducesNoInfoItem(t *testing.T) {
 	for _, o := range collect() {
 		if o.ScanCtxID != "" {
 			t.Fatalf("unattributed traffic was attributed: %+v", o)
+		}
+		if o.Raw != nil {
+			t.Fatalf("system-level traffic was raw-captured: %+v", o.Raw)
 		}
 	}
 	journalBytes, err := os.ReadFile(filepath.Join(scanDir, "domain_journal.jsonl"))

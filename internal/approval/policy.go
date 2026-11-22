@@ -158,6 +158,15 @@ var authFieldRe = regexp.MustCompile(`(password|passwd|token|session|cookie|secr
 // classifier cannot vouch for (substitution, redirection, loader/path
 // shadowing, unknown program) sends the whole command to approval.
 func (p *Policy) allowCommand(command string) (string, bool) {
+	return p.allowCommandWith(command, "")
+}
+
+// allowCommandWith is allowCommand with one extension for operator rules
+// (rules.go): when ruleProgram is non-empty, segments whose program equals it
+// bypass the per-program flag checks — the rule's trust is the program's flag
+// surface, narrowed only by the rule's contains constraint. Deny shapes still
+// refuse every segment unconditionally, exactly as in the base classification.
+func (p *Policy) allowCommandWith(command, ruleProgram string) (string, bool) {
 	trimmed := strings.TrimSpace(command)
 	if trimmed == "" {
 		return "", false
@@ -179,6 +188,9 @@ func (p *Policy) allowCommand(command string) (string, bool) {
 		}
 		program, rest := splitProgram(seg)
 		program = strings.ToLower(program)
+		if ruleProgram != "" && program == ruleProgram {
+			continue
+		}
 		switch program {
 		case "nmap":
 			if nmapReadOnly(rest) {

@@ -136,7 +136,7 @@ func (a *Agent) verifyFinding(req reporting.VerificationRequest) reporting.Verif
 		{Role: "user", Content: "Independently re-test the candidate finding NOW using the tools. Do NOT trust the original proof — reproduce it yourself, include a negative/baseline control where applicable, then call submit_verdict with your decision."},
 	}
 
-	a.emit(Event{Type: "message", Content: fmt.Sprintf("🔎 Verifier: independently re-testing candidate %q before it can be reported...", req.Title)})
+	a.emit(Event{Type: "message", Content: a.opf("🔎 Verifier: independently re-testing candidate %q before it can be reported...", "🔎 验证器：候选发现 %q 上报前正在独立复测……", req.Title)})
 	a.client.SetTemperature(TempValidator)
 
 	deadline := time.Now().Add(verifierDeadline)
@@ -253,11 +253,11 @@ func (a *Agent) verifyFinding(req reporting.VerificationRequest) reporting.Verif
 	}
 
 	if verdict.Confirmed {
-		a.emit(Event{Type: "message", Content: fmt.Sprintf("✅ Verifier CONFIRMED: %s", req.Title)})
+		a.emit(Event{Type: "message", Content: a.opf("✅ Verifier CONFIRMED: %s", "✅ 验证器已证实：%s", req.Title)})
 	} else if verdict.Inconclusive {
-		a.emit(Event{Type: "message", Content: fmt.Sprintf("🔎 Verifier INCONCLUSIVE %q: %s", req.Title, verdict.Reason)})
+		a.emit(Event{Type: "message", Content: a.opf("🔎 Verifier INCONCLUSIVE %q: %s", "🔎 验证器无法定论 %q：%s", req.Title, verdict.Reason)})
 	} else {
-		a.emit(Event{Type: "message", Content: fmt.Sprintf("🚫 Verifier REJECTED %q: %s", req.Title, verdict.Reason)})
+		a.emit(Event{Type: "message", Content: a.opf("🚫 Verifier REJECTED %q: %s", "🚫 验证器已否决 %q：%s", req.Title, verdict.Reason)})
 	}
 	return *verdict
 }
