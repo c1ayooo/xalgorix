@@ -89,6 +89,15 @@
 
 **验收判据**：同一本地靶标一次运行后，`info_items` 同时含 `sensitive_artifact_served`（引擎观测）与 `purpose=finding`（报告投影），`/api/info/region` 返回二者且 `incomplete=false`。
 
+| I-7 | ✅已修（2026-11-22） | eino AfterTool 丢弃 tool-result metadata：`report_vulnerability` 的 `vuln_id` 到不了 web 层，`scan.json.vulns` 运行中恒空（违反宪章 §8「信息层不得有孤儿事实」），发现页整个会话不可见直至收尾合并 | `internal/agent/eino_observer.go`（AfterTool 透传 Metadata）+ `wsEvt.ResultMeta` 填充；实测 TSec 会话 scan.json vulns=8、发现页运行中可见 | 已闭合 |
+
+## 安全链（2026-11-22 实测）
+
+| ID | 状态 | 问题 | 证据位置 | 影响 |
+|---|---|---|---|---|
+| S-1 | 未修（运维决策项） | python/terminal 子进程出网不经 Go `DialGuard`（第 3 环只覆盖 Go 原生 dial），字符串扫描是唯一防线；`[egress] OS-level isolation is unmanaged`（uid+nft 强制走代理需 root 运行或授权 nft）。变体构造（动态拼接 URL、7 段式 `1.2.7.0.0.0.1` 首次调用）可执行 | `internal/egress/egress_linux.go`（preparePlatform 需 root+nft）、实测 21:23:07 一次变体探测返回内容后二次才被拦 | 子进程流量无 OS 级围栏；启用路径 = root 运行或授权 nft cap，属运维决策 |
+| S-2 | 未修（记录） | scopeguard 字符串级检测对「运行期动态拼接的 loopback 字面量」天然盲（首次漏检、二次拦截）；canonicalHosts 对 7 段式数字串本身拒绝 ✓ | `internal/scopeguard/scopeguard.go`（canonicalHosts）、实测 21:23 事件对 | 与 S-1 同根；S-1 落地后此条自然闭合 |
+
 ## 处理原则
 
 1. 本台账不改变 CORE v2.1 的 M0–M5 路线图。

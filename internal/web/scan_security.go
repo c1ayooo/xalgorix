@@ -1,0 +1,204 @@
+package web
+
+// scan_security.go — GET /api/scans/{id}/security: the operator-facing view
+// of the security chain for one scan (REDESIGN D11 follow-up, 2026-11-22).
+//
+// Two halves:
+//   - guards: the STATIC catalog of enforcement layers (charter §2 安全链六环
+//     + the agent-level gates). Static by design — the frontend localizes
+//     titles/details from the rule id, so the catalog never drifts per scan.
+//   - blocks: every guard refusal observed in this scan's events journal,
+//     categorized by the guard that fired, newest first, capped.
+//
+// Blocks are extracted from events.jsonl (the audit projection of record).
+// The marker set mirrors the guard block prefixes emitted by agent_guard /
+// scopeguard / target_scope / goal_gate / hooks. Journal-only by intention:
+// a refusal that never reached the journal also never reached the model,
+// so it is not a guard event the operator needs to see.
+
+import (
+	"bytes"
+	"encoding/json"
+	"net/http"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+)
+
+// securityBlock is one guard refusal surfaced to the operator.
+type securityBlock struct {
+	TS       string `json:"ts"`
+	Category string `json:"category"`
+	Tool     string `json:"tool,omitempty"`
+	Reason   string `json:"reason"`
+}
+
+// scanSecurityView is the GET /api/scans/{id}/security response.
+type scanSecurityView struct {
+	ScanID    string          `json:"scan_id"`
+	Blocks    []securityBlock `json:"blocks"`
+	Counters  map[string]int  `json:"counters"`
+	Truncated bool            `json:"truncated"`
+}
+
+// securityBlockCategories maps journal marker prefixes to a stable category
+// key the frontend localizes. Order matters: first match wins.
+var securityBlockCategories = []struct {
+	prefix  string
+	category string
+}{
+	{"OUT-OF-SCOPE TARGET BLOCKED", "scopeguard"},
+	{"OUTSIDE SCAN BOUNDARY", "target_scope"},
+	{"PHASE RESTRICTION BLOCKED", "phase"},
+	{"AUTH PREREQUISITE GUARD BLOCKED", "auth"},
+	{"ACTIVITY POLICY BLOCKED", "activity"},
+	{"GOAL OBLIGATION", "goal"},
+	{"RUN RE-OPENED BY THE OPERATOR", "goal"},
+	{"UNRECORDED EVIDENCE", "ledger"},
+	{"proven-but-unreported", "ledger"},
+	{"REPORT NOT SAVED", "report"},
+	{"benchmark isolation", "benchmark"},
+}
+
+// securityCategories is the fixed counter key set (zero-filled) so the UI
+// renders every bucket without inferring absent keys.
+var securityCategories = []string{
+	"scopeguard", "target_scope", "phase", "auth", "activity",
+	"goal", "ledger", "report", "benchmark", "other",
+}
+
+const securityBlockCap = 200        // newest blocks returned
+const securityJournalMaxBytes = 32 << 20 // read cap for oversized journals
+
+// handleScanSecurity serves GET /api/scans/{id}/security.
+func (s *Server) handleScanSecurity(w http.ResponseWriter, r *http.Request) {
+	scanID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/scans/"), "/security")
+	if scanID == "" {
+		http.Error(w, `{"error":"scan id is required"}`, http.StatusBadRequest)
+		return
+	}
+	dir, ok := s.resolveScanDirByID(scanID)
+	if !ok {
+		http.Error(w, `{"error":"scan not found"}`, http.StatusNotFound)
+		return
+	}
+
+	view := scanSecurityView{
+		ScanID: filepath.Base(scanID),
+		Blocks: []securityBlock{},
+		Counters: map[string]int{},
+	}
+	for _, c := range securityCategories {
+		view.Counters[c] = 0
+	}
+
+	data, err := readJournalTail(filepath.Join(dir, scanEventJournalFile), securityJournalMaxBytes)
+	if err != nil || len(data) == 0 {
+		writeJSONStatus(w, http.StatusOK, view)
+		return
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	// Newest first; the cap keeps the tail when a scan racks up refusals.
+	var blocks []securityBlock
+	truncated := false
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line == "" {
+			continue
+		}
+		var ev WSEvent
+		if json.Unmarshal([]byte(line), &ev) != nil {
+			continue
+		}
+		category, reason := classifySecurityBlock(&ev)
+		if category == "" {
+			continue
+		}
+		if len(blocks) >= securityBlockCap {
+			truncated = true
+			break
+		}
+		view.Counters[category]++
+		blocks = append(blocks, securityBlock{
+			TS:       ev.Timestamp,
+			Category: category,
+			Tool:     ev.ToolName,
+			Reason:   firstLine(reason),
+		})
+	}
+	// Chronological order for display (oldest → newest within the cap).
+	sort.Slice(blocks, func(i, j int) bool { return blocks[i].TS < blocks[j].TS })
+	view.Blocks = blocks
+	view.Truncated = truncated
+	writeJSONStatus(w, http.StatusOK, view)
+}
+
+// classifySecurityBlock inspects one journal event for a guard refusal,
+// returning (category, reason-first-line). Category "" = not a guard event.
+func classifySecurityBlock(ev *WSEvent) (string, string) {
+	text := ""
+	switch ev.Type {
+	case "tool_result":
+		// Journal events carry the tool result flat (Output/Error), already
+		// projected from the agent Event's ToolResult by processEvent.
+		text = ev.Output
+	case "message":
+		text = ev.Content
+	default:
+		return "", ""
+	}
+	if ev.Error != "" {
+		text = ev.Error + "\n" + text
+	}
+	if !strings.Contains(text, "⛔") && !strings.Contains(text, "⚠️") {
+		return "", ""
+	}
+	for _, m := range securityBlockCategories {
+		if idx := strings.Index(text, m.prefix); idx >= 0 {
+			reason := text[idx:]
+			if nl := strings.IndexAny(reason, "\n"); nl >= 0 {
+				reason = reason[:nl]
+			}
+			return m.category, strings.TrimSpace(reason)
+		}
+	}
+	return "other", firstLine(text)
+}
+
+// readJournalTail reads at most maxBytes from the end of the journal so an
+// oversized scan never balloons the response build.
+func readJournalTail(path string, maxBytes int64) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if info.Size() <= maxBytes {
+		return os.ReadFile(path)
+	}
+	off := info.Size() - maxBytes
+	buf := make([]byte, maxBytes)
+	n, err := f.ReadAt(buf, off)
+	if err != nil && n == 0 {
+		return nil, err
+	}
+	// Drop the first (likely partial) line.
+	if idx := bytes.IndexByte(buf[:n], '\n'); idx >= 0 {
+		buf = buf[idx+1:]
+		n -= idx + 1
+	}
+	return buf[:n], nil
+}
+
+// firstLine returns the first line of s, trimmed.
+func firstLine(s string) string {
+	if idx := strings.IndexByte(s, '\n'); idx >= 0 {
+		s = s[:idx]
+	}
+	return strings.TrimSpace(s)
+}

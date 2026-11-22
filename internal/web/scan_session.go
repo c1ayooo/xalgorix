@@ -726,12 +726,14 @@ func (s *Server) executeScanSession(sess *scanSession) {
 					if s.telegramConfigured() {
 						s.sendTelegramWithFile(0x3b82f6, "✅ Scan Finished - Report Ready", desc, p)
 					}
+					s.sendDomesticIM("", 0x3b82f6, "✅ Scan Finished - Report Ready", desc)
 				} else {
 					desc := fmt.Sprintf("**Target:** %s\n**Result:** No vulnerabilities found (clean scan)\n**Completed at:** %s",
 						sess.target, time.Now().Format("15:04:05 MST"))
 					if s.telegramConfigured() {
 						s.sendTelegramWithFile(0x2dd4bf, "✅ Scan Finished - Clean Report", desc, p)
 					}
+					s.sendDomesticIM("", 0x2dd4bf, "✅ Scan Finished - Clean Report", desc)
 				}
 			}
 			// The report being generated IS phase-22 work: record it on the phase
@@ -896,6 +898,9 @@ func (s *Server) processEvent(evt agent.Event, sess *scanSession) {
 							} else if s.telegramConfigured() {
 								log.Printf("[TELEGRAM] Skipping %s vuln notification (min severity: %s)", vs.Severity, s.telegramMinSeverity)
 							}
+							// Domestic IM: per-channel severity thresholds are applied
+							// inside sendDomesticIM, independent of Discord/Telegram.
+							s.sendDomesticIM(vs.Severity, sevColor, fmt.Sprintf("🐛 %s Vulnerability Found", strings.ToUpper(vs.Severity)), details)
 						}
 					} else {
 						log.Printf("[VULN] Skipping duplicate vuln already present in session record: %s %s", vs.ID, vs.Title)

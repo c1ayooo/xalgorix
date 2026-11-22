@@ -69,6 +69,7 @@ import type {
   UserSkill,
   UserSkillPatch,
   UserSkillRequest,
+  ScanSecurity,
 } from "@/types/api";
 import type { FlatFinding } from "@/lib/findings";
 import type { TokenUsageResponse } from "@/types/token-usage";
@@ -328,6 +329,9 @@ export const api = {
   listScansPage: (params: ListParams) =>
     http<Paginated<ScanListItem>>(`/api/scans${listQuery(params)}`),
   getScan: (id: string) => http<ScanRecord | null>(`/api/scans/${id}`),
+  // 安全链视图（REDESIGN D11 后续）：守卫拦截事件 + 计数（scan_security.go）。
+  scanSecurity: (id: string) =>
+    http<ScanSecurity>(`/api/scans/${id}/security`),
   // Raw HTTP exchange archive written by the traffic proxy (finding detail
   // renders these packets). endpoint: case-insensitive URL substring (a
   // finding's endpoint); method: exact method; limit: newest window (server

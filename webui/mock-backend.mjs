@@ -1000,6 +1000,19 @@ const server = http.createServer(async (req, res) => {
     return ok(res, { status: "resumed" });
   }
 
+  // GET /api/scans/{id}/security — guard refusals + counters（mock：静态目录
+  // 由前端持有，这里只给空 blocks，语义与真实后端一致）。
+  const secMatch = url.match(/^\/api\/scans\/([^/]+)\/security$/);
+  if (secMatch && method === "GET") {
+    return send(res, {
+      scan_id: secMatch[1],
+      blocks: [],
+      counters: Object.fromEntries(
+        ["scopeguard","target_scope","phase","auth","activity","goal","ledger","report","benchmark","other"].map((k) => [k, 0]),
+      ),
+      truncated: false,
+    });
+  }
   // -------- Scans (records) -------------------------------------------------
   if (method === "GET" && url === "/api/scans") {
     // listScansPage (paginated table) expects { items, total }; bare-list

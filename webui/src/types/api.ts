@@ -270,6 +270,21 @@ export interface Paginated<T> {
   size: number;
 }
 
+/** GET /api/scans/{id}/security — guard refusals + counters for one scan. */
+export interface SecurityBlock {
+  ts: string;
+  category: string;
+  tool?: string;
+  reason: string;
+}
+
+export interface ScanSecurity {
+  scan_id: string;
+  blocks: SecurityBlock[];
+  counters: Record<string, number>;
+  truncated: boolean;
+}
+
 /** Query params accepted by the paginated list endpoints. */
 export interface ListParams {
   page: number;

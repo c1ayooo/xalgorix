@@ -832,6 +832,17 @@ export function useRunEvents(instanceId?: string, live?: boolean) {
   });
 }
 
+export function useScanSecurity(scanId?: string, running?: boolean) {
+  return useQuery({
+    queryKey: ["scan", scanId ?? "none", "security"],
+    queryFn: () => api.scanSecurity(scanId!),
+    enabled: !!scanId,
+    retry: false,
+    refetchInterval: running ? 10000 : 30000,
+    placeholderData: (prev) => prev,
+  });
+}
+
 export function useScanLedger(scanId?: string, running?: boolean) {
   return useQuery({
     queryKey: ["scan", scanId ?? "none", "ledger"],

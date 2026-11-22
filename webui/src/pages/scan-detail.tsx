@@ -43,6 +43,7 @@ import { ScanStatusPill } from "@/components/scan-status-pill";
 import { StopReasonBadge } from "@/components/stop-reason-badge";
 import { RunObjectiveCard } from "@/components/run-objective-card";
 import { LedgerTab } from "@/components/ledger-tab";
+import { SecurityTab } from "@/components/security-tab";
 import { SeverityBadge } from "@/components/severity-badge";
 import { Markdown } from "@/components/markdown";
 import { VerificationBadge } from "@/components/verification-badge";
@@ -524,6 +525,10 @@ export default function ScanDetailPage() {
             <BookOpen className="mr-1.5 h-3.5 w-3.5" />
             {t("scanDetail.tab.ledger")}
           </TabsTrigger>
+          <TabsTrigger value="security">
+            <ShieldAlert className="mr-1.5 h-3.5 w-3.5" />
+            {t("scanDetail.tab.security")}
+          </TabsTrigger>
           <TabsTrigger value="tokens">
             <Activity className="mr-1.5 h-3.5 w-3.5" />
             {t("scanDetail.tab.tokens")}
@@ -566,6 +571,9 @@ export default function ScanDetailPage() {
               Run 详情；id 用实例 id（与任务详情账本 tab 同一约定）。 */}
           <LedgerTab scanId={eventInstanceId} running={isLiveScan} />
         </TabsContent>
+          <TabsContent value="security">
+            <SecurityTab scanId={eventInstanceId} running={isLiveScan} />
+          </TabsContent>
         <TabsContent value="tokens">
           <TokenUsageTab scanId={scan.id} running={status === "running" || status === "paused"} />
         </TabsContent>

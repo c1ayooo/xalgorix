@@ -476,7 +476,7 @@ type ScanRequest struct {
 	// ResumeIntent marks the controlled 1:1 task:run re-dispatch (REDESIGN
 	// D11): it may replace a rebuilt-from-disk copy of a terminal run in the
 	// live map, which the paused-resume placeholder path would refuse.
-	ResumeIntent         bool     `json:"-"`
+	ResumeIntent bool `json:"-"`
 	// RedispatchFromDir points a 1:1 re-dispatch at the previous scan dir
 	// (REDESIGN D11): the new session copies durable continuity files
 	// (notes/ledger/intelligence) from it and replays its conversation, while
@@ -1021,6 +1021,14 @@ type Server struct {
 	telegramBotToken       string      // XALGORIX_TELEGRAM_BOT_TOKEN (secret, never exposed via API)
 	telegramChatID         string      // XALGORIX_TELEGRAM_CHAT_ID (numeric ID or @channelusername)
 	telegramMinSeverity    string      // minimum severity to send to Telegram ("info", "low", "medium", "high", "critical")
+	dingTalkWebhook        string      // XALGORIX_DINGTALK_WEBHOOK - DingTalk robot webhook (credential in query, never exposed via API)
+	dingTalkSecret         string      // XALGORIX_DINGTALK_SECRET - DingTalk sign secret (加签)
+	dingTalkMinSeverity    string      // minimum severity to send to DingTalk ("info", "low", "medium", "high", "critical")
+	feishuWebhook          string      // XALGORIX_FEISHU_WEBHOOK - Feishu robot webhook (credential in path, never exposed via API)
+	feishuSecret           string      // XALGORIX_FEISHU_SECRET - Feishu sign secret (加签)
+	feishuMinSeverity      string      // minimum severity to send to Feishu ("info", "low", "medium", "high", "critical")
+	weComWebhook           string      // XALGORIX_WECOM_WEBHOOK - WeCom robot webhook (credential in query, never exposed via API)
+	weComMinSeverity       string      // minimum severity to send to WeCom ("info", "low", "medium", "high", "critical")
 	notifyScanComplete     atomic.Bool // XALGORIX_NOTIFY_SCAN_COMPLETE - send the "Scan Finished" summary after every scan (default false)
 	rateLimiter            *RateLimiter
 	settingsMu             sync.RWMutex
@@ -1171,6 +1179,14 @@ func NewServer(cfg *config.Config, port int) *Server {
 		telegramBotToken:       cfg.TelegramBotToken,
 		telegramChatID:         cfg.TelegramChatID,
 		telegramMinSeverity:    strings.ToLower(strings.TrimSpace(cfg.TelegramMinSeverity)),
+		dingTalkWebhook:        strings.TrimSpace(cfg.DingTalkWebhook),
+		dingTalkSecret:         strings.TrimSpace(cfg.DingTalkSecret),
+		dingTalkMinSeverity:    strings.ToLower(strings.TrimSpace(cfg.DingTalkMinSeverity)),
+		feishuWebhook:          strings.TrimSpace(cfg.FeishuWebhook),
+		feishuSecret:           strings.TrimSpace(cfg.FeishuSecret),
+		feishuMinSeverity:      strings.ToLower(strings.TrimSpace(cfg.FeishuMinSeverity)),
+		weComWebhook:           strings.TrimSpace(cfg.WeComWebhook),
+		weComMinSeverity:       strings.ToLower(strings.TrimSpace(cfg.WeComMinSeverity)),
 		rateLimiter:            rl,
 		instances:              make(map[string]*ScanInstance),
 		dispatchReservations:   make(map[string]bool),
@@ -1536,6 +1552,14 @@ func (s *Server) Start() error {
 			s.handleScanTraffic(w, r)
 			return
 		}
+		// GET /api/scans/{id}/security — read-only security-chain view: guard
+		// refusals extracted from this scan's journal, categorized by the
+		// guard that fired, with counters (scan_security.go). Checked before
+		// the generic detail handler.
+		if strings.HasSuffix(r.URL.Path, "/security") && r.Method == http.MethodGet {
+			s.handleScanSecurity(w, r)
+			return
+		}
 		s.handleGetScan(w, r)
 	})
 	// DELETE /api/data-dirs/{name} — delete one top-level Scan_Folder under
@@ -1848,6 +1872,7 @@ func (s *Server) Start() error {
 		if s.telegramConfigured() {
 			s.sendTelegram(0xff6b6b, "🔄 Xalgorix Restarting", fmt.Sprintf("Service received %s signal. Saving state and restarting.\nInterrupted scans will auto-resume.", sig.String()))
 		}
+		s.sendDomesticIM("", 0xff6b6b, "🔄 Xalgorix Restarting", fmt.Sprintf("Service received %s signal. Saving state and restarting.\nInterrupted scans will auto-resume.", sig.String()))
 
 		// Give scans a moment to save their queue state
 		time.Sleep(2 * time.Second)
@@ -1907,6 +1932,8 @@ func (s *Server) scheduleGracefulRestart() bool {
 		s.sendTelegram(0x4dabf7, "🕓 Xalgorix Restart Scheduled",
 			"A restart was requested. Xalgorix will restart automatically once all running scans finish and no tools are active.")
 	}
+	s.sendDomesticIM("", 0x4dabf7, "🕓 Xalgorix Restart Scheduled",
+		"A restart was requested. Xalgorix will restart automatically once all running scans finish and no tools are active.")
 	go s.restartWhenIdleWatcher(s.httpServer)
 	return true
 }
@@ -1976,6 +2003,7 @@ func (s *Server) restartNow(httpServer *http.Server) {
 	if s.telegramConfigured() {
 		s.sendTelegram(0x4dabf7, "🔄 Xalgorix Restarting", "Scanner is idle. Restarting now; interrupted work (if any) auto-resumes.")
 	}
+	s.sendDomesticIM("", 0x4dabf7, "🔄 Xalgorix Restarting", "Scanner is idle. Restarting now; interrupted work (if any) auto-resumes.")
 
 	// Belt-and-suspenders: reap any stray tool processes before we go.
 	terminal.KillAllProcesses()
@@ -2420,6 +2448,8 @@ func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
 			s.sendTelegram(0xff6b6b, "🔁 Xalgorix Force Restart",
 				"An immediate restart was requested. Xalgorix is restarting now; in-flight processes are interrupted and resumable queues will recover after startup.")
 		}
+		s.sendDomesticIM("", 0xff6b6b, "🔁 Xalgorix Force Restart",
+			"An immediate restart was requested. Xalgorix is restarting now; in-flight processes are interrupted and resumable queues will recover after startup.")
 		// Prevent an already-scheduled idle watcher from also firing.
 		s.restartWhenIdle.Store(true)
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -3531,7 +3561,7 @@ type scanSession struct {
 	discoveryMode       bool
 	genReport           bool
 	resetState          bool
-	redispatchFromDir   string // 1:1 re-dispatch: previous scan dir for continuity copy + replay (REDESIGN D11)
+	redispatchFromDir   string               // 1:1 re-dispatch: previous scan dir for continuity copy + replay (REDESIGN D11)
 	instanceID          string               // parent instance ID for multi-instance tracking
 	parentCtx           context.Context      // parent target context; canceled by exact stop
 	scanMode            string               // single, wildcard, dast — persisted so dashboard shows correct mode
@@ -3951,6 +3981,7 @@ func (s *Server) handleStopNotify(w http.ResponseWriter, r *http.Request) {
 	if s.telegramConfigured() {
 		s.sendTelegram(0xff6b6b, "🛑 Xalgorix Stopped", "The Xalgorix service has been stopped by the user.")
 	}
+	s.sendDomesticIM("", 0xff6b6b, "🛑 Xalgorix Stopped", "The Xalgorix service has been stopped by the user.")
 
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "notified"})
 }
