@@ -9,9 +9,9 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/xalgord/xalgorix/v4/internal/methodology"
-	"github.com/xalgord/xalgorix/v4/internal/scopeguard"
-	"github.com/xalgord/xalgorix/v4/internal/tools/httpclient"
+	"github.com/c1ayooo/xalgorix/v4/internal/methodology"
+	"github.com/c1ayooo/xalgorix/v4/internal/scopeguard"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools/httpclient"
 )
 
 // shouldBlockForMissingAuthPrerequisites prevents an anonymous assessment from
@@ -442,7 +442,7 @@ func (a *Agent) shouldBlockForOutOfScope(toolName string, toolArgs map[string]st
 		}
 		return false, ""
 	case "terminal_execute", "python_action", "browser_action", "page_agent", "pageagent",
-		"report_vulnerability", "authz_matrix", "probe_hypothesis":
+		"report_vulnerability", "authz_matrix", "probe_hypothesis", "port_scan":
 		// gated
 	default:
 		return false, ""
@@ -452,14 +452,32 @@ func (a *Agent) shouldBlockForOutOfScope(toolName string, toolArgs map[string]st
 	// just means no host was named (e.g. hostless local-artifact
 	// commands like grep/awk/jq) — let those flow through.
 	hosts := extractHostsFromArgs(toolArgs)
+	// SSRF payload data refinement (2026-11-23): a loopback token that only
+	// ever appears in VALUE position (after '=', ':', '{', ',' or '+', i.e.
+	// a query parameter / JSON / header value) is data the TARGET application
+	// may fetch — not a request this machine makes. When the same call also
+	// names an allowed destination, those occurrences no longer block; a
+	// loopback that stands as a destination (start of curl/nc/connect, or any
+	// non-value position) still does.
+	nonLocalDestination := false
 	for _, h := range hosts {
-		if scopeguard.IsLocalOrListener(a.localGuard, h) {
-			return true, fmt.Sprintf(
-				"%q points at the operator's machine or local network. "+
-					"Refusing to probe localhost / RFC1918 / the dashboard's "+
-					"listener from a Gated_Tool.", h,
-			)
+		if !scopeguard.IsLocalOrListener(a.localGuard, h) {
+			nonLocalDestination = true
+			break
 		}
+	}
+	for _, h := range hosts {
+		if !scopeguard.IsLocalOrListener(a.localGuard, h) {
+			continue
+		}
+		if nonLocalDestination && localHostOnlyInPayloadValues(toolArgs, h) {
+			continue
+		}
+		return true, fmt.Sprintf(
+			"%q points at the operator's machine or local network. "+
+				"Refusing to probe localhost / RFC1918 / the dashboard's "+
+				"listener from a Gated_Tool.", h,
+		)
 	}
 
 	// Belt-and-braces leg for report_vulnerability: validate the
@@ -1173,7 +1191,7 @@ func containsDirectTargetURL(text string, hosts []string) bool {
 
 func containsActiveAccessPattern(text string) bool {
 	patterns := []string{
-		"browser_action", "page_agent",
+		"browser_action", "page_agent", "port_scan", " gogo ",
 		"curl ", " wget ", "httpx", "nmap", "masscan", "naabu",
 		"ffuf", "gobuster", "feroxbuster", "dirsearch", "katana", "gospider", "hakrawler",
 		"nuclei", "sqlmap", "dalfox", "nikto", "wpscan", "joomscan", "whatweb", "wafw00f",
@@ -1189,4 +1207,49 @@ func containsActiveAccessPattern(text string) bool {
 		}
 	}
 	return false
+}
+
+// localHostOnlyInPayloadValues reports whether every occurrence of host in
+// the tool args sits in VALUE position — preceded (past one opening quote and
+// spaces) by '=', ':', '{', ',' or '+' — i.e. a query parameter, JSON/header
+// value or string concatenation fragment, never a connect destination.
+func localHostOnlyInPayloadValues(toolArgs map[string]string, host string) bool {
+	saw := false
+	for _, v := range toolArgs {
+		for idx := 0; idx < len(v); {
+			pos := strings.Index(v[idx:], host)
+			if pos < 0 {
+				break
+			}
+			at := idx + pos
+			saw = true
+			i := at - 1
+			// Step over a URL scheme so the context character is the one
+			// before "http://" / "https://" / "//", not the slashes.
+			switch {
+			case at >= 8 && v[at-8:at] == "https://":
+				i = at - 8 - 1
+			case at >= 7 && v[at-7:at] == "http://":
+				i = at - 7 - 1
+			case at >= 2 && v[at-2:at] == "//":
+				i = at - 2 - 1
+			}
+			if i >= 0 && (v[i] == '\'' || v[i] == '"' || v[i] == '`') {
+				i--
+			}
+			for i >= 0 && (v[i] == ' ' || v[i] == '\t') {
+				i--
+			}
+			if i < 0 {
+				return false
+			}
+			switch v[i] {
+			case '=', ':', '{', ',', '+':
+			default:
+				return false
+			}
+			idx = at + len(host)
+		}
+	}
+	return saw
 }
