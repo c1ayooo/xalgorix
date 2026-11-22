@@ -12,17 +12,17 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/xalgord/xalgorix/v4/internal/agent"
-	"github.com/xalgord/xalgorix/v4/internal/egress"
-	"github.com/xalgord/xalgorix/v4/internal/engine"
-	"github.com/xalgord/xalgorix/v4/internal/llm"
-	"github.com/xalgord/xalgorix/v4/internal/platform"
-	"github.com/xalgord/xalgorix/v4/internal/scanctx"
-	"github.com/xalgord/xalgorix/v4/internal/scopeguard"
-	"github.com/xalgord/xalgorix/v4/internal/tools/intelligence"
-	"github.com/xalgord/xalgorix/v4/internal/tools/notes"
-	"github.com/xalgord/xalgorix/v4/internal/tools/reporting"
-	"github.com/xalgord/xalgorix/v4/internal/trafficproxy"
+	"github.com/c1ayooo/xalgorix/v4/internal/agent"
+	"github.com/c1ayooo/xalgorix/v4/internal/egress"
+	"github.com/c1ayooo/xalgorix/v4/internal/engine"
+	"github.com/c1ayooo/xalgorix/v4/internal/llm"
+	"github.com/c1ayooo/xalgorix/v4/internal/platform"
+	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
+	"github.com/c1ayooo/xalgorix/v4/internal/scopeguard"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools/intelligence"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools/notes"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools/reporting"
+	"github.com/c1ayooo/xalgorix/v4/internal/trafficproxy"
 )
 
 // vulnNotificationDetails renders the Markdown body pushed to Telegram/Discord
@@ -204,6 +204,10 @@ func (s *Server) executeScanSession(sess *scanSession) {
 	// 0. Create and activate a per-session ScanContext for isolation.
 	//    This must happen BEFORE any tool state is touched.
 	sctx := scanctx.New(sess.id, sess.scanDir)
+	// Stamp the run identity on the ledger (D11): with the PG backend the
+	// snapshot carries it, and a re-dispatched session's first ledger load
+	// inherits the previous sibling session's chain (charter v3.0 §6.3).
+	sctx.Ledger.SetInstanceID(sess.instanceID)
 	// Link the platform run to the scan-data identity. Runs are mounted at
 	// dispatch time, before this directory exists, so without this write
 	// ProjectScanIDs never learns the id the domain journal and the InfoItem
@@ -827,6 +831,10 @@ func (s *Server) processEvent(evt agent.Event, sess *scanSession) {
 		TotalTokens: evt.TotalTokens,
 		Aborted:     evt.Aborted,
 		AbortReason: evt.AbortReason,
+		// Structured lifecycle telemetry (agent_*/plan_updated) rides the
+		// documented result_meta field so clients never parse prose. It is an
+		// invalidation hint only; projection endpoints stay authoritative.
+		ResultMeta: evt.Meta,
 	}
 
 	// Latch the full-detail specialist-wave defer diagnostic so a scan
@@ -843,7 +851,9 @@ func (s *Server) processEvent(evt agent.Event, sess *scanSession) {
 		// receipt ids): previously only output+error crossed the event schema,
 		// so rejected reports were indistinguishable from clean ones unless a
 		// consumer parsed prose.
-		wsEvt.ResultMeta = evt.ToolResult.Metadata
+		if evt.ToolResult.Metadata != nil {
+			wsEvt.ResultMeta = evt.ToolResult.Metadata
+		}
 		// The plan's completed tasks are the richest per-phase work signal:
 		// merge their phases into the worked ledger on EVERY result.
 		// reconcilePlan completes tasks automatically from coverage and
@@ -1455,6 +1465,13 @@ func (s *Server) capturePlanDisposition(sess *scanSession) {
 	sess.record.PlanTasksTotal, sess.record.PlanTasksCompleted,
 		sess.record.PlanTasksSkipped, sess.record.PlanTasksUnfinished = sess.agent.PlanDisposition()
 	sess.record.PlanPresent = sess.agent.HasPlan()
+	// Persist the plan projection next to its counters (same write point, same
+	// atomic record save). Without it a terminal run can only report numbers,
+	// which is exactly the "Planner pane is empty" failure this endpoint fixes.
+	if view := sess.agent.PlanSnapshot(); view.Present {
+		snapshot := view
+		sess.record.PlanView = &snapshot
+	}
 	sess.record.AssessmentProgress = max(sess.record.AssessmentProgress, sess.agent.AssessmentProgress())
 	// Completed plan tasks carry explicit phase numbers - the richest
 	// per-phase work evidence (auth=5, business-logic=12, classes the command

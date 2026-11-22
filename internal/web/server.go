@@ -30,29 +30,29 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/xalgord/xalgorix/v4/internal/agent"
-	"github.com/xalgord/xalgorix/v4/internal/auth"
-	"github.com/xalgord/xalgorix/v4/internal/config"
-	"github.com/xalgord/xalgorix/v4/internal/goalanalysis"
-	"github.com/xalgord/xalgorix/v4/internal/infoitem"
-	"github.com/xalgord/xalgorix/v4/internal/llm"
-	"github.com/xalgord/xalgorix/v4/internal/platform"
-	"github.com/xalgord/xalgorix/v4/internal/platformutil"
-	"github.com/xalgord/xalgorix/v4/internal/providers"
-	"github.com/xalgord/xalgorix/v4/internal/proxy"
-	"github.com/xalgord/xalgorix/v4/internal/resources"
-	"github.com/xalgord/xalgorix/v4/internal/safe"
-	"github.com/xalgord/xalgorix/v4/internal/sandbox"
-	"github.com/xalgord/xalgorix/v4/internal/scanctx"
-	"github.com/xalgord/xalgorix/v4/internal/scopeguard"
-	"github.com/xalgord/xalgorix/v4/internal/storage"
-	"github.com/xalgord/xalgorix/v4/internal/tools/browser"
-	"github.com/xalgord/xalgorix/v4/internal/tools/httpclient"
-	"github.com/xalgord/xalgorix/v4/internal/tools/intelligence"
-	"github.com/xalgord/xalgorix/v4/internal/tools/notes"
-	"github.com/xalgord/xalgorix/v4/internal/tools/reporting"
-	"github.com/xalgord/xalgorix/v4/internal/tools/terminal"
-	"github.com/xalgord/xalgorix/v4/internal/trafficproxy"
+	"github.com/c1ayooo/xalgorix/v4/internal/agent"
+	"github.com/c1ayooo/xalgorix/v4/internal/auth"
+	"github.com/c1ayooo/xalgorix/v4/internal/config"
+	"github.com/c1ayooo/xalgorix/v4/internal/goalanalysis"
+	"github.com/c1ayooo/xalgorix/v4/internal/infoitem"
+	"github.com/c1ayooo/xalgorix/v4/internal/llm"
+	"github.com/c1ayooo/xalgorix/v4/internal/platform"
+	"github.com/c1ayooo/xalgorix/v4/internal/platformutil"
+	"github.com/c1ayooo/xalgorix/v4/internal/providers"
+	"github.com/c1ayooo/xalgorix/v4/internal/proxy"
+	"github.com/c1ayooo/xalgorix/v4/internal/resources"
+	"github.com/c1ayooo/xalgorix/v4/internal/safe"
+	"github.com/c1ayooo/xalgorix/v4/internal/sandbox"
+	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
+	"github.com/c1ayooo/xalgorix/v4/internal/scopeguard"
+	"github.com/c1ayooo/xalgorix/v4/internal/storage"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools/browser"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools/httpclient"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools/intelligence"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools/notes"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools/reporting"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools/terminal"
+	"github.com/c1ayooo/xalgorix/v4/internal/trafficproxy"
 )
 
 // configSnapshot returns a shallow copy of the runtime config under the
@@ -641,20 +641,27 @@ type ScanRecord struct {
 	// record for the final root plan. Skips carry justifications but are not
 	// executed coverage; unfinished work is visible here instead of being
 	// folded into a single percentage or completion label.
-	PlanTasksTotal           int       `json:"plan_tasks_total,omitempty"`
-	PlanTasksCompleted       int       `json:"plan_tasks_completed,omitempty"`
-	PlanTasksSkipped         int       `json:"plan_tasks_skipped,omitempty"`
-	PlanTasksUnfinished      int       `json:"plan_tasks_unfinished,omitempty"`
-	ScanMode                 string    `json:"scan_mode,omitempty"`                  // single, wildcard, dast
-	Instruction              string    `json:"instruction,omitempty"`                // custom scan instructions
-	SeverityFilter           []string  `json:"severity_filter,omitempty"`            // severity filter for scan
-	DiscordWebhook           string    `json:"discord_webhook,omitempty"`            // discord notification webhook
-	DiscordWebhookConfigured bool      `json:"discord_webhook_configured,omitempty"` // true when a per-scan or global webhook is configured
-	TelegramConfigured       bool      `json:"telegram_configured,omitempty"`        // true when global Telegram notifications are configured (token never exposed)
-	ReconMode                string    `json:"recon_mode,omitempty"`                 // active or passive reconnaissance
-	ScanIntensity            string    `json:"scan_intensity,omitempty"`             // active or passive testing/scanning
-	Events                   []WSEvent `json:"events"`
-	EventsJournal            bool      `json:"events_journal,omitempty"`
+	PlanTasksTotal      int `json:"plan_tasks_total,omitempty"`
+	PlanTasksCompleted  int `json:"plan_tasks_completed,omitempty"`
+	PlanTasksSkipped    int `json:"plan_tasks_skipped,omitempty"`
+	PlanTasksUnfinished int `json:"plan_tasks_unfinished,omitempty"`
+	// PlanView is the terminal read projection of the root plan (task graph,
+	// provenance, counters). Plan detail previously survived only as
+	// build_plan/update_plan tool-call telemetry, which the engine never emits
+	// for engine-authored plans — so the Planner pane went blank on resume and
+	// after the live agent was released. Written at the same terminal safe point
+	// as the counters; R6.1 moves this to PG with the rest of run state.
+	PlanView                 *agent.PlanView `json:"plan_view,omitempty"`
+	ScanMode                 string          `json:"scan_mode,omitempty"`                  // single, wildcard, dast
+	Instruction              string          `json:"instruction,omitempty"`                // custom scan instructions
+	SeverityFilter           []string        `json:"severity_filter,omitempty"`            // severity filter for scan
+	DiscordWebhook           string          `json:"discord_webhook,omitempty"`            // discord notification webhook
+	DiscordWebhookConfigured bool            `json:"discord_webhook_configured,omitempty"` // true when a per-scan or global webhook is configured
+	TelegramConfigured       bool            `json:"telegram_configured,omitempty"`        // true when global Telegram notifications are configured (token never exposed)
+	ReconMode                string          `json:"recon_mode,omitempty"`                 // active or passive reconnaissance
+	ScanIntensity            string          `json:"scan_intensity,omitempty"`             // active or passive testing/scanning
+	Events                   []WSEvent       `json:"events"`
+	EventsJournal            bool            `json:"events_journal,omitempty"`
 	// EventsTotal / EventsTruncated are RESPONSE-ONLY hints for the scan-detail
 	// view. GET /api/scans/{id} returns only a tail of the event log (the most
 	// recent detailEventTail events) so a scan with a multi-hundred-MB event log
@@ -950,6 +957,10 @@ var dashboardRoutes = []string{
 	"/api/skills/invocations",
 	"/api/agent-profiles/invocations",
 
+	// Built-in tool directory + its invocation records (read-only).
+	"/api/tools",
+	"/api/tools/invocations",
+
 	// User skills (operator-authored methodology, API_CONTRACT §integration-skills).
 	"/api/skills",
 	"/api/skills/",
@@ -985,6 +996,13 @@ func registerPlatformAPIRoutes(mux *http.ServeMux, s *Server) {
 	mux.HandleFunc("/api/mcp-servers/invocations", s.handleMcpInvocations)
 	mux.HandleFunc("/api/skills/invocations", s.handleSkillInvocations)
 	mux.HandleFunc("/api/agent-profiles/invocations", s.handleAgentInvocations)
+
+	// Built-in tool directory + invocation records (same read-only posture).
+	mux.HandleFunc("/api/tools/invocations", s.handleToolInvocations)
+	mux.HandleFunc("/api/tools", s.handleToolCatalog)
+
+	// Read-only projection of the container tool runtime (execution plane).
+	mux.HandleFunc("/api/runtime", s.handleRuntime)
 
 	mux.HandleFunc("/api/skills", s.handleSkills)
 	mux.HandleFunc("/api/skills/", s.handleSkillDetail)
@@ -1582,6 +1600,13 @@ func (s *Server) Start() error {
 		// with status counts and honest presence/damage flags (scan_ledger.go).
 		if strings.HasSuffix(r.URL.Path, "/ledger") && r.Method == http.MethodGet {
 			s.handleScanLedger(w, r)
+			return
+		}
+		// GET /api/scans/{id}/plan — read projection of the root plan (task
+		// graph + provenance + counters). The Planner pane reads this instead of
+		// reconstructing the plan from build_plan/update_plan telemetry.
+		if strings.HasSuffix(r.URL.Path, "/plan") && r.Method == http.MethodGet {
+			s.handleScanPlan(w, r)
 			return
 		}
 		// GET /api/scans/{id}/exploration — read-only exploration projection
@@ -3113,6 +3138,18 @@ func (s *Server) handleInstanceAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	instanceID := parts[0]
+
+	// GET /api/instances/{id}/agents — worker pool projection (state, not
+	// telemetry): per-agent lifecycle, queue position and current claims.
+	if len(parts) >= 2 && parts[1] == "agents" {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		s.handleInstanceAgents(w, r, instanceID)
+		return
+	}
 
 	// GET /api/instances/{id}/snapshot is the authoritative coordinator API.
 	// It resolves only the exact external instance ID and returns status,
