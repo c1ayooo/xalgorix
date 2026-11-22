@@ -90,9 +90,9 @@ let state = {
       company_name: "Acme",
       current_phase: 3,
       vulns: [
-        { id: "v1", title: "SQL Injection in /search", severity: "critical", endpoint: "https://acme.com/search?q=", cvss: 9.8, cve: "CVE-2024-1234" },
-        { id: "v2", title: "Reflected XSS in /login", severity: "high", endpoint: "https://acme.com/login", cvss: 7.5 },
-        { id: "v3", title: "Open Redirect on /go", severity: "medium", endpoint: "https://acme.com/go", cvss: 4.3 },
+        { id: "v1", title: "/search 存在 SQL 注入", severity: "critical", endpoint: "https://acme.com/search?q=", cvss: 9.8, cve: "CVE-2024-1234" },
+        { id: "v2", title: "/login 存在反射型 XSS", severity: "high", endpoint: "https://acme.com/login", cvss: 7.5 },
+        { id: "v3", title: "/go 存在开放重定向", severity: "medium", endpoint: "https://acme.com/go", cvss: 4.3 },
       ],
     },
     {
@@ -239,6 +239,7 @@ let state = {
   ],
   // 任务情报（契约 §3.7 mock）：按 task_id 聚合的观测项 + 操作者分诊覆盖层。
   intelTriages: new Map(), // taskId -> Map(fingerprint -> triage)
+  convMeta: new Map(), // instance_id -> { title?, pinned?, archived? }（会话元数据覆盖层）
   tasks: [
     {
       id: "task_acme_nightly",
@@ -625,6 +626,158 @@ setInterval(() => {
   }
 }, 15000);
 
+// -------- 会话投影 helper（chat_transcript.go 同语义）----------------------
+
+/** 实例事件 fixture（确定性合成，/api/instances/:id/events 与转录共用）。
+ *  演示文案全部中文；message 事件 = LLM 每轮结论（转录渲染为 assistant 气泡）。 */
+function mockInstanceEvents(inst) {
+  const kinds = [
+    { type: "phase", content: "进入阶段：信息侦察", agent_id: inst.id },
+    { type: "thought", content: "目标面较宽，优先摸清 api 主机与认证入口", agent_id: inst.id },
+    {
+      type: "tool_call",
+      tool_name: "build_plan",
+      content: "build_plan",
+      tool_args: {
+        tasks: JSON.stringify([
+          { id: "recon", title: "侦察 + 端点清点", phase: 1, depends_on: [] },
+          { id: "test-idor", title: "测试 /api/v1/orders 越权（IDOR）", phase: 8, vuln_class: "idor", depends_on: ["recon"] },
+          { id: "test-sqli", title: "测试 /search SQL 注入", phase: 6, vuln_class: "sqli", depends_on: ["recon"] },
+        ]),
+      },
+      agent_id: inst.id,
+    },
+    {
+      type: "tool_call",
+      tool_name: "update_plan",
+      content: "update_plan recon",
+      tool_args: { task_id: "recon", status: "completed", notes: "端点清点完成" },
+      agent_id: inst.id,
+    },
+    {
+      type: "tool_call",
+      tool_name: "update_plan",
+      content: "update_plan test-idor",
+      tool_args: { task_id: "test-idor", status: "active" },
+      agent_id: inst.id,
+    },
+    { type: "tool_call", tool_name: "nuclei", content: `nuclei -rl 60 -severity low,medium ${inst.targets}`, agent_id: inst.id },
+    { type: "tool_result", content: "被动集 42 个模板跑完，无命中", agent_id: inst.id },
+    {
+      type: "message",
+      content: "本轮侦察结论：\n\n- 目标边界确认：`acme.com` 与 `api.acme.com`，均由 Cloudflare 代理\n- 被动漏扫无命中，攻击面集中在 API\n- 下一轮计划：优先验证 `/api/v1/orders` 的越权（IDOR），其次 `/search` 的注入",
+      agent_id: inst.id,
+    },
+    { type: "tool_call", tool_name: "httpx", content: `httpx -silent -status-code ${inst.targets}`, agent_id: `${inst.id}/spec-injection` },
+    { type: "tool_result", content: "3 个端点返回 200", agent_id: `${inst.id}/spec-injection` },
+    { type: "thought", content: "/admin 返回 401，存在横向越权测试价值，登记 authz 矩阵", agent_id: `${inst.id}/spec-injection` },
+    { type: "decision", content: "认领假设：/api/v1/orders 存在 IDOR", agent_id: `${inst.id}/spec-injection` },
+    { type: "tool_call", tool_name: "nmap", content: `nmap -sV -p 443 ${inst.targets}`, agent_id: inst.id },
+    { type: "tool_result", content: "1 个服务：nginx 1.24.0", agent_id: inst.id },
+    { type: "http", content: "GET /api/v1/users/42 => 200（角色 A）", agent_id: `${inst.id}/spec-injection` },
+    { type: "http", content: "GET /api/v1/users/42（匿名）=> 401", agent_id: `${inst.id}/spec-injection` },
+    {
+      type: "message",
+      content: "Worker 结论（spec-injection）：\n\n- 同一接口，角色 A 可见 `users/42`，匿名 401——存在对象级访问控制差异\n- 已认领 IDOR 假设，下一步用两个低权账号交叉验证",
+      agent_id: `${inst.id}/spec-injection`,
+    },
+    { type: "phase", content: "进入阶段：漏洞测试", agent_id: inst.id },
+    { type: "tool_call", tool_name: "sqlmap", content: `sqlmap -u 'https://${inst.targets}/search?q=1' --batch --level=2`, agent_id: `${inst.id}/spec-injection` },
+    { type: "vuln", content: "/search 存在 SQL 注入（critical，CVSS 9.8）", agent_id: `${inst.id}/spec-injection` },
+    { type: "tool_result", content: "验证器独立复现：时间盲注 payload 确认", agent_id: inst.id },
+    {
+      type: "message",
+      content: "**本轮结论：/search 的 `q` 参数确认 SQL 注入（时间盲注），CVSS 9.8，已由验证器独立复现。**\n\n建议：该参数直接拼接进查询语句，需参数化修复；同版本代码路径建议全局排查。",
+      agent_id: inst.id,
+    },
+  ];
+  const base = Date.now() - kinds.length * 60_000;
+  return kinds.map((k, idx) => ({
+    ...k,
+    instance_id: inst.id,
+    timestamp: new Date(base + idx * 60_000).toISOString(),
+  }));
+}
+
+/** 侧栏行：run + 会话元数据（标题/置顶/归档）+ 任务名。 */
+function conversationRows(includeArchived) {
+  const taskNames = new Map(state.tasks.map((t) => [t.id, t.name]));
+  return state.runs
+    .filter((r) => r.instance_id)
+    .filter((r) => includeArchived || !state.convMeta.get(r.instance_id)?.archived)
+    .map((r) => {
+      const meta = state.convMeta.get(r.instance_id) ?? {};
+      const taskName = taskNames.get(r.task_id) || "";
+      return {
+        ...r,
+        title: meta.title || `${taskName || "任务"} · ${String(r.started_at ?? "").slice(5, 16).replace("T", " ")}`,
+        pinned: meta.pinned ?? false,
+        archived: meta.archived ?? false,
+        task_name: taskName,
+      };
+    });
+}
+
+/** 转录投影：guidance → human + 事件 fixture → assistant/tool/finding/system。 */
+function buildMockTranscript(instanceId, run) {
+  const inst = state.instances.find((i) => i.id === instanceId);
+  if (!inst) return [];
+  const taskNames = new Map(state.tasks.map((t) => [t.id, t.name]));
+  const rows = [];
+
+  // 人工 turn（服务端先持久化再广播；guidance 行带 run/instance 归属）。
+  for (const g of state.guidances) {
+    if (g.instance_id !== instanceId && (!run || g.run_id !== run.id)) continue;
+    if (!g.message?.trim()) continue;
+    rows.push({ kind: "human", role: "human", text: g.message, status: g.status, at: g.created_at });
+  }
+
+  // 事件 fixture（与 /api/instances/:id/events 同源，时间轴对齐）。
+  const events = mockInstanceEvents(inst);
+  let lastTool = "";
+  for (const ev of events) {
+    const at = ev.timestamp;
+    if (ev.type === "tool_call") {
+      lastTool = ev.tool_name || "";
+      rows.push({ kind: "tool_use", tool: lastTool, args: ev.tool_args, text: ev.content, agent_id: ev.agent_id, at });
+    } else if (ev.type === "tool_result") {
+      rows.push({ kind: "tool_result", tool: ev.tool_name || lastTool, output: ev.content, agent_id: ev.agent_id, at });
+    } else if (ev.type === "vuln") {
+      rows.push({ kind: "finding", text: ev.content, at });
+    } else if (ev.type === "message") {
+      // LLM 每轮结论（chat_transcript.go 同款映射；mock 无工具回显消息）。
+      rows.push({ kind: "assistant", role: "agent", text: ev.content, agent_id: ev.agent_id, at });
+    }
+  }
+
+  // 审批投影（requested / decided）。
+  for (const a of state.approvals) {
+    if (a.instance_id !== instanceId) continue;
+    const summary = a.payload.command || `${a.payload.method ?? ""} ${a.payload.url ?? ""}`.trim();
+    rows.push({
+      kind: "approval",
+      text: `审批请求：${a.kind} · ${summary}`,
+      status: a.status,
+      at: a.created_at,
+      approval: {
+        kind: a.kind,
+        status: a.status,
+        decided_by: a.decided_by,
+        reason: a.reason,
+        decided: a.status !== "pending",
+      },
+    });
+  }
+
+  // 终态系统行。
+  if (inst.finished_at) {
+    rows.push({ kind: "system", text: inst.status === "finished" ? "finished" : `aborted: ${inst.status}`, at: inst.finished_at });
+  }
+
+  rows.sort((a, b) => (Date.parse(a.at) || 0) - (Date.parse(b.at) || 0));
+  return rows.map((row, idx) => ({ seq: idx + 1, ...row, task_name: taskNames.get(run?.task_id) }));
+}
+
 const server = http.createServer(async (req, res) => {
   const method = req.method || "GET";
   const url = req.url.split("?")[0];
@@ -842,15 +995,26 @@ const server = http.createServer(async (req, res) => {
     // listScansPage (paginated table) expects { items, total }; bare-list
     // consumers (useScansList → overview/reports) expect the plain array.
     const qs = new URLSearchParams(req.url.split("?")[1] || "");
+    // project_id isolation（与真实后端 handleListScans §3.2 对齐）：
+    // scan.id == instance.id，经 run.instance_id → run.task_id → task.project_id 联查。
+    const projectFilter = qs.get("project_id");
+    const scoped = projectFilter
+      ? state.scans.filter((scan) => {
+          const run = state.runs.find((r) => r.instance_id === scan.id);
+          if (!run) return false;
+          const task = state.tasks.find((tk) => tk.id === run.task_id);
+          return task?.project_id === projectFilter;
+        })
+      : state.scans;
     if (qs.get("page") != null) {
       const size = Math.max(1, Number(qs.get("size") ?? 50) || 50);
       const pg = Math.max(1, Number(qs.get("page")) || 1);
       return send(res, {
-        items: state.scans.slice((pg - 1) * size, pg * size),
-        total: state.scans.length,
+        items: scoped.slice((pg - 1) * size, pg * size),
+        total: scoped.length,
       });
     }
-    return send(res, state.scans);
+    return send(res, scoped);
   }
   const scanOne = url.match(/^\/api\/scans\/([^/]+)$/);
   if (scanOne) {
@@ -884,9 +1048,9 @@ const server = http.createServer(async (req, res) => {
         inst?.vulns ??
         (id === "scan_01"
           ? [
-              { id: "v1", title: "SQL Injection in /search", severity: "critical", endpoint: "https://acme.com/search?q=", cvss: 9.8, cve: "CVE-2024-1234" },
-              { id: "v2", title: "Reflected XSS in /login", severity: "high", endpoint: "https://acme.com/login", cvss: 7.5 },
-              { id: "v3", title: "Open Redirect on /go", severity: "medium", endpoint: "https://acme.com/go", cvss: 4.3 },
+              { id: "v1", title: "/search 存在 SQL 注入", severity: "critical", endpoint: "https://acme.com/search?q=", cvss: 9.8, cve: "CVE-2024-1234" },
+              { id: "v2", title: "/login 存在反射型 XSS", severity: "high", endpoint: "https://acme.com/login", cvss: 7.5 },
+              { id: "v3", title: "/go 存在开放重定向", severity: "medium", endpoint: "https://acme.com/go", cvss: 4.3 },
               { id: "v4", title: "Verbose error in /api/v1/users", severity: "low", endpoint: "https://acme.com/api/v1/users", cvss: 2.0 },
               { id: "v5", title: "Missing security headers", severity: "info", endpoint: "https://acme.com/", cvss: 0 },
             ]
@@ -1031,59 +1195,7 @@ const server = http.createServer(async (req, res) => {
     const qs = new URLSearchParams(req.url.split("?")[1] || "");
     const offset = Number(qs.get("offset") || 0);
     const limit = Math.min(Number(qs.get("limit") || 100), 300);
-    const kinds = [
-      { type: "phase", content: "Entering phase: reconnaissance", agent_id: inst.id },
-      { type: "thought", content: "Surface is wide; prioritize the api host first", agent_id: inst.id },
-      {
-        type: "tool_call",
-        tool_name: "build_plan",
-        content: "build_plan",
-        tool_args: {
-          tasks: JSON.stringify([
-            { id: "recon", title: "Recon + endpoint inventory", phase: 1, depends_on: [] },
-            { id: "test-idor", title: "Test /api/v1/orders for IDOR", phase: 8, vuln_class: "idor", depends_on: ["recon"] },
-            { id: "test-sqli", title: "Test /search for SQL injection", phase: 6, vuln_class: "sqli", depends_on: ["recon"] },
-          ]),
-        },
-        agent_id: inst.id,
-      },
-      {
-        type: "tool_call",
-        tool_name: "update_plan",
-        content: "update_plan recon",
-        tool_args: { task_id: "recon", status: "completed", notes: "endpoint inventory complete" },
-        agent_id: inst.id,
-      },
-      {
-        type: "tool_call",
-        tool_name: "update_plan",
-        content: "update_plan test-idor",
-        tool_args: { task_id: "test-idor", status: "active" },
-        agent_id: inst.id,
-      },
-      { type: "tool_call", tool_name: "nuclei", content: `nuclei -rl 60 -severity low,medium ${inst.targets}`, agent_id: inst.id },
-      { type: "tool_result", content: "42 templates ran; 0 matches in passive set", agent_id: inst.id },
-      { type: "tool_call", tool_name: "httpx", content: `httpx -silent -status-code ${inst.targets}`, agent_id: `${inst.id}/spec-injection` },
-      { type: "tool_result", content: "3 endpoints responded 200", agent_id: `${inst.id}/spec-injection` },
-      { type: "thought", content: "401 on /admin suggests authz surface; queue authz matrix", agent_id: `${inst.id}/spec-injection` },
-      { type: "decision", content: "Claimed hypothesis: IDOR on /api/v1/orders", agent_id: `${inst.id}/spec-injection` },
-      { type: "tool_call", tool_name: "nmap", content: `nmap -sV -p 443 ${inst.targets}`, agent_id: inst.id },
-      { type: "tool_result", content: "1 service: nginx 1.24.0", agent_id: inst.id },
-      { type: "http", content: "GET /api/v1/users/42 => 200 (role A)", agent_id: `${inst.id}/spec-injection` },
-      { type: "http", content: "GET /api/v1/users/42 (anonymous) => 401", agent_id: `${inst.id}/spec-injection` },
-      { type: "phase", content: "Entering phase: vulnerability testing", agent_id: inst.id },
-      { type: "tool_call", tool_name: "sqlmap", content: `sqlmap -u 'https://${inst.targets}/search?q=1' --batch --level=2`, agent_id: `${inst.id}/spec-injection` },
-      { type: "vuln", content: "SQL Injection in /search (critical, cvss 9.8)", agent_id: `${inst.id}/spec-injection` },
-      { type: "tool_result", content: "Verifier re-exploited: confirmed via time-based payload", agent_id: inst.id },
-    ];
-    const total = kinds.length;
-    const slice = kinds.slice(offset, offset + limit);
-    const base = Date.now() - total * 60_000;
-    const events = slice.map((k, idx) => ({
-      ...k,
-      instance_id: inst.id,
-      timestamp: new Date(base + (offset + idx) * 60_000).toISOString(),
-    }));
+    const events = mockInstanceEvents(inst).slice(offset, offset + limit);
     return send(res, events);
   }
 
@@ -1394,6 +1506,24 @@ const server = http.createServer(async (req, res) => {
           timestamp: nowIso(),
         });
       }, 1500);
+    }
+    // 任务:运行 = 1:1（REDESIGN D11，2026-11-22）：终态 Run 重派同一实例，
+    // 复用同一 run 记录——与真实后端 handleTaskRunStart 一致；仅无历史 Run
+    // 时才新建。
+    const priorRun = state.runs.find((r) => r.task_id === task.id);
+    if (priorRun) {
+      const inst = state.instances.find((i) => i.id === priorRun.instance_id);
+      if (inst) {
+        inst.status = "pending";
+        inst.stop_reason = undefined;
+        inst.started_at = nowIso();
+        inst.instruction = task.instruction || task.goal;
+      }
+      priorRun.status = "pending";
+      priorRun.started_at = nowIso();
+      task.last_run_at = priorRun.started_at;
+      task.last_run_status = "pending";
+      return ok(res, { status: "pending", run_id: priorRun.id, instance_id: priorRun.instance_id });
     }
     const instId = `inst_${String(state.instances.length + 1).padStart(2, "0")}`;
     state.instances.unshift({
@@ -1876,6 +2006,95 @@ const server = http.createServer(async (req, res) => {
     return send(res, { items });
   }
 
+  // -------- 会话页 / 对话页（docs/SESSIONS_CHAT_1TO1_PLAN.md V1 前置）--------
+  // 与 internal/web/chat_transcript.go 的投影语义对齐：guidance → human、
+  // tool_call/tool_result、vuln → finding、finished → system、审批 → approval。
+  const projConvs = url.match(/^\/api\/projects\/([^/]+)\/conversations$/);
+  if (projConvs && method === "GET") {
+    const qs = new URLSearchParams(req.url.split("?")[1] || "");
+    const includeArchived = qs.get("include_archived") === "true";
+    const taskIds = new Set(state.tasks.filter((t) => t.project_id === projConvs[1]).map((t) => t.id));
+    const rows = conversationRows(includeArchived).filter((r) => taskIds.has(r.task_id));
+    return send(res, { items: rows });
+  }
+
+  const convSub = url.match(/^\/api\/conversations\/([^/]+)\/(transcript|attachments)$/);
+  if (convSub) {
+    const instanceId = convSub[1];
+    const run = state.runs.find((r) => r.instance_id === instanceId);
+    if (convSub[2] === "transcript" && method === "GET") {
+      const qs = new URLSearchParams(req.url.split("?")[1] || "");
+      const limit = Math.min(Math.max(Number(qs.get("limit") || 80), 1), 500);
+      const beforeSeq = Number(qs.get("before_seq") || 0);
+      const items = buildMockTranscript(instanceId, run);
+      const total = items.length;
+      const end = beforeSeq > 0 ? Math.min(beforeSeq - 1, total) : total;
+      const start = Math.max(0, end - limit);
+      const page = items.slice(start, end);
+      return send(res, {
+        items: page,
+        total,
+        has_more: start > 0,
+        earliest_seq: page[0]?.seq ?? 0,
+        latest_seq: total,
+        running: state.instances.find((i) => i.id === instanceId)?.status === "running",
+      });
+    }
+    if (convSub[2] === "attachments" && method === "POST") {
+      // multipart 只取文件名做回显；mock 不落盘，路径仅供 chip 展示。
+      const raw = await new Promise((resolve) => {
+        let data = "";
+        req.setEncoding("binary");
+        req.on("data", (chunk) => (data += chunk));
+        req.on("end", () => resolve(data));
+      });
+      const names = [...raw.matchAll(/filename="([^"]+)"/g)].map((m) => m[1]);
+      const attachments = (names.length ? names : ["attachment.bin"]).map((name) => ({
+        path: `uploads/${instanceId}/${name}`,
+        name,
+        size: Buffer.byteLength(raw, "binary"),
+      }));
+      return send(res, { attachments });
+    }
+  }
+
+  const convOne = url.match(/^\/api\/conversations\/([^/]+)$/);
+  if (convOne && method === "PATCH") {
+    const instanceId = convOne[1];
+    const run = state.runs.find((r) => r.instance_id === instanceId);
+    if (!run) return send(res, { error: "not found" }, 404);
+    const body = await readBody(req);
+    const meta = state.convMeta.get(instanceId) ?? {};
+    if (typeof body.title === "string" && body.title.trim()) meta.title = body.title.trim();
+    if (typeof body.pinned === "boolean") meta.pinned = body.pinned;
+    if (typeof body.archived === "boolean") meta.archived = body.archived;
+    state.convMeta.set(instanceId, meta);
+    const row = conversationRows(true).find((r) => r.instance_id === instanceId);
+    return send(res, row ?? run);
+  }
+
+  // 持久事件 journal（契约同 internal/web handleScanEvents）：角色会话在实例
+  // 缓冲缺席（引擎重启）时的兜底数据源，{events,total,offset,limit} 信封。
+  const scanEventsMatch = url.match(/^\/api\/scans\/([^/]+)\/events$/);
+  if (scanEventsMatch && method === "GET") {
+    const scanId = decodeURIComponent(scanEventsMatch[1]);
+    const inst =
+      state.instances.find((i) => i.id === scanId) ||
+      state.instances.find((i) => i.name === scanId) ||
+      state.scans.find((sc) => sc.id === scanId && sc.instance_id && state.instances.find((i) => i.id === sc.instance_id));
+    const inst2 = inst?.id ? state.instances.find((i) => i.id === inst.id) : undefined;
+    const events = inst2 ? mockInstanceEvents(inst2) : [];
+    const qs2 = new URLSearchParams(req.url.split("?")[1] || "");
+    const offset = Math.max(Number(qs2.get("offset") || 0), 0);
+    const limit = Math.min(Math.max(Number(qs2.get("limit") || 300), 1), 1000);
+    return send(res, {
+      events: events.slice(offset, offset + limit),
+      total: events.length,
+      offset,
+      limit,
+    });
+  }
+
   // -------- Run 账本投影（契约 §3.6）+ 任务情报（契约 §3.7）-----------------
   // 确定性 fixture：已知 scan 返回同一份假设快照（含 observed/inferred、
   // 引擎 source、finding_ref）；情报按 task 维度聚合，分诊 PATCH 落内存覆盖层。
@@ -2139,7 +2358,7 @@ setInterval(() => {
     if (hit) {
       broadcastEvent({
         type: "approval_rule_hit",
-        content: `Approval rule matched — allowed without an approval row`,
+        content: `命中审批豁免规则——免审批直接放行`,
         timestamp: nowIso(),
         agent_id: run.id,
         instance_id: run.id,
@@ -2153,9 +2372,9 @@ setInterval(() => {
   // 前端按 message_id 累积成打字气泡，done 后固化为事件行。
   if (i % 9 === 5) {
     const rounds = [
-      "The httpx sweep found 3 live endpoints on the api host. Combined with the 401/200 differential we recorded earlier, /api/v1/orders is the strongest IDOR candidate so far.",
-      "Nuclei came back clean on the passive set, so I'm moving the injection lane to claim the next hypothesis while the coordinator keeps widening endpoint coverage.",
-      "Two signals contradict on /admin: the role-A session got 200, but the fresh cookie replay got 401. Treating the first as stale-session noise and re-verifying before reporting.",
+      "httpx 扫到 api 主机 3 个存活端点。结合此前记录的 401/200 差异，/api/v1/orders 是目前最强的 IDOR 候选，下一轮做双账号交叉验证。",
+      "被动漏扫无命中，注入泳道转去认领下一条假设，协调器继续扩端点覆盖。",
+      "/admin 出现信号矛盾：角色 A 会话拿到 200，新 cookie 重放却是 401。先按过期会话噪声处理，上报前重新验证。",
     ];
     const text = rounds[(i / 9 | 0) % rounds.length];
     const msgId = `msg_${run.id}_${i}`;

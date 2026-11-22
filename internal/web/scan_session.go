@@ -19,6 +19,7 @@ import (
 	"github.com/xalgord/xalgorix/v4/internal/platform"
 	"github.com/xalgord/xalgorix/v4/internal/scanctx"
 	"github.com/xalgord/xalgorix/v4/internal/scopeguard"
+	"github.com/xalgord/xalgorix/v4/internal/tools/intelligence"
 	"github.com/xalgord/xalgorix/v4/internal/tools/notes"
 	"github.com/xalgord/xalgorix/v4/internal/tools/reporting"
 	"github.com/xalgord/xalgorix/v4/internal/trafficproxy"
@@ -203,6 +204,20 @@ func (s *Server) executeScanSession(sess *scanSession) {
 	// 0. Create and activate a per-session ScanContext for isolation.
 	//    This must happen BEFORE any tool state is touched.
 	sctx := scanctx.New(sess.id, sess.scanDir)
+	// Link the platform run to the scan-data identity. Runs are mounted at
+	// dispatch time, before this directory exists, so without this write
+	// ProjectScanIDs never learns the id the domain journal and the InfoItem
+	// replica are keyed by — and /api/info/* returns an empty region for a
+	// project whose scans did produce information.
+	if sess.instanceID != "" && sess.id != "" {
+		if store := s.currentPlatformStore(); store != nil {
+			linkCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			if err := store.SetRunLegacyScanID(linkCtx, sess.instanceID, sess.id); err != nil {
+				log.Printf("[platform] link run %s to scan %s failed: %v", sess.instanceID, sess.id, err)
+			}
+			cancel()
+		}
+	}
 	cfg := s.configSnapshot()
 	if cfg != nil {
 		sctx.Ledger.SetVOIWeight(cfg.VOIWeight)
@@ -260,11 +275,13 @@ func (s *Server) executeScanSession(sess *scanSession) {
 			defer logRecover("session.resetContextState")
 			reporting.ResetVulnerabilitiesForContext(sctx.ID)
 			notes.ResetNotesForContext(sctx.ID)
+			intelligence.ResetForContext(sctx.ID)
 		}()
 	}
 
 	// 1b. Configure notes disk persistence → saves notes.json in scan directory
 	notes.SetPersistPathForContext(sctx.ID, sess.scanDir)
+	intelligence.SetPersistPathForContext(sctx.ID, sess.scanDir)
 	if !sess.resetState {
 		// Resume scenario: load previously saved notes from disk
 		if _, err := notes.LoadFromDiskForContext(sctx.ID); err != nil {
@@ -278,6 +295,9 @@ func (s *Server) executeScanSession(sess *scanSession) {
 				log.Printf("[RESUME] %s: %v — continuing with in-memory notes only", sctx.ID, err)
 			}
 		}
+		if _, err := intelligence.LoadFromDiskForContext(sctx.ID); err != nil {
+			log.Printf("[RESUME] %s: %v — continuing with in-memory intelligence only", sctx.ID, err)
+		}
 	}
 
 	// 1c. Configure hypothesis/evidence ledger persistence → ledger.json.
@@ -290,6 +310,23 @@ func (s *Server) executeScanSession(sess *scanSession) {
 	} else {
 		// Resume scenario: reload the durable hypothesis/evidence graph.
 		sctx.Ledger.LoadFromDisk()
+	}
+
+	// 1d. The operator objective enters the information layer as a
+	// human-sourced observation (charter 2/3.4): operator intent is an
+	// observed InfoItem, never a verdict. A missing journal must never
+	// stop the scan - the objective stays in the prompt either way.
+	if sess.objective != nil && sctx.Ledger != nil {
+		item := scanctx.NewObjectiveInfoItem(scanctx.ObjectiveObservation{
+			ID:        objectiveInfoItemID(sess),
+			ProjectID: sess.objectiveProjectID,
+			TaskID:    sess.objectiveTaskID,
+			Statement: sess.objective.Statement,
+			Criteria:  objectiveCriterionLines(sess.objective),
+		})
+		if err := sctx.Ledger.AppendObjectiveObservation(&item, "operator objective recorded"); err != nil {
+			log.Printf("[objective] %s: journal append failed: %v", sess.id, err)
+		}
 	}
 
 	// 2. Set working directory (context-aware)
@@ -310,57 +347,75 @@ func (s *Server) executeScanSession(sess *scanSession) {
 	if sess.llmClient != nil {
 		agentOpts = append(agentOpts, agent.WithLLMClient(sess.llmClient))
 	}
-	// HITL approval gate (R2a, REDESIGN §5.2): one gate bound to this scan
-	// instance + ScanContext. nil when the pipeline is disabled (mode=off is
-	// the default) so the registry keeps its byte-identical legacy behavior.
-	// Eino installs the interrupt-aware broker instead; installing both would
-	// park the same call twice. Both adapters bind the agent's secret-value
-	// registry AFTER construction (HIGH-1: by-value payload redaction before
-	// persistence — the secrets register during Run's prepareScanEnvironment).
-	einoMode := sess.cfg != nil && strings.EqualFold(strings.TrimSpace(sess.cfg.Engine), "eino")
-	var legacyGate *registryGate
-	var einoBroker *einoApprovalBroker
-	if einoMode {
-		databaseURL := ""
-		if cfg != nil {
-			databaseURL = cfg.DatabaseURL
-		}
-		store, err := engine.OpenCheckpointStore(context.Background(), s.dataDir, databaseURL)
-		if err != nil {
-			// PG is a cold-path capability: a database outage must not disable
-			// scanning. Fall back to the atomic file checkpoint, loudly.
-			log.Printf("[eino] PostgreSQL checkpoint unavailable for %s: %v — using file fallback", sess.instanceID, err)
-			store, err = engine.NewFileCheckpointStore(s.dataDir)
-			if err != nil {
-				log.Printf("[eino] file checkpoint unavailable for %s: %v", sess.instanceID, err)
-				sess.abortReason = "eino_checkpoint_unavailable"
-				return
-			}
-		}
-		defer engine.CloseCheckpointStore(store)
-		einoBroker = s.einoApprovalBroker(sess.instanceID, sctx)
-		agentOpts = append(agentOpts, agent.WithEinoRuntime(store, einoBroker))
-	} else if gate := s.approvalGateFor(sess.instanceID, sctx); gate != nil {
-		legacyGate = gate
-		agentOpts = append(agentOpts, agent.WithApprovalGate(gate))
+	// Operator-authored user skills ride into the per-scan skill state
+	// (best-effort: no store / store error = corpus-only scan, charter §6.6).
+	if userSkills := s.scanUserSkills(); len(userSkills) > 0 {
+		agentOpts = append(agentOpts, agent.WithUserSkills(userSkills))
 	}
+	// Operator-authored delegation profiles merge behind the builtin
+	// specialists (same best-effort posture).
+	if profiles := s.scanAgentProfiles(); len(profiles) > 0 {
+		agentOpts = append(agentOpts, agent.WithAgentProfiles(profiles))
+	}
+	// Operator-registered MCP servers bridge their tools into the registry
+	// at Run start (connection failures skip the server, never the scan).
+	if mcpSpecs := s.scanMcpServers(); len(mcpSpecs) > 0 {
+		agentOpts = append(agentOpts, agent.WithMcpServers(mcpSpecs))
+	}
+	// HITL approval is an execution-time obligation implemented by the Eino
+	// interrupt/resume protocol. The broker binds the agent's secret registry
+	// after construction (HIGH-1: by-value payload redaction before
+	// persistence — secrets register during Run's prepareScanEnvironment).
+	databaseURL := ""
+	if cfg != nil {
+		databaseURL = cfg.DatabaseURL
+	}
+	store, err := engine.OpenCheckpointStore(context.Background(), s.dataDir, databaseURL)
+	if err != nil {
+		// PG is a cold-path capability: a database outage must not disable
+		// scanning. Fall back to the atomic file checkpoint, loudly.
+		log.Printf("[eino] PostgreSQL checkpoint unavailable for %s: %v — using file fallback", sess.instanceID, err)
+		store, err = engine.NewFileCheckpointStore(s.dataDir)
+		if err != nil {
+			log.Printf("[eino] file checkpoint unavailable for %s: %v", sess.instanceID, err)
+			sess.abortReason = "eino_checkpoint_unavailable"
+			return
+		}
+	}
+	defer engine.CloseCheckpointStore(store)
+	// The broker constructor returns a typed nil when approvals are off; assigning
+	// it straight into engine.ApprovalBroker makes a non-nil interface holding a
+	// nil pointer, which defeats ApprovalTool's `broker == nil` guard and panics
+	// on the first approval-classified tool call. Keep the interface nil instead.
+	var einoBroker engine.ApprovalBroker
+	var brokerOpts *einoApprovalBroker
+	if b := s.einoApprovalBroker(sess.instanceID, sctx); b != nil {
+		einoBroker = b
+		brokerOpts = b
+	}
+	agentOpts = append(agentOpts, agent.WithRuntime(store, einoBroker))
 	agnt := agent.NewAgent(sess.cfg, "XalgorixAgent", events, scopeguard.Config{
 		BindAddr:           cfg.BindAddr,
 		Port:               s.port,
 		AllowLoopbackPorts: sess.allowLoopbackPorts,
 		AllowLocalTargets:  cfg.AllowLocalTargets,
 	}, agentOpts...)
-	// Bind the operator-secret registry into whichever approval adapter was
-	// installed (HIGH-1): approval payloads are by-value redacted with the
-	// same credentials the event stream redacts, before they reach the
-	// store, the WS stream, or the API.
-	if legacyGate != nil {
-		legacyGate.BindSecrets(agnt.SecretValues)
-	}
-	if einoBroker != nil {
-		einoBroker.BindSecrets(agnt.SecretValues)
+	// Bind the operator-secret registry into the approval adapter (HIGH-1):
+	// approval payloads are by-value redacted with the same credentials the
+	// event stream redacts, before they reach the store, WS stream, or API.
+	if brokerOpts != nil {
+		brokerOpts.BindSecrets(agnt.SecretValues)
 	}
 	agnt.SetPhaseRestrictions(sess.phases)
+	// The operator objective (REDESIGN 3.1) is intent for the loop: the
+	// engine marks the plan tasks that serve a criterion, and the objective
+	// statement travels in its own prompt section. It never changes what
+	// counts as a finding. Since R-goal (REDESIGN D10) unmet required
+	// criteria DO close the loop's exits: the finish gate refuses voluntary
+	// finish and the plan-complete tail defers (internal/agent/goal_gate.go).
+	if spec := agentObjectiveSpec(sess.objective); spec != nil {
+		agnt.SetObjective(spec)
+	}
 	agnt.SetActivityPolicy(sess.reconMode, sess.scanIntensity, []string{sess.target, sess.parentTarget})
 	if sess.discoveryMode || isReconReportOnlyPhaseSelection(sess.phases) {
 		agnt.SetDiscoveryMode(true)
@@ -424,6 +479,14 @@ func (s *Server) executeScanSession(sess *scanSession) {
 			// before the restart; resumed defer notes stay compact.
 			agnt.SetDeferNoteDetailEmitted()
 		}
+		// Hot-resume ladder L2 (REDESIGN 2026-11-22): seed the session with a
+		// bounded projection of the previous conversation. Prompt context
+		// only — the state authority remains scan.json + notes + ledger
+		// (charter §6). Falls back to the L3 briefing alone when the journal
+		// is absent.
+		if transcript := conversationReplayTranscript(sctx); transcript != "" {
+			agnt.SetConversationReplay(transcript)
+		}
 		if briefing := formatResumeBriefing(sess.record, sctx.ID); briefing != "" {
 			agnt.SetResumeBriefing(briefing)
 		}
@@ -433,6 +496,12 @@ func (s *Server) executeScanSession(sess *scanSession) {
 	// newer than the periodically saved record or exact instance snapshot.
 	if _, err := agnt.RestoreExecutionCheckpoint(); err == nil {
 		s.initializeSessionCounters(sess)
+		// The restore REPLACES the agent state, so the objective has to be
+		// re-attached: the operator's current objective wins over the one
+		// persisted in the checkpoint.
+		if spec := agentObjectiveSpec(sess.objective); spec != nil {
+			agnt.SetObjective(spec)
+		}
 	}
 	s.syncSessionAdmissionClocks(sess)
 
@@ -452,6 +521,12 @@ func (s *Server) executeScanSession(sess *scanSession) {
 
 	// 6. Build instruction with severity filter
 	instruction := sess.instruction
+	// The objective travels as its OWN section, never merged into the
+	// execution instruction (a task goal and an execution instruction are
+	// different things).
+	if sess.objective != nil {
+		instruction = buildObjectiveInstruction(sess.objective) + instruction
+	}
 	if len(sess.severityFilter) > 0 {
 		instruction = buildSeverityPrefix(sess.severityFilter) + "\n\n" + instruction
 	}
@@ -952,6 +1027,12 @@ func (s *Server) processEvent(evt agent.Event, sess *scanSession) {
 		s.instancesMu.RUnlock()
 	}
 
+	// Integration invocation records (MCP calls / skill loads / delegations):
+	// best-effort cross-scan projection derived from engine events. Runs
+	// before the thinking filter — derivation only consumes tool_result /
+	// delegated-finished shapes, so a thinking event falls through harmlessly.
+	deriveInvocationRecords(evt, sess)
+
 	// Filter thinking events from being stored or broadcast to the frontend
 	if evt.Type == "thinking" {
 		return
@@ -1224,6 +1305,12 @@ func formatResumeBriefing(rec *ScanRecord, contextID string) string {
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("🔄 SCENARIO RESUME BRIEFING (Continued scan session from Iteration %d):\n", rec.Iterations))
 	sb.WriteString(fmt.Sprintf("Target: %s\n", rec.Target))
+	// L3 (REDESIGN 2026-11-22): surface why the previous session ended so the
+	// resumed agent doesn't re-derive it from scratch (eino_runtime_error
+	// mid-tool, user_stopped, goal_achieved, …).
+	if rec.StopReason != "" {
+		sb.WriteString(fmt.Sprintf("Previous session ended with: %s. Pick up from there — do not redo completed work.\n", rec.StopReason))
+	}
 	if len(rec.Vulns) > 0 {
 		sb.WriteString(fmt.Sprintf("Confirmed Vulnerabilities Reported So Far (%d):\n", len(rec.Vulns)))
 		for _, v := range rec.Vulns {
@@ -1320,6 +1407,10 @@ func (s *Server) capturePlanDisposition(sess *scanSession) {
 		sess.record.PhaseStatus = agent.PhaseStatusMap(dispositions)
 		sess.record.PhaseReasons = agent.PhaseReasonMap(dispositions)
 	}
+	// The objective evaluation is captured on the same terminal paths as
+	// the plan disposition, so a finished run and an interrupted run both
+	// carry the honest objective state.
+	s.captureObjectiveDisposition(sess)
 	s.mirrorScanIntegrity(sess.instanceID, sess.record)
 }
 

@@ -271,6 +271,8 @@ export interface ListParams {
   q?: string;
   status?: string;
   mode?: string;
+  /** Project isolation filter (wire name: project_id). */
+  projectId?: string;
 }
 
 export interface InstancesResponse {

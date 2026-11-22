@@ -255,6 +255,7 @@ function listQuery(params: ListParams): string {
   if (params.q && params.q.trim()) sp.set("q", params.q.trim());
   if (params.status && params.status !== "all") sp.set("status", params.status);
   if (params.mode && params.mode !== "all") sp.set("mode", params.mode);
+  if (params.projectId) sp.set("project_id", params.projectId);
   const qs = sp.toString();
   return qs ? `?${qs}` : "";
 }

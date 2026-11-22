@@ -178,6 +178,59 @@ func (s *Server) retryReadyExactSnapshot(inst *ScanInstance) error {
 	return nil
 }
 
+// errDispatchBusy reports a snapshot that cannot be reopened right now
+// (still stopping / mid-flight) — the caller maps it to 409.
+var errDispatchBusy = errors.New("dispatch is busy")
+
+// reactivateTerminalDispatchSnapshot reopens a terminal exact snapshot as a
+// pending dispatch under the SAME instance id, reserving the id in-process.
+// This is the 1:1 task:run re-dispatch path (POST /api/tasks/{id}/runs on a
+// finished/stopped/failed run, REDESIGN 2026-11-22): rewriting — not
+// bypassing — the tombstone keeps registerMultiScan's exact-stop guard
+// intact (it sees a pending snapshot and proceeds) while a stale duplicate
+// of the same POST finds the reservation and is rejected as busy. The
+// snapshot's durable counters (tokens/progress) are preserved so the
+// IsResume merge in registerMultiScan keeps continuity.
+//
+// Returns reactivated=false with a nil error when no snapshot exists (a
+// save-only or purged history): the caller then dispatches through the
+// standard fresh path under the same id.
+func (s *Server) reactivateTerminalDispatchSnapshot(instanceID string, req ScanRequest) (bool, error) {
+	s.dispatchMu.Lock()
+	defer s.dispatchMu.Unlock()
+	rec, err := s.loadExactDispatchSnapshot(instanceID)
+	if errors.Is(err, errDispatchSnapshotNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if strings.EqualFold(rec.Status, "stopping") {
+		return false, fmt.Errorf("%w: instance %s is still stopping", errDispatchBusy, instanceID)
+	}
+	if !isTerminalScanStatus(rec.Status) {
+		return false, fmt.Errorf("%w: instance %s is %s", errDispatchBusy, instanceID, rec.Status)
+	}
+	now := time.Now().Format(time.RFC3339Nano)
+	rec.Status = "pending"
+	rec.StopReason = ""
+	rec.FinishedAt = ""
+	rec.StartedAt = now
+	// Fresh operator intent wins (goal/instruction may have been PATCHed on
+	// the task between runs — that is the documented continuation lever).
+	rec.Name = req.Name
+	rec.Instruction = req.Instruction
+	rec.Target = strings.Join(req.Targets, ", ")
+	if err := s.saveExactDispatchSnapshot(rec); err != nil {
+		return false, err
+	}
+	if s.dispatchReservations == nil {
+		s.dispatchReservations = make(map[string]bool)
+	}
+	s.dispatchReservations[instanceID] = true
+	return true, nil
+}
+
 // abortPendingDispatchSnapshot records a concrete local rejection when HTTP
 // acceptance cannot also persist a resumable queue request. A retry therefore
 // sees a terminal rejection instead of an orphaned pending acknowledgement.

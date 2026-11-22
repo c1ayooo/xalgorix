@@ -3,17 +3,12 @@ package agent
 
 import (
 	"context"
-
-	"github.com/cloudwego/eino/adk"
-
 	"fmt"
-	"github.com/xalgord/xalgorix/v4/internal/engine"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -21,20 +16,25 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cloudwego/eino/adk"
+
 	"github.com/xalgord/xalgorix/v4/internal/attacksurface"
 	"github.com/xalgord/xalgorix/v4/internal/config"
+	"github.com/xalgord/xalgorix/v4/internal/domainjournal"
+	"github.com/xalgord/xalgorix/v4/internal/engine"
 	"github.com/xalgord/xalgorix/v4/internal/llm"
 	"github.com/xalgord/xalgorix/v4/internal/safe"
 	"github.com/xalgord/xalgorix/v4/internal/scanctx"
 	"github.com/xalgord/xalgorix/v4/internal/scopeguard"
 	"github.com/xalgord/xalgorix/v4/internal/tools"
-	"github.com/xalgord/xalgorix/v4/internal/tools/agentmail"
 	"github.com/xalgord/xalgorix/v4/internal/tools/agentsgraph"
 	"github.com/xalgord/xalgorix/v4/internal/tools/browser"
 	"github.com/xalgord/xalgorix/v4/internal/tools/codesearch"
 	"github.com/xalgord/xalgorix/v4/internal/tools/fileedit"
 	"github.com/xalgord/xalgorix/v4/internal/tools/finish"
 	"github.com/xalgord/xalgorix/v4/internal/tools/httpclient"
+	"github.com/xalgord/xalgorix/v4/internal/tools/intelligence"
+	mcptool "github.com/xalgord/xalgorix/v4/internal/tools/mcp"
 	"github.com/xalgord/xalgorix/v4/internal/tools/notes"
 	oobtool "github.com/xalgord/xalgorix/v4/internal/tools/oob"
 	"github.com/xalgord/xalgorix/v4/internal/tools/pageagent"
@@ -94,6 +94,9 @@ func (a *Agent) maxRateLimitWait() time.Duration {
 // tool name, falling back to defaultToolHardTimeout when the tool is not
 // listed in toolHardTimeout.
 func (a *Agent) hardTimeoutFor(tool string) time.Duration {
+	if isExecChannelTool(tool) && int(a.execTimeoutStreak.Load()) >= execChannelBreakerThreshold {
+		return execChannelDegradedTimeout
+	}
 	if t, ok := toolHardTimeout[tool]; ok {
 		return t
 	}
@@ -174,12 +177,6 @@ type Event struct {
 	Resumable bool
 }
 
-// toolExecResult holds the result of an async tool execution.
-type toolExecResult struct {
-	Result tools.Result
-	Err    error
-}
-
 func (a *Agent) protocolResetNudge(nudge string) string {
 	if a.registry == nil {
 		return nudge
@@ -209,21 +206,22 @@ type Agent struct {
 	// XML-in-text dialect. Resolved once at the start of Run from the operator
 	// flag plus the resolved endpoint, so it is stable for the whole scan.
 	nativeToolCalling bool
-	nativeToolDefs    []llm.ToolDefinition
 	registry          *tools.Registry
-	// approvalGate is the HITL approval hook installed on the registry via
-	// WithApprovalGate (REDESIGN §5.2 R2). nil (default) = ungated. Child
-	// agents spawned through agentsgraph inherit it so delegated lanes go
-	// through the same obligation as the coordinator.
-	approvalGate tools.ApprovalGate
-	// einoCheckpointStore/einoApprovalBroker are set only when the operator
-	// explicitly selected the Eino engine. They remain nil on the legacy path.
-	einoCheckpointStore        adk.CheckPointStore
-	einoApprovalBroker         engine.ApprovalBroker
-	einoFinished               atomic.Bool
-	einoFinishAccepted         atomic.Bool                        // set when the finish gate accepts a finish call; the eino StopCheck reads it because AfterTool (completeWithFinish) can race the ADK's next model turn
-	einoRunCancel              atomic.Pointer[context.CancelFunc] // set by runEinoLoop; completeWithFinish cancels it so the ADK graph stops before another model call
+	// checkpointStore/approvalBroker are the durable ADK seams. scan_session
+	// injects them at construction; a caller that omits them gets a per-scan
+	// file/memory store at run time.
+	checkpointStore            adk.CheckPointStore
+	approvalBroker             engine.ApprovalBroker
+	scanFinished               atomic.Bool
+	finishAccepted             atomic.Bool                        // set when the finish gate accepts a finish call; StopCheck reads it because AfterTool (completeWithFinish) can race the ADK's next model turn
+	goalAchievedEmitted        atomic.Bool                        // once-only guard for the R-goal auto-stop (goal_achieved)
+	runCancel                  atomic.Pointer[context.CancelFunc] // set by runLoop; completeWithFinish cancels it so the ADK graph stops before another model call
+	nextTemperature            atomic.Pointer[float64]            // one-shot per-role temperature for the next model turn
 	scanCtx                    *scanctx.ScanContext               // per-session state (vulns, notes, terminal, browser)
+	userSkills                 []skillstool.UserSkill             // operator-authored skills injected for THIS scan only
+	userProfiles               []specialistProfile                // operator-authored delegation profiles injected for THIS scan only
+	mcpServers                 []mcptool.ServerSpec               // operator-registered MCP servers for THIS scan only
+	mcpManager                 *mcptool.Manager                   // per-scan MCP session owner (nil until Run)
 	messages                   []llm.Message
 	msgMu                      sync.Mutex
 	events                     chan Event
@@ -238,15 +236,16 @@ type Agent struct {
 	cancel                     context.CancelFunc
 	lastActivity               time.Time
 	activityMu                 sync.Mutex
-	scanStart                  time.Time // when Run() was called
-	discoveryMode              bool      // When true, allow finish at any iteration (for Phase 1 enumeration)
-	singleHostScope            bool      // single-target scan: no subdomain discovery or subdomain obligations
-	allowedPhases              []int     // selected methodology phases, empty means all
-	reconMode                  string    // active or passive reconnaissance
-	scanIntensity              string    // active or passive testing/scanning
-	activityHosts              []string  // normalized target hosts used by passive policy
-	targets                    []string  // raw scan targets from Run(), used to resolve a base URL for probe_hypothesis
-	passiveReconGuardActive    bool      // full scans with passive recon block direct access until passive evidence is collected
+	scanStart                  time.Time      // when Run() was called
+	discoveryMode              bool           // When true, allow finish at any iteration (for Phase 1 enumeration)
+	singleHostScope            bool           // single-target scan: no subdomain discovery or subdomain obligations
+	allowedPhases              []int          // selected methodology phases, empty means all
+	objective                  *ObjectiveSpec // operator-stated goal of this session (intent, not authority)
+	reconMode                  string         // active or passive reconnaissance
+	scanIntensity              string         // active or passive testing/scanning
+	activityHosts              []string       // normalized target hosts used by passive policy
+	targets                    []string       // raw scan targets from Run(), used to resolve a base URL for probe_hypothesis
+	passiveReconGuardActive    bool           // full scans with passive recon block direct access until passive evidence is collected
 	passiveReconGuardDone      bool
 	passiveReconPassiveLookups int
 	passiveReconBlockedActive  int
@@ -276,6 +275,11 @@ type Agent struct {
 	// history when a scan is resumed/restarted across server restarts.
 	initialIter         int
 	resumeBriefing      string
+	// replayTranscript carries the 1:1 hot-resume projection of the previous
+	// session's conversation (built by the web layer from events.jsonl). It is
+	// prompt context only — the state authority remains scan.json + notes +
+	// ledger (charter §6: events cannot replay the same decision).
+	replayTranscript    string
 	assignedClasses     []string
 	laneScoped          bool
 	checkpointLoaded    bool
@@ -284,11 +288,6 @@ type Agent struct {
 	resumeFindings      []reporting.Vulnerability
 	publishedAssessment atomic.Pointer[assessmentSnapshot]
 	livenessExpired     atomic.Bool
-	// providerRetry marks that the previous iteration ended in an LLM provider
-	// retry (rate limit, overload, quota or error backoff). The model got no
-	// turn, so the next iteration must not count toward the idle limits.
-	// Touched only by the run loop goroutine.
-	providerRetry bool
 
 	// deferNoteSuppressed restores the specialist-wave defer detail latch
 	// across server restarts: a resumed run emits only compact defer notes
@@ -349,23 +348,6 @@ func WithLLMClient(c *llm.Client) AgentOption {
 	}
 }
 
-// WithApprovalGate installs the HITL approval gate (REDESIGN §5.2 R2, the
-// "第 0.5 环") on the agent's tool registry, next to the SetRequestGuard/
-// SetDialGuard installation above. The gate runs at the very top of
-// registry.Execute and blocks until the operator decides, the deadline
-// elapses (timeout = rejection), or the scan context is cancelled. nil (the
-// default) leaves the registry ungated — the verifier's restricted registry
-// is deliberately never given one (verifier.go: a report-gate approval could
-// deadlock the 15-minute watchdog race on the shared LLM client).
-func WithApprovalGate(g tools.ApprovalGate) AgentOption {
-	return func(a *Agent) {
-		a.approvalGate = g
-		if a.registry != nil {
-			a.registry.SetApprovalGate(g)
-		}
-	}
-}
-
 // WithBenchmarkIsolation constrains an agent-driven benchmark to evidence
 // obtainable through the declared target interface (plus an explicitly
 // attached source tree for white-box cases). It prevents a locally hosted
@@ -374,6 +356,98 @@ func WithBenchmarkIsolation() AgentOption {
 	return func(a *Agent) {
 		a.benchmarkIsolated = true
 	}
+}
+
+// WithUserSkills carries this scan's operator-authored skill set (from the
+// platform store) into the per-scan skill state. Per-scan by construction:
+// concurrent scans never observe each other's sets. nil = corpus only.
+func WithUserSkills(skills []skillstool.UserSkill) AgentOption {
+	return func(a *Agent) {
+		a.userSkills = skills
+	}
+}
+
+// WithAgentProfiles carries this scan's operator-authored delegation
+// profiles (from the platform store; enabled filter applied by the caller).
+// They merge behind the builtin specialists and participate in both the
+// automatic wave and spawn_agent by role name. Per-scan by construction.
+func WithAgentProfiles(profiles []specialistProfile) AgentOption {
+	return func(a *Agent) {
+		a.userProfiles = profiles
+	}
+}
+
+// WithMcpServers carries this scan's operator-registered MCP server specs.
+// Connection happens at Run start (bounded); a server that fails to connect
+// or enumerate is skipped with a visible event — the scan continues without
+// its tools (charter §6.6: an unavailable integration never blocks scanning).
+func WithMcpServers(specs []mcptool.ServerSpec) AgentOption {
+	return func(a *Agent) {
+		a.mcpServers = specs
+	}
+}
+
+// setupMcpTools connects the scan's MCP servers and bridges their tools into
+// the registry. Called once per Run before the prompt schema snapshot so a
+// bridged tool looks exactly like any registered tool to the model. The
+// manager is closed when Run returns (stdio children die with the scan).
+func (a *Agent) setupMcpTools() {
+	if a == nil || len(a.mcpServers) == 0 {
+		return
+	}
+	if a.mcpManager != nil {
+		a.mcpManager.Close()
+	}
+	mgr := mcptool.NewManager()
+	a.mcpManager = mgr
+	for _, spec := range a.mcpServers {
+		// HTTP servers dial through the same guards the HTTP tools use:
+		// redirect hops re-checked, post-DNS addresses re-checked.
+		spec.RequestGuard = a.checkHTTPHop
+		spec.DialGuard = a.checkDialAddr
+		connectCtx, cancel := context.WithTimeout(a.ctx, 60*time.Second)
+		descriptors, err := mgr.Connect(connectCtx, spec)
+		cancel()
+		if err != nil {
+			log.Printf("[mcp] server %q unavailable: %v", spec.Name, err)
+			a.emit(Event{Type: "message", Content: a.opf("⚠️ MCP server %q unavailable (%v) — its tools are not available this scan.", "⚠️ MCP 服务器 %q 不可用（%v）——本次扫描无法使用其工具。", spec.Name, err)})
+			continue
+		}
+		names := make([]string, 0, len(descriptors))
+		for _, td := range descriptors {
+			names = append(names, td.Name)
+		}
+		mgr.BridgeTools(a.registry)
+		a.emit(Event{Type: "message", Content: a.opf("🔌 MCP server %q connected: %d tool(s) registered (%s).", "🔌 MCP 服务器 %q 已连接：注册 %d 个工具（%s）。", spec.Name, len(descriptors), strings.Join(names, ", "))})
+	}
+}
+
+// mergedSpecialistProfiles returns the builtin specialists followed by this
+// scan's operator-authored profiles — the single delegation vocabulary the
+// engine spawns from (wave, spawn_agent, nudge prompt).
+func (a *Agent) mergedSpecialistProfiles() []specialistProfile {
+	if a == nil {
+		return defaultSpecialistProfiles
+	}
+	out := make([]specialistProfile, 0, len(defaultSpecialistProfiles)+len(a.userProfiles))
+	out = append(out, defaultSpecialistProfiles...)
+	out = append(out, a.userProfiles...)
+	return out
+}
+
+// lookupUserProfile resolves an operator-authored profile by exact role
+// name (spawn vocabulary). Builtin roles never match here — they resolve
+// through determineAgentType.
+func (a *Agent) lookupUserProfile(role string) (specialistProfile, bool) {
+	if a == nil {
+		return specialistProfile{}, false
+	}
+	for _, p := range a.userProfiles {
+		if p.Role == role {
+			return p, true
+		}
+	}
+	return specialistProfile{}, false
 }
 
 // withRateLimitBackoff overrides the progressive rate-limit backoff policy.
@@ -457,14 +531,20 @@ func NewAgent(cfg *config.Config, name string, events chan Event, localGuard sco
 		cfg = config.Get()
 	}
 
-	// Fix Python httpx interfering with ProjectDiscovery httpx
+	// An iteration cap below the engine default starves a single-target scan:
+	// recon alone consumes most of it and the report never lands. The engine
+	// default is 20; an operator override is honoured but flagged, because the
+	// symptom (completion=partial, zero findings) looks like a model failure.
+	if cfg.MaxIterations > 0 && cfg.MaxIterations < 20 {
+		log.Printf("[agent] XALGORIX_MAX_ITERATIONS=%d is below the engine default 20 — single-target scans will likely end partial before reporting", cfg.MaxIterations)
+	}
 	fixHttpxConflict()
 
 	// Resolve ScanContext — use provided or fall back to default.
 	// Also collect any AgentOption values from the polymorphic
-	// tail so callers can mix the legacy ScanContext-only call
-	// shape with the new B1 option-bearing call shape without
-	// either side knowing about the other.
+	// tail so callers can mix the ScanContext-only call shape with
+	// AgentOption-bearing call shapes without either side knowing about the
+	// other.
 	var sctx *scanctx.ScanContext
 	var opts []AgentOption
 	for _, v := range scOrOpts {
@@ -505,11 +585,13 @@ func NewAgent(cfg *config.Config, name string, events chan Event, localGuard sco
 	// NOTE: playwright.Register removed — it registered the same "browser_action" name
 	// and overwrote the enhanced rod browser with a weaker curl-based stub.
 	notes.Register(reg)
+	intelligence.Register(reg)
 	finish.Register(reg)
 	python.Register(reg)
 	websearch.Register(reg)
-	agentmail.Register(reg)
-	skillstool.Register(reg, cfg.SkillsDir)
+	// NOTE: skill tools register AFTER the AgentOption tail is applied (see
+	// below) so this scan's operator-authored skill set can ride WithUserSkills
+	// into the per-scan skill state.
 	oobtool.Register(reg)
 	codesearch.Register(reg)
 	reg.SetLeanSchema(cfg.LeanToolSchema)
@@ -553,6 +635,10 @@ func NewAgent(cfg *config.Config, name string, events chan Event, localGuard sco
 	for _, opt := range opts {
 		opt(a)
 	}
+	// Skill tools register after the option tail: the per-scan
+	// operator-authored skill set (WithUserSkills) must be on the agent
+	// before the per-scan skill state is built.
+	skillstool.Register(reg, cfg.SkillsDir, a.userSkills)
 	if a.scanBudget == nil {
 		a.scanBudget = newScanBudget()
 	}
@@ -693,7 +779,9 @@ func NewAgent(cfg *config.Config, name string, events chan Event, localGuard sco
 		// The lifetime cap must cover every engine lane plus one manual
 		// model-spawned agent: the early recon-discovery lane launches before
 		// the testing wave, so the old default (3) would strand the wave.
-		a.agentGraph = agentsgraph.NewWithLimit(a.ctx, len(defaultSpecialistProfiles)+1, func(ctx context.Context, agentID, subName string, targets []string, task string) (string, error) {
+		// Operator-authored profiles join the wave, so the merged set sizes
+		// the cap.
+		a.agentGraph = agentsgraph.NewWithLimit(a.ctx, len(a.mergedSpecialistProfiles())+1, func(ctx context.Context, agentID, subName string, targets []string, task string) (string, error) {
 			subEvents := make(chan Event, 256)
 			// All descendants join this root's graph and inherit its cancellation
 			// context. Creating a child therefore cannot overwrite another scan's
@@ -702,25 +790,24 @@ func NewAgent(cfg *config.Config, name string, events chan Event, localGuard sco
 			for _, opt := range delegatedAgentOptions(ctx, a.agentGraph, a.scanBudget, agentID, a.benchmarkIsolated) {
 				subArgs = append(subArgs, opt)
 			}
-			// Specialists run the same engine as the coordinator. Their unique
+			// Specialists run the same runtime as the coordinator. Their unique
 			// delegatedAgentID gives them a per-agent checkpoint namespace.
-			if a.einoCheckpointStore != nil {
-				subArgs = append(subArgs, WithEinoRuntime(a.einoCheckpointStore, a.einoApprovalBroker))
+			if a.checkpointStore != nil {
+				subArgs = append(subArgs, WithRuntime(a.checkpointStore, a.approvalBroker))
 			}
 			if a.client != nil {
 				subArgs = append(subArgs, WithLLMClient(a.client.Clone()))
-			}
-			// Delegated lanes inherit the HITL approval gate: a specialist
-			// running terminal/browser/HTTP tools carries the same operator
-			// obligation as the coordinator (REDESIGN §5.2).
-			if a.approvalGate != nil {
-				subArgs = append(subArgs, WithApprovalGate(a.approvalGate))
 			}
 			subAgent := NewAgent(cfg, subName, subEvents, a.localGuard, subArgs...)
 			a.registerChildAgent(subAgent)
 			defer a.unregisterChildAgent(subAgent)
 			subAgent.SetPhaseRestrictions(a.allowedPhases)
-			for _, profile := range defaultSpecialistProfiles {
+			// The specialist inherits the operator objective so its lane plan
+			// marks the tasks that serve a criterion (marking only).
+			if a.objective != nil {
+				subAgent.SetObjective(a.objective)
+			}
+			for _, profile := range a.mergedSpecialistProfiles() {
 				if profile.Role == subName {
 					subAgent.laneScoped = true
 					subAgent.assignedClasses = append([]string(nil), profile.VulnClasses...)
@@ -789,6 +876,18 @@ func NewAgent(cfg *config.Config, name string, events chan Event, localGuard sco
 			return results.String(), delegatedErr
 		})
 	}
+	// Delegation lifecycle audit → per-scan domain journal (best-effort: a
+	// journal-less context simply never records; delegation itself is never
+	// blocked by audit failures).
+	a.agentGraph.SetAuditSink(func(op domainjournal.Operation, summary string) {
+		sc := scanctx.Get(a.scanCtx.ID)
+		if sc == nil || sc.Ledger == nil {
+			return
+		}
+		if err := sc.Ledger.AppendInvocationAudit(op, domainjournal.Actor{Kind: domainjournal.ActorEngine, Source: "agentsgraph"}, summary); err != nil {
+			log.Printf("[audit] delegation record skipped: %v", err)
+		}
+	})
 	// Only the root coordinator can delegate. Prompt wording alone is not a
 	// sufficient boundary: removing the graph tools from child registries makes
 	// nested delegation impossible and keeps the one-wave lifetime budget exact.
@@ -864,10 +963,10 @@ func (a *Agent) noteDelegationDefer(reason string) {
 	// stay quiet), then keep change-triggered follow-ups to one line.
 	if !a.state.DelegationDeferDetailEmitted {
 		a.state.DelegationDeferDetailEmitted = true
-		a.emit(Event{Type: "message", Content: fmt.Sprintf("⏸️ Specialist wave deferred: %s. The wave launches automatically once the blocker clears (configuration blockers need an operator change).", reason)})
+		a.emit(Event{Type: "message", Content: a.opf("⏸️ Specialist wave deferred: %s. The wave launches automatically once the blocker clears (configuration blockers need an operator change).", "⏸️ 专家组暂缓：%s。阻碍解除后自动启动（配置类阻碍需要操作者介入）。", reason)})
 		return
 	}
-	a.emit(Event{Type: "message", Content: "⏸️ Specialist wave still deferred: " + compactDeferReason(reason)})
+	a.emit(Event{Type: "message", Content: a.op("⏸️ Specialist wave still deferred: ", "⏸️ 专家组仍处暂缓：") + compactDeferReason(reason)})
 }
 
 // compactDeferReason shortens a defer reason to a single line for
@@ -951,7 +1050,7 @@ func (a *Agent) maybeAutoDelegate(targets []string) string {
 	if !a.state.DelegationEnabled {
 		if !a.state.SingleAgentNoted {
 			a.state.SingleAgentNoted = true
-			a.emit(Event{Type: "message", Content: "🧭 Single-agent mode: specialist delegation is disabled by configuration. The root agent owns the complete methodology — reconnaissance, plan, testing, verification, and reporting — and every coverage gate applies unchanged. No specialist wave will be launched."})
+			a.emit(Event{Type: "message", Content: a.op("🧭 Single-agent mode: specialist delegation is disabled by configuration. The root agent owns the complete methodology — reconnaissance, plan, testing, verification, and reporting — and every coverage gate applies unchanged. No specialist wave will be launched.", "🧭 单代理模式：专家委派已被配置禁用。根代理独立完成全方法论——侦察、规划、测试、验证与报告——所有覆盖闸门照常生效，不会启动专家组。")})
 		}
 		return ""
 	}
@@ -1037,7 +1136,7 @@ func (a *Agent) maybeAutoDelegate(targets []string) string {
 }
 
 func (a *Agent) eligibleSpecialistProfiles() []specialistProfile {
-	profiles := make([]specialistProfile, 0, len(defaultSpecialistProfiles))
+	profiles := make([]specialistProfile, 0, len(defaultSpecialistProfiles)+len(a.userProfiles))
 	for _, profile := range defaultSpecialistProfiles {
 		// The discovery lane launches EARLY (stage E), not with the testing
 		// wave — its work is the wave's prerequisite, not a testing lane.
@@ -1048,6 +1147,16 @@ func (a *Agent) eligibleSpecialistProfiles() []specialistProfile {
 			continue
 		}
 		// Operator-toggled lanes are excluded from the wave entirely.
+		if a.specialistDisabled(profile.Role) {
+			continue
+		}
+		profiles = append(profiles, profile)
+	}
+	// Operator-authored profiles join the testing wave unconditionally: the
+	// enabled filter was applied at fetch (integration_inputs) and the
+	// operator toggle still applies. They get no special prerequisite
+	// gating — their contract is the operator's responsibility.
+	for _, profile := range a.userProfiles {
 		if a.specialistDisabled(profile.Role) {
 			continue
 		}
@@ -1248,7 +1357,7 @@ func (a *Agent) delegationEnabled() bool {
 	if _, ok := a.registry.Get("spawn_agent"); !ok {
 		return false
 	}
-	for _, profile := range defaultSpecialistProfiles {
+	for _, profile := range a.mergedSpecialistProfiles() {
 		if !a.specialistDisabled(profile.Role) {
 			return true
 		}
@@ -1410,21 +1519,6 @@ func (a *Agent) SetActivityPolicy(reconMode, scanIntensity string, targets []str
 	a.refreshPassiveReconGuard()
 }
 
-// appendToolOutcome records a tool result in the conversation.
-//
-// On the native channel the provider requires each result to reference the call
-// it answers, so it becomes a role:"tool" message carrying tool_call_id. The
-// XML path keeps the legacy user message, unchanged.
-func (a *Agent) appendToolOutcome(tc llm.ToolCall, text string) {
-	a.msgMu.Lock()
-	defer a.msgMu.Unlock()
-	if a.nativeToolCalling && tc.ID != "" {
-		a.messages = append(a.messages, llm.Message{Role: "tool", ToolCallID: tc.ID, Content: text})
-		return
-	}
-	a.messages = append(a.messages, llm.Message{Role: "user", Content: text})
-}
-
 // canonicalizeAssistantTurn renders an assistant turn in the canonical tool-
 // call format: the model's clean prose (tool XML already stripped) followed by
 // one well-formed <function=NAME>…</function> block per parsed/recovered call.
@@ -1537,7 +1631,7 @@ func (a *Agent) startWatchdog() func() {
 				// ── Reap dead processes that weren't properly untracked ──
 				reaped := a.scanCtx.Terminal.ReapDead()
 				if reaped > 0 {
-					a.emit(Event{Type: "message", Content: fmt.Sprintf("🧹 Watchdog: reaped %d dead process(es) from tracker", reaped)})
+					a.emit(Event{Type: "message", Content: a.opf("🧹 Watchdog: reaped %d dead process(es) from tracker", "🧹 看门狗：已清理 %d 个失活进程", reaped)})
 				}
 
 				activeProcs := a.scanCtx.Terminal.ActiveProcessCount()
@@ -1582,11 +1676,11 @@ func (a *Agent) startWatchdog() func() {
 				if idleKillThreshold > 0 {
 					idleTime := a.sinceActivity()
 					if idleTime > 5*time.Minute && idleTime <= 10*time.Minute {
-						a.emit(Event{Type: "message", Content: fmt.Sprintf("⚠️ Watchdog: No activity for %s. No active processes.", idleTime.Round(time.Second))})
+						a.emit(Event{Type: "message", Content: a.opf("⚠️ Watchdog: No activity for %s. No active processes.", "⚠️ 看门狗：%s 无活动，当前无活跃进程。", idleTime.Round(time.Second))})
 					}
 
 					if idleTime > 10*time.Minute && idleTime <= idleKillThreshold {
-						a.emit(Event{Type: "message", Content: fmt.Sprintf("⚠️ Watchdog: Idle for %s. Will force-stop at %s.", idleTime.Round(time.Second), idleKillThreshold)})
+						a.emit(Event{Type: "message", Content: a.opf("⚠️ Watchdog: Idle for %s. Will force-stop at %s.", "⚠️ 看门狗：已空闲 %s，将于 %s 强制停止。", idleTime.Round(time.Second), idleKillThreshold)})
 					}
 
 					if idleTime > idleKillThreshold {
@@ -1612,175 +1706,6 @@ func (a *Agent) startWatchdog() func() {
 	}
 }
 
-// executeToolAsync runs a tool in a goroutine with heartbeat monitoring.
-// It keeps the watchdog alive by updating lastActivity while the tool runs,
-// and streams partial output from long-running terminal commands.
-//
-// The function body is guarded by safe.Recover so any panic in the tool
-// invocation, heartbeat plumbing, or watchdog hooks is converted into a
-// typed error rather than crashing the agent loop. The tool invocation is
-// additionally bounded by a context.WithTimeout derived from
-// hardTimeoutFor(toolName) plus a 30-second grace window so even tools
-// that ignore their own context still terminate within the ceiling.
-func (a *Agent) executeToolAsync(toolName string, toolArgs map[string]string) (result tools.Result, returnErr error) {
-	defer safe.Recover("agent.tool_exec", a.scanCtx.ID, &returnErr)
-
-	// Set up streaming callback for terminal commands
-	var lastPartialOutput string
-	a.scanCtx.Terminal.SetStreamCallback(func(partial string) {
-		a.touchActivity()
-		// Only emit if output changed
-		if partial != lastPartialOutput {
-			lastPartialOutput = partial
-			// Trim to last 500 chars for the UI
-			preview := partial
-			if len(preview) > 500 {
-				preview = "..." + preview[len(preview)-500:]
-			}
-			a.emit(Event{
-				Type:    "message",
-				Content: fmt.Sprintf("⏳ [%s] partial output:\n%s", toolName, preview),
-			})
-		}
-	})
-	defer a.scanCtx.Terminal.ClearStreamCallback()
-
-	// Hard timeout safety net (P2.1): bound the tool invocation by the
-	// per-tool ceiling plus a 30-second grace so even tools that ignore
-	// their own ctx still terminate. We derive from a.ctx so parent
-	// cancellation propagates as well.
-	//
-	// Exec-channel breaker: once consecutive exec tools have hit the hard
-	// cap (only possible when the exec backend is wedged), shrink the
-	// ceiling so a dead channel cannot burn the full 65 minutes per call.
-	hardTimeoutDuration := a.hardTimeoutFor(toolName)
-	degradedExecChannel := false
-	if isExecChannelTool(toolName) && int(a.execTimeoutStreak.Load()) >= execChannelBreakerThreshold {
-		hardTimeoutDuration = execChannelDegradedTimeout
-		degradedExecChannel = true
-	}
-	tcCtx, tcCancel := a.toolWaitContext(hardTimeoutDuration + 30*time.Second)
-	defer tcCancel()
-
-	// Execute in goroutine with panic recovery.
-	//
-	// NOTE (Task 6.3): this goroutine is intentionally NOT wrapped with
-	// safe.Go. The inner `defer recover()` here has bespoke behavior the
-	// generic safe.Recover cannot replicate: on panic it must construct
-	// a tools.Result{Error: "tool panicked: …"} and push it on resultCh
-	// so the agent loop can surface a tool result (with the typed err)
-	// to the LLM instead of bubbling the panic up. The enclosing
-	// executeToolAsync function body is already wrapped by
-	// `defer safe.Recover("agent.tool_exec", …)` (Task 6.2), which
-	// catches any panic that escapes this defer (e.g. a panic in the
-	// recover branch itself). Wrapping with safe.Go in addition would
-	// duplicate counter increments and log lines without adding safety.
-	resultCh := make(chan toolExecResult, 1)
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				log.Printf("[ERROR] [PANIC] Tool '%s' panicked: %v\n%s", toolName, r, debug.Stack())
-				resultCh <- toolExecResult{
-					Result: tools.Result{Error: fmt.Sprintf("tool panicked: %v", r)},
-					Err:    fmt.Errorf("tool '%s' panicked: %v", toolName, r),
-				}
-			}
-		}()
-		res, err := a.registry.ExecuteContext(tcCtx, toolName, toolArgs)
-		resultCh <- toolExecResult{Result: res, Err: err}
-	}()
-
-	// Heartbeat loop while waiting for tool to complete
-	heartbeat := time.NewTicker(15 * time.Second)
-	defer heartbeat.Stop()
-
-	for {
-		select {
-		case res := <-resultCh:
-			// Tool completed — update activity and return immediately.
-			// A promptly returning exec tool proves the launch path is
-			// healthy again: reset the exec-channel breaker.
-			a.touchActivity()
-			if isExecChannelTool(toolName) {
-				a.execTimeoutStreak.Store(0)
-			}
-			return res.Result, res.Err
-
-		case <-heartbeat.C:
-			// Keep watchdog alive while tool is running
-			a.touchActivity()
-
-		case <-tcCtx.Done():
-			if deadline, ok := a.scanDeadline(); ok && !time.Now().Before(deadline) {
-				if a.scanCtx != nil && a.scanCtx.Cancel != nil {
-					a.scanCtx.Cancel()
-				}
-				return tools.Result{Error: "Scan duration budget exhausted during tool execution"}, context.DeadlineExceeded
-			}
-			// Distinguish hard-timeout from parent cancellation. When the
-			// parent (a.ctx) is canceled, tcCtx.Err() is context.Canceled;
-			// when our own deadline elapses it is context.DeadlineExceeded.
-			if tcCtx.Err() == context.DeadlineExceeded {
-				// Signal cooperative tools before the hard fallback. Tools that
-				// do not implement ExecuteContext are counted so the terminal
-				// telemetry can distinguish a real leak from a normal timeout.
-				if !a.registry.SupportsContext(toolName) {
-					a.uncooperativeTimeouts.Add(1)
-				}
-				tcCancel()
-				a.emit(Event{Type: "error", Content: fmt.Sprintf("⛔ Tool '%s' timed out after %s. Force-returning to prevent infinite hang.", toolName, hardTimeoutDuration)})
-				if isExecChannelTool(toolName) {
-					streak := int(a.execTimeoutStreak.Add(1))
-					if streak == execChannelBreakerThreshold {
-						a.emit(Event{Type: "error", Content: fmt.Sprintf("⛔ EXEC-CHANNEL CIRCUIT BREAKER OPEN: %d consecutive exec tools hit the hard timeout — the execution backend is not returning results (a healthy channel never reaches this cap: terminal commands enforce their own, lower ceilings). terminal_execute/python_action calls are now capped at %s per call until one succeeds. If quick commands also fail, stop retrying: record a typed disposition for the remaining lane work, finish, and restart the scan/worker instead of queuing more commands.", streak, execChannelDegradedTimeout)})
-					}
-				}
-				switch toolName {
-				case "terminal_execute", "python_action":
-					a.scanCtx.Terminal.KillAll()
-				case "browser_action":
-					browser.CleanupContext(a.scanCtx.ID)
-				}
-				if degradedExecChannel {
-					return tools.Result{Error: fmt.Sprintf("[TIMEOUT exceeded %s] Exec channel is in degraded mode after consecutive hard timeouts — the execution backend is not returning results. Do not queue more long commands; record a typed disposition (blocked) for the remaining lane work and finish, or report the environment failure.", hardTimeoutDuration)}, nil
-				}
-				return tools.Result{Error: fmt.Sprintf("[TIMEOUT exceeded %s]", hardTimeoutDuration)}, nil
-			}
-			// Parent canceled (agent stopped).
-			return tools.Result{Error: "Agent stopped during tool execution"}, fmt.Errorf("agent canceled")
-		}
-	}
-}
-
-// Run starts the agent loop with the given targets and instructions.
-// buildNativeToolDefinitions converts the registry's visible tools into the
-// provider-neutral definitions sent on the native tool-calling channel. The
-// registry already applies role-scoped visibility and a stable sort, so the
-// request body stays byte-identical across iterations.
-func buildNativeToolDefinitions(reg *tools.Registry) []llm.ToolDefinition {
-	if reg == nil {
-		return nil
-	}
-	snaps := reg.VisibleToolSnapshots()
-	defs := make([]llm.ToolDefinition, 0, len(snaps))
-	for _, s := range snaps {
-		params := make([]llm.ToolParameter, 0, len(s.Parameters))
-		for _, p := range s.Parameters {
-			params = append(params, llm.ToolParameter{
-				Name:        p.Name,
-				Description: p.Description,
-				Required:    p.Required,
-			})
-		}
-		defs = append(defs, llm.ToolDefinition{
-			Name:        s.Name,
-			Description: s.Description,
-			Parameters:  params,
-		})
-	}
-	return defs
-}
-
 func (a *Agent) Run(targets []string, instruction string) {
 	// Stop-before-Run is a valid lifecycle outcome when exact cancellation wins
 	// the session admission race. Do not clone source, initialize browsers, or
@@ -1789,7 +1714,7 @@ func (a *Agent) Run(targets []string, instruction string) {
 		return
 	}
 	if _, err := a.RestoreExecutionCheckpoint(); err != nil {
-		a.stopForHook(HookResult{StopReason: "checkpoint_restore_failed", EmitMessage: "Scan stopped: execution checkpoint could not be restored safely; saved findings are preserved."})
+		a.stopForHook(HookResult{StopReason: "checkpoint_restore_failed", EmitMessage: a.op("Scan stopped: execution checkpoint could not be restored safely; saved findings are preserved.", "扫描已停止：执行检查点无法安全恢复；已保存的发现不受影响。")})
 		return
 	}
 	if terminal := a.terminalOutcome.Load(); terminal != nil {
@@ -1801,27 +1726,23 @@ func (a *Agent) Run(targets []string, instruction string) {
 			log.Printf("[checkpoint] final save failed: %v", err)
 		}
 	}()
+	// MCP bridge: connect + register BEFORE the prompt schema snapshot so a
+	// bridged tool is indistinguishable from any registered tool. Bounded and
+	// best-effort: a failed server skips, never blocks the scan.
+	a.setupMcpTools()
+	if a.mcpManager != nil {
+		defer a.mcpManager.Close()
+	}
 	a.targets = targets // remember the scan targets so probe_hypothesis can resolve a base URL for a bare path
 	if a.scanCtx != nil && a.delegatedAgentID == "" {
 		a.scanCtx.SetTargets(targets)
 	}
 	a.ctfMission = isExplicitCTFMission(instruction)
 	a.scanStart = time.Now()
-	// Resolve the tool-calling channel before the system prompt is built: the
-	// prompt differs depending on which one is active.
-	a.nativeToolCalling = a.cfg != nil && a.cfg.NativeToolCalls &&
-		a.client != nil && a.client.NativeToolCallingSupported()
-	if a.cfg != nil && strings.EqualFold(strings.TrimSpace(a.cfg.Engine), "eino") {
-		// The eino loop has no XML tool parser: the ADK speaks only the native
-		// channel, so the system prompt and tool surface must use native
-		// semantics regardless of XALGORIX_NATIVE_TOOL_CALLS (REDESIGN D3:
-		// native is the primary path). Protocol capability is fail-closed in
-		// runEinoLoop before any request is issued.
-		a.nativeToolCalling = a.client != nil && a.client.NativeToolCallingSupported()
-	}
-	if a.nativeToolCalling {
-		a.nativeToolDefs = buildNativeToolDefinitions(a.registry)
-	}
+	// Native tool calling is the primary channel. Endpoints that cannot carry
+	// the tools array use the ChatModel adapter's XML fallback; the prompt must
+	// describe the same channel the adapter will actually send.
+	a.nativeToolCalling = a.client != nil && a.client.NativeToolCallingSupported()
 	if a.scanBudget != nil {
 		a.scanBudget.start()
 	}
@@ -1839,7 +1760,7 @@ func (a *Agent) Run(targets []string, instruction string) {
 		})
 		defer stopCleanup()
 		if !time.Now().Before(deadline) {
-			a.stopForHook(HookResult{StopReason: "resource_budget", EmitMessage: "Scan stopped: original duration budget is exhausted; saved findings are preserved."})
+			a.stopForHook(HookResult{StopReason: "resource_budget", EmitMessage: a.op("Scan stopped: original duration budget is exhausted; saved findings are preserved.", "扫描已停止：原定时长预算耗尽；已保存的发现不受影响。")})
 			return
 		}
 	}
@@ -1869,6 +1790,11 @@ func (a *Agent) Run(targets []string, instruction string) {
 	if a.scanContextBriefing != "" {
 		a.messages = append(a.messages, llm.Message{Role: "user", Content: a.scanContextBriefing})
 	}
+	// Hot-resume transcript sits before the briefing: the replay is history,
+	// the briefing is the final "continue from here" instruction.
+	if a.replayTranscript != "" {
+		a.messages = append(a.messages, llm.Message{Role: "user", Content: a.replayTranscript})
+	}
 	if a.resumeBriefing != "" {
 		a.messages = append(a.messages, llm.Message{Role: "user", Content: a.resumeBriefing})
 	}
@@ -1896,6 +1822,9 @@ func (a *Agent) Run(targets []string, instruction string) {
 	a.state.DelegatedAgentID = a.delegatedAgentID
 	a.state.LaneScoped = a.laneScoped
 	a.state.AssignedClasses = append([]string(nil), a.assignedClasses...)
+	// Delegation vocabulary (builtin + operator-authored profiles) is frozen
+	// at Run so hooks and the engine spawn from the same set.
+	a.state.SpecialistProfiles = a.mergedSpecialistProfiles()
 	a.state.BenchmarkIsolated = a.benchmarkIsolated
 	a.state.ProfessionalAssessment = !a.ctfMission
 	a.state.AuthContextKnown = true
@@ -1950,881 +1879,9 @@ func (a *Agent) Run(targets []string, instruction string) {
 		return a.syncBudgetTokens()
 	}
 
-	// Running total of tool calls, for the optional resource budget.
-	toolCallsTotal := 0
-
-	// R4: an explicit eino selection runs the ADK loop. Any construction error
-	// is reported as an aborted terminal outcome; it never silently falls back
-	// to legacy (that would hide a configuration/checkpoint failure).
-	if a.cfg != nil && strings.EqualFold(strings.TrimSpace(a.cfg.Engine), "eino") {
-		a.runEinoLoop(systemPrompt, tokenCount)
-		return
-	}
-
-	iter := a.initialIter
-	for ; (a.scanBudget != nil || a.maxIter == 0 || iter < a.maxIter) && !a.stopped.Load() && (a.ctx == nil || a.ctx.Err() == nil); iter++ {
-		// Reset activity watchdog on each iteration — IMMEDIATELY, no delay
-		a.touchActivity()
-		a.state.Iteration = iter
-
-		// ── Resource budget / early-stopping (MAPTA §2.7/§3.3) ──
-		// Halt cleanly if a configured cap is hit. Findings already reported
-		// are persisted, so this is a graceful teardown, not a data loss.
-		if over, why := a.overBudget(toolCallsTotal); over {
-			a.emit(Event{Type: "message", Content: fmt.Sprintf("⏱️ Resource budget reached (%s) — stopping and finalizing. Findings reported so far are preserved.", why), TotalTokens: tokenCount()})
-			a.emit(Event{Type: "finished", Content: fmt.Sprintf("Scan stopped: resource budget reached (%s).", why), TotalTokens: tokenCount(), Aborted: true, AbortReason: "resource_budget"})
-			return
-		}
-		if a.scanBudget != nil && !a.scanBudget.reserveIteration(a.maxIter) {
-			reason := fmt.Sprintf("%d shared agent iterations ≥ scan cap %d", a.scanBudget.iterationCount(), a.maxIter)
-			a.emit(Event{Type: "message", Content: "⏱️ Resource budget reached (" + reason + ") — stopping and finalizing. Findings reported so far are preserved.", TotalTokens: tokenCount()})
-			a.emit(Event{Type: "finished", Content: "Scan stopped: resource budget reached (" + reason + ").", TotalTokens: tokenCount(), Aborted: true, AbortReason: "resource_budget"})
-			return
-		}
-		if !a.checkpointOrStop() {
-			return
-		}
-		// A provider retry is not a model turn: it must not spend the
-		// stuck-loop limit, the finish tail or the verification window. Each
-		// retry path is bounded on its own (the cumulative provider wait pauses
-		// the scan; plain errors stop after 25 attempts).
-		providerRetry := a.providerRetry
-		a.providerRetry = false
-		if !providerRetry {
-			if a.stopForHook(a.semanticLivenessCheck()) {
-				return
-			}
-			// Plan-complete, finding-idle finalizer: end the no-new-findings tail
-			// once the whole structured plan is exhausted (coverage churn alone
-			// keeps the semantic clock above alive, which let scans run many
-			// thousands of iterations past diminishing returns). A
-			// still-productive scan is never cut — any new finding resets the
-			// counter.
-			if a.autoFinalizeIfPlanComplete() {
-				return
-			}
-		}
-		if guardMsg := a.maybeCompletePassiveReconGuardAtIterationStart(iter); guardMsg != "" {
-			a.msgMu.Lock()
-			a.messages = append(a.messages, llm.Message{Role: "user", Content: guardMsg})
-			a.msgMu.Unlock()
-			a.emit(Event{Type: "message", Content: guardMsg, TotalTokens: tokenCount()})
-		}
-
-		if a.maxIter > 0 {
-			a.emit(Event{Type: "thinking", Content: fmt.Sprintf("Iteration %d/%d", iter+1, a.maxIter), TotalTokens: tokenCount()})
-		} else {
-			a.emit(Event{Type: "thinking", Content: fmt.Sprintf("Iteration %d", iter+1), TotalTokens: tokenCount()})
-		}
-
-		// ── Hook: OnIterationStart ──
-		iterResult := a.hooks.Fire(OnIterationStart, a.state, nil)
-		if autoDelegation := a.maybeAutoDelegate(targets); autoDelegation != "" {
-			// If the hook also produced its model-directed decomposition prompt on
-			// this pass, replace it: the engine has already done that work. Keep a
-			// planner/coverage nudge alongside the launch status when applicable.
-			if strings.Contains(iterResult.Nudge, "MULTI-AGENT DECOMPOSITION") || iterResult.Nudge == "" {
-				iterResult.Nudge = autoDelegation
-			} else {
-				iterResult.Nudge = autoDelegation + "\n\n" + iterResult.Nudge
-			}
-		}
-		if iterResult.Nudge != "" {
-			a.msgMu.Lock()
-			a.messages = append(a.messages, llm.Message{Role: "user", Content: iterResult.Nudge})
-			a.msgMu.Unlock()
-		}
-		if iterResult.EmitMessage != "" {
-			a.emit(Event{Type: "message", Content: iterResult.EmitMessage, TotalTokens: tokenCount()})
-		}
-
-		// Proactively prune before the LLM call when the accumulated
-		// message buffer has grown past pruneThresholdBytes. This is the
-		// pre-LLM pruning gate (Requirement 2.3 / Property P2.3) — it
-		// supplements the existing post-iteration prune at the end of
-		// the loop and the context-overflow recovery branch below, so
-		// the serialized buffer is bounded before every outbound call,
-		// not only after a 413 from the provider.
-		// Bounded working context (information-complete): replace tool-result
-		// messages older than the active window with retrieval stubs BEFORE
-		// the snapshot is taken, so aged raw output is not resent on every
-		// iteration. Every stubbed byte stays retrievable via read_tool_output.
-		if a.boundedContextEnabled() {
-			a.ageOutToolOutputs()
-		}
-		if a.shouldPruneBeforeLLM() {
-			a.pruneMessages()
-		}
-
-		// Snapshot the message buffer under msgMu before handing it to the
-		// LLM client. Chat() ranges over the slice to serialize the request
-		// while SendMessage() (called from the web chat handler on another
-		// goroutine) may append concurrently. Reading a.messages directly
-		// here is a data race: a concurrent append can reallocate the backing
-		// array mid-serialization. Copying under the lock gives Chat a stable
-		// view; messages that arrive during the call are picked up next iter.
-		a.msgMu.Lock()
-		msgsSnapshot := make([]llm.Message, len(a.messages))
-		copy(msgsSnapshot, a.messages)
-		a.msgMu.Unlock()
-
-		// Adaptive Temperature Control:
-		// Default to TempScanner (0.0) for 100% deterministic, consistent scan behavior.
-		// Dynamically boost to 0.2 when stuck or retrying failed calls to allow creative payload variation.
-		scannerTemp := scannerTemperatureFor(a.state)
-		a.client.SetTemperature(&scannerTemp)
-
-		category := reasoningRequestCategory(a.state)
-
-		var apiToolCalls []llm.ToolCall
-		var response string
-		var usage *llm.TokenUsage
-		var err error
-		if a.nativeToolCalling {
-			// Repair assistant/tool pairing at the boundary so pruning or an
-			// early exit on a previous iteration cannot make the history
-			// invalid for the provider.
-			msgsSnapshot = llm.NormalizeNativeToolHistory(msgsSnapshot)
-			response, apiToolCalls, usage, err = a.client.ChatWithUsageToolCalls(msgsSnapshot, a.nativeToolDefs)
-		} else {
-			response, usage, err = a.client.ChatWithUsage(msgsSnapshot)
-		}
-		a.recordTokenAttribution(usage, msgsSnapshot, iter, category, 0)
-		if usage != nil && usage.TotalTokens > 0 && a.state != nil {
-			a.state.FinishRecoveryPending = false
-		}
-		// Update activity after LLM response
-		a.touchActivity()
-		// A benchmark deadline, operator stop, or parent cancellation must win
-		// over provider retry logic. Otherwise an already-canceled request can
-		// enter the 25-attempt exponential backoff and keep a stopped scan alive
-		// for many minutes after its deadline.
-		if a.stopped.Load() || (a.ctx != nil && a.ctx.Err() != nil) {
-			a.emitContextStop()
-			return
-		}
-
-		if err != nil {
-			a.state.ConsecutiveErrors++
-			errStr := err.Error()
-			classified := llm.ClassifyErrorString(errStr)
-
-			if classified.Class == llm.ErrorClassContextWindow {
-				// Context window overflow: force-prune messages so the next
-				// attempt has a smaller payload. Don't count this as a
-				// consecutive error — it's recoverable via pruning.
-				a.emit(Event{Type: "error", Content: fmt.Sprintf("⚠️ Context window overflow — force-pruning message history (%d messages)", len(a.messages)), TotalTokens: tokenCount()})
-				a.forcePruneMessages()
-				a.state.ConsecutiveErrors-- // don't penalize for recoverable overflow
-				if a.state.ConsecutiveErrors < 0 {
-					a.state.ConsecutiveErrors = 0
-				}
-				continue
-			}
-
-			// Rate limit / Overloaded / Quota exhausted: back off in progressive increments
-			// and keep retrying until the upstream provider recovers or the window refreshes.
-			//
-			// CRITICAL:
-			// 1. DO NOT terminate the scan on rate limits or quota resets. Keep the agent alive
-			//    in memory so that when the provider window refreshes (e.g. rolling 5h provider quota,
-			//    RPM/TPM resets), the scan resumes seamlessly without interruption.
-			// 2. DO NOT emit provider rate-limit or quota error messages to the frontend/user.
-			//    All upstream provider wait messages are logged strictly to backend server logs
-			//    (log.Printf) so the SaaS user never sees scary billing or provider notices.
-			if classified.Class == llm.ErrorClassRateLimit ||
-				classified.Class == llm.ErrorClassOverloaded ||
-				classified.Class == llm.ErrorClassQuotaExhausted {
-				a.state.ConsecutiveErrors-- // don't penalize normal consecutive error count
-				if a.state.ConsecutiveErrors < 0 {
-					a.state.ConsecutiveErrors = 0
-				}
-				a.state.ConsecutiveRateLimits++
-
-				var abortReason string
-				switch classified.Class {
-				case llm.ErrorClassOverloaded:
-					abortReason = "provider_overloaded"
-				case llm.ErrorClassQuotaExhausted:
-					abortReason = "provider_quota_exhausted"
-				default:
-					abortReason = "provider_rate_limited"
-				}
-
-				// Progressive retry backoff: 15s -> 30s -> 60s max per attempt.
-				backoff := a.rateLimitBackoff(a.state.ConsecutiveRateLimits)
-				if classified.Class == llm.ErrorClassQuotaExhausted && a.rateLimitBackoffFn == nil && backoff < 30*time.Second {
-					backoff = 30 * time.Second
-				}
-
-				maxWait := a.maxRateLimitWait()
-				if maxWait > 0 && a.state.CumulativeRateLimitWait >= maxWait {
-					a.pauseForProviderWait(err, abortReason, maxWait, tokenCount())
-					return
-				}
-
-				// Cap backoff by remaining cumulative budget
-				if maxWait > 0 {
-					remaining := maxWait - a.state.CumulativeRateLimitWait
-					if remaining <= 0 {
-						a.pauseForProviderWait(err, abortReason, maxWait, tokenCount())
-						return
-					}
-					if remaining < backoff {
-						backoff = remaining
-					}
-				}
-
-				// Log strictly to backend server logs for operator visibility (silent on user frontend)
-				a.logProviderWait(err, backoff, maxWait)
-
-				// Provider waiting time is not idle assessment time.
-				a.pauseIdleClock(backoff)
-				a.providerRetry = true
-
-				// Interruptible sleep: bail out immediately if the scan is stopped or canceled by operator.
-				if a.ctx != nil {
-					select {
-					case <-a.ctx.Done():
-						a.emitContextStop()
-						return
-					case <-time.After(backoff):
-					}
-				} else {
-					time.Sleep(backoff)
-				}
-
-				if a.stopped.Load() {
-					return
-				}
-
-				a.state.CumulativeRateLimitWait += backoff
-				a.touchActivity() // keep watchdog alive during rate-limit/quota backoff
-
-				if maxWait > 0 && a.state.CumulativeRateLimitWait >= maxWait {
-					a.pauseForProviderWait(err, abortReason, maxWait, tokenCount())
-					return
-				}
-				continue
-			}
-
-			a.emit(Event{Type: "error", Content: fmt.Sprintf("LLM error (attempt %d/25): %s", a.state.ConsecutiveErrors, errStr), TotalTokens: tokenCount()})
-			if a.state.ConsecutiveErrors >= 25 {
-				a.emit(Event{Type: "error", Content: fmt.Sprintf("⛔ Agent stopped: LLM failed %d consecutive times. Last error: %s", a.state.ConsecutiveErrors, errStr), TotalTokens: tokenCount()})
-				a.emit(Event{Type: "finished", Content: fmt.Sprintf("Agent stopped: LLM failed %d consecutive times. Last error: %s", a.state.ConsecutiveErrors, errStr), TotalTokens: tokenCount(), Aborted: true, AbortReason: "llm_repeated_errors"})
-				return
-			}
-			// Exponential backoff: 10s, 20s, 30s... capped at 120s
-			// Long-running wildcard scans need more tolerance for transient API issues
-			backoff := time.Duration(a.state.ConsecutiveErrors*10) * time.Second
-			if backoff > 120*time.Second {
-				backoff = 120 * time.Second
-			}
-			a.pauseIdleClock(backoff)
-			a.providerRetry = true
-			if a.ctx != nil {
-				select {
-				case <-a.ctx.Done():
-					a.emitContextStop()
-					return
-				case <-time.After(backoff):
-				}
-			} else {
-				time.Sleep(backoff)
-			}
-			if a.stopped.Load() {
-				return
-			}
-			continue
-		}
-		// ConsecutiveErrors reset is handled by OnHealthyResponse hook below
-
-		// ── Hook: OnEmptyResponse ──
-		// A native tool-calling turn legitimately carries content:"" with a
-		// populated tool_calls array; counting that as an empty response would
-		// burn the 12-response budget without ever executing anything.
-		if strings.TrimSpace(response) == "" && len(apiToolCalls) == 0 {
-			emptyResult := a.hooks.Fire(OnEmptyResponse, a.state, nil)
-			a.emit(Event{Type: "message", Content: fmt.Sprintf("⚠️ LLM returned empty response (%d/12)", a.state.EmptyResponseCount), TotalTokens: tokenCount()})
-			if emptyResult.ForceSkip {
-				a.emit(Event{Type: "error", Content: emptyResult.EmitMessage, TotalTokens: tokenCount()})
-				a.emit(Event{Type: "finished", Content: "Agent stopped: LLM returned too many empty responses", TotalTokens: tokenCount(), Aborted: true, AbortReason: "llm_empty_responses"})
-				return
-			}
-			if emptyResult.Nudge != "" {
-				a.msgMu.Lock()
-				a.messages = append(a.messages, llm.Message{Role: "user", Content: emptyResult.Nudge})
-				a.msgMu.Unlock()
-			}
-			continue
-		}
-		// EmptyResponseCount reset is handled by OnHealthyResponse hook below
-
-		// Strip <think>...</think> blocks for parsing
-		responseClean := stripThink(response)
-
-		// Extract display prose. It is emitted only after malformed tool-output
-		// detection below so provider control-token leaks never pollute the UI or
-		// get persisted back into the model's conversation.
-		cleanText := llm.CleanContent(responseClean)
-		cleanText = strings.TrimSpace(cleanText)
-
-		// Native calls take precedence: when the model answered on the native
-		// channel there is nothing to recover from the text. The XML parser
-		// stays as the fallback for every other backend — and for a native
-		// model that still emits tags out of habit.
-		toolCalls := apiToolCalls
-		nativeTurn := len(apiToolCalls) > 0
-		if nativeTurn {
-			toolCalls = llm.EnsureToolCallIDs(toolCalls, fmt.Sprintf("call_%d", iter))
-		} else {
-			toolCalls = llm.ParseToolCalls(responseClean)
-		}
-		// ── Drop empty-Args calls for tools that require parameters ──
-		// When a model drifts and splits a multi-parameter call's fields
-		// across separate <function=NAME> blocks, the parser produces
-		// well-formed calls with EMPTY bodies (e.g. <function=update_plan>
-		// </function> → ToolCall{Name:"update_plan", Args:{}}). Such a call
-		// can never satisfy the tool's required params, so sending it to the
-		// registry just wastes an iteration on a guaranteed "missing required
-		// parameter" error (observed ~10× near the end of the z-text.com
-		// scan). Drop these fragments here so they fall through to the
-		// orphan-recovery path (which can re-associate stray params) or the
-		// no-tool compaction path. Tools whose params are ALL optional (e.g.
-		// code_search) legitimately accept an empty body and are kept.
-		// Native calls are exempt: an argument-less native call is a model
-		// decision the registry can reject with a precise error the model gets
-		// to read, which is more useful than silently dropping the turn.
-		if len(toolCalls) > 0 && !nativeTurn {
-			kept := toolCalls[:0]
-			for _, tc := range toolCalls {
-				if len(tc.Args) == 0 && a.registry.RequiresParams(tc.Name) {
-					continue
-				}
-				kept = append(kept, tc)
-			}
-			toolCalls = kept
-		}
-		// ── In-batch duplicate dedup ──
-		// A model response can carry many tool calls, and executing a
-		// byte-identical call twice within ONE turn cannot produce a different
-		// result: the model has not seen the first result yet. Worse, the
-		// repeat-call tracker counted in-batch duplicates toward the loop-limit
-		// kill, force-finishing healthy scans mid-batch (production: a final
-		// bookkeeping batch carried several identical empty update_plan calls
-		// and a 60-minute scan with 11 unfinished tasks died without the model
-		// ever getting a turn to adapt). Skip duplicates quietly; CROSS-turn
-		// repeats still count toward the stuck-loop guard exactly as before.
-		if deduped := dedupeBatchCalls(toolCalls); len(deduped) != len(toolCalls) {
-			a.emit(Event{Type: "recovery", Content: fmt.Sprintf("Skipped %d duplicate tool call(s) within one response — an identical repeat in the same turn cannot produce a different result.", len(toolCalls)-len(deduped)), TotalTokens: tokenCount()})
-			toolCalls = deduped
-		}
-		// ── Schema-guided recovery of dropped-open-tag tool calls ──
-		// Some models intermittently drop the <function=NAME> open tag and
-		// emit only <parameter=X>…</parameter> blocks + a trailing
-		// </function>. ParseToolCalls can't recover the tool name from that,
-		// so every such response counts as "no tool call" and the scan
-		// force-stops at 15 (observed on codeant.ai). Recover by matching
-		// the orphaned parameter set against the registered tool schemas:
-		// a tool whose required params are all present is the intended call.
-		// This runs BEFORE the no-tool hook so recovered calls are healthy,
-		// not counted toward the reasoning-loop threshold.
-		if len(toolCalls) == 0 {
-			for _, oc := range llm.ParseOrphanedCalls(responseClean) {
-				// Prefer the tool name the model actually emitted (it dropped only
-				// the "<function=" prefix, e.g. `terminal_execute>`), validated
-				// against the registry. This rescues the common case that
-				// MatchByParams cannot resolve: a call carrying only {command},
-				// which ties across terminal_execute / browser_action / pageagent
-				// and is rejected as ambiguous — the exact regression that turned
-				// dropped-tag shell calls into "no tool call" → reasoning loops.
-				name, ok := "", false
-				if oc.NameHint != "" {
-					if _, exists := a.registry.Get(oc.NameHint); exists {
-						name, ok = oc.NameHint, true
-					}
-				}
-				if !ok {
-					name, ok = a.registry.MatchByParams(oc.ParamNames)
-				}
-				if ok {
-					a.emit(Event{Type: "message", Content: fmt.Sprintf("🔧 Recovered a tool call whose <function> open tag was dropped — resolved to '%s' (params %v).", name, oc.ParamNames), TotalTokens: tokenCount()})
-					toolCalls = append(toolCalls, llm.ToolCall{Name: name, Args: oc.Args})
-				}
-			}
-		}
-
-		// Distinguish ordinary prose-only reasoning from an attempted tool call
-		// corrupted by the provider/model protocol. The latter must be discarded
-		// rather than appended to history: feeding a provider's leaked control-token
-		// delimiters or a bare ` + "`" + ` marker back to the model caused it to
-		// mimic the corruption for 30 turns and falsely finish a scan.
-		malformedToolReason := ""
-		if len(toolCalls) == 0 {
-			malformedToolReason = llm.MalformedToolOutputReason(responseClean)
-		}
-		if malformedToolReason != "" {
-			// Type "recovery", not "error": the discard-and-retry below is a
-			// handled self-healing action and the scan continues normally.
-			// Error-typed events render as red failures in hosted dashboards,
-			// alarming users over routine protocol recovery.
-			a.emit(Event{
-				Type:        "recovery",
-				Content:     fmt.Sprintf("Discarded malformed LLM tool output (%s); requesting a clean executable call.", malformedToolReason),
-				TotalTokens: tokenCount(),
-			})
-		} else if cleanText != "" {
-			a.emit(Event{Type: "message", Content: cleanText, TotalTokens: tokenCount()})
-		}
-		// Enforce the tool-call budget WITHIN the batch. overBudget is only
-		// checked at iteration start, so a single response emitting many calls
-		// could otherwise blow past XALGORIX_MAX_TOOL_CALLS. Truncate the batch
-		// to the remaining allowance so the cap is honored precisely.
-		requestedCalls := len(toolCalls)
-		allowedCalls := requestedCalls
-		maxToolCalls := 0
-		if a.cfg != nil {
-			maxToolCalls = a.cfg.MaxToolCalls
-		}
-		if a.scanBudget != nil {
-			allowedCalls = a.scanBudget.reserveToolCalls(requestedCalls, maxToolCalls)
-		} else if maxToolCalls > 0 {
-			remaining := maxToolCalls - toolCallsTotal
-			if remaining < 0 {
-				remaining = 0
-			}
-			if allowedCalls > remaining {
-				allowedCalls = remaining
-			}
-		}
-		if !a.checkpointOrStop() {
-			return
-		}
-		if allowedCalls < requestedCalls {
-			a.emit(Event{Type: "message", Content: fmt.Sprintf("⏱️ Shared tool-call budget: executing %d of %d requested calls (scan cap %d reached).", allowedCalls, requestedCalls, maxToolCalls), TotalTokens: tokenCount()})
-			toolCalls = toolCalls[:allowedCalls]
-		}
-		toolCallsTotal += allowedCalls
-
-		// ── Persist the assistant turn ──
-		// When tool calls were parsed OR recovered, store a CANONICAL rendering
-		// (clean prose + well-formed <function=…> blocks) instead of the raw
-		// response. The model few-shot-mimics its own prior turns, so persisting
-		// malformed tool-call XML (e.g. a dropped "<function=" tag) teaches it to
-		// keep malforming — the format drifts and escalates until it emits an
-		// unrecoverable shape and the scan reasoning-loops. Rewriting to the
-		// canonical form keeps the conversation self-consistent so the model
-		// stays on-format. When NO tool call was found, store the raw response so
-		// the no-tool hook's format nudge reflects the real (malformed) output.
-		if malformedToolReason == "" {
-			turn := llm.Message{Role: "assistant"}
-			if nativeTurn {
-				// On the native channel the provider expects the call structure
-				// to be replayed as-is; re-encoding it as XML would teach the
-				// model — which few-shot-mimics its own turns — to go back to
-				// the dialect we are migrating away from.
-				turn.Content = cleanText
-				turn.ToolCalls = llm.MessageToolCallsFrom(toolCalls)
-			} else {
-				turn.Content = response
-				if len(toolCalls) > 0 {
-					turn.Content = canonicalizeAssistantTurn(cleanText, toolCalls)
-				}
-			}
-			a.msgMu.Lock()
-			a.messages = append(a.messages, turn)
-			a.msgMu.Unlock()
-		}
-
-		// ── Hook: OnNoToolResponse ──
-		if len(toolCalls) == 0 {
-			noToolResult := a.hooks.Fire(OnNoToolResponse, a.state, map[string]string{
-				"response":         cleanText,
-				"malformed_reason": malformedToolReason,
-			})
-			if noToolResult.ForceSkip {
-				reason, detail := classifyNoToolAbort(a.state)
-				if noToolResult.EmitMessage != "" {
-					a.emit(Event{Type: "error", Content: noToolResult.EmitMessage, TotalTokens: tokenCount()})
-				}
-				a.emit(Event{Type: "finished", Content: detail, TotalTokens: tokenCount(), Aborted: true, AbortReason: reason})
-				return
-			}
-			// Reasoning-loop recovery is NUDGE-ONLY: we inject a focused
-			// "resume and call a tool" prompt and let the model recover on
-			// its own. We deliberately do NOT compact the context here —
-			// compaction is a context-size concern, unrelated to reasoning
-			// loops, and collapsing the model's own working notes mid-thought
-			// tends to make a stall worse. Proactive size-based compaction
-			// still happens independently in the main loop (shouldPruneBeforeLLM).
-			// NoToolCount is not reset here; the count climbing is what drives
-			// the escalating nudges (and, in bounded mode, the eventual abort).
-			if noToolResult.PruneContext {
-				// Hard context reset: truncate the conversation to the system
-				// prompt only. The model's own context (oversized, poisoned by
-				// provider control-token leaks, or few-shot-mimicking its own
-				// malformed turns) is the CAUSE of the corruption — nudging
-				// into the same context just produces more of the same.
-				resetNudge := a.protocolResetNudge(noToolResult.Nudge)
-				a.msgMu.Lock()
-				if len(a.messages) > 0 && a.messages[0].Role == "system" {
-					a.messages = append(a.messages[:0:1], llm.Message{Role: "user", Content: resetNudge})
-				} else {
-					a.messages = []llm.Message{{Role: "user", Content: resetNudge}}
-				}
-				a.msgMu.Unlock()
-				a.emit(Event{Type: "recovery", Content: "Context hard-reset: truncated conversation to system prompt + protocol recovery instruction.", TotalTokens: tokenCount()})
-				// The count resets so the model gets a full recovery window in the
-				// clean context — a relapse starts the ladder from step 1, not
-				// from the abort edge.
-				a.state.MalformedToolOutputCount = 0
-			} else if noToolResult.Nudge != "" {
-				a.appendUserNudge(noToolResult.Nudge)
-			}
-			// Avoid a rapid paid retry storm for provider-protocol corruption. The
-			// delay is deliberately small and bounded; ordinary prose-only turns
-			// keep their existing immediate retry behavior.
-			if malformedToolReason != "" {
-				seconds := a.state.MalformedToolOutputCount
-				if seconds > 3 {
-					seconds = 3
-				}
-				time.Sleep(time.Duration(seconds) * time.Second)
-			}
-			continue
-		}
-		// Non-empty response with tool calls = healthy. Reset all error counters.
-		if a.state.ConsecutiveRateLimits > 0 {
-			log.Printf("[agent:%s] Upstream LLM recovered: wait_attempts=%d cumulative_wait=%s; continuing assessment",
-				a.ID, a.state.ConsecutiveRateLimits, a.state.CumulativeRateLimitWait)
-		}
-		a.hooks.Fire(OnHealthyResponse, a.state, nil)
-
-		for _, tc := range toolCalls {
-			if a.stopped.Load() {
-				break
-			}
-			// A malformed native `arguments` payload is reported back to the
-			// model as a tool result rather than silently dropping the call: the
-			// turn stays healthy and the model gets to correct itself.
-			if tc.ArgumentError != "" {
-				a.emit(Event{Type: "tool_call", ToolName: tc.Name, ToolArgs: tc.Args})
-				a.emit(Event{Type: "tool_result", ToolName: tc.Name, ToolResult: tools.Result{Error: tc.ArgumentError}, TotalTokens: tokenCount()})
-				a.appendToolOutcome(tc, fmt.Sprintf("⚠️ Malformed arguments for %s: %s\nCall it again with a valid JSON object.", tc.Name, tc.ArgumentError))
-				continue
-			}
-			if tc.Name == "terminal_execute" {
-				if command, ok := tc.Args["command"]; ok {
-					contextID := ""
-					if a.scanCtx != nil {
-						contextID = a.scanCtx.ID
-					}
-					// Fix options the tool would reject first, so the rate policy
-					// then caps the real flag (e.g. arjun --threads → -t).
-					normalized, flagNote := terminal.NormalizeToolFlags(command)
-					normalized, note := terminal.NormalizeCommandForRequestRatePolicy(contextID, normalized)
-					note = flagNote + note
-					normalized = terminal.InjectScanHeadersIntoCommand(normalized)
-					normalized = terminal.CapDirbusterRuntime(normalized)
-					if normalized != command {
-						updatedArgs := make(map[string]string, len(tc.Args))
-						for k, v := range tc.Args {
-							updatedArgs[k] = v
-						}
-						updatedArgs["command"] = normalized
-						tc.Args = updatedArgs
-						if note != "" {
-							a.emit(Event{Type: "message", Content: note, TotalTokens: tokenCount()})
-						}
-					}
-				}
-			}
-
-			// ── Hook: OnToolCall (work tracking + stuck tracking) ──
-			toolArgs := map[string]string{
-				"tool_name": tc.Name,
-			}
-			for k, v := range tc.Args {
-				toolArgs[k] = v
-			}
-
-			if blocked, reason := a.shouldBlockForActivityPolicy(tc.Name, tc.Args); blocked {
-				blockMsg := "⛔ ACTIVITY POLICY BLOCKED TOOL — " + reason + noteBlockedToolCall(a.state, tc.Name, tc.Args)
-				a.emit(Event{Type: "tool_call", ToolName: tc.Name, ToolArgs: tc.Args})
-				a.emit(Event{Type: "tool_result", ToolName: tc.Name, ToolResult: tools.Result{Output: blockMsg}, TotalTokens: tokenCount()})
-				a.appendToolOutcome(tc, blockMsg)
-				continue
-			}
-
-			if blocked, reason := a.shouldBlockForPhaseRestriction(tc.Name, tc.Args); blocked {
-				blockMsg := "⛔ PHASE RESTRICTION BLOCKED TOOL — " + reason + noteBlockedToolCall(a.state, tc.Name, tc.Args)
-				a.emit(Event{Type: "tool_call", ToolName: tc.Name, ToolArgs: tc.Args})
-				a.emit(Event{Type: "tool_result", ToolName: tc.Name, ToolResult: tools.Result{Output: blockMsg}, TotalTokens: tokenCount()})
-				a.appendToolOutcome(tc, blockMsg)
-				continue
-			}
-
-			if blocked, reason := a.shouldBlockForMissingAuthPrerequisites(tc.Name, tc.Args); blocked {
-				blockMsg := "⛔ AUTH PREREQUISITE GUARD BLOCKED TOOL — " + reason + noteBlockedToolCall(a.state, tc.Name, tc.Args)
-				a.emit(Event{Type: "tool_call", ToolName: tc.Name, ToolArgs: tc.Args})
-				a.emit(Event{Type: "tool_result", ToolName: tc.Name, ToolResult: tools.Result{Output: blockMsg}, TotalTokens: tokenCount()})
-				a.appendToolOutcome(tc, blockMsg)
-				continue
-			}
-
-			// ── In-scope guard ──
-			// Runs UNCONDITIONALLY (active and passive). Probes and
-			// finding reports for hosts not derived from the configured
-			// scan target are rejected — prevents the agent from
-			// pivoting to third-party hosts discovered via DNS, port
-			// scans, related infrastructure, etc.
-			if blocked, reason := a.shouldBlockForOutOfScope(tc.Name, tc.Args); blocked {
-				blockMsg := "⛔ OUT-OF-SCOPE TARGET BLOCKED — " + reason + noteBlockedToolCall(a.state, tc.Name, tc.Args)
-				a.emit(Event{Type: "tool_call", ToolName: tc.Name, ToolArgs: tc.Args})
-				a.emit(Event{Type: "tool_result", ToolName: tc.Name, ToolResult: tools.Result{Output: blockMsg}, TotalTokens: tokenCount()})
-				a.appendToolOutcome(tc, blockMsg)
-				continue
-			}
-
-			// ── Target boundary guard ──
-			// The operator's own boundaries: a port named in the target URL,
-			// and single-host scans (target_scope.go).
-			if blocked, reason := a.shouldBlockForTargetScope(tc.Name, tc.Args); blocked {
-				blockMsg := "⛔ OUTSIDE SCAN BOUNDARY — " + reason + noteBlockedToolCall(a.state, tc.Name, tc.Args)
-				a.emit(Event{Type: "tool_call", ToolName: tc.Name, ToolArgs: tc.Args})
-				a.emit(Event{Type: "tool_result", ToolName: tc.Name, ToolResult: tools.Result{Output: blockMsg}, TotalTokens: tokenCount()})
-				a.appendToolOutcome(tc, blockMsg)
-				continue
-			}
-
-			// This call passed every block guard — a real, allowed action.
-			// Clear the consecutive-blocked-call counter so only a SUSTAINED
-			// block loop (no allowed call in between) escalates.
-			a.state.ConsecutiveBlockedCalls = 0
-
-			toolCallHook := a.hooks.Fire(OnToolCall, a.state, toolArgs)
-			if toolCallHook.Nudge != "" {
-				a.msgMu.Lock()
-				a.messages = append(a.messages, llm.Message{Role: "user", Content: toolCallHook.Nudge})
-				a.msgMu.Unlock()
-			}
-			if toolCallHook.EmitMessage != "" {
-				a.emit(Event{Type: "message", Content: toolCallHook.EmitMessage, TotalTokens: tokenCount()})
-			}
-			if a.stopForHook(toolCallHook) {
-				return
-			}
-			if toolCallHook.ForceSkip {
-				continue
-			}
-
-			// ── Hook: OnStuckCheck (nudge/force-skip based on stuck counters) ──
-			stuckResult := a.hooks.Fire(OnStuckCheck, a.state, toolArgs)
-			if a.stopForHook(stuckResult) {
-				return
-			}
-			if stuckResult.Nudge != "" {
-				a.msgMu.Lock()
-				a.messages = append(a.messages, llm.Message{Role: "user", Content: stuckResult.Nudge})
-				a.msgMu.Unlock()
-			}
-			if stuckResult.CleanupBrowser {
-				browser.CleanupContext(a.scanCtx.ID)
-			}
-			if stuckResult.ForceSkip {
-				continue // skip executing this tool call
-			}
-
-			// Track coverage only after every scope, activity, policy, and loop
-			// guard has accepted the call. Recording at OnToolCall time would let
-			// a force-skipped request count as endpoint/class evidence even though
-			// it never reached the target.
-			a.hooks.Fire(OnToolExecute, a.state, toolArgs)
-
-			a.emit(Event{
-				Type:     "tool_call",
-				ToolName: tc.Name,
-				ToolArgs: tc.Args,
-			})
-
-			// Execute tool ASYNC with heartbeat monitoring
-			result, err := a.executeToolAsync(tc.Name, tc.Args)
-			if err != nil {
-				result = tools.Result{Error: err.Error()}
-			}
-			result.Error = a.unknownToolRecoveryError(result.Error)
-
-			a.emit(Event{
-				Type:        "tool_result",
-				ToolName:    tc.Name,
-				ToolResult:  result,
-				TotalTokens: tokenCount(),
-			})
-			if deadline, ok := a.scanDeadline(); ok && !time.Now().Before(deadline) {
-				a.stopForHook(HookResult{StopReason: "resource_budget", EmitMessage: "Scan stopped: duration budget exhausted during tool execution; saved findings are preserved."})
-				return
-			}
-
-			// ── Hook: OnToolResult (WAF detection, tech detection) ──
-			resultArgs := make(map[string]string, len(toolArgs)+2)
-			for k, v := range toolArgs {
-				resultArgs[k] = v
-			}
-			resultArgs["output"] = result.Output
-			resultArgs["error"] = result.Error
-			// Propagate tool-emitted identity metadata (e.g. read_skill tags
-			// its result with the canonical skill name and duplicate flag) so
-			// result hooks can count successful canonical loads instead of
-			// guessing from the raw request args.
-			if result.Metadata != nil {
-				if v, ok := result.Metadata["skill_name"].(string); ok && v != "" {
-					resultArgs["skill_name"] = v
-				}
-				if v, ok := result.Metadata["skill_duplicate"].(bool); ok && v {
-					resultArgs["skill_duplicate"] = "true"
-				}
-			}
-			previousTargetErrors := a.state.ConsecutiveTargetErrors
-			toolResultHook := a.hooks.Fire(OnToolResult, a.state, resultArgs)
-			if !a.checkpointOrStop() {
-				return
-			}
-			if a.stopForHook(toolResultHook) {
-				return
-			}
-			if toolResultHook.EmitMessage != "" {
-				a.emit(Event{Type: "message", Content: toolResultHook.EmitMessage, TotalTokens: tokenCount()})
-			}
-			if toolResultHook.Nudge != "" {
-				a.msgMu.Lock()
-				a.messages = append(a.messages, llm.Message{Role: "user", Content: toolResultHook.Nudge})
-				a.msgMu.Unlock()
-			}
-
-			// ── Sustained target-unresponsive breaker ──
-			// A stale failure streak alone cannot cancel a scan. Recheck the
-			// configured targets after a fresh network failure; only a
-			// corroborated outage may stop all agents.
-			if !a.state.TargetUnresponsiveSince.IsZero() &&
-				time.Since(a.state.TargetUnresponsiveSince) > targetUnresponsiveKillThreshold &&
-				a.state.ConsecutiveTargetErrors >= 3 &&
-				a.state.ConsecutiveTargetErrors > previousTargetErrors {
-				if !a.confirmTargetUnresponsive() {
-					a.state.ConsecutiveTargetErrors = 0
-					a.state.TargetUnresponsiveSince = time.Time{}
-					a.emit(Event{Type: "message", Content: "Target outage was not confirmed; scan continues on available routes.", TotalTokens: tokenCount()})
-				} else {
-					downFor := time.Since(a.state.TargetUnresponsiveSince).Round(time.Minute)
-					detail := fmt.Sprintf(
-						"Agent stopped before clean completion: the target was unreachable or returning gateway failures (connection refused / timeout / 502 / 503 / 504) continuously for %s across %d consecutive failed requests. Existing findings are preserved; re-run the scan once the target recovers.",
-						downFor, a.state.ConsecutiveTargetErrors)
-					a.emit(Event{Type: "error", Content: "⛔ TARGET UNRESPONSIVE: " + detail, TotalTokens: tokenCount()})
-					safe.IncWatchdogKill()
-					log.Printf("[watchdog] WARN kill scan=%s down_for=%s consecutive_failures=%d reason=target_unresponsive",
-						a.scanCtx.ID, downFor, a.state.ConsecutiveTargetErrors)
-					a.stopped.Store(true)
-					if a.cancel != nil {
-						a.cancel()
-					}
-					a.scanCtx.Terminal.KillAll()
-					a.emit(Event{Type: "finished", Content: detail, TotalTokens: tokenCount(), Aborted: true, AbortReason: "target_unresponsive"})
-					return
-				}
-			}
-
-			// ── Hook: OnFinishAttempt ──
-			if tc.Name == "finish" || (result.Metadata != nil && result.Metadata["finished"] == true) {
-				finishResult := a.hooks.Fire(OnFinishAttempt, a.state, nil)
-				if finishResult.Block {
-					a.state.FinishRecoveryPending = true
-					rejectMsg := fmt.Sprintf("⚠️ FINISH REJECTED — %s\n\nDO NOT call finish again until you have done more testing.\nContinue with the NEXT PHASE of testing NOW.", finishResult.BlockReason)
-					a.emit(Event{Type: "tool_result", ToolName: "finish", ToolResult: tools.Result{Output: rejectMsg}, TotalTokens: tokenCount()})
-					a.appendToolOutcome(tc, rejectMsg)
-					// Finish was rejected — switch to validator temperature (0.0)
-					// for deterministic re-verification of coverage gaps
-					a.client.SetTemperature(TempValidator)
-					continue
-				}
-				a.completeWithFinish(result.Output, tokenCount)
-				return
-			}
-
-			resultMsg := formatToolResult(tc.Name, result)
-			if a.boundedContextEnabled() && result.Error == "" {
-				// Information-complete archiving: persist the COMPLETE raw
-				// output (pre-truncation) so aged stubs can point at a
-				// byte-identical retrievable original.
-				minBytes := a.toolArchiveMinBytes()
-				if len(result.Output) >= minBytes {
-					if id := a.scanCtx.ToolOutputs.Archive(tc.Name, result.Output, minBytes); id != "" {
-						resultMsg = strings.TrimRight(resultMsg, "\n") + "\n" + archiveToolResultMarker(id)
-					}
-				}
-			}
-			a.appendToolOutcome(tc, resultMsg)
-
-			// ── Per-role temperature switching ──
-			// Adjust LLM temperature based on what the agent is about to do
-			// next, inferred from the tool it just called.
-			switch tc.Name {
-			case "report_vulnerability":
-				// Next response will write/refine a vulnerability report
-				a.client.SetTemperature(TempReporter)
-			case "add_note", "read_notes":
-				// Next response involves analysis/reasoning about findings
-				a.client.SetTemperature(TempReasoner)
-			default:
-				// Default scanning temperature for all other tools
-				a.client.SetTemperature(TempScanner)
-			}
-		}
-		// Prune message history to prevent context window overflow — but only
-		// once the buffer has grown past the window-relative compaction ceiling
-		// (pruneMessages self-guards on the same threshold; this check just
-		// avoids the lock/scan when we're nowhere near it).
-		if a.shouldPruneBeforeLLM() {
-			a.pruneMessages()
-		}
-		// Optional iteration delay to pace LLM request velocity and conserve provider rolling-window quotas.
-		if delay := a.getIterationDelay(); delay > 0 && !a.stopped.Load() && (a.maxIter == 0 || iter+1 < a.maxIter) {
-			timer := time.NewTimer(delay)
-			select {
-			case <-timer.C:
-			case <-a.ctx.Done():
-				timer.Stop()
-			}
-			if a.stopped.Load() || (a.ctx != nil && a.ctx.Err() != nil) {
-				break
-			}
-		}
-	}
-
-	// The loop exited. Report the ACTUAL termination reason instead of always
-	// blaming "maximum iterations". With the default unlimited iteration budget
-	// (maxIter == 0) the loop can ONLY end here via an external Stop() or a
-	// canceled context — mislabeling every such exit as "maximum iterations"
-	// hid the real cause (user stop, shutdown, watchdog kill, or upstream
-	// context cancellation) and made healthy scans look like they'd blown a cap.
-	var finishReason string
-	abortReason := ""
-	switch {
-	case a.ctx != nil && a.ctx.Err() != nil && (a.livenessExpired.Load() || a.semanticIdleRemaining() <= 0):
-		a.emitContextStop()
-		return
-	case a.ctx != nil && a.ctx.Err() == context.DeadlineExceeded:
-		finishReason = "Scan stopped: duration budget exhausted; saved findings are preserved."
-		abortReason = "resource_budget"
-	case a.maxIter > 0 && iter >= a.maxIter:
-		finishReason = fmt.Sprintf("Agent reached maximum iterations (%d)", a.maxIter)
-		abortReason = "resource_budget"
-	case a.stopped.Load():
-		finishReason = "Scan stopped"
-	case a.ctx != nil && a.ctx.Err() != nil:
-		finishReason = "Scan canceled: " + a.ctx.Err().Error()
-	default:
-		finishReason = "Scan ended"
-	}
-	a.emit(Event{Type: "finished", Content: finishReason, TotalTokens: tokenCount(), Aborted: abortReason != "", AbortReason: abortReason, Resumable: abortReason == ""})
+	// The Eino ADK is the only scan runtime. Construction or execution
+	// failures are terminal and visible; there is no fallback loop.
+	a.runLoop(systemPrompt, tokenCount)
 }
 
 // DroppedNarration reports narration events dropped because the event channel
@@ -2845,10 +1902,8 @@ func (a *Agent) TelemetryStats() string {
 	return fmt.Sprintf("telemetry: dropped_narration=%d uncooperative_timeouts=%d\n", dropped, uncooperative)
 }
 
-// completeWithFinish emits the terminal finish event with the same honest
-// completion assessment and telemetry used by the legacy loop. The Eino
-// observer calls it after an allowed finish tool; keeping one implementation
-// prevents the two engines from drifting.
+// completeWithFinish emits the terminal finish event with the honest
+// completion assessment and telemetry for the single runtime.
 func (a *Agent) completeWithFinish(output string, tokenCount func() int) {
 	content := output
 	if !a.state.DelegatedAgent {
@@ -2872,12 +1927,11 @@ func (a *Agent) completeWithFinish(output string, tokenCount func() int) {
 			a.emit(Event{Type: "message", Content: summary, TotalTokens: tokenCount()})
 		}
 	}
-	a.einoFinished.Store(true)
-	// The eino graph runs ahead of its event consumer: without this cancel it
+	a.scanFinished.Store(true)
+	// The ADK graph runs ahead of its event consumer: without this cancel it
 	// would issue one more model call after a completed finish and discard the
-	// result — a paid call the scan can never use (legacy returns immediately
-	// here, so cancelling keeps both engines ending at the same turn).
-	if cancel := a.einoRunCancel.Load(); cancel != nil {
+	// result — a paid call the scan can never use.
+	if cancel := a.runCancel.Load(); cancel != nil {
 		(*cancel)()
 	}
 	a.emit(Event{Type: "finished", Content: content, TotalTokens: tokenCount()})
@@ -2933,7 +1987,7 @@ func (a *Agent) SendMessage(message string) (string, error) {
 	a.msgMu.Unlock()
 
 	// Emit as a visible event so it appears in the feed
-	a.emit(Event{Type: "message", Content: fmt.Sprintf("📨 User message received: %s", message)})
+	a.emit(Event{Type: "message", Content: a.opf("📨 User message received: %s", "📨 已收到用户消息：%s", message)})
 
 	return "Message received and will be processed on the next iteration.", nil
 }
@@ -3164,6 +2218,13 @@ func (a *Agent) SetResumeBriefing(s string) {
 	a.resumeBriefing = strings.TrimSpace(s)
 }
 
+// SetConversationReplay seeds a hot-resumed session with a bounded projection
+// of the previous session's conversation (hot-resume ladder L2; the fallback
+// is the L3 resume briefing alone). Call before Run().
+func (a *Agent) SetConversationReplay(s string) {
+	a.replayTranscript = strings.TrimSpace(s)
+}
+
 // SetDeferNoteDetailEmitted marks that the full-detail specialist-wave
 // defer note was already displayed in a previous process lifetime
 // (resume path): the current run emits only compact follow-up notes.
@@ -3264,13 +2325,13 @@ func (a *Agent) prepareScanEnvironment() {
 		// never leaks into telemetry, the scan log, PDF reports, or git's
 		// own "authentication failed for <url>" error output.
 		a.secretValues = append(a.secretValues, credentialsInURL(a.sourceRepo)...)
-		a.emit(Event{Type: "message", Content: fmt.Sprintf("📦 Whitebox: resolving source (%s)…", a.redactSecrets(a.sourceRepo))})
+		a.emit(Event{Type: "message", Content: a.opf("📦 Whitebox: resolving source (%s)…", "📦 白盒：正在解析源码（%s）…", a.redactSecrets(a.sourceRepo))})
 		if root, err := codesearch.ResolveSource(a.sourceRepo, dest); err != nil {
 			a.emit(Event{Type: "error", Content: "Whitebox source unavailable: " + a.redactSecrets(err.Error()) + " — continuing black-box."})
 			log.Printf("[agent] whitebox source unavailable (%s): %v", a.redactSecrets(a.sourceRepo), a.redactSecrets(err.Error()))
 		} else if root != "" {
 			codesearch.SetSourceRoot(a.scanCtx.ID, root)
-			a.emit(Event{Type: "message", Content: "📦 Whitebox source ready — use code_search to hunt sinks."})
+			a.emit(Event{Type: "message", Content: a.op("📦 Whitebox source ready — use code_search to hunt sinks.", "📦 白盒源码就绪——可用 code_search 查找污点汇。")})
 			log.Printf("[agent] whitebox source ready at %s", root)
 			// Auto-seed the ledger from source so the source-to-runtime bridge
 			// starts populated (mirrors seedLedgerFromSurface for uploaded
@@ -3278,7 +2339,7 @@ func (a *Agent) prepareScanEnvironment() {
 			// hypotheses from iteration 1, without waiting for the model to call
 			// scan_source_sinks / scan_source_routes.
 			if s := a.seedLedgerFromSource(); s.SinkHypotheses+s.RouteHypotheses > 0 {
-				a.emit(Event{Type: "message", Content: fmt.Sprintf("🔎 Seeded %d source→sink and %d route hypotheses from source (%d route↔sink correlated) — use read_ledger and probe_hypothesis to confirm reachability.", s.SinkHypotheses, s.RouteHypotheses, s.Correlated)})
+				a.emit(Event{Type: "message", Content: a.opf("🔎 Seeded %d source→sink and %d route hypotheses from source (%d route↔sink correlated) — use read_ledger and probe_hypothesis to confirm reachability.", "🔎 已从源码播种 %d 条 source→sink 与 %d 条路由假设（%d 条路由↔污点汇已关联）——用 read_ledger 与 probe_hypothesis 确认可达性。", s.SinkHypotheses, s.RouteHypotheses, s.Correlated)})
 				log.Printf("[agent] source seeding: %d sink, %d route hypotheses (%d correlated)", s.SinkHypotheses, s.RouteHypotheses, s.Correlated)
 			}
 		}
@@ -3334,7 +2395,7 @@ func (a *Agent) prepareScanEnvironment() {
 				a.state.SeededSurface = append(a.state.SeededSurface, record)
 			}
 			if a.scanContextBriefing != "" {
-				msg := fmt.Sprintf("🗺️ Attack surface seeded from context (%d endpoints", len(res.Endpoints))
+				msg := a.opf("🗺️ Attack surface seeded from context (%d endpoints", "🗺️ 已从上下文播种攻击面（%d 个端点", len(res.Endpoints))
 				if seeded > 0 {
 					msg += fmt.Sprintf(", %d ledger hypotheses", seeded)
 				}

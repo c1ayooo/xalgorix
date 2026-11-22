@@ -36,6 +36,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -233,6 +234,50 @@ func (idx *scanSummaryIndex) runStatus(run *platform.Run, isPending func(instanc
 		return "pending"
 	}
 	return RunMissingStatus
+}
+
+// taskTerminalRun returns the task's newest run once it is no longer active
+// (projected exactly like taskActiveRun). A "stopping" run is returned too —
+// it is not resumable yet, and the caller maps it to 409.
+func (s *Server) taskTerminalRun(ctx context.Context, store platform.Repository, taskID string) (platform.Run, bool) {
+	runs, _, err := store.ListRuns(ctx, taskID, 1, runProjectionPageSize)
+	if err != nil || len(runs) == 0 {
+		return platform.Run{}, false
+	}
+	idx := s.scanSummaryIndexFor(s.findAllScanSummaries())
+	idx.projectRuns(runs, s.pendingDispatchExists)
+	for i := range runs {
+		switch strings.ToLower(runs[i].Status) {
+		case "running", "pending", "paused":
+			// Caller already 409'd via taskActiveRun; nothing to re-dispatch.
+			return platform.Run{}, false
+		}
+		return runs[i], true
+	}
+	return platform.Run{}, false
+}
+
+// scanDirForRun resolves the on-disk scan dir for a run's instance from the
+// shared events-free summary walk (instance_id first, legacy scan id as the
+// fallback key), so a 1:1 re-dispatch can bind to the same scan dir and keep
+// notes / ledger / execution checkpoint / engine checkpoint ID continuous.
+func (s *Server) scanDirRecordForRun(instanceID, legacyScanID string) (string, *ScanRecord) {
+	entries := s.findAllScanSummaries()
+	if instanceID != "" {
+		for i := range entries {
+			if strings.TrimSpace(entries[i].rec.InstanceID) == instanceID {
+				return entries[i].dir, &entries[i].rec
+			}
+		}
+	}
+	if legacyScanID != "" {
+		for i := range entries {
+			if entries[i].rec.ID == legacyScanID {
+				return entries[i].dir, &entries[i].rec
+			}
+		}
+	}
+	return "", nil
 }
 
 // projectRuns projects a page of runs in place.
@@ -726,6 +771,28 @@ func (s *Server) handleTaskRunStart(w http.ResponseWriter, r *http.Request, stor
 		return
 	}
 
+	// 1:1 task:run (REDESIGN 2026-11-22): a task owns exactly ONE run. When
+	// that run is terminal, POST runs re-dispatches the SAME instance under
+	// the SAME mount — it never stacks a second run record. The agent
+	// hot-resumes from the run's own scan dir (notes/ledger/execution
+	// checkpoint continuity; conversation replay per scan_session). Steering
+	// between continuations is PATCHing the task goal/instruction, which the
+	// re-dispatch picks up below like a fresh start would.
+	terminalRun, hasTerminal := s.taskTerminalRun(r.Context(), store, task.ID)
+	if hasTerminal && strings.EqualFold(terminalRun.Status, "stopping") {
+		writeJSONStatus(w, http.StatusConflict, map[string]string{
+			"error":       "the task's run is still stopping; retry once it reaches a terminal state",
+			"run_id":      terminalRun.ID,
+			"instance_id": terminalRun.InstanceID,
+		})
+		return
+	}
+	var resumeDir string
+	var resumeRec *ScanRecord
+	if hasTerminal {
+		resumeDir, resumeRec = s.scanDirRecordForRun(terminalRun.InstanceID, terminalRun.LegacyScanID)
+	}
+
 	// Targets: request override, else the project scope defaults.
 	targets := flattenPlatformTargets(override.Targets)
 	if len(targets) == 0 {
@@ -824,14 +891,33 @@ func (s *Server) handleTaskRunStart(w http.ResponseWriter, r *http.Request, stor
 	applyScanLLMOverrides(&scanCfg, req)
 
 	// ── dispatch sequence copied from handleScan (server.go) ──
-	instanceID := strings.TrimSpace(req.DispatchID)
-	callerDispatchID := instanceID != ""
+	instanceID := ""
+	resumeSameInstance := hasTerminal
+	if resumeSameInstance {
+		// Same identity, same scan dir: notes, ledger, execution checkpoint
+		// and the engine checkpoint ID (scanCtx.ID) all stay continuous. The
+		// hot-resume ladder (checkpoint → conversation replay → briefing)
+		// picks the agent's starting context in scan_session.
+		instanceID = terminalRun.InstanceID
+		if resumeDir != "" && resumeRec != nil {
+			req.IsResume = true
+			req.ResumeScanDir = resumeDir
+			req.ResumeScanID = filepath.Base(resumeDir)
+			req.ResumeActiveTarget = firstNonEmptyString(resumeRec.Target, targets[0])
+			req.ResumeIterations = resumeRec.Iterations
+			req.ResumeTotalTokens = resumeRec.TotalTokens
+			req.ResumeToolCalls = resumeRec.ToolCalls
+		}
+	} else {
+		instanceID = strings.TrimSpace(req.DispatchID)
+	}
+	callerDispatchID := !resumeSameInstance && instanceID != ""
 	if callerDispatchID {
 		if !validDispatchID(instanceID) {
 			writeJSONStatus(w, http.StatusBadRequest, map[string]string{"error": "dispatch_id must be 16-128 URL-safe characters"})
 			return
 		}
-	} else {
+	} else if !resumeSameInstance {
 		for {
 			instanceID = randomSlug()
 			if _, reserved := s.reserveDispatchID(instanceID); reserved {
@@ -855,6 +941,50 @@ func (s *Server) handleTaskRunStart(w http.ResponseWriter, r *http.Request, stor
 	if !owned {
 		s.releaseDispatchID(instanceID)
 		writeJSONStatus(w, http.StatusOK, taskRunAck{Status: "pending", RunID: existingRunID, InstanceID: instanceID})
+		return
+	}
+	if resumeSameInstance {
+		// Reopen the terminal snapshot as a pending dispatch under the same
+		// id (REDESIGN 2026-11-22): rewriting — not bypassing — the tombstone
+		// keeps registerMultiScan's exact-stop guard intact (it now sees a
+		// pending snapshot and proceeds, while a stale duplicate of this POST
+		// finds the reservation and is rejected). The run mount is reused,
+		// never re-created; persistPendingDispatchSnapshot's prior-snapshot-
+		// wins rule must not run on this path. reactivated=false means the
+		// instance has no snapshot at all (save-only / purged history): the
+		// durable queue state below is the acceptance, same as a fresh run.
+		reactivated, rerr := s.reactivateTerminalDispatchSnapshot(instanceID, req)
+		if rerr != nil {
+			ownership.release()
+			s.releaseDispatchID(instanceID)
+			if errors.Is(rerr, errDispatchBusy) {
+				writeJSONStatus(w, http.StatusConflict, map[string]string{"error": rerr.Error()})
+			} else {
+				writeJSONStatus(w, http.StatusInternalServerError, map[string]string{"error": "could not reopen the task's run"})
+			}
+			return
+		}
+		log.Printf("[platform] task %s run %s re-dispatch on instance %s (snapshot %s)",
+			task.ID, terminalRun.ID, instanceID,
+			map[bool]string{true: "reactivated", false: "absent; queue state is the acceptance"}[reactivated])
+		req.Name = strings.TrimSpace(req.Name)
+		req.InstanceID = instanceID
+		if err := s.saveQueueStateDurable(0, req); err != nil {
+			if abortErr := s.abortPendingDispatchSnapshot(instanceID, "queue_state_persist_failed"); abortErr != nil {
+				log.Printf("[scan] failed to terminalize dispatch %s after queue-state error: %v", instanceID, abortErr)
+			}
+			ownership.release()
+			s.releaseDispatchID(instanceID)
+			writeJSONStatus(w, http.StatusInternalServerError, map[string]string{"error": "could not durably persist resumable dispatch"})
+			return
+		}
+		go func() {
+			defer s.releaseDispatchID(instanceID)
+			s.runMultiScan(req, &scanCfg, instanceID)
+		}()
+		// Same ack semantics as /api/scan: queued as "pending" until
+		// admission. RunID is the existing mount — one task, one run.
+		writeJSONStatus(w, http.StatusOK, taskRunAck{Status: "pending", RunID: terminalRun.ID, InstanceID: instanceID})
 		return
 	}
 	req.queueOwnership = ownership

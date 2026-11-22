@@ -8,6 +8,7 @@ import (
 
 	"github.com/xalgord/xalgorix/v4/internal/config"
 	"github.com/xalgord/xalgorix/v4/internal/scopeguard"
+	"github.com/xalgord/xalgorix/v4/internal/tools"
 )
 
 func TestEngineObserverMatchesLegacyHookResults(t *testing.T) {
@@ -254,6 +255,42 @@ func TestEngineObserverBeforeToolPreservesLegacyGateOrder(t *testing.T) {
 			t.Fatalf("expected out-of-scope to win over target boundary, got %+v", verdict)
 		}
 	})
+}
+
+// TestEngineObserverAfterToolCarriesMetadata pins the tool_result metadata
+// passthrough: the web layer gates the live report_vulnerability persist on
+// ToolResult.Metadata["vuln_id"], so a dropped map strands accepted findings
+// in the reporting store until session teardown.
+func TestEngineObserverAfterToolCarriesMetadata(t *testing.T) {
+	a, _ := newGateTestAgent(t, "eino-metadata")
+	observer := a.EngineObserver()
+
+	drainEvents(a)
+	metadata := map[string]any{"vuln_id": "XALG-1", "upgraded": true}
+	observer.AfterTool(context.Background(), "report_vulnerability",
+		map[string]string{"title": "test finding"}, "reported", metadata, nil)
+
+	var result *tools.Result
+	for {
+		select {
+		case ev := <-a.events:
+			if ev.Type == "tool_result" && ev.ToolName == "report_vulnerability" {
+				r := ev.ToolResult
+				result = &r
+			}
+		default:
+			if result == nil {
+				t.Fatal("no tool_result event emitted for report_vulnerability")
+			}
+			if got, _ := result.Metadata["vuln_id"].(string); got != "XALG-1" {
+				t.Fatalf("tool_result metadata lost vuln_id: got %q", got)
+			}
+			if upgraded, _ := result.Metadata["upgraded"].(bool); !upgraded {
+				t.Fatal("tool_result metadata lost upgraded flag")
+			}
+			return
+		}
+	}
 }
 
 // TestEngineObserverBlockedCallEscalationMatchesLegacy pins the escalating

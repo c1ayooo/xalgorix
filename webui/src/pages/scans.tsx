@@ -29,6 +29,7 @@ import {
 import { useDeleteScan, useScansPage } from "@/api/queries";
 import { cn, timeAgo, shortId, menuContentClass, menuItemClass } from "@/lib/utils";
 import { useDebounced } from "@/lib/use-debounced";
+import { useActiveProjectId } from "@/lib/use-active-project";
 import type { ScanListItem } from "@/types/api";
 import { Pagination, DEFAULT_PAGE_SIZE } from "@/components/Pagination";
 import {
@@ -51,17 +52,19 @@ export default function ScansPage() {
   const [pageSize, setPageSize] = useState<number>(DEFAULT_PAGE_SIZE);
   const [pendingDelete, setPendingDelete] = useState<string[] | null>(null);
   const debouncedQ = useDebounced(q, 300);
+  const projectId = useActiveProjectId();
 
   // Reset to the first page whenever the filters change shape.
   useEffect(() => {
     setPage(1);
-  }, [debouncedQ, status, pageSize]);
+  }, [debouncedQ, status, pageSize, projectId]);
 
   const { data, isLoading, error, refetch } = useScansPage({
     page,
     size: pageSize,
     q: debouncedQ,
     status,
+    projectId: projectId ?? undefined,
   });
   const del = useDeleteScan();
 
