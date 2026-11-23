@@ -28,7 +28,7 @@ type Config struct {
 	// LLMExtraHeaders are additional HTTP headers sent on every LLM request
 	// (XALGORIX_LLM_EXTRA_HEADERS, JSON object). Used by gateways that require
 	// a routing/session header (e.g. OpenCode Go's x-opencode-session).
-	LLMExtraHeaders     map[string]string
+	LLMExtraHeaders map[string]string
 	// ControlPlaneHosts (XALGORIX_CONTROL_PLANE_HOSTS, comma list) are API
 	// endpoints that are never scan targets: auto-delegation lanes and recon
 	// are skipped when every target is one of these.
@@ -258,7 +258,12 @@ type Config struct {
 	ProjectTmpfsMB     int64 // XALGORIX_PROJECT_TMPFS_MB, default 512
 	ProjectIdleTTLSec  int   // XALGORIX_PROJECT_IDLE_TTL_SECONDS, default 600
 	ProjectMaxLifeSec  int   // XALGORIX_PROJECT_MAX_LIFE_SECONDS, default 21600
-	ToolboxKeepDigests int   // XALGORIX_TOOLBOX_KEEP_DIGESTS, default 3
+	// ProjectDiskEnforce applies the per-project DiskMB budget as the Docker
+	// writable-layer StorageOpt. It is opt-in because only overlay2 with
+	// project quotas supports it; without support container creation fails, so
+	// silently enabling it would break existing daemons.
+	ProjectDiskEnforce bool // XALGORIX_PROJECT_DISK_ENFORCE, default false
+	ToolboxKeepDigests int  // XALGORIX_TOOLBOX_KEEP_DIGESTS, default 3
 
 	Workspace     string // XALGORIX_WORKSPACE — workspace root dir
 	DataDir       string // Active per-installation data root. Defaults to ~/.xalgorix/data/. Override via XALGORIX_DATA_DIR.
@@ -666,6 +671,7 @@ func load() *Config {
 		ProjectTmpfsMB:           int64(envOrInt("XALGORIX_PROJECT_TMPFS_MB", 512)),
 		ProjectIdleTTLSec:        envOrInt("XALGORIX_PROJECT_IDLE_TTL_SECONDS", 600),
 		ProjectMaxLifeSec:        envOrInt("XALGORIX_PROJECT_MAX_LIFE_SECONDS", 21600),
+		ProjectDiskEnforce:       envOrBool("XALGORIX_PROJECT_DISK_ENFORCE", false),
 		ToolboxKeepDigests:       envOrInt("XALGORIX_TOOLBOX_KEEP_DIGESTS", 3),
 		Workspace:                workspace,
 		DataDir:                  dataDir,

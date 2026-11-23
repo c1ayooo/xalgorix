@@ -58,6 +58,7 @@ var securityBlockCategories = []struct {
 	{"UNRECORDED EVIDENCE", "ledger"},
 	{"proven-but-unreported", "ledger"},
 	{"REPORT NOT SAVED", "report"},
+	{"DELEGATION DUPLICATE", "delegation"},
 	{"benchmark isolation", "benchmark"},
 }
 
@@ -65,7 +66,7 @@ var securityBlockCategories = []struct {
 // renders every bucket without inferring absent keys.
 var securityCategories = []string{
 	"scopeguard", "target_scope", "phase", "auth", "activity",
-	"goal", "ledger", "report", "benchmark", "other",
+	"goal", "ledger", "report", "benchmark", "delegation", "other",
 }
 
 const securityBlockCap = 200             // newest blocks returned
