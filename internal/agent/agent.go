@@ -1088,6 +1088,10 @@ func (a *Agent) maybeAutoDelegate(targets []string) string {
 		a.state.ReconOnlyMode {
 		return ""
 	}
+	// DisableAutoDelegate = no deterministic wave; manual spawn stays open.
+	if a.cfg != nil && a.cfg.DisableAutoDelegate {
+		return ""
+	}
 	// Opt-in bounded reschedule (P2, XALGORIX_WAVE_RESCHEDULE): after the first
 	// wave drains, still-unfinished plan classes may justify ONE more lane.
 	// Checked before the DelegationAttempted early return below, which the
@@ -1529,9 +1533,10 @@ func (a *Agent) delegationEnabled() bool {
 	if a == nil || a.registry == nil {
 		return false
 	}
-	if a.cfg != nil && a.cfg.DisableAutoDelegate {
-		return false
-	}
+	// NOTE: XALGORIX_DISABLE_AUTO_DELEGATE suppresses the automatic specialist
+	// WAVE only (checked in maybeAutoDelegate). It must NOT disable manual
+	// spawn_agent: operators use it precisely to keep the engine from
+	// generating lanes while still delegating per-unit work themselves.
 	if a.ctfDelegationBlocked() {
 		return false
 	}
