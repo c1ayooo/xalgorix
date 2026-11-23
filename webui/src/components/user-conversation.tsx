@@ -36,8 +36,8 @@ export function UserConversation({
   /** 旁路提问在途：回答尚未回流时占一行，避免"发出去没反应"的观感。 */
   pending?: boolean;
   className?: string;
-  /** 空态上报（对话页据此把 composer 居中）；缺省不报告。 */
-  onEmptyChange?: (empty: boolean) => void;
+  /** 空态上报（对话页据此把 composer 居中）；undefined=加载中，位置未决。 */
+  onEmptyChange?: (empty: boolean | undefined) => void;
 }) {
   const { t } = useI18n();
   const { data, isLoading, error, refetch } = useTranscript(instanceId, undefined, 200, true);
@@ -84,10 +84,13 @@ export function UserConversation({
   }, [messages, pending]);
 
   // 空态上报须在早退 return（skeleton/error）之前声明，保证各分支都在报告。
-  const isEmpty = !isLoading && authStatus !== "loading" && !error && messages.length === 0 && !pending;
+  // 口径：只看人工对话内容（提问/回答/指令），run 的执行内容与本页无关；
+  // 加载中上报 undefined（位置未决），避免"先居中再跳底"。
+  const loaded = !isLoading && authStatus !== "loading";
+  const emptiness: boolean | undefined = !loaded ? undefined : error ? false : messages.length === 0 && !pending;
   useEffect(() => {
-    onEmptyChange?.(isEmpty);
-  }, [isEmpty, onEmptyChange]);
+    onEmptyChange?.(emptiness);
+  }, [emptiness, onEmptyChange]);
 
   if (isLoading || authStatus === "loading") {
     return (

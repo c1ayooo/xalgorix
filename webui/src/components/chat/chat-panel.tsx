@@ -71,7 +71,9 @@ export function ChatPanel({
   const [renaming, setRenaming] = useState(false);
   const [title, setTitle] = useState(run.title ?? "");
   // 转录为空时 composer 垂直居中（ChatGPT 新会话式）；有内容即钉底。
-  const [empty, setEmpty] = useState(false);
+  // undefined = 投影还在加载（或刚切换会话），保持底部布局，等上报后落位，
+  // 避免"先居中再跳底"或沿用上一个会话的空态。
+  const [empty, setEmpty] = useState<boolean | undefined>(undefined);
   // 发送语义按投影分开（4zreco 对话页）：人工页默认「提问」走旁路应答（保证
   // 有回应、不消耗扫描轮次），指令通过同一个小选择按钮切换、注入主循环（HITL
   // guidance）；转录页默认「指令」，因为它就是执行过程的下发口。
@@ -94,6 +96,8 @@ export function ChatPanel({
   useEffect(() => {
     setQuestionPending(false);
     setSendMode(view === "full" ? "directive" : "question");
+    // 切换会话/投影时先回到"未决"，由新投影重新上报空态。
+    setEmpty(undefined);
   }, [instanceId, view]);
 
   useEffect(() => {
@@ -269,7 +273,7 @@ export function ChatPanel({
             ? t("chat.questionPlaceholder")
             : undefined
         }
-        className={empty ? "mx-auto w-full max-w-3xl rounded-lg border border-border" : undefined}
+        className={empty === true ? "mx-auto w-full max-w-3xl rounded-lg border border-border" : undefined}
         leftSlot={
           view === "human" || running ? (
             <div className="inline-flex rounded-md border border-border p-0.5" role="group" aria-label={t("chat.sendModeLabel")}>
@@ -350,7 +354,7 @@ export function ChatPanel({
       />
 
       {/* 空态：composer 之后的等高占位把它推到面板垂直正中；有内容时不渲染 → 钉底。 */}
-      {empty && <div aria-hidden className="flex-1" />}
+      {empty === true && <div aria-hidden className="flex-1" />}
 
       <AlertDialog open={stopOpen} onOpenChange={setStopOpen}>
         <AlertDialogContent>

@@ -60,8 +60,8 @@ export function Transcript({
   filter?: (item: TranscriptItem) => boolean;
   className?: string;
   empty?: React.ReactNode;
-  /** 空态上报（对话页据此把 composer 居中）；缺省不报告。 */
-  onEmptyChange?: (empty: boolean) => void;
+  /** 空态上报（对话页据此把 composer 居中）；undefined=加载中，位置未决。 */
+  onEmptyChange?: (empty: boolean | undefined) => void;
 }) {
   const { t } = useI18n();
   const [beforeSeq, setBeforeSeq] = useState<number | undefined>(undefined);
@@ -191,10 +191,12 @@ export function Transcript({
   const hasMore = data?.has_more ?? false;
 
   // 空态上报须在早退 return（skeleton/error）之前声明，保证各分支都在报告。
-  const isEmpty = !isLoading && !error && filtered.length === 0;
+  // 首屏加载期间上报 undefined（位置未决），避免"先居中再跳底"。
+  const emptiness: boolean | undefined =
+    isLoading && pages.length === 0 ? undefined : !error && filtered.length === 0;
   useEffect(() => {
-    onEmptyChange?.(isEmpty);
-  }, [isEmpty, onEmptyChange]);
+    onEmptyChange?.(emptiness);
+  }, [emptiness, onEmptyChange]);
 
   if (!instanceId) return null;
   if (isLoading && pages.length === 0) {
