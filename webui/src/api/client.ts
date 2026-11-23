@@ -757,9 +757,12 @@ export const api = {
     http<{ items: ConversationRow[] }>(
       `/api/projects/${projectId}/conversations${includeArchived ? "?include_archived=true" : ""}`,
     ),
-  conversationTranscript: (instanceId: string, beforeSeq?: number, limit = 80) => {
+  conversationTranscript: (instanceId: string, beforeSeq?: number, limit = 80, human = false) => {
     const qs = new URLSearchParams({ limit: String(limit) });
     if (beforeSeq && beforeSeq > 0) qs.set("before_seq", String(beforeSeq));
+    // human=1: the operator-conversation projection (human turns + side-question
+    // answers); the full transcript keeps tool/plan/worker/lifecycle rows.
+    if (human) qs.set("human", "1");
     return http<TranscriptPage>(`/api/conversations/${instanceId}/transcript?${qs.toString()}`);
   },
   updateConversation: (instanceId: string, patch: ConversationPatch) =>

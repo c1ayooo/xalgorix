@@ -936,10 +936,10 @@ export function useProjectConversations(projectId?: string, includeArchived = fa
   });
 }
 
-export function useTranscript(instanceId?: string, beforeSeq?: number, limit = 80) {
+export function useTranscript(instanceId?: string, beforeSeq?: number, limit = 80, human = false) {
   return useQuery({
-    queryKey: ["conversation", instanceId ?? "none", "transcript", beforeSeq ?? 0, limit],
-    queryFn: () => api.conversationTranscript(instanceId!, beforeSeq, limit),
+    queryKey: ["conversation", instanceId ?? "none", "transcript", beforeSeq ?? 0, limit, human ? "human" : "full"],
+    queryFn: () => api.conversationTranscript(instanceId!, beforeSeq, limit, human),
     enabled: !!instanceId,
     retry: false,
     refetchInterval: (query) => (query.state.data?.running ? 2500 : false),

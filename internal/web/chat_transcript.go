@@ -53,7 +53,11 @@ type transcriptItem struct {
 	Output  string          `json:"output,omitempty"`
 	Status  string          `json:"status,omitempty"`
 	AgentID string          `json:"agent_id,omitempty"`
-	At      time.Time       `json:"at"`
+	// CreatedBy is the operator who produced a human turn (guidance author,
+	// side-question asker). Empty for agent output. The human-only projection
+	// keeps the per-user filtering the old guidance view had.
+	CreatedBy string    `json:"created_by,omitempty"`
+	At        time.Time `json:"at"`
 	// Phase carries the inferred methodology phase of tool events (Track C
 	// round segmentation): the transcript view inserts a divider when it
 	// changes. Zero = event carried no phase.
@@ -289,6 +293,13 @@ func (s *Server) handleTranscript(w http.ResponseWriter, r *http.Request, store 
 	run, _ := s.runForInstance(ctx, store, instanceID)
 
 	items := s.buildTranscript(ctx, store, instanceID, run)
+	// ?human=1 narrows the projection to the operator conversation (human
+	// turns + side-question answers). The human page is a conversation, not a
+	// trace: tool calls, plans, workers and lifecycle stay in the full
+	// transcript. Filtering here keeps one persisted authority for both views.
+	if r.URL.Query().Get("human") == "1" {
+		items = humanTranscriptItems(items)
+	}
 	total := len(items)
 
 	end := total
@@ -457,6 +468,10 @@ func foldTranscriptLine(line []byte, seen map[string]struct{}, out *[]transcript
 		Aborted     bool               `json:"aborted"`
 		AbortReason string             `json:"abort_reason"`
 		Approval    *platform.Approval `json:"approval"`
+		ResultMeta  struct {
+			CreatedBy  string `json:"created_by"`
+			AnsweredBy string `json:"answered_by"`
+		} `json:"result_meta"`
 	}
 	if err := json.Unmarshal(line, &ev); err != nil {
 		return
@@ -483,13 +498,13 @@ func foldTranscriptLine(line []byte, seen map[string]struct{}, out *[]transcript
 		if strings.TrimSpace(ev.Content) == "" {
 			return
 		}
-		*out = append(*out, transcriptItem{Kind: "human", Role: "human", Text: ev.Content, At: at})
+		*out = append(*out, transcriptItem{Kind: "human", Role: "human", Text: ev.Content, CreatedBy: ev.ResultMeta.CreatedBy, At: at})
 	case "chat_reply":
 		// The side-question responder's answer (or its honest failure).
 		// Role "chat" lets the UI badge it apart from main-loop agent
 		// narration; a failed call keeps its row so the operator sees
 		// the error instead of silence.
-		item := transcriptItem{Kind: "assistant", Role: "chat", AgentID: ev.AgentID, At: at}
+		item := transcriptItem{Kind: "assistant", Role: "chat", AgentID: ev.AgentID, CreatedBy: ev.ResultMeta.AnsweredBy, At: at}
 		if strings.TrimSpace(ev.Error) != "" {
 			// Text stays the raw error; the UI renders the localized
 			// "answer failed" framing from Status.
@@ -548,6 +563,26 @@ func foldTranscriptLine(line []byte, seen map[string]struct{}, out *[]transcript
 
 // transcriptGuidance folds the operator's own turns in. Guidance rows carry
 // both run_id and instance_id; matching on either keeps older rows visible.
+// humanTranscriptItems keeps only the operator conversation: human turns
+// (guidance and side questions) and the side-question answers. Seq is
+// renumbered so the pagination contract ("1-based contiguous") still holds
+// for the narrowed projection.
+func humanTranscriptItems(items []transcriptItem) []transcriptItem {
+	out := make([]transcriptItem, 0, len(items))
+	for _, item := range items {
+		if item.Kind == "human" || item.Role == "chat" {
+			out = append(out, item)
+		}
+	}
+	for i := range out {
+		out[i].Seq = i + 1
+	}
+	return out
+}
+
+// transcriptGuidance folds the task's guidance rows (the human turns the
+// platform store owns) into the timeline. Status rides along so the human
+// view can show injected/queued/consumed without a second query.
 func (s *Server) transcriptGuidance(ctx context.Context, store platform.Repository, instanceID string, run *platform.Run) []transcriptItem {
 	if store == nil || run == nil {
 		return nil
@@ -566,7 +601,7 @@ func (s *Server) transcriptGuidance(ctx context.Context, store platform.Reposito
 		}
 		out = append(out, transcriptItem{
 			Kind: "human", Role: "human", Text: g.Message,
-			Status: g.Status, At: g.CreatedAt,
+			Status: g.Status, CreatedBy: g.CreatedBy, At: g.CreatedAt,
 		})
 	}
 	return out

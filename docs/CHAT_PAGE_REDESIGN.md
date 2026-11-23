@@ -72,10 +72,11 @@ CREATE INDEX IF NOT EXISTS runs_task_pinned_idx ON runs (task_id, pinned DESC, c
 ### 4.2 转录分页 API
 
 ```
-GET /api/instances/{instanceID}/transcript?before_seq=<int>&limit=<1..200>
+GET /api/instances/{instanceID}/transcript?before_seq=<int>&limit=<1..200>&human=1
 → { items: Activity[], has_more: bool, earliest_seq: int, latest_seq: int, running: bool }
 ```
 
+- `human=1`（2026-11-23）：只返回人工对话切片——`kind=human`（guidance 与旁路提问）加 `role=chat`（旁路回答）。工具/计划/worker/生命周期行不进人工页；`seq` 在切片内重排为连续。两个投影共用同一份持久化转录，人工页默认走它。
 - 数据源：该 run 的扫描目录 `events.jsonl`（逆序读尾部，seek 定位，不全量载入）+ `guidance` 表按 `instance_id` 过滤，按时间归并后分配单调 `seq`。
 - `Activity.kind`：`human | assistant | tool_use | tool_result | approval | finding | system`。
 - 无 PG / 无扫描目录时返回空集 + `has_more=false`，不报错（保住单二进制降级，不变量 9）。

@@ -75,20 +75,20 @@ func (s *Server) handleTaskQuestions(w http.ResponseWriter, r *http.Request, sto
 		return
 	}
 
+	createdBy := ""
+	if claims, ok := sessionClaimsFrom(r); ok {
+		createdBy = claims.Username
+	}
 	snap := s.snapshotChatInstance(instanceID)
 	question := WSEvent{
 		Type:       "chat_question",
 		Content:    req.Message,
 		InstanceID: instanceID,
-		ResultMeta: map[string]any{"request_id": req.RequestID, "task_id": taskID, "run_id": runID},
+		ResultMeta: map[string]any{"request_id": req.RequestID, "task_id": taskID, "run_id": runID, "created_by": createdBy},
 	}
 	s.appendConversationEvent(instanceID, question)
 	s.broadcastToInstance(instanceID, question)
 
-	createdBy := ""
-	if claims, ok := sessionClaimsFrom(r); ok {
-		createdBy = claims.Username
-	}
 	language := ""
 	if cfg := s.configSnapshot(); cfg != nil {
 		language = cfg.Language

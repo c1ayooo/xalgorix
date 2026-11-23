@@ -78,3 +78,34 @@ func TestApprovalTranscriptLine(t *testing.T) {
 		}
 	}
 }
+
+// TestHumanTranscriptItems keeps the human page a conversation: human turns
+// (guidance + side questions) and side-question answers survive; tool calls,
+// plans, lifecycle rows and main-loop narration do not. Seq is renumbered so
+// before_seq pagination keeps its contiguous contract on the narrowed slice.
+func TestHumanTranscriptItems(t *testing.T) {
+	items := []transcriptItem{
+		{Seq: 1, Kind: "human", Role: "human", Text: "check a-17", CreatedBy: "c1ay"},
+		{Seq: 2, Kind: "assistant", Role: "agent", Text: "I'll start with recon"},
+		{Seq: 3, Kind: "tool_use", Tool: "http_request"},
+		{Seq: 4, Kind: "tool_result", Tool: "http_request", Output: "200"},
+		{Seq: 5, Kind: "human", Role: "human", Text: "is sqli possible?"},
+		{Seq: 6, Kind: "assistant", Role: "chat", Text: "Not yet proven; the form reflects input."},
+		{Seq: 7, Kind: "system", Text: "phase 3"},
+	}
+	out := humanTranscriptItems(items)
+	if len(out) != 3 {
+		t.Fatalf("human slice = %d rows, want 3: %#v", len(out), out)
+	}
+	if out[0].Text != "check a-17" || out[1].Text != "is sqli possible?" {
+		t.Fatalf("human turns lost: %#v", out)
+	}
+	if out[2].Role != "chat" || out[2].Text == "" {
+		t.Fatalf("side-question answer lost: %#v", out[2])
+	}
+	for i, item := range out {
+		if item.Seq != i+1 {
+			t.Fatalf("seq not renumbered at %d: %#v", i, item)
+		}
+	}
+}

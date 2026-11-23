@@ -72,10 +72,10 @@ export function ChatPanel({
   const [title, setTitle] = useState(run.title ?? "");
   // 转录为空时 composer 垂直居中（ChatGPT 新会话式）；有内容即钉底。
   const [empty, setEmpty] = useState(false);
-  // 运行中的发送语义（4zreco 对话页）：默认「提问」走旁路应答（保证有回应、
-  // 不消耗扫描轮次），「指令」才注入主循环（HITL guidance）。空闲/终态只有
-  // guidance 一条路，切换器不出现。
-  const [sendMode, setSendMode] = useState<"question" | "directive">("question");
+  // 发送语义按投影分开（4zreco 对话页）：人工页默认「提问」走旁路应答（保证
+  // 有回应、不消耗扫描轮次），指令通过同一个小选择按钮切换、注入主循环（HITL
+  // guidance）；转录页默认「指令」，因为它就是执行过程的下发口。
+  const [sendMode, setSendMode] = useState<"question" | "directive">(view === "full" ? "directive" : "question");
   // 提问在途标记：202 后等 chat_reply 事件回流（SSE→refetch 渲染答案），
   // 期间禁用发送避免 409。切换会话即复位。
   const [questionPending, setQuestionPending] = useState(false);
@@ -93,8 +93,8 @@ export function ChatPanel({
   }, [events, questionPending, instanceId]);
   useEffect(() => {
     setQuestionPending(false);
-    setSendMode("question");
-  }, [instanceId]);
+    setSendMode(view === "full" ? "directive" : "question");
+  }, [instanceId, view]);
 
   useEffect(() => {
     setTitle(run.title ?? "");
@@ -182,13 +182,13 @@ export function ChatPanel({
         <div className="ml-auto flex min-w-0 items-center gap-1.5">
           <Tabs value={view} onValueChange={(v) => onViewChange(v as ViewMode)}>
             <TabsList className="h-7">
-              <TabsTrigger value="full" className="h-6 px-2 text-[11px]">
-                <Eye className="mr-1 size-3" aria-hidden />
-                {t("chat.viewFull")}
-              </TabsTrigger>
               <TabsTrigger value="human" className="h-6 px-2 text-[11px]">
                 <MessageSquare className="mr-1 size-3" aria-hidden />
                 {t("chat.viewHuman")}
+              </TabsTrigger>
+              <TabsTrigger value="full" className="h-6 px-2 text-[11px]">
+                <Eye className="mr-1 size-3" aria-hidden />
+                {t("chat.viewFull")}
               </TabsTrigger>
             </TabsList>
           </Tabs>
@@ -250,9 +250,8 @@ export function ChatPanel({
       ) : (
         <div className="min-h-0 flex-1 overflow-hidden">
           <UserConversation
-            taskId={run.task_id}
             instanceId={instanceId}
-            runId={run.id}
+            pending={questionPending}
             onEmptyChange={setEmpty}
             className="h-full bg-muted/10"
           />
@@ -264,15 +263,15 @@ export function ChatPanel({
         // 提问模式下发送键保持发送（停止控制在次行头部已有）；指令模式沿用
         // 「运行中发送键变停止键」的参照语义。
         running={running && sendMode === "directive"}
-        disabled={running && sendMode === "question" && questionPending}
+        disabled={sendMode === "question" && questionPending}
         placeholder={
-          running && sendMode === "question"
+          sendMode === "question"
             ? t("chat.questionPlaceholder")
             : undefined
         }
         className={empty ? "mx-auto w-full max-w-3xl rounded-lg border border-border" : undefined}
         leftSlot={
-          running ? (
+          view === "human" || running ? (
             <div className="inline-flex rounded-md border border-border p-0.5" role="group" aria-label={t("chat.sendModeLabel")}>
               <button
                 type="button"
@@ -306,7 +305,7 @@ export function ChatPanel({
           ) : undefined
         }
         onSend={async (message) => {
-          if (running && sendMode === "question") {
+          if (sendMode === "question") {
             await new Promise<void>((resolve, reject) => {
               ask.mutate(
                 { id: run.task_id, message, requestId: newRequestId(), instanceId },

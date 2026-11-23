@@ -16,14 +16,15 @@ import type { ConversationRow } from "@/types/api";
  *
  * 左栏：新建对话 + 任务筛选 + 计数/多选 + 置顶 + 按任务分组（折叠持久化）
  * 右栏：无 ?run= 时 DraftChat（首条消息才创建 Run）；选中后 ChatView。
- * URL 是唯一权威：/chat?run=&view=full|human&archived=1；不再自动选第一条。
+ * URL 是唯一权威：/chat?run=&view=human|full&archived=1；不再自动选第一条。
+ * 默认投影是人工对话（干净的人↔助手回合）；?view=full 才进执行转录。
  */
 export default function ChatPage() {
   const { t } = useI18n();
   const [searchParams, setSearchParams] = useSearchParams();
   const projectId = useActiveProjectId();
   const archived = searchParams.get("archived") === "1";
-  const view = searchParams.get("view") === "human" ? "human" : "full";
+  const view = searchParams.get("view") === "full" ? "full" : "human";
 
   const { data: tasksData } = useTasks(projectId ?? undefined);
   const tasks = useMemo(() => tasksData?.tasks ?? [], [tasksData]);
