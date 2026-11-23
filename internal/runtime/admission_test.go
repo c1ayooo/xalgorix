@@ -350,3 +350,35 @@ func equalStrings(a, b []string) bool {
 	}
 	return true
 }
+
+// TestBuildProjectAcceptsGatewayProxy pins the container-reachable proxy path:
+// a proxy-only project whose proxy is addressed through the project network's
+// gateway (the platform traffic proxy bound on 0.0.0.0) is valid — the driver
+// resolves the gateway and injects the URL itself after the network exists.
+func TestBuildProjectAcceptsGatewayProxy(t *testing.T) {
+	t.Setenv("XALGORIX_ALLOW_UNPINNED_TOOLBOX", "yes")
+	opt := ProjectOptions{
+		ScanID:           "scan-gwproxy",
+		ScanDir:          t.TempDir(),
+		SharedDir:        t.TempDir(),
+		Image:            "xalgorix-toolbox:dev-core",
+		NetProfile:       NetProfileProxyOnly,
+		ProxyGatewayPort: 8081,
+	}
+	spec, err := BuildProject(opt)
+	if err != nil {
+		t.Fatalf("gateway-addressed proxy must be accepted: %v", err)
+	}
+	if spec.Network.ProxyGatewayPort != 8081 {
+		t.Fatalf("gateway port lost: %#v", spec.Network)
+	}
+	if !spec.Network.Internal {
+		t.Fatal("proxy-only projects must use an internal network")
+	}
+
+	// Without either a URL or a gateway port the fail-closed check stays.
+	opt.ProxyGatewayPort = 0
+	if _, err := BuildProject(opt); err == nil {
+		t.Fatal("proxy-only without a reachable proxy must be rejected")
+	}
+}

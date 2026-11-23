@@ -151,20 +151,27 @@ func ActiveToolbox() *Toolbox {
 
 // ProjectOptions is the input for BuildProject.
 type ProjectOptions struct {
-	InstanceID  string
-	ScanID      string
-	ScanDir     string
-	SharedDir   string
-	Image       string
-	Profile     string
-	NetProfile  string
-	ProxyURL    string
-	CACertPath  string
-	EgressCIDRs []string
-	Limits      ResourceLimits
-	Env         []string
+	InstanceID string
+	ScanID     string
+	ScanDir    string
+	SharedDir  string
+	Image      string
+	Profile    string
+	NetProfile string
+	ProxyURL   string
+	// ProxyGatewayPort selects the per-project network gateway as the proxy
+	// address (http://<gateway>:<port>). It is used when the platform's proxy
+	// listens on 0.0.0.0 and an --internal project network can reach only its
+	// own gateway, not the host loopback.
+	ProxyGatewayPort int
+	CACertPath       string
+	EgressCIDRs      []string
+	Limits           ResourceLimits
+	Env              []string
 	// BrowserProxy is only used by web-profile projects (Chromium argument).
 	BrowserProxy string
+	// HTTPWorkerSocket enables the in-container HTTP worker on this path.
+	HTTPWorkerSocket string
 }
 
 // BuildProject assembles a ProjectSpec with the same-path mount plan and the
@@ -196,9 +203,11 @@ func BuildProject(opt ProjectOptions) (ProjectSpec, error) {
 	default:
 		return ProjectSpec{}, fmt.Errorf("runtime: unknown net profile %q", netProfile)
 	}
-	if netProfile == NetProfileProxyOnly && strings.TrimSpace(opt.ProxyURL) == "" {
+	if netProfile == NetProfileProxyOnly && strings.TrimSpace(opt.ProxyURL) == "" && opt.ProxyGatewayPort <= 0 {
 		// Fail closed at configuration time rather than silently letting a
-		// proxy-only project fall back to direct egress.
+		// proxy-only project fall back to direct egress. A gateway port is a
+		// valid proxy address too: the driver resolves the project network's
+		// gateway after the network exists and injects the URL itself.
 		return ProjectSpec{}, fmt.Errorf("runtime: proxy-only projects require a proxy URL")
 	}
 
@@ -245,15 +254,17 @@ func BuildProject(opt ProjectOptions) (ProjectSpec, error) {
 		WorkDir:    absScan,
 		Env:        env,
 		Network: NetworkSpec{
-			Name:        "xalg-proj-" + sanitizeNetName(opt.ScanID),
-			Internal:    netProfile == NetProfileProxyOnly,
-			ProxyURL:    opt.ProxyURL,
-			CACertPath:  opt.CACertPath,
-			EgressCIDRs: opt.EgressCIDRs,
+			Name:             "xalg-proj-" + sanitizeNetName(opt.ScanID),
+			Internal:         netProfile == NetProfileProxyOnly,
+			ProxyURL:         opt.ProxyURL,
+			ProxyGatewayPort: opt.ProxyGatewayPort,
+			CACertPath:       opt.CACertPath,
+			EgressCIDRs:      opt.EgressCIDRs,
 		},
-		Capabilities: capabilitiesForProfile(opt.Profile, netProfile),
-		PublishCDP:   orDefault(opt.Profile, ProfileCore) == ProfileWeb,
-		BrowserProxy: opt.BrowserProxy,
+		Capabilities:     capabilitiesForProfile(opt.Profile, netProfile),
+		PublishCDP:       orDefault(opt.Profile, ProfileCore) == ProfileWeb,
+		BrowserProxy:     opt.BrowserProxy,
+		HTTPWorkerSocket: opt.HTTPWorkerSocket,
 	}
 	if err := ValidateMounts(spec.Mounts); err != nil {
 		return ProjectSpec{}, err
@@ -262,15 +273,18 @@ func BuildProject(opt ProjectOptions) (ProjectSpec, error) {
 }
 
 func capabilitiesForProfile(profile, netProfile string) []string {
-	if netProfile != NetProfileRaw {
-		return nil
+	// DAC override/read-search are not optional: the project runs as root but
+	// the container drops ALL capabilities, and the scan directory is owned by
+	// the platform's uid with mode 0700. Without these two, root is subject to
+	// file DAC and cannot write its own workspace.
+	caps := []string{"CAP_DAC_OVERRIDE", "CAP_DAC_READ_SEARCH"}
+	if profile == ProfileFull {
+		caps = append(caps, "NET_RAW", "NET_ADMIN")
 	}
-	switch profile {
-	case ProfileFull:
-		return []string{"NET_RAW", "NET_ADMIN"}
-	default:
-		return []string{"NET_RAW"}
+	if netProfile == NetProfileRaw && profile != ProfileFull {
+		caps = append(caps, "NET_RAW")
 	}
+	return caps
 }
 
 func sanitizeNetName(scanID string) string {
