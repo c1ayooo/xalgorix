@@ -572,7 +572,7 @@ func (b *explorationBuilder) mergeLedger() {
 		for _, ev := range h.Evidence {
 			evID := evNodeID(ev.ID)
 			if en, ok := b.nodes[evID]; ok && en.Title == "" {
-				en.Title = string(ev.Kind)
+				en.Title = ev.Kind
 			}
 			if ev.FindingID != "" {
 				fid := findingNodeID(ev.FindingID)

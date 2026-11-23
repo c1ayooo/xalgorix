@@ -21,9 +21,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/c1ayooo/xalgorix/v4/internal/config"
 	ishclient "github.com/projectdiscovery/interactsh/pkg/client"
 	ishserver "github.com/projectdiscovery/interactsh/pkg/server"
-	"github.com/c1ayooo/xalgorix/v4/internal/config"
 )
 
 const (

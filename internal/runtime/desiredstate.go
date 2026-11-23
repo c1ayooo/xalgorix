@@ -40,18 +40,18 @@ const (
 
 // DesiredProject is one row of toolbox_projects.
 type DesiredProject struct {
-	ProjectID    string    `json:"project_id"`
-	ScanID       string    `json:"scan_id"`
-	InstanceID   string    `json:"instance_id"`
-	ImageDigest  string    `json:"image_digest"`
-	Profile      string    `json:"profile"`
-	NetProfile   string    `json:"net_profile"`
-	DesiredState string    `json:"desired_state"`
-	DesiredGen   int64     `json:"desired_gen"`
-	AppliedGen   int64     `json:"applied_gen"`
-	Status       string    `json:"status"`
-	ContainerID  string    `json:"container_id"`
-	LastError    string    `json:"last_error"`
+	ProjectID    string `json:"project_id"`
+	ScanID       string `json:"scan_id"`
+	InstanceID   string `json:"instance_id"`
+	ImageDigest  string `json:"image_digest"`
+	Profile      string `json:"profile"`
+	NetProfile   string `json:"net_profile"`
+	DesiredState string `json:"desired_state"`
+	DesiredGen   int64  `json:"desired_gen"`
+	AppliedGen   int64  `json:"applied_gen"`
+	Status       string `json:"status"`
+	ContainerID  string `json:"container_id"`
+	LastError    string `json:"last_error"`
 	// Spec is the serialised ProjectSpec so the reconciler can rebuild the
 	// exact container without consulting live memory after a restart.
 	Spec      string    `json:"spec"`

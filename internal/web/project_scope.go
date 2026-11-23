@@ -118,7 +118,7 @@ func (s *Server) putProjectScope(w http.ResponseWriter, r *http.Request, store p
 		writePlatformError(w, err)
 		return
 	}
-	// Scope observer baseline (v4.6): materialise preset rules for the new
+	// Scope observer baseline (v4.6): materialize preset rules for the new
 	// scope hosts so the operator sees what the observer will auto-deny.
 	if n := s.seedScopeApprovalRules(r.Context(), store, project.ID); n > 0 {
 		log.Printf("[scope-observer] seeded %d baseline rule(s) after scope update of %s", n, project.ID)

@@ -236,10 +236,10 @@ func decodeNDJSON(r io.Reader, onFrame func(StreamFrame)) (*ExecResult, error) {
 
 // runnerdFrame is one NDJSON line produced by runnerd.
 type runnerdFrame struct {
-	Type   string       `json:"type"`
-	Seq    uint64       `json:"seq,omitempty"`
-	Data   string       `json:"data,omitempty"`
-	Result *ExecResult  `json:"result,omitempty"`
+	Type   string        `json:"type"`
+	Seq    uint64        `json:"seq,omitempty"`
+	Data   string        `json:"data,omitempty"`
+	Result *ExecResult   `json:"result,omitempty"`
 	Error  *runnerdError `json:"error,omitempty"`
 }
 
@@ -290,10 +290,32 @@ func (d *RunnerdDriver) Capacity(ctx context.Context) (CapacityReport, error) {
 	return out.Capacity, nil
 }
 
+// CDPEndpoint asks runnerd for a relay URL to the project's Chromium DevTools
+// endpoint. The relay is what makes the browser usable from a platform that
+// runs in its own container: runnerd sees the host's published port, the
+// platform cannot.
+func (d *RunnerdDriver) CDPEndpoint(ctx context.Context, projectID, proxyURL string) (string, error) {
+	var out struct {
+		Endpoint string `json:"endpoint"`
+	}
+	body := map[string]string{"proxy_url": proxyURL}
+	if err := d.call(ctx, http.MethodPost, "/v1/projects/"+projectID+"/cdp", body, &out); err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(out.Endpoint) == "" {
+		return "", NewExecError(CodeRuntimeUnavailable, PhaseExec, "runnerd returned an empty CDP endpoint")
+	}
+	return out.Endpoint, nil
+}
+
 // RunnerdHandler is the server half of the runnerd contract. cmd/runnerd wires
 // it to a DockerDriver; tests wire it to a fake.
 type RunnerdHandler struct {
 	Driver Driver
+	// CDP relays the project's loopback-bound Chromium DevTools port to a
+	// host name the platform can reach. nil keeps the direct endpoint (host
+	// platform) and makes the /cdp route unsupported.
+	CDP *CDPRelay
 }
 
 // ServeHTTP implements the runnerd API.
@@ -357,6 +379,25 @@ func (h *RunnerdHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"result": result})
 
+	case r.Method == http.MethodPost && strings.HasSuffix(path, "/cdp"):
+		projectID := strings.TrimSuffix(strings.TrimPrefix(path, "/projects/"), "/cdp")
+		var body struct {
+			ProxyURL string `json:"proxy_url"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		provider, ok := h.Driver.(CDPProvider)
+		if !ok || h.CDP == nil {
+			writeRunnerdError(w, NewExecError(CodeUnsupported, PhaseExec,
+				"this runnerd cannot relay a CDP endpoint (driver has no DevTools support or the relay is disabled)"))
+			return
+		}
+		endpoint, err := h.CDP.Endpoint(r.Context(), provider, projectID, body.ProxyURL)
+		if err != nil {
+			writeRunnerdError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"endpoint": endpoint})
+
 	case r.Method == http.MethodPost && strings.HasSuffix(path, "/stop"):
 		projectID := strings.TrimSuffix(strings.TrimPrefix(path, "/projects/"), "/stop")
 		var body struct {
@@ -373,6 +414,9 @@ func (h *RunnerdHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeRunnerdError(w, err)
 			return
 		}
+		if h.CDP != nil {
+			h.CDP.Remove(projectID)
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 
 	case r.Method == http.MethodDelete && strings.HasPrefix(path, "/projects/"):
@@ -380,6 +424,9 @@ func (h *RunnerdHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if err := h.Driver.RemoveProject(r.Context(), projectID); err != nil {
 			writeRunnerdError(w, err)
 			return
+		}
+		if h.CDP != nil {
+			h.CDP.Remove(projectID)
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 

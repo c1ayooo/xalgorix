@@ -25,13 +25,13 @@ import (
 
 // ProjectBudget is the per-project container budget.
 type ProjectBudget struct {
-	MemoryMB   int64 `json:"memory_mb"`
-	CPUQuota   int64 `json:"cpu_quota"`
-	CPUPeriod  int64 `json:"cpu_period"`
-	Pids       int64 `json:"pids"`
-	TmpfsMB    int64 `json:"tmpfs_mb"`
-	DiskMB     int64 `json:"disk_mb"`
-	MaxProjects int  `json:"max_projects"`
+	MemoryMB    int64 `json:"memory_mb"`
+	CPUQuota    int64 `json:"cpu_quota"`
+	CPUPeriod   int64 `json:"cpu_period"`
+	Pids        int64 `json:"pids"`
+	TmpfsMB     int64 `json:"tmpfs_mb"`
+	DiskMB      int64 `json:"disk_mb"`
+	MaxProjects int   `json:"max_projects"`
 }
 
 const defaultProjectMemMB = 2048

@@ -225,6 +225,7 @@ type Agent struct {
 	goalAchievedEmitted        atomic.Bool // once-only guard for the R-goal auto-stop (goal_achieved)
 	forceContinuation          atomic.Bool
 	dwellMaxCalls              int // XALGORIX_DWELL_MAX_CALLS (0=off, dwell_guard.go)
+	controlPlaneHosts          []string // XALGORIX_CONTROL_PLANE_HOSTS (delegation_claim.go)
 	dwellMu                    sync.Mutex
 	dwellStats                 map[string]*dwellStat              // 1:1 re-open of a finished run (REDESIGN D11): suppress the plan-complete auto-finalize the restored checkpoint would re-fire
 	runCancel                  atomic.Pointer[context.CancelFunc] // set by runLoop; completeWithFinish cancels it so the ADK graph stops before another model call
@@ -631,6 +632,7 @@ func NewAgent(cfg *config.Config, name string, events chan Event, localGuard sco
 		events:        events,
 		maxIter:       cfg.MaxIterations,
 		dwellMaxCalls: cfg.DwellMaxCalls,
+		controlPlaneHosts: cfg.ControlPlaneHosts,
 		ctx:           context.Background(),
 		lastActivity:  time.Now(),
 		hooks:         hookReg,

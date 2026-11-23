@@ -167,10 +167,8 @@ func TestResumedRunDashboardsCarryHistoryFromPG(t *testing.T) {
 	putEvents := func(scanID string, lines ...string) {
 		t.Helper()
 		rows := make([]runstate.EventRow, 0, len(lines))
-		base := time.Time{}
-		if scanID == oldID {
-			base = time.Date(2026, 5, 1, 18, 5, 0, 0, time.UTC)
-		} else {
+		base := time.Date(2026, 5, 1, 18, 5, 0, 0, time.UTC)
+		if scanID != oldID {
 			base = time.Date(2026, 5, 1, 19, 5, 0, 0, time.UTC)
 		}
 		for i, line := range lines {

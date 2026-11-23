@@ -84,8 +84,8 @@ const (
 // Phase names the lifecycle stage that produced an error, so operators can tell
 // "we never got a container" from "the command ran and failed".
 const (
-	PhaseEnsure = "ensure"
-	PhaseExec   = "exec"
+	PhaseEnsure  = "ensure"
+	PhaseExec    = "exec"
 	PhaseStop    = "stop"
 	PhaseRemove  = "remove"
 	PhaseInspect = "inspect"
@@ -181,10 +181,10 @@ type Mount struct {
 
 // NetworkSpec describes the per-project network and its only egress path.
 type NetworkSpec struct {
-	Name       string   `json:"name"`
-	Internal   bool     `json:"internal"`
-	ProxyURL   string   `json:"proxy_url,omitempty"`
-	CACertPath string   `json:"ca_cert,omitempty"`
+	Name        string   `json:"name"`
+	Internal    bool     `json:"internal"`
+	ProxyURL    string   `json:"proxy_url,omitempty"`
+	CACertPath  string   `json:"ca_cert,omitempty"`
 	EgressCIDRs []string `json:"egress_cidrs,omitempty"`
 }
 
@@ -284,10 +284,10 @@ type ExecSpec struct {
 // ExecResult is the outcome of a command. It never carries an infrastructure
 // failure: those are returned as *ExecError.
 type ExecResult struct {
-	CallSeq   uint64 `json:"call_seq"`
-	ExitCode  int    `json:"exit_code"`
-	Stdout    string `json:"stdout"`
-	Stderr    string `json:"stderr"`
+	CallSeq  uint64 `json:"call_seq"`
+	ExitCode int    `json:"exit_code"`
+	Stdout   string `json:"stdout"`
+	Stderr   string `json:"stderr"`
 
 	StdoutTruncated bool `json:"stdout_truncated,omitempty"`
 	StderrTruncated bool `json:"stderr_truncated,omitempty"`
@@ -325,16 +325,16 @@ type StreamFrame struct {
 
 // CapacityReport is the read-only capacity projection for the dashboard.
 type CapacityReport struct {
-	Backend          Backend `json:"backend"`
-	Transport        string  `json:"transport,omitempty"`
-	ProjectLimit     int     `json:"project_limit"`
-	ProjectsActive   int     `json:"projects_active"`
-	ProjectsPending  int     `json:"projects_pending"`
-	ExecQueueDepth   int     `json:"exec_queue_depth"`
-	Image            string  `json:"image,omitempty"`
-	ImageDigest      string  `json:"image_digest,omitempty"`
-	Profile          string  `json:"profile,omitempty"`
-	Reason           string  `json:"reason,omitempty"`
+	Backend         Backend `json:"backend"`
+	Transport       string  `json:"transport,omitempty"`
+	ProjectLimit    int     `json:"project_limit"`
+	ProjectsActive  int     `json:"projects_active"`
+	ProjectsPending int     `json:"projects_pending"`
+	ExecQueueDepth  int     `json:"exec_queue_depth"`
+	Image           string  `json:"image,omitempty"`
+	ImageDigest     string  `json:"image_digest,omitempty"`
+	Profile         string  `json:"profile,omitempty"`
+	Reason          string  `json:"reason,omitempty"`
 }
 
 // Driver is the execution-plane contract. Implementations must be safe for

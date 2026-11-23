@@ -106,6 +106,9 @@ services:
     environment:
       XALGORIX_DATABASE_URL: postgres://xalgorix:xalgorix@db:5432/xalgorix?sslmode=disable
       XALGORIX_DATA_DIR: ${XALGORIX_DATA_DIR:-/srv/xalgorix/data}
+      # The platform runs in a container and hands scan paths to the daemon
+      # verbatim; the host path must equal the container path.
+      XALGORIX_HOST_DATA_DIR: ${XALGORIX_DATA_DIR:-/srv/xalgorix/data}
       XALGORIX_RUNTIME_BACKEND: docker
       XALGORIX_RUNTIME_TRANSPORT: runnerd
       XALGORIX_RUNNERD_SOCKET: /run/xalgorix/runner.sock

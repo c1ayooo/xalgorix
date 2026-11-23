@@ -15,6 +15,7 @@
 // (RecordForContext rolls the item back and reports the failure —
 // persist-failure is not success, §5.2) and recorded on the run-state
 // watermark by the implementation.
+
 package intelligence
 
 import "sync"

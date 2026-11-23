@@ -135,18 +135,18 @@ type dockerContainerConfig struct {
 }
 
 type dockerHostConfig struct {
-	Binds         []string                `json:"Binds,omitempty"`
-	NetworkMode   string                  `json:"NetworkMode,omitempty"`
-	ReadonlyRootfs bool                   `json:"ReadonlyRootfs,omitempty"`
-	Privileged    bool                    `json:"Privileged"`
-	CapDrop       []string                `json:"CapDrop,omitempty"`
-	CapAdd        []string                `json:"CapAdd,omitempty"`
-	SecurityOpt   []string                `json:"SecurityOpt,omitempty"`
-	Tmpfs         map[string]string       `json:"Tmpfs,omitempty"`
-	Resources     dockerResources              `json:"Resources"`
-	PortBindings  map[string][]dockerPortBinding `json:"PortBindings,omitempty"`
-	AutoRemove    bool                          `json:"AutoRemove"`
-	Init          bool                          `json:"Init,omitempty"`
+	Binds          []string                       `json:"Binds,omitempty"`
+	NetworkMode    string                         `json:"NetworkMode,omitempty"`
+	ReadonlyRootfs bool                           `json:"ReadonlyRootfs,omitempty"`
+	Privileged     bool                           `json:"Privileged"`
+	CapDrop        []string                       `json:"CapDrop,omitempty"`
+	CapAdd         []string                       `json:"CapAdd,omitempty"`
+	SecurityOpt    []string                       `json:"SecurityOpt,omitempty"`
+	Tmpfs          map[string]string              `json:"Tmpfs,omitempty"`
+	Resources      dockerResources                `json:"Resources"`
+	PortBindings   map[string][]dockerPortBinding `json:"PortBindings,omitempty"`
+	AutoRemove     bool                           `json:"AutoRemove"`
+	Init           bool                           `json:"Init,omitempty"`
 }
 
 type dockerResources struct {
@@ -243,12 +243,12 @@ func (c *dockerClient) inspectContainer(ctx context.Context, id string) (dockerC
 }
 
 type dockerContainerSummary struct {
-	ID     string            `json:"Id"`
-	Names  []string          `json:"Names"`
-	Image  string            `json:"Image"`
-	State  string            `json:"State"`
-	Labels map[string]string `json:"Labels"`
-	Created int64            `json:"Created"`
+	ID      string            `json:"Id"`
+	Names   []string          `json:"Names"`
+	Image   string            `json:"Image"`
+	State   string            `json:"State"`
+	Labels  map[string]string `json:"Labels"`
+	Created int64             `json:"Created"`
 }
 
 func (c *dockerClient) listContainers(ctx context.Context, filters map[string][]string) ([]dockerContainerSummary, error) {

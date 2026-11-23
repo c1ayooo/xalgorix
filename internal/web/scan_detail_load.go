@@ -377,7 +377,11 @@ func (s *Server) loadScanDetailFromState(b ScanStateBackend, dir string, tail in
 		log.Printf("[journal] durable event count for %s failed, trying legacy file: %v", scanID, err)
 		return nil, false
 	}
-	seed, _, err := events.LoadEventsByScan(ctx, scanID, int(max(int64(total)-int64(tail), 0)), tail)
+	offset := total - int64(tail)
+	if offset < 0 {
+		offset = 0
+	}
+	seed, _, err := events.LoadEventsByScan(ctx, scanID, int(offset), tail)
 	if err != nil {
 		log.Printf("[journal] durable event tail for %s failed, trying legacy file: %v", scanID, err)
 		return nil, false

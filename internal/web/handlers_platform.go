@@ -314,15 +314,16 @@ func (s *Server) taskTerminalRun(ctx context.Context, store platform.Repository,
 	}
 	idx := s.scanSummaryIndexFor(s.findAllScanSummaries())
 	idx.projectRuns(runs, s.pendingDispatchExists)
-	for i := range runs {
-		switch strings.ToLower(runs[i].Status) {
-		case "running", "pending", "paused":
-			// Caller already 409'd via taskActiveRun; nothing to re-dispatch.
-			return platform.Run{}, false
-		}
-		return runs[i], true
+	if len(runs) == 0 {
+		return platform.Run{}, false
 	}
-	return platform.Run{}, false
+	// Only the newest run is inspected: an active newest run means the caller
+	// already 409'd via taskActiveRun; anything else re-dispatches it.
+	switch strings.ToLower(runs[0].Status) {
+	case "running", "pending", "paused":
+		return platform.Run{}, false
+	}
+	return runs[0], true
 }
 
 // scanDirForRun resolves the on-disk scan dir for a run's instance from the

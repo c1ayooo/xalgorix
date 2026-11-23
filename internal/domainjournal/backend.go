@@ -15,6 +15,7 @@
 // backend first → legacy file fallback: once a backend is registered, the
 // file is no longer the durable source, so a backend read error surfaces as
 // an error rather than silently reading a stale file (D12 red line).
+
 package domainjournal
 
 import (

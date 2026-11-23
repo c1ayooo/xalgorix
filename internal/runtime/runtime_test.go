@@ -255,9 +255,10 @@ func mustJSON(t *testing.T, v any) string {
 }
 
 type fakeDriver struct {
-	ensured []string
-	removed []string
-	listed  []ProjectState
+	ensured     []string
+	removed     []string
+	listed      []ProjectState
+	cdpEndpoint string
 }
 
 func (f *fakeDriver) Backend() Backend { return BackendDocker }
@@ -295,3 +296,7 @@ func (f *fakeDriver) Capacity(context.Context) (CapacityReport, error) {
 }
 
 func (f *fakeDriver) Close() error { return nil }
+
+func (f *fakeDriver) CDPEndpoint(context.Context, string, string) (string, error) {
+	return f.cdpEndpoint, nil
+}

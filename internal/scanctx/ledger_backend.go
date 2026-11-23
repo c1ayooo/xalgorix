@@ -12,6 +12,7 @@
 // "persist-failure is not success") and recorded on the run-state watermark
 // by the implementation; the in-memory state stays authoritative and the
 // next successful mutation re-persists the full snapshot.
+
 package scanctx
 
 import "sync"

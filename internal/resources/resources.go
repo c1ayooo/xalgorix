@@ -22,8 +22,8 @@ import (
 	"github.com/shirou/gopsutil/v3/load"
 	"github.com/shirou/gopsutil/v3/mem"
 
-	"github.com/shirou/gopsutil/v3/process"
 	"github.com/c1ayooo/xalgorix/v4/internal/platformutil"
+	"github.com/shirou/gopsutil/v3/process"
 )
 
 // ── Resource Levels ──

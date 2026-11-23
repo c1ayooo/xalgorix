@@ -86,14 +86,19 @@ func main() {
 		log.Printf("runnerd: chmod socket: %v", err)
 	}
 
+	cdpBind := envOr("XALGORIX_RUNNERD_CDP_BIND", "127.0.0.1:0")
+	cdpAdvertise := strings.TrimSpace(os.Getenv("XALGORIX_RUNNERD_CDP_ADVERTISE"))
+	relay := toolrt.NewCDPRelay(cdpBind, cdpAdvertise)
+	defer func() { _ = relay.Close() }()
+
 	srv := &http.Server{
-		Handler:           &toolrt.RunnerdHandler{Driver: driver},
+		Handler:           &toolrt.RunnerdHandler{Driver: driver, CDP: relay},
 		ReadHeaderTimeout: 10 * time.Second,
 		// Exec calls stream for as long as the command runs; the per-command
 		// deadline is enforced inside the container, so no server write timeout.
 	}
-	log.Printf("[runnerd] %s listening on %s (image=%s profile=%s instance=%s max_projects=%d concurrency=%d)",
-		version, *socket, *image, *prof, instanceID, limit, concurrency)
+	log.Printf("[runnerd] %s listening on %s (image=%s profile=%s instance=%s max_projects=%d concurrency=%d cdp_bind=%s cdp_advertise=%s)",
+		version, *socket, *image, *prof, instanceID, limit, concurrency, cdpBind, cdpAdvertise)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

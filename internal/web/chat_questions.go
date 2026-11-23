@@ -139,7 +139,7 @@ func (s *Server) snapshotChatInstance(instanceID string) *ScanInstance {
 	}
 	inst.mu.RLock()
 	defer inst.mu.RUnlock()
-	cp := *inst
+	cp := *inst //nolint:govet // intentional snapshot under RLock; the copy's mutex is never taken
 	cp.Vulns = append([]VulnSummary(nil), inst.Vulns...)
 	cp.events = append([]WSEvent(nil), inst.events...)
 	cp.chatCfg = nil

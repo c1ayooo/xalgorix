@@ -221,7 +221,7 @@ func (s *Store) PutScanRecord(rec ScanRecordState) error {
 // swallowed silently).
 func (s *Store) failScanRecord(ctx context.Context, rec ScanRecordState, cause error) error {
 	if wmErr := s.RecordWatermarkFailure(ctx, rec.ScanID, WatermarkKindScanRecord, rec.InstanceID, 0, cause); wmErr != nil {
-		return fmt.Errorf("%v (watermark also failed: %v)", cause, wmErr)
+		return fmt.Errorf("%w (watermark also failed: %w)", cause, wmErr)
 	}
 	return cause
 }

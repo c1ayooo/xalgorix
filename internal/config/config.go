@@ -29,6 +29,10 @@ type Config struct {
 	// (XALGORIX_LLM_EXTRA_HEADERS, JSON object). Used by gateways that require
 	// a routing/session header (e.g. OpenCode Go's x-opencode-session).
 	LLMExtraHeaders     map[string]string
+	// ControlPlaneHosts (XALGORIX_CONTROL_PLANE_HOSTS, comma list) are API
+	// endpoints that are never scan targets: auto-delegation lanes and recon
+	// are skipped when every target is one of these.
+	ControlPlaneHosts   []string
 	APIKeys             []string // XALGORIX_API_KEYS — additional provider API keys rotated to dodge provider rate limits (combined with APIKey)
 	KeyPoolStrategy     string   // XALGORIX_KEY_POOL_STRATEGY — "roundrobin" (default; both keys share load) or "sticky" (overflow failover: one key at a time, switch only on a rate limit)
 	DisableAutoDelegate bool     // XALGORIX_DISABLE_AUTO_DELEGATE — skip the deterministic specialist wave entirely
@@ -227,6 +231,10 @@ type Config struct {
 	RuntimeTransport string // XALGORIX_RUNTIME_TRANSPORT: socket|runnerd
 	DockerSocket     string // XALGORIX_DOCKER_SOCKET, default /var/run/docker.sock
 	RunnerSocket     string // XALGORIX_RUNNERD_SOCKET, default /run/xalgorix/runner.sock
+	// HostDataDir is the host path bind-mounted at DataDir when the platform
+	// itself runs in a container. It must equal DataDir: the platform hands
+	// scan paths to the daemon verbatim and never translates them.
+	HostDataDir string // XALGORIX_HOST_DATA_DIR
 	// ToolboxImage must be digest-pinned in production (":tag@sha256:...").
 	ToolboxImage   string // XALGORIX_TOOLBOX_IMAGE
 	ToolboxProfile string // XALGORIX_TOOLBOX_PROFILE: core|full|web
@@ -602,6 +610,7 @@ func load() *Config {
 		APIBase:                  envOr("XALGORIX_API_BASE", ""),
 		APIKey:                   envOr("XALGORIX_API_KEY", ""),
 		LLMExtraHeaders:          envJSONMap("XALGORIX_LLM_EXTRA_HEADERS"),
+		ControlPlaneHosts:        envCSV("XALGORIX_CONTROL_PLANE_HOSTS"),
 		APIKeys:                  ParseAPIKeyList(envOr("XALGORIX_API_KEYS", "")),
 		KeyPoolStrategy:          envOr("XALGORIX_KEY_POOL_STRATEGY", "roundrobin"),
 		DisableAutoDelegate:      envOrBool("XALGORIX_DISABLE_AUTO_DELEGATE", false),
@@ -645,6 +654,7 @@ func load() *Config {
 		RuntimeTransport:         normalizeRuntimeTransport(envOr("XALGORIX_RUNTIME_TRANSPORT", "socket")),
 		DockerSocket:             envOr("XALGORIX_DOCKER_SOCKET", "/var/run/docker.sock"),
 		RunnerSocket:             envOr("XALGORIX_RUNNERD_SOCKET", "/run/xalgorix/runner.sock"),
+		HostDataDir:              envOr("XALGORIX_HOST_DATA_DIR", ""),
 		ToolboxImage:             envOr("XALGORIX_TOOLBOX_IMAGE", ""),
 		ToolboxProfile:           envOr("XALGORIX_TOOLBOX_PROFILE", "core"),
 		ToolboxBrowserProxy:      envOr("XALGORIX_TOOLBOX_BROWSER_PROXY", ""),
@@ -1334,6 +1344,22 @@ func envJSONMap(key string) map[string]string {
 	out := map[string]string{}
 	if err := json.Unmarshal([]byte(raw), &out); err != nil {
 		return nil
+	}
+	return out
+}
+
+// envCSV parses a comma-separated environment variable into trimmed,
+// non-empty entries.
+func envCSV(key string) []string {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return nil
+	}
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		if p := strings.TrimSpace(part); p != "" {
+			out = append(out, p)
+		}
 	}
 	return out
 }

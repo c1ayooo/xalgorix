@@ -881,10 +881,10 @@ func (c *Client) resolveRequestEndpoint(ctx context.Context) (Endpoint, error) {
 	return c.applyKeyRotation(Endpoint{
 		ExtraHeaders: c.cfg.LLMExtraHeaders,
 		URL:          url,
-		Model:       model,
-		HeaderStyle: hs,
-		Auth:        AuthAPIKey,
-		APIKey:      c.cfg.APIKey,
+		Model:        model,
+		HeaderStyle:  hs,
+		Auth:         AuthAPIKey,
+		APIKey:       c.cfg.APIKey,
 	}), nil
 }
 

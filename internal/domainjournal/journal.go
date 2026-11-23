@@ -145,7 +145,7 @@ const (
 	// <dataDir>/_invocations/*.jsonl; the telemetry events.jsonl is never an
 	// audit source (charter §5.1).
 	OpSkillLoad Operation = "skill_load"
-	// OpAgentDelegate is the audit record for one sub-agent delegation
+	// OpAgentDelegat is the audit record for one sub-agent delegation
 	// lifecycle event (spawn/create and completion), audit-only.
 	OpAgentDelegat Operation = "agent_delegate"
 	// OpMcpCall is the audit record for one completed MCP tool call

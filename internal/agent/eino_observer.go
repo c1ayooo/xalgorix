@@ -151,6 +151,9 @@ func (o *einoObserver) BeforeTool(_ context.Context, name string, args map[strin
 	if blocked, reason := a.shouldBlockForDwellBudget(name, merged); blocked {
 		return block("⛔ DWELL BUDGET EXHAUSTED — ", reason)
 	}
+	if blocked, reason := a.shouldBlockForDelegationDuplicate(name, merged); blocked {
+		return block("⛔ DELEGATION DUPLICATE — ", reason)
+	}
 	if name == "finish" {
 		finish := a.hooks.Fire(OnFinishAttempt, a.state, nil)
 		if finish.Block {

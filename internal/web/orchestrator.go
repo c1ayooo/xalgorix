@@ -10,8 +10,6 @@ import (
 	mathrand "math/rand"
 	"os"
 	"path/filepath"
-
-	"github.com/c1ayooo/xalgorix/v4/internal/storage"
 	"regexp"
 	"runtime"
 	"runtime/debug"
@@ -24,6 +22,7 @@ import (
 	"github.com/c1ayooo/xalgorix/v4/internal/resources"
 	"github.com/c1ayooo/xalgorix/v4/internal/safe"
 	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
+	"github.com/c1ayooo/xalgorix/v4/internal/storage"
 	"github.com/c1ayooo/xalgorix/v4/internal/tools/intelligence"
 	"github.com/c1ayooo/xalgorix/v4/internal/tools/notes"
 	"github.com/c1ayooo/xalgorix/v4/internal/tools/reporting"

@@ -261,7 +261,7 @@ func (s *Store) SaveLedgerSnapshot(scanID, instanceID string, seq int64, data []
 	err := s.PutLedgerSnapshot(ctx, scanID, instanceID, seq, data)
 	if err != nil {
 		if wmErr := s.Watermark(context.Background(), scanID, WatermarkKindLedger, instanceID, seq, StatusFailed, err.Error()); wmErr != nil {
-			return fmt.Errorf("%v (watermark also failed: %v)", err, wmErr)
+			return fmt.Errorf("%w (watermark also failed: %w)", err, wmErr)
 		}
 		return err
 	}
@@ -324,7 +324,7 @@ func (s *Store) SaveStateFileSnapshot(scanID, kind, instanceID string, seq int64
 	err := s.PutStateFile(ctx, scanID, kind, instanceID, seq, data)
 	if err != nil {
 		if wmErr := s.Watermark(context.Background(), scanID, "state:"+kind, instanceID, seq, StatusFailed, err.Error()); wmErr != nil {
-			return fmt.Errorf("%v (watermark also failed: %v)", err, wmErr)
+			return fmt.Errorf("%w (watermark also failed: %w)", err, wmErr)
 		}
 		return err
 	}
@@ -624,8 +624,8 @@ func (s *Store) AppendJournalRecord(scanID, instanceID string, rec domainjournal
 		scanID, instanceID, rec.Seq, rec.At, string(payload),
 	); err != nil {
 		err = fmt.Errorf("runstate: append journal %s/%d: %w", scanID, rec.Seq, err)
-		if wmErr := s.RecordWatermarkFailure(context.Background(), scanID, WatermarkKindJournal, instanceID, int64(rec.Seq), err); wmErr != nil {
-			return fmt.Errorf("%v (watermark also failed: %v)", err, wmErr)
+		if wmErr := s.RecordWatermarkFailure(context.Background(), scanID, WatermarkKindJournal, instanceID, int64(rec.Seq), err); wmErr != nil { //nolint:gosec // G115: journal seq counters are far below 2^63
+			return fmt.Errorf("%w (watermark also failed: %w)", err, wmErr)
 		}
 		return err
 	}
@@ -653,7 +653,7 @@ func (s *Store) LoadJournalSources(ctx context.Context) ([]domainjournal.Journal
 		if err := rows.Scan(&src.ScanID, &last); err != nil {
 			return nil, fmt.Errorf("runstate: scan journal source: %w", err)
 		}
-		src.LastSeq = uint64(last)
+		src.LastSeq = uint64(last) //nolint:gosec // G115: journal seq counters are far below 2^63
 		out = append(out, src)
 	}
 	if err := rows.Err(); err != nil {

@@ -248,7 +248,7 @@ func parseEvents(dir string) ([]EventRow, error) {
 			// discipline as the merged events window): skip and continue.
 			continue
 		}
-		row := EventRow{Seq: uint64(len(out) + 1), Type: ev.Type, Payload: []byte(line)}
+		row := EventRow{Seq: uint64(len(out)) + 1, Type: ev.Type, Payload: []byte(line)} //nolint:gosec // G115: line counters are far below 2^63
 		if t, err := parseTime(ev.Timestamp); err == nil {
 			row.OccurredAt = *t
 		} else {

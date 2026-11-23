@@ -459,24 +459,50 @@ func (a *Agent) shouldBlockForOutOfScope(toolName string, toolArgs map[string]st
 	// names an allowed destination, those occurrences no longer block; a
 	// loopback that stands as a destination (start of curl/nc/connect, or any
 	// non-value position) still does.
-	nonLocalDestination := false
-	for _, h := range hosts {
-		if !scopeguard.IsLocalOrListener(a.localGuard, h) {
-			nonLocalDestination = true
-			break
-		}
+	// Classify each extracted host once. The classifier may resolve names, and
+	// the guard must not pay a second DNS lookup for the same argument.
+	type hostClass struct {
+		host  string
+		local bool
 	}
+	classes := make([]hostClass, 0, len(hosts))
+	hasPrivateDestination := false
+	hasPublicDestination := false
 	for _, h := range hosts {
-		if !scopeguard.IsLocalOrListener(a.localGuard, h) {
+		local := scopeguard.IsLocalOrListener(a.localGuard, h)
+		classes = append(classes, hostClass{host: h, local: local})
+		if local {
 			continue
 		}
-		if nonLocalDestination && localHostOnlyInPayloadValues(toolArgs, h) {
+		// Only address literals participate in the payload decision. Dotted
+		// Python/module identifiers extracted from source are not destinations;
+		// real hostnames deliberately do not enable the exception either.
+		if ip, ok := destinationLiteral(h); ok {
+			if ip.IsPrivate() || ip.IsLinkLocalUnicast() {
+				hasPrivateDestination = true
+			} else {
+				hasPublicDestination = true
+			}
+		}
+	}
+	// Payload-data exception: a loopback token in value position is data the
+	// target may fetch only when the call's own destination is a private
+	// address literal (an internal app whose 127.0.0.1 is not this machine).
+	// A public destination — a hostname, a public IP literal, or a redirect
+	// query to a public host — keeps the strict rule: any loopback token
+	// blocks.
+	payloadException := hasPrivateDestination && !hasPublicDestination
+	for _, c := range classes {
+		if !c.local {
+			continue
+		}
+		if payloadException && localHostOnlyInPayloadValues(toolArgs, c.host) {
 			continue
 		}
 		return true, fmt.Sprintf(
 			"%q points at the operator's machine or local network. "+
 				"Refusing to probe localhost / RFC1918 / the dashboard's "+
-				"listener from a Gated_Tool.", h,
+				"listener from a Gated_Tool.", c.host,
 		)
 	}
 
@@ -785,6 +811,22 @@ func isAddressShaped(h string) bool {
 	return !isVersionLike(l) || strings.Count(l, ".") == 3
 }
 
+// destinationLiteral returns h as an address literal when it is written as
+// one (including the loose IPv4 spellings curl and Python accept). Hostnames
+// are deliberately not resolved here: the caller already classified them, and
+// a second DNS lookup would break the single-lookup contract.
+func destinationLiteral(h string) (net.IP, bool) {
+	h = strings.TrimSpace(strings.ToLower(h))
+	h = strings.TrimPrefix(strings.TrimSuffix(h, "]"), "[")
+	if ip := net.ParseIP(h); ip != nil {
+		return ip, true
+	}
+	if ip, ok := scopeguard.ParseIPv4Loose(h); ok {
+		return ip, true
+	}
+	return nil, false
+}
+
 // readsAsAddress reports whether h (a host, or a whole URL handed on to the
 // classifier) names its host as an address: h itself, or any host the
 // classifier would read out of it.
@@ -943,7 +985,12 @@ func extractHostFromTokenForScope(token string) string {
 			return strings.ToLower(inner)
 		}
 	}
-	if strings.Contains(token, ".") && !strings.ContainsAny(token, " /\\") {
+	// A token with an internal colon that survived SplitHostPort above is not
+	// a host: "TCP:127.0.0.1:9137" and "h:443:127.0.0.1" are option values
+	// whose real address colonListHosts extracts separately. Returning the
+	// whole token here would make an unrelated non-local "destination" and
+	// enable the SSRF-payload exception for the loopback it contains.
+	if strings.Contains(token, ".") && !strings.ContainsAny(token, " /\\:") {
 		if strings.HasPrefix(token, "./") || strings.HasPrefix(token, "../") || strings.HasPrefix(token, "/") {
 			return ""
 		}

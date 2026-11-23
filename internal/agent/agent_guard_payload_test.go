@@ -39,10 +39,10 @@ func TestOutOfScopeAllowsLoopbackPayloadData(t *testing.T) {
 func TestOutOfScopeStillBlocksLoopbackDestinations(t *testing.T) {
 	a := payloadGuardAgent(t)
 	cases := []map[string]string{
-		{"command": "curl -s http://127.0.0.1:9137/api/projects"},                        // destination
-		{"command": "nc 127.0.0.1 22"},                                                   // destination
-		{"command": `curl "http://10.0.179.225/?u=http://127.0.0.1"; curl http://127.0.0.1/`}, // one payload, one destination
-		{"command": "echo x=127.0.0.1"},                                                  // payload but NO allowed destination
+		{"command": "curl -s http://127.0.0.1:9137/api/projects"},                               // destination
+		{"command": "nc 127.0.0.1 22"},                                                          // destination
+		{"command": `curl "http://10.0.179.225/?u=http://127.0.0.1"; curl http://127.0.0.1/`},   // one payload, one destination
+		{"command": "echo x=127.0.0.1"},                                                         // payload but NO allowed destination
 		{"command": "python3 -c \"import socket; socket.create_connection(('127.0.0.1',22))\""}, // destination
 	}
 	for _, args := range cases {

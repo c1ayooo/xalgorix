@@ -130,7 +130,7 @@ func (s *Server) handleScanColdPath(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	state := deriveColdPathSyncState(scanID, journalSourceSeq(r.Context(), dir), s.currentColdPathSyncer(), r.Context())
+	state := deriveColdPathSyncState(r.Context(), scanID, journalSourceSeq(r.Context(), dir), s.currentColdPathSyncer())
 	writeJSONStatus(w, http.StatusOK, state)
 }
 
@@ -139,7 +139,7 @@ func (s *Server) handleScanColdPath(w http.ResponseWriter, r *http.Request) {
 // the backend is registered, the legacy file otherwise — D12) with the
 // PostgreSQL watermark. Derivation stays here so the pending/applied/gap/failed
 // state machine is contract-testable without a database.
-func deriveColdPathSyncState(scanID string, sourceSeq uint64, syncer ColdPathSyncer, ctx context.Context) ColdPathSyncState {
+func deriveColdPathSyncState(ctx context.Context, scanID string, sourceSeq uint64, syncer ColdPathSyncer) ColdPathSyncState {
 	state := ColdPathSyncState{
 		ScanID:    scanID,
 		ColdPath:  "disabled",

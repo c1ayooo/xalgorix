@@ -1245,6 +1245,9 @@ func (noopColdProcessor) ProcessRange(context.Context, string, string, uint64, u
 // workers. The returned stop function reverses everything in shutdown order:
 // stop accepting work, stop project containers, close the transport and pool.
 func setupToolRuntime(ctx context.Context, cfg *config.Config) (func(), error) {
+	if err := preflightContainerRuntime(cfg); err != nil {
+		return nil, err
+	}
 	if strings.TrimSpace(cfg.ToolboxImage) == "" {
 		return nil, fmt.Errorf("XALGORIX_TOOLBOX_IMAGE is required when XALGORIX_RUNTIME_BACKEND=docker")
 	}

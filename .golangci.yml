@@ -99,6 +99,11 @@ linters:
       # targets in skills.go.
       ignore-rules:
         - mitre
+        # "cancelled" is the approval state machine's contract spelling: the
+        # DB CHECK constraint, the API status string and the wire payloads all
+        # use it (§5.3). Renaming is a data migration, not a typo fix.
+        - cancelled
+        - cancelling
     revive:
       severity: warning
       rules:
