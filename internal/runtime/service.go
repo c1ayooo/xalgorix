@@ -193,6 +193,18 @@ func BuildProject(opt ProjectOptions) (ProjectSpec, error) {
 	if err != nil {
 		return ProjectSpec{}, err
 	}
+	// The in-container HTTP worker binds a unix socket. Its path is short by
+	// design (a scan dir exceeds the kernel's ~104-byte sun_path limit), so the
+	// socket no longer lives inside the scan mount — mount its parent at the
+	// same absolute path on both sides.
+	if socket := strings.TrimSpace(opt.HTTPWorkerSocket); socket != "" {
+		parent := filepath.Dir(socket)
+		if mkErr := os.MkdirAll(parent, 0o750); mkErr != nil {
+			return ProjectSpec{}, fmt.Errorf("runtime: prepare http worker socket dir: %w", mkErr)
+		}
+		plan.Mounts = append(plan.Mounts, Mount{Host: parent, Container: parent, Mode: MountReadWrite})
+		plan.Writable = append(plan.Writable, parent)
+	}
 	absScan, err := filepath.Abs(opt.ScanDir)
 	if err != nil {
 		return ProjectSpec{}, fmt.Errorf("runtime: resolve scan dir: %w", err)
@@ -233,11 +245,15 @@ func BuildProject(opt ProjectOptions) (ProjectSpec, error) {
 		)
 	}
 	if strings.TrimSpace(opt.CACertPath) != "" {
+		// The CA is mounted at MountCACert; the host path the caller holds is
+		// not visible inside the container. Pointing SSL_CERT_FILE at it made
+		// every in-container HTTPS request fail with "certificate signed by
+		// unknown authority" (the MITM proxy's CA was never trusted).
 		env = append(env,
-			"SSL_CERT_FILE="+opt.CACertPath,
-			"CURL_CA_BUNDLE="+opt.CACertPath,
-			"REQUESTS_CA_BUNDLE="+opt.CACertPath,
-			"GIT_SSL_CAINFO="+opt.CACertPath,
+			"SSL_CERT_FILE="+MountCACert,
+			"CURL_CA_BUNDLE="+MountCACert,
+			"REQUESTS_CA_BUNDLE="+MountCACert,
+			"GIT_SSL_CAINFO="+MountCACert,
 		)
 	}
 	env = append(env, opt.Env...)

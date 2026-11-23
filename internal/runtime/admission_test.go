@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"net"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -380,5 +381,72 @@ func TestBuildProjectAcceptsGatewayProxy(t *testing.T) {
 	opt.ProxyGatewayPort = 0
 	if _, err := BuildProject(opt); err == nil {
 		t.Fatal("proxy-only without a reachable proxy must be rejected")
+	}
+}
+
+// TestBuildProjectMountsHTTPWorkerSocketDir keeps the short socket path
+// dialable from both sides: the worker binds it inside the container, the
+// platform dials the same absolute path on the host.
+func TestBuildProjectMountsHTTPWorkerSocketDir(t *testing.T) {
+	t.Setenv("XALGORIX_ALLOW_UNPINNED_TOOLBOX", "yes")
+	socket := filepath.Join(t.TempDir(), "xalg-http", "abc123.sock")
+	spec, err := BuildProject(ProjectOptions{
+		ScanID:           "scan-hw",
+		ScanDir:          t.TempDir(),
+		SharedDir:        t.TempDir(),
+		Image:            "xalgorix-toolbox:dev-core",
+		NetProfile:       NetProfileNone,
+		HTTPWorkerSocket: socket,
+	})
+	if err != nil {
+		t.Fatalf("BuildProject: %v", err)
+	}
+	parent := filepath.Dir(socket)
+	found := false
+	for _, m := range spec.Mounts {
+		if m.Host == parent && m.Container == parent {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("socket dir %q not mounted: %#v", parent, spec.Mounts)
+	}
+	if info, statErr := os.Stat(parent); statErr != nil || !info.IsDir() {
+		t.Fatalf("socket dir must exist before container creation: %v", statErr)
+	}
+}
+
+// TestBuildProjectPointsCACertAtContainerMount pins the TLS fix: the host CA
+// path is not visible inside the container, so the trust env vars must name
+// the mounted location (MountCACert) instead.
+func TestBuildProjectPointsCACertAtContainerMount(t *testing.T) {
+	t.Setenv("XALGORIX_ALLOW_UNPINNED_TOOLBOX", "yes")
+	ca := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(ca, []byte("test-ca"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	spec, err := BuildProject(ProjectOptions{
+		ScanID:     "scan-ca",
+		ScanDir:    t.TempDir(),
+		SharedDir:  t.TempDir(),
+		Image:      "xalgorix-toolbox:dev-core",
+		NetProfile: NetProfileNone,
+		CACertPath: ca,
+	})
+	if err != nil {
+		t.Fatalf("BuildProject: %v", err)
+	}
+	want := "SSL_CERT_FILE=" + MountCACert
+	found := false
+	for _, e := range spec.Env {
+		if e == want {
+			found = true
+		}
+		if strings.Contains(e, ca) {
+			t.Fatalf("env leaks the host CA path into the container: %q", e)
+		}
+	}
+	if !found {
+		t.Fatalf("container env must trust %s: %#v", MountCACert, spec.Env)
 	}
 }
