@@ -174,6 +174,12 @@ type Hypothesis struct {
 	VOIEstimated bool    `json:"voi_estimated,omitempty"`
 	// AssignedTo is the delegation/agent ID that currently owns the work.
 	AssignedTo string `json:"assigned_to,omitempty"`
+	// LeaseUntil is when a claim at HypothesisTesting expires. An expired
+	// lease returns the hypothesis to queued (deterministic reclaim, audited
+	// as OpReclaimHypothesis) so a stalled or crashed owner cannot strand
+	// work forever. Zero means "no lease recorded" (legacy rows): never
+	// reclaimed automatically.
+	LeaseUntil time.Time `json:"lease_until,omitempty"`
 	// NextAction is the next-best concrete step for whoever picks this up.
 	NextAction string `json:"next_action,omitempty"`
 	// Attempts counts exploit attempts spent (for exhaustion/economics).
@@ -230,6 +236,26 @@ type LedgerStore struct {
 	persistPath string
 	journal     *domainjournal.Journal
 	voiWeight   float64
+	leaseTTL    time.Duration // hypothesis claim lease (0 = defaultHypothesisLease)
+}
+
+// defaultHypothesisLease bounds how long a claimed (testing) hypothesis may
+// sit without activity before reclaim returns it to the queue.
+const defaultHypothesisLease = 15 * time.Minute
+
+// SetLeaseTTL overrides the hypothesis claim lease duration (<=0 resets to the
+// default).
+func (ls *LedgerStore) SetLeaseTTL(d time.Duration) {
+	ls.mu.Lock()
+	ls.leaseTTL = d
+	ls.mu.Unlock()
+}
+
+func (ls *LedgerStore) effectiveLeaseLocked() time.Duration {
+	if ls.leaseTTL > 0 {
+		return ls.leaseTTL
+	}
+	return defaultHypothesisLease
 }
 
 // NewLedgerStore creates an empty ledger with no persistence configured.
@@ -545,6 +571,13 @@ func (ls *LedgerStore) claimNextAs(vulnClass, agentID string, unassignedOnly boo
 
 	ls.mu.Lock()
 	defer ls.mu.Unlock()
+	// Deterministic reclaim before selection: an expired claim returns to
+	// queued so a stalled owner cannot strand the unit (charter: claim is a
+	// lease, not ownership forever). Audited as OpReclaimHypothesis.
+	now := time.Now().UTC()
+	if err := ls.reclaimExpiredLocked(now, actor); err != nil {
+		return Hypothesis{}, false, err
+	}
 	var picked *Hypothesis
 	for _, id := range ls.order {
 		h := ls.hyps[id]
@@ -570,7 +603,8 @@ func (ls *LedgerStore) claimNextAs(vulnClass, agentID string, unassignedOnly boo
 	cp := picked.clone()
 	cp.AssignedTo = owner
 	cp.Status = HypothesisTesting
-	cp.UpdatedAt = time.Now().UTC()
+	cp.LeaseUntil = now.Add(ls.effectiveLeaseLocked())
+	cp.UpdatedAt = now
 	if err := ls.appendAuditLocked(domainjournal.Record{
 		Actor:        actor,
 		Operation:    domainjournal.OpClaimHypothesis,
@@ -589,6 +623,36 @@ func (ls *LedgerStore) claimNextAs(vulnClass, agentID string, unassignedOnly boo
 	return out, true, nil
 }
 
+// reclaimExpiredLocked returns every testing hypothesis whose lease elapsed to
+// the queued pool, clearing the owner. Callers must hold ls.mu. Each reclaim
+// is audited before it commits.
+func (ls *LedgerStore) reclaimExpiredLocked(now time.Time, actor domainjournal.Actor) error {
+	for _, id := range ls.order {
+		h := ls.hyps[id]
+		if h == nil || h.Status != HypothesisTesting || h.LeaseUntil.IsZero() || now.Before(h.LeaseUntil) {
+			continue
+		}
+		before := h.auditState()
+		cp := h.clone()
+		cp.Status = HypothesisQueued
+		cp.AssignedTo = ""
+		cp.LeaseUntil = time.Time{}
+		cp.UpdatedAt = now
+		if err := ls.appendAuditLocked(domainjournal.Record{
+			Actor:        actor,
+			Operation:    domainjournal.OpReclaimHypothesis,
+			HypothesisID: cp.ID,
+			Summary:      "lease expired; returned to queue",
+			Before:       before,
+			After:        cp.auditState(),
+		}); err != nil {
+			return err
+		}
+		*h = cp
+	}
+	return nil
+}
+
 // RecordAttempt increments the exploit-attempt counter (economics/exhaustion).
 func (ls *LedgerStore) RecordAttempt(hypID string) bool {
 	return ls.RecordAttemptAs(hypID, engineActor("ledger")) == nil
@@ -598,6 +662,11 @@ func (ls *LedgerStore) RecordAttempt(hypID string) bool {
 func (ls *LedgerStore) RecordAttemptAs(hypID string, actor domainjournal.Actor) error {
 	_, err := ls.mutateHypothesisAs(hypID, actor, domainjournal.OpRecordAttempt, "record attempt", func(h *Hypothesis) {
 		h.Attempts++
+		// Activity renews the claim lease: an owner that keeps working never
+		// loses the unit; only silence lets reclaim take it back.
+		if h.Status == HypothesisTesting {
+			h.LeaseUntil = time.Now().UTC().Add(ls.effectiveLeaseLocked())
+		}
 	})
 	return err
 }

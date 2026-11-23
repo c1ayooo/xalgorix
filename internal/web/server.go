@@ -1632,6 +1632,13 @@ func (s *Server) Start() error {
 			s.handleScanSecurity(w, r)
 			return
 		}
+		// GET /api/scans/{id}/units — unified WorkUnit projection (plan tasks as
+		// intent units + ledger hypotheses as belief units, with claim owners and
+		// leases; scan_units.go). Read-only.
+		if strings.HasSuffix(r.URL.Path, "/units") && r.Method == http.MethodGet {
+			s.handleScanUnits(w, r)
+			return
+		}
 		s.handleGetScan(w, r)
 	})
 	// DELETE /api/data-dirs/{name} — delete one top-level Scan_Folder under

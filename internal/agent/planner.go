@@ -39,6 +39,7 @@ import (
 	"strings"
 
 	"github.com/c1ayooo/xalgorix/v4/internal/methodology"
+	"time"
 )
 
 // TaskStatus is the lifecycle state of a single planned task.
@@ -76,6 +77,12 @@ type Task struct {
 	// observed surface. Unrelated discoveries must not undo that judgment;
 	// newly applicable inputs must still reopen the work.
 	DispositionSurface string `json:"disposition_surface,omitempty"`
+	// Owner is the agent that claimed this intent (plan-task claim protocol).
+	// Empty = unclaimed. A lease-bound active task returns to pending when the
+	// lease lapses so a stalled owner cannot strand it.
+	Owner string `json:"owner,omitempty"`
+	// LeaseUntil bounds the claim; zero = no lease recorded (legacy row).
+	LeaseUntil time.Time `json:"lease_until,omitempty"`
 	// Prerequisite marks a task as a TECHNICAL PREREQUISITE for the
 	// selected phases rather than a methodology obligation of its own
 	// phase: a restricted phase selection still needs bounded discovery
@@ -309,6 +316,95 @@ func (p *Plan) ProgressPct() int {
 // phase then ID for deterministic output. When no dependency-ready tasks remain
 // but pending tasks exist (stuck on an unmet dependency), it returns the
 // lowest-phase pending tasks so the scan never deadlocks on a malformed graph.
+// DefaultTaskLease bounds an unclaimed-active plan task: silence lets the
+// engine return it to the pending pool (deterministic claim protocol).
+const DefaultTaskLease = 15 * time.Minute
+
+// taskSubject is the plan task's unit identity: its endpoint when it names one
+// (challenge/asset work), else phase+class for whole-target methodology work.
+// It is the key the delegation dedup guard compares across workers.
+func taskSubject(t *Task) string {
+	if t == nil {
+		return ""
+	}
+	if ep := strings.TrimSpace(t.Endpoint); ep != "" {
+		return "endpoint:" + strings.ToLower(ep)
+	}
+	if t.VulnClass != "" {
+		return fmt.Sprintf("phase:%d:%s", t.Phase, strings.ToLower(t.VulnClass))
+	}
+	return ""
+}
+
+// reclaimExpiredTasks returns active tasks whose lease lapsed to pending,
+// clearing the owner. Deterministic and cheap; runs before every claim.
+func (p *Plan) reclaimExpiredTasks(now time.Time) int {
+	if p == nil {
+		return 0
+	}
+	n := 0
+	for _, t := range p.Tasks {
+		if t.Status != TaskActive || t.Owner == "" || t.LeaseUntil.IsZero() || now.Before(t.LeaseUntil) {
+			continue
+		}
+		t.Status = TaskPending
+		t.Owner = ""
+		t.LeaseUntil = time.Time{}
+		n++
+	}
+	return n
+}
+
+// ClaimNext deterministically claims the next ready pending task for owner:
+// lowest phase first, then insertion order (stable). Dependency-blocked tasks
+// are skipped unless nothing else is ready (same tail rule as NextTasks). The
+// claim sets active+owner+lease; a second call for the same task is impossible
+// by construction (successive calls take successive tasks).
+func (p *Plan) ClaimNext(owner string, ttl time.Duration, now time.Time) *Task {
+	if p == nil || len(p.Tasks) == 0 {
+		return nil
+	}
+	if ttl <= 0 {
+		ttl = DefaultTaskLease
+	}
+	p.reclaimExpiredTasks(now)
+	redosReady := p.readyForReDoS()
+	var best *Task
+	for _, t := range p.Tasks {
+		if t.Status != TaskPending {
+			continue
+		}
+		if isReDoSTask(t) && !redosReady {
+			continue
+		}
+		if !p.dependenciesSatisfied(t) {
+			continue
+		}
+		if best == nil || t.Phase < best.Phase {
+			best = t
+		}
+	}
+	if best == nil {
+		// Dependency tail: lowest-phase pending work still gets claimed so a
+		// stalled dependency cannot freeze dispatch.
+		for _, t := range p.Tasks {
+			if t.Status != TaskPending || (isReDoSTask(t) && !redosReady) {
+				continue
+			}
+			if best == nil || t.Phase < best.Phase {
+				best = t
+			}
+		}
+	}
+	if best == nil {
+		return nil
+	}
+	best.Status = TaskActive
+	best.Owner = owner
+	best.LeaseUntil = now.Add(ttl)
+	return best
+}
+
 func (p *Plan) NextTasks(limit int) []*Task {
 	if p == nil || limit <= 0 {
 		return nil
@@ -959,7 +1055,70 @@ func AutoPlan(endpoints []string, detectedTechs map[string]bool) *Plan {
 // lifecycle itself. They are DERIVED phase states (phase_disposition.go), so
 // the plan no longer carries permanently-pending fake tasks that the finish
 // gate ignores.
+
+// allTargetsControlPlaneState reports whether every configured scan target is a
+// declared control-plane host (state.ControlPlaneHosts).
+func allTargetsControlPlaneState(state *ScanState) bool {
+	if state == nil || len(state.ControlPlaneHosts) == 0 || len(state.ScanTargets) == 0 {
+		return false
+	}
+	declared := make(map[string]bool, len(state.ControlPlaneHosts))
+	for _, h := range state.ControlPlaneHosts {
+		if h = strings.ToLower(strings.TrimSpace(h)); h != "" {
+			declared[h] = true
+		}
+	}
+	if len(declared) == 0 {
+		return false
+	}
+	for _, t := range state.ScanTargets {
+		host, _ := targetHostPort(t)
+		if host == "" || !declared[host] {
+			return false
+		}
+	}
+	return true
+}
+
+// controlPlaneEndpoint reports whether a discovered endpoint lives on a
+// control-plane host. A path-only endpoint inherits the scan target's role.
+func controlPlaneEndpoint(state *ScanState, endpoint string) bool {
+	if state == nil || len(state.ControlPlaneHosts) == 0 {
+		return false
+	}
+	host, _ := targetHostPort(endpoint)
+	if host == "" {
+		return allTargetsControlPlaneState(state)
+	}
+	for _, h := range state.ControlPlaneHosts {
+		if strings.EqualFold(strings.TrimSpace(h), host) {
+			return true
+		}
+	}
+	return false
+}
+
+func filterControlPlaneEndpoints(state *ScanState, endpoints []string) []string {
+	if state == nil || len(state.ControlPlaneHosts) == 0 || len(endpoints) == 0 {
+		return endpoints
+	}
+	out := make([]string, 0, len(endpoints))
+	for _, ep := range endpoints {
+		if !controlPlaneEndpoint(state, ep) {
+			out = append(out, ep)
+		}
+	}
+	return out
+}
+
 func buildEnginePlan(state *ScanState, endpoints []string, detectedTechs map[string]bool, scope phaseScope) *Plan {
+	// Control-plane targets are API endpoints, never scan targets: a plan that
+	// only sees control-plane surface is empty by definition (charter: work
+	// units come from real evidence, not from the control channel).
+	if state != nil && allTargetsControlPlaneState(state) {
+		return NewPlan()
+	}
+	endpoints = filterControlPlaneEndpoints(state, endpoints)
 	p := NewPlan()
 
 	// Phase 1: recon is a prerequisite for everything. Even with a seeded

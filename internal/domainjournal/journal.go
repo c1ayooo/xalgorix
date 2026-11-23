@@ -125,6 +125,9 @@ const (
 	OpAddEvidence       Operation = "add_evidence"
 	OpRecordAttempt     Operation = "record_attempt"
 	OpSetVOI            Operation = "set_voi"
+	// OpReclaimHypothesis records a lease expiry returning a claimed
+	// hypothesis to the schedulable pool (deterministic claim protocol).
+	OpReclaimHypothesis Operation = "reclaim_hypothesis"
 	OpMergeLedger       Operation = "merge_ledger"
 	OpResetLedger       Operation = "reset_ledger"
 	OpInfoItemEnriched  Operation = "info_item_enriched"
@@ -167,7 +170,7 @@ const (
 func (o Operation) Valid() bool {
 	switch o {
 	case OpSeedHypothesis, OpRecordHypothesis, OpClaimHypothesis, OpAssignHypothesis,
-		OpSetStatus, OpAddEvidence, OpRecordAttempt, OpSetVOI, OpMergeLedger, OpResetLedger,
+		OpSetStatus, OpAddEvidence, OpRecordAttempt, OpSetVOI, OpReclaimHypothesis, OpMergeLedger, OpResetLedger,
 		OpInfoItemEnriched, OpInfoItemProjected, OpObserveTraffic, OpRecordObjective,
 		OpSkillLoad, OpAgentDelegat, OpMcpCall, OpFindingRecorded, OpToolObservation:
 		return true

@@ -420,6 +420,9 @@ type ScanState struct {
 	// Run). It drives scope-aware applicability: a single explicit host does
 	// not owe subdomain enumeration; a bare domain or wildcard does.
 	ScanTargets []string
+	// ControlPlaneHosts are API control-plane hosts that are never scan
+	// targets (XALGORIX_CONTROL_PLANE_HOSTS); plan seeding skips them.
+	ControlPlaneHosts []string
 	// DiscoveredHosts records bare hostnames surfaced by DNS/subdomain/
 	// crawl results that may never appear as full URLs inside the endpoint
 	// inventory. They still owe content-discovery dispositions.
@@ -2240,7 +2243,7 @@ func hookStuckTracker(state *ScanState, args map[string]string) HookResult {
 // advance or reset the repeated-probe counters.
 func isAdministrativeTool(name string) bool {
 	switch name {
-	case "add_note", "read_notes", "update_plan", "finish", "read_skill", "list_skills", "search_skills", "read_ledger", "record_hypothesis", "update_hypothesis", "add_hypothesis_evidence", "claim_next_hypothesis", "report_vulnerability":
+	case "add_note", "read_notes", "update_plan", "finish", "read_skill", "list_skills", "search_skills", "read_ledger", "record_hypothesis", "update_hypothesis", "add_hypothesis_evidence", "claim_next_hypothesis", "claim_next_task", "report_vulnerability":
 		return true
 	}
 	return false
@@ -2549,7 +2552,7 @@ var localOnlyTools = map[string]bool{
 	"read_skill": true, "list_skills": true, "search_skills": true,
 	"web_search": true, "cve_search": true, "exploit_search": true, "code_search": true,
 	"record_hypothesis": true, "add_hypothesis_evidence": true, "update_hypothesis": true,
-	"read_ledger": true, "claim_next_hypothesis": true,
+	"read_ledger": true, "claim_next_hypothesis": true, "claim_next_task": true,
 	"build_plan": true, "update_plan": true,
 	"create_agent": true, "spawn_agent": true, "check_agent": true, "wait_agent": true,
 	"report_vulnerability": true, "submit_verdict": true, "finish": true,

@@ -323,6 +323,8 @@ GET /api/info/association?project_id=&scan_id=&ids=id1,id2&edge_types=supports,.
 - InfoItem 形状沿用 `internal/infoitem.Item`：`id/scan_id/source_seq/nature/coordinates/supports/confidence/coordinate_status/...`。
 - 既有 `GET /api/scans/{id}/audit`（领域审计投影）与 `GET /api/scans/{id}/coldpath`（pending/applied/gap/failed/disabled）为同一信息空间的审计/同步状态来源，前端可复用。
 
+- **WorkUnit 投影（2026-11-23 增补）**：`GET /api/scans/{id}/units` → `{ scan_id, source: live|record|none, units: [{kind: task|hypothesis, id, subject, state, owner?, lease_until?, vuln_class?, phase?, expired?}], counters: {tasks_open, tasks_claimed, tasks_expired, hypotheses_queued, hypotheses_testing, hypotheses_expired} }`——intent 单位=plan task、belief 单位=ledger hypothesis 的统一派发视图（只读；认领协议见 docs/WORK_UNIT_DESIGN.md）。
+
 - **安全链视图（2026-11-22 增补）**：`GET /api/scans/{id}/security` → `{ scan_id, blocks: [{ts, category, tool?, reason}], counters: {scopeguard|target_scope|phase|auth|activity|goal|ledger|report|benchmark|other}, truncated }`——守卫拦截事件从事件 journal 提取（⛔/⚠️ 标记分类：scopeguard 操作者机器守卫 / target_scope 目标边界 / phase 阶段工具面 / auth 认证前置 / activity 活动策略 / goal 收工义务 / ledger 假设精度 / report 报告门），newest-first、上限 200 条；守卫规则目录为静态内容由前端本地化渲染。命令历史见 `/events`，原始 HTTP 交互见 `/traffic`。
 
 ## 3.4 Approval Rules — 审批豁免规则（approve & remember，2026-11-21 增补）

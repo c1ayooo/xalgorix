@@ -26,6 +26,7 @@ import (
 	"strings"
 
 	"github.com/c1ayooo/xalgorix/v4/internal/tools"
+	"time"
 )
 
 // planTaskInput is the LLM-supplied task shape for build_plan.
@@ -72,6 +73,49 @@ func (a *Agent) registerPlanTools(reg *tools.Registry) {
 		},
 		Execute: a.updatePlanTool,
 	})
+
+	reg.Register(&tools.Tool{
+		Name: "claim_next_task",
+		Description: "Atomically claim the next ready plan task for yourself (deterministic claim " +
+			"protocol): lowest phase first, then plan order, dependencies satisfied. Assigns the task " +
+			"to you with a lease and marks it active, so no other worker can take the same task. Prefer " +
+			"this over update_plan(status=active) when several workers run: it guarantees exclusive " +
+			"ownership and prevents two workers from working the same unit.",
+		Parameters: []tools.Parameter{
+			{Name: "none", Description: "No parameters.", Required: false},
+		},
+		Execute: a.claimNextTaskTool,
+	})
+}
+
+// claimNextTaskTool claims the next ready plan task for this agent.
+func (a *Agent) claimNextTaskTool(args map[string]string) (tools.Result, error) {
+	if a.state == nil || a.state.Plan == nil || a.state.Plan.IsEmpty() {
+		return tools.Result{Output: "No plan exists yet. Build one with build_plan, then claim from it."}, nil
+	}
+	owner := a.claimOwner()
+	task := a.state.Plan.ClaimNext(owner, DefaultTaskLease, time.Now().UTC())
+	if task == nil {
+		return tools.Result{Output: "No claimable pending task: every task is active, completed, or dispositioned. Check the plan; unblock a dependency or finish open tasks."}, nil
+	}
+	return tools.Result{Output: fmt.Sprintf(
+		"Claimed task %s (phase %d, class %s) — owner %s, lease until %s. Subject: %s. Work it now; mark it completed or dispositioned via update_plan when done.",
+		task.ID, task.Phase, func() string { if task.VulnClass != "" { return task.VulnClass }; return "-" }(), owner,
+		task.LeaseUntil.Format("15:04:05Z"), taskSubject(task))}, nil
+}
+
+// claimOwner returns this agent's claim identity.
+func (a *Agent) claimOwner() string {
+	if a == nil {
+		return "agent"
+	}
+	if id := strings.TrimSpace(a.delegatedAgentID); id != "" {
+		return id
+	}
+	if a.scanCtx != nil && strings.TrimSpace(a.scanCtx.ID) != "" {
+		return "root:" + a.scanCtx.ID
+	}
+	return "root"
 }
 
 // buildPlanTool replaces the scan plan from a JSON task array.

@@ -1,6 +1,9 @@
 package agent
 
-import "strings"
+import (
+	"strings"
+	"time"
+)
 
 // PlanView is the read-only projection of the root plan. Panels read this
 // instead of reconstructing the plan from build_plan/update_plan tool calls
@@ -56,6 +59,11 @@ type PlanTaskView struct {
 	Origin       string   `json:"origin,omitempty"`
 	Prerequisite bool     `json:"prerequisite,omitempty"`
 	WholeTarget  bool     `json:"whole_target,omitempty"`
+
+	// Owner/LeaseUntil expose the claim protocol to panels: who holds this
+	// intent and until when (empty owner = unclaimed).
+	Owner      string    `json:"owner,omitempty"`
+	LeaseUntil time.Time `json:"lease_until,omitempty"`
 }
 
 // buildPlanView copies the plan out of live state. It must run on the owner
@@ -103,6 +111,8 @@ func buildPlanView(state *ScanState) *PlanView {
 			Origin:       origin,
 			Prerequisite: task.Prerequisite,
 			WholeTarget:  task.WholeTarget,
+			Owner:        task.Owner,
+			LeaseUntil:   task.LeaseUntil,
 		})
 	}
 	switch {

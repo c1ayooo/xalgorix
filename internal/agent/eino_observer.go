@@ -50,6 +50,11 @@ func (o *einoObserver) BeforeTurn(_ context.Context, turn int) engine.TurnDecisi
 	if a.stopped.Load() || (a.ctx != nil && a.ctx.Err() != nil) {
 		return engine.TurnDecision{StopReason: "stopped"}
 	}
+	// Claim protocol / plan seeding read the control-plane role from state;
+	// restored checkpoints predate the field, so fill it once per turn.
+	if a.state != nil && len(a.state.ControlPlaneHosts) == 0 && len(a.controlPlaneHosts) > 0 {
+		a.state.ControlPlaneHosts = a.controlPlaneHosts
+	}
 	a.touchActivity()
 	a.state.Iteration = turn
 	if over, why := a.overBudget(o.toolCalls); over {

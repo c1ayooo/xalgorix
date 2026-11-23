@@ -1,5 +1,28 @@
 # WorkUnit + Claim — 派活协议设计（M4 扩展，2026-11-23）
 
+## 0. 宪章映射（CORE_PHILOSOPHY v3.0 对齐，2026-11-23）
+
+WorkUnit **不是新顶层原语**（宪章 §2/§8）——它是本仓既有对象的统一派发身份：
+
+| 单位 kind | 宪章对象 | 权威 |
+|---|---|---|
+| intent（task） | PlanTask（Intent） | `ScanState.Plan`（live）/ `ScanRecord.PlanView`（persisted） |
+| belief（hypothesis） | Hypothesis（Belief，六态） | `scanctx.LedgerStore`（ledger.json） |
+
+认领协议作用于这两类对象：**独占 + 租约 + 审计投影**，排序保持确定性（§7.1/§7.2：confidence + 稳定 tie-break；VOI ≤30% 已在 ledger 的 `betterHypothesis` 中）。全部实现保持「纯排序与原子认领分离」。
+
+### 实施状态
+
+| 项 | 状态 | 证据 |
+|---|---|---|
+| B1 hypothesis 租约/回收/续租 | ✅ | `ledger.go`（`LeaseUntil`、`reclaimExpiredLocked`、`OpReclaimHypothesis`）；`ledger_lease_test.go` |
+| B2 plan-task 认领（`claim_next_task`，独占+租约） | ✅ | `planner.go`（`ClaimNext`/`reclaimExpiredTasks`/`taskSubject`）、`plan_tools.go`；`plan_claim_test.go` |
+| B2 spawn 去重（活跃 claim 拒绝） | ✅ | `delegation_claim.go`；`delegation_claim_test.go` |
+| B3 证据生成计划（确定性）+ 控制面排除 | ✅ | `AutoPlanFromState`/`buildEnginePlan` 过滤 + `XALGORIX_CONTROL_PLANE_HOSTS`；`plan_units_test.go` |
+| B4 单位统一投影 | ✅ | `GET /api/scans/{id}/units`（`scan_units.go`，含租约过期标记）；`scan_units_test.go` |
+| B4 收工判据 | ✅（既有） | 收工闸门已对 open plan tasks / proven-unreported 拒绝（`hookFinishGatekeeper`/`hookLedgerFinishGate`），本方案不改闸门顺序 |
+
+
 > **立项依据**：TSec 第二轮实测暴露——自动委派波把 specialist 派去侦察平台域名（30+ 分钟 × 1/3 并发）；模型对同一题重复 spawn（a-17、c-09 各有 running+queued 两个 worker）。根因不是模型笨，是**planner 的派活缺少「单位」与「认领」**：spawn 的任务是自由文本，没有独占、没有租约、没有完成判据。本文定义修复协议，分阶段落地，**不改变** Verifier、`report_vulnerability` 闸门与 HITL 语义。
 
 ## 1. 问题陈述（与宪章对照）
