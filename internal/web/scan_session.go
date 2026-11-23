@@ -23,6 +23,7 @@ import (
 	"github.com/c1ayooo/xalgorix/v4/internal/tools/notes"
 	"github.com/c1ayooo/xalgorix/v4/internal/tools/reporting"
 	"github.com/c1ayooo/xalgorix/v4/internal/trafficproxy"
+	"sort"
 )
 
 // vulnNotificationDetails renders the Markdown body pushed to Telegram/Discord
@@ -32,6 +33,58 @@ import (
 // every alert reads like an unsubstantiated claim and gets treated as a false
 // positive (issue #429). Fields are written only when present, mirroring the
 // PDF report's evidence section.
+// vulnDigestList renders a compact, severity-ranked findings digest for
+// summary notifications (scan-finished cards). Per-finding alerts carry the
+// full detail; the summary must still name WHAT was found — a count alone
+// tells the operator nothing (operator feedback 2026-11-23: "实际发给飞书
+// 的内容不带漏洞信息").
+func vulnDigestList(vulns []VulnSummary, limit int) string {
+	if len(vulns) == 0 {
+		return ""
+	}
+	if limit <= 0 || limit > len(vulns) {
+		limit = len(vulns)
+	}
+	rank := map[string]int{"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+	icon := map[string]string{"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🔵", "info": "⚪"}
+	sorted := append([]VulnSummary(nil), vulns...)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		ri, riOK := rank[strings.ToLower(sorted[i].Severity)]
+		rj, rjOK := rank[strings.ToLower(sorted[j].Severity)]
+		if !riOK {
+			ri = 9
+		}
+		if !rjOK {
+			rj = 9
+		}
+		if ri != rj {
+			return ri < rj
+		}
+		return sorted[i].Title < sorted[j].Title
+	})
+	var b strings.Builder
+	b.WriteString("**Findings:**\n")
+	for _, v := range sorted[:limit] {
+		sev := strings.ToLower(v.Severity)
+		em := icon[sev]
+		if em == "" {
+			em = "•"
+		}
+		b.WriteString(fmt.Sprintf("- %s [%s] %s", em, strings.ToUpper(v.Severity), v.Title))
+		if v.Endpoint != "" {
+			b.WriteString(fmt.Sprintf(" — `%s`", v.Endpoint))
+		}
+		if v.CVSS > 0 {
+			b.WriteString(fmt.Sprintf(" (CVSS %.1f)", v.CVSS))
+		}
+		b.WriteString("\n")
+	}
+	if rest := len(sorted) - limit; rest > 0 {
+		b.WriteString(fmt.Sprintf("- … and %d more (see the dashboard report)\n", rest))
+	}
+	return b.String()
+}
+
 func vulnNotificationDetails(vs VulnSummary) string {
 	var details strings.Builder
 	details.WriteString(fmt.Sprintf("**%s**\n\n", vs.Title))
@@ -732,8 +785,8 @@ func (s *Server) executeScanSession(sess *scanSession) {
 			if s.notifyScanComplete.Load() {
 				vulnCount := len(sess.record.Vulns)
 				if vulnCount > 0 {
-					desc := fmt.Sprintf("**Target:** %s\n**Vulnerabilities:** %d found\n**Completed at:** %s",
-						sess.target, vulnCount, time.Now().Format("15:04:05 MST"))
+					desc := fmt.Sprintf("**Target:** %s\n**Vulnerabilities:** %d found\n\n%s\n**Completed at:** %s",
+						sess.target, vulnCount, vulnDigestList(sess.record.Vulns, 8), time.Now().Format("15:04:05 MST"))
 					if s.telegramConfigured() {
 						s.sendTelegramWithFile(0x3b82f6, "✅ Scan Finished - Report Ready", desc, p)
 					}
