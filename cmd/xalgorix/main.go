@@ -381,6 +381,7 @@ func main() {
 		// by the store. nil backend (tests) keeps the legacy events.jsonl
 		// file path byte-for-byte.
 		web.SetEventStateBackend(rsStore)
+		web.SetWorkerStateBackend(rsStore)
 		scanctx.SetStateFilesBackend(rsStore)
 		intelligence.SetBackend(rsStore)
 		// Scan record → PG (R6.1 runs-table takeover of scan.json, charter
