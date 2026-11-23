@@ -422,7 +422,7 @@ func main() {
 	// restores the pre-R2b behavior byte-for-byte). XALGORIX_CA_DIR points
 	// at the interception CA (default ~/.xalgorix/ca).
 	// -------------------------------------------------------------------------
-	if err := trafficproxy.Configure(cfg.TrafficProxy, cfg.CADir, cfg.TLSSkipVerify); err != nil {
+	if err := trafficproxy.ConfigureWithListen(cfg.TrafficProxy, cfg.CADir, cfg.TLSSkipVerify, cfg.TrafficProxyBind, cfg.TrafficProxyAdvertise); err != nil {
 		fmt.Fprintf(os.Stderr, "[trafficproxy] init warning: %v\n", err)
 		// Non-fatal: a broken CA already degrades to blind forwarding inside
 		// Configure; scanning continues.
@@ -1261,6 +1261,7 @@ func setupToolRuntime(ctx context.Context, cfg *config.Config) (func(), error) {
 		Profile:      cfg.ToolboxProfile,
 		ProjectLimit: cfg.MaxProjects,
 		ExecLimit:    cfg.ToolboxConcurrency,
+		DiskEnforce:  cfg.ProjectDiskEnforce,
 	})
 	if err != nil {
 		return nil, err

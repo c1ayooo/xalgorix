@@ -88,12 +88,21 @@ func main() {
 	}
 }
 
+// profileMatches reports whether a tool belongs to the requested image
+// profile. `full` and `web` are built FROM core, so a core tool must also be
+// verified in those images; the reverse is not true (a full-only tool is not in
+// core, and a web-only tool is not in full).
 func profileMatches(profiles []string, want string) bool {
+	want = strings.ToLower(strings.TrimSpace(want))
 	if want == "all" || len(profiles) == 0 {
 		return true
 	}
 	for _, p := range profiles {
-		if strings.EqualFold(strings.TrimSpace(p), want) {
+		p = strings.ToLower(strings.TrimSpace(p))
+		if p == want {
+			return true
+		}
+		if p == "core" && (want == "full" || want == "web") {
 			return true
 		}
 	}

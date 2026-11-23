@@ -30,9 +30,9 @@
 
 | 接缝 | 约束 | 现状 | 实施要求 |
 |---|---|---|---|
-| **扫描目录同路径挂载** | 平台把 `scanDir` 原样交给 daemon 做 bind mount，宿主必须存在**完全相同绝对路径** | compose 默认把数据放在 named volume（容器内 `/data`），宿主没有 `/data/...` | docker backend 必须把数据目录改成**宿主机 bind mount 且容器内路径一致**，例如 `/srv/xalgorix/data:/data`；否则 `EnsureProject` 创建的容器挂到空目录 |
-| **流量代理可达性** | `proxy-only` 网络是 `--internal`，唯一出口是平台流量代理；代理当前监听 `127.0.0.1:0` | 工具容器无法访问平台容器/宿主 loopback | 新增 `XALGORIX_TOOLBOX_PROXY_URL`（或代理 sidecar 接入每个项目网络），代理监听地址改为项目网络可达；未配置且要求代理时必须 **fail-closed** |
-| **Chromium CDP 可达性** | `web` profile 把 DevTools 发布到宿主 `127.0.0.1:<ephemeral>`，平台从 `127.0.0.1` 探测 | 平台在容器内时，`127.0.0.1` 是平台自己 | 短期：`web` profile 仅用于宿主二进制平台；生产容器平台用 runnerd 增加 CDP relay，或把平台加入项目网络后按容器名寻址。核心/full profile 不受影响 |
+| **扫描目录同路径挂载** | 平台把 `scanDir` 原样交给 daemon 做 bind mount，宿主必须存在**完全相同绝对路径** | 已加启动预检：容器内 `XALGORIX_HOST_DATA_DIR` 必须存在且等于 `XALGORIX_DATA_DIR`；split compose 用 `${XALGORIX_DATA_DIR}:${XALGORIX_DATA_DIR}` | 部署时把宿主机目录挂到**完全相同的绝对路径**，例如 `/srv/xalgorix/data:/srv/xalgorix/data` 并设 `XALGORIX_DATA_DIR=/srv/xalgorix/data`。`/srv/...:/data` 不满足同路径契约 |
+| **流量代理可达性** | `proxy-only` 网络是 `--internal`，唯一出口是平台流量代理 | 代理支持 `XALGORIX_TRAFFICPROXY_BIND` / `XALGORIX_TRAFFICPROXY_ADVERTISE`；工具侧用 `XALGORIX_TOOLBOX_PROXY_URL` | 绑定项目网络可达地址（或 sidecar），并让 `TOOLBOX_PROXY_URL` 指向同一地址；未配置且要求代理时 fail-closed。绑 `0.0.0.0` 会暴露拦截代理，必须防火墙限制 |
+| **Chromium CDP 可达性** | `web` profile 把 DevTools 发布到宿主 `127.0.0.1:<ephemeral>` | 已实现 runnerd TCP relay：runnerd 用 host network 探测宿主端口，平台经 `host.docker.internal` 访问 relay | compose split 已加 `extra_hosts: host.docker.internal:host-gateway` 与 runnerd `network_mode: host`（Linux）。宿主二进制平台仍可直接用 `127.0.0.1` |
 
 ### 0.4 标记约定与本文结构
 
@@ -512,7 +512,7 @@ L1 缺口是 7.1 的 P0：并发多项目时如果没有统一项目配额，容
 | CPU | 1 核（quota=period） | 预算内固定 | 硬 quota 会让扫描时长不可预测，默认交给内核时间片 |
 | PIDs | 512 | `XALGORIX_PROJECT_PIDS` | 防 fork bomb |
 | `/tmp` tmpfs | 512 MB | `XALGORIX_PROJECT_TMPFS_MB` | `rw,size=...,exec` |
-| 磁盘 | 4096 MB | `XALGORIX_PROJECT_DISK_MB` | ⚠️ 仅传播，未落配额 |
+| 磁盘 | 4096 MB | `XALGORIX_PROJECT_DISK_MB` + `XALGORIX_PROJECT_DISK_ENFORCE` | opt-in `StorageOpt size`；仅覆盖容器可写层，scan 目录需外部 quota |
 | 项目数 | RAM 推导 | `XALGORIX_MAX_PROJECTS` | ⚠️ 未接入 driver/热路径 |
 
 cgroup 落地：
@@ -630,15 +630,29 @@ Tmpfs:      "/tmp": "rw,size=<n>m,exec"
 - selftest capability/profile 白名单与 `--profile` 拼错 fail-closed；
 - 构建/部署三轴：`PLATFORM_VARIANT=slim|allinone`、`TOOLBOX_PROFILE=core|full|web`、`RUNTIME_MODE=native|docker`，compose `allinone|split`；
 - split 数据目录同路径 bind mount、entrypoint 跟随 `XALGORIX_DATA_DIR`、共享 CA/cache 目录自动准备；
-- 根 compose 默认包含 PostgreSQL 与 DSN，`docker compose up -d` 不再因空 DSN 退出。
+- 根 compose 默认包含 PostgreSQL 与 DSN，`docker compose up -d` 不再因空 DSN 退出；
+- `main.go` 接线：max-life 作业入参、`XALGORIX_HOST_DATA_DIR` 容器内同路径预检；
+- `web` profile 容器化 CDP relay：runnerd 侧 TCP 转发 + 平台侧 `CDPEndpoint`，compose 用 host network + `host.docker.internal`；
+- 磁盘配额 opt-in：`XALGORIX_PROJECT_DISK_ENFORCE=1` 把 `DiskMB` 写成 Docker `StorageOpt size`（仅覆盖可写层，scan 目录需外部 quota）；
+- 流量代理可配置监听：`XALGORIX_TRAFFICPROXY_BIND` / `XALGORIX_TRAFFICPROXY_ADVERTISE`，可绑定项目网络可达地址。
+
+构建与运行验证（2026-11-23）：
+
+- `xalgorix:4.6.133-slim` 225MB，`xalgorix --version` → `v4.6.133`（用最新代码重建）；
+- `xalgorix-runnerd:dev` 136MB，`runnerd --version` → `4.6.133`；
+- `xalgorix-toolbox:dev-core` selftest 27/27 通过；
+- `xalgorix-toolbox:dev-full` 带 `NET_RAW/NET_ADMIN/SYS_PTRACE` 的继承 profile selftest 49/49 通过；web 28/28（core + chromium）通过；
+- runnerd 真实链路冒烟通过：`ensure project → exec（echo/toolshim/subfinder）→ remove`，并修复了容器内 `timeout --` 导致 Exec 返回 127 的缺陷；
+- CDP relay 端到端通过：web 项目启动 Chromium 后，经 runnerd relay 的 `/json/version` 返回 Chrome 156 与可用 `webSocketDebuggerUrl`；Chromium 只监听容器回环，容器内 Python 转发器把 `0.0.0.0:9222` 桥到 `127.0.0.1:9223`；
+- 构建默认使用 `GOPROXY=https://goproxy.cn,direct`、`KALI_MIRROR=http://mirrors.ustc.edu.cn/kali`，可在 `make` 命令行覆盖；
+- 最终门禁：`go build ./...`、`go test ./...`、`go test -race ./internal/runtime ./internal/trafficproxy ./cmd/xalgorix`、`go vet`、`gofmt -l`、`make deploy-check`、四组 `docker compose config`、两个 workflow YAML 解析、`bash -n install.sh/docker-entrypoint.sh` 全部通过。
 
 仍待下一轮：
 
-- `main.go` 的显式接线（配额启动参数、max-life 作业入参、host 数据目录预检）；
-- `web` profile 的容器化 CDP relay；
-- 磁盘配额强制（`StorageOpt` 依赖存储驱动）；
-- 真实镜像构建 + 一次容器化端到端扫描（本机只做了 target 解析与 compose config）；
-- 代理监听地址本身的部署侧可达性。
+- 一次完整容器化扫描（需要 LLM key 与授权目标；目前验证到项目容器 exec 层）；
+- 镜像体积优化：Go module/build cache 残留在镜像层内，core 14GB、full 18GB；后续把 `go clean -modcache -cache` 并入安装层可显著缩小；
+- scan 目录级磁盘 quota（`StorageOpt` 只覆盖容器可写层）；
+- `debug` profile 文档收口（目前统一到 `full` + SYS_PTRACE 工具）。
 
 ### 7.1 必须补齐的缺口
 
@@ -701,6 +715,8 @@ Tmpfs:      "/tmp": "rw,size=<n>m,exec"
 | `PLATFORM_VARIANT` | `slim` / `allinone` | `allinone` | `image-platform` 选择 Dockerfile target |
 | `TOOLBOX_PROFILE` | `core` / `full` / `web` | `core` | `image-toolbox` / `selftest` / `toolbox-push` |
 | `RUNTIME_MODE` | `native` / `docker` | `native` | `make run` 注入 `XALGORIX_RUNTIME_BACKEND` |
+| `GOPROXY` | 任意 Go module proxy | `https://proxy.golang.org,direct` | 镜像内 `go mod download`；网络不可达官方源时改用可达镜像 |
+| `KALI_MIRROR` | 任意 Kali apt 镜像 | `http://mirrors.ustc.edu.cn/kali` | 工具镜像的 apt 源；默认中科大，可用 `KALI_MIRROR=` 覆盖 |
 
 | 目标 | 产物 |
 |---|---|
@@ -710,6 +726,14 @@ Tmpfs:      "/tmp": "rw,size=<n>m,exec"
 | `make deploy-check` | 两个 compose 文件 × `allinone`/`split` 的 `config` 校验 + 默认形态选中服务的断言 |
 
 非法取值在 make 解析期报错，`make -n` 同样拦截（不会先打印再执行 Docker）。
+
+镜像构建默认走官方 Go module proxy；在无法访问 `proxy.golang.org` 的网络里追加
+`GOPROXY=https://goproxy.cn,direct`（或企业内网代理），例如：
+
+```bash
+make image-platform PLATFORM_VARIANT=slim GOPROXY=https://goproxy.cn,direct
+make image-toolbox TOOLBOX_PROFILE=core GOPROXY=https://goproxy.cn,direct
+```
 
 **镜像 tag 约定**
 
@@ -739,10 +763,11 @@ Tmpfs:      "/tmp": "rw,size=<n>m,exec"
 
 **宿主机（无容器）平台**：`make build` 产出二进制，运行时设 `XALGORIX_RUNTIME_BACKEND=docker` 并接 runnerd/socket 即可，不需要新增镜像。
 
-**仍未落地（不属于本变体工作包）**
-- `main.go` 接线：项目配额启动参数、max-life 作业入参、宿主数据目录预检尚未接入；本包只提供部署侧选择器、镜像与 compose。
-- 代理可达性：`trafficproxy` 仍监听 loopback；split 形态要求操作者提供项目网络可达的 `XALGORIX_TOOLBOX_PROXY_URL`，否则 docker backend fail-closed。
-- `web` profile 的 CDP relay 未实现：容器化平台下 `web` profile 仍限宿主二进制平台使用。
+**运行态接线（已落地）**
+- `main.go` 已接入 max-life 作业入参和 `XALGORIX_HOST_DATA_DIR` 同路径预检；配额在 driver 层按资源预算兜底。
+- 代理可达性：`trafficproxy` 支持 `XALGORIX_TRAFFICPROXY_BIND` / `XALGORIX_TRAFFICPROXY_ADVERTISE`；split 形态仍需操作者选择项目网络可达地址并配合 `XALGORIX_TOOLBOX_PROXY_URL`，否则 docker backend fail-closed。
+- `web` profile 的 CDP relay 已实现：runnerd 提供 TCP relay，平台通过 `host.docker.internal`（compose 已加 host-gateway 与 host network）访问。
+- 仍未落地：scan 目录级磁盘 quota（`StorageOpt` 只覆盖容器可写层）、真实端到端扫描（需要 LLM 与目标）。
 
 ---
 
@@ -754,18 +779,25 @@ Tmpfs:      "/tmp": "rw,size=<n>m,exec"
 | `XALGORIX_RUNTIME_TRANSPORT` | `socket` | `runnerd`（推荐）/ `socket`（开发） |
 | `XALGORIX_DOCKER_SOCKET` | `/var/run/docker.sock` | socket transport |
 | `XALGORIX_RUNNERD_SOCKET` | `/run/xalgorix/runner.sock` | runnerd transport |
-| `XALGORIX_TOOLBOX_IMAGE` | 空 | 必须 digest 固定（目标） |
+| `XALGORIX_HOST_DATA_DIR` | 空 | 平台在容器内时必填，且必须等于 `XALGORIX_DATA_DIR` |
+| `XALGORIX_TOOLBOX_IMAGE` | 空 | 必须 digest 固定（强制，tag 被拒绝） |
+| `XALGORIX_ALLOW_UNPINNED_TOOLBOX` | `0` | 仅开发：允许 tag 引用 |
 | `XALGORIX_TOOLBOX_PROFILE` | `core` | `core` / `full` / `web` |
 | `XALGORIX_TOOLBOX_BROWSER_PROXY` | 空 | Chromium 代理（项目网络可达） |
-| `XALGORIX_TOOLBOX_PROXY_URL` | 空（待实现） | 通用工具代理（项目网络可达） |
+| `XALGORIX_TOOLBOX_PROXY_URL` | 空 | 通用工具代理（项目网络可达；要求代理时必填） |
 | `XALGORIX_MAX_PROJECTS` | 0（RAM 推导） | 项目容器上限 |
 | `XALGORIX_TOOLBOX_CONCURRENCY` | 4 | 单容器并发 exec |
 | `XALGORIX_PROJECT_MEM_MB` | RAM 推导 | 每项目内存 |
 | `XALGORIX_PROJECT_PIDS` | 512 | 每项目 PID 上限 |
 | `XALGORIX_PROJECT_TMPFS_MB` | 512 | `/tmp` tmpfs |
-| `XALGORIX_PROJECT_DISK_MB` | 4096 | 磁盘预算（待强制） |
+| `XALGORIX_PROJECT_DISK_MB` | 4096 | 磁盘预算 |
+| `XALGORIX_PROJECT_DISK_ENFORCE` | `0` | opt-in：写成 Docker `StorageOpt size`（仅可写层） |
 | `XALGORIX_PROJECT_IDLE_TTL_SECONDS` | 600 | 空闲回收 |
-| `XALGORIX_PROJECT_MAX_LIFE_SECONDS` | 21600 | 最长寿命（待实现） |
+| `XALGORIX_PROJECT_MAX_LIFE_SECONDS` | 21600 | 最长寿命 |
+| `XALGORIX_RUNNERD_CDP_BIND` | `127.0.0.1:0` | runnerd CDP relay 监听地址 |
+| `XALGORIX_RUNNERD_CDP_ADVERTISE` | 空 | relay 返回给平台的 host（容器化平台用 `host.docker.internal`） |
+| `XALGORIX_TRAFFICPROXY_BIND` | `127.0.0.1:0` | 流量代理监听地址 |
+| `XALGORIX_TRAFFICPROXY_ADVERTISE` | 空 | 代理 URL 的 host:port（bind 为 0.0.0.0 时必填） |
 | `XALGORIX_TOOLBOX_KEEP_DIGESTS` | 3 | 镜像 GC 保留数 |
 | `XALGORIX_TARGET_CONCURRENCY` | 1（上限 4） | 单扫描多目标并发；共享同一项目容器 |
 

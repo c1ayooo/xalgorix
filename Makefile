@@ -97,6 +97,13 @@ TOOLBOX_PROFILE  ?= core
 PLATFORM_IMAGE ?= xalgorix:$(VERSION)
 TOOLBOX_IMAGE  ?= xalgorix-toolbox:dev
 RUNNERD_IMAGE  ?= xalgorix-runnerd:dev
+# Module proxy used inside the image builds. Override on networks where the
+# default proxy is unreachable, e.g. GOPROXY=https://goproxy.cn,direct.
+GOPROXY ?= https://proxy.golang.org,direct
+# Kali apt mirror. USTC is the default for the build environment; any Kali
+# mirror can be selected.
+KALI_MIRROR ?= http://mirrors.ustc.edu.cn/kali
+DOCKER_BUILD_ARGS ?= --build-arg GOPROXY=$(GOPROXY) --build-arg KALI_MIRROR=$(KALI_MIRROR)
 
 # Expand to a parse-time error so `make -n <target>` rejects typos too, before
 # any Docker command is printed or executed.
@@ -119,17 +126,17 @@ endif
 # XALGORIX_RUNTIME_BACKEND=docker.
 image-platform:
 	@echo "Building platform image $(PLATFORM_VARIANT): $(PLATFORM_IMAGE)-$(PLATFORM_VARIANT)"
-	docker build -f Dockerfile --target platform-$(PLATFORM_VARIANT) -t $(PLATFORM_IMAGE)-$(PLATFORM_VARIANT) .
+	docker build -f Dockerfile --target platform-$(PLATFORM_VARIANT) -t $(PLATFORM_IMAGE)-$(PLATFORM_VARIANT) $(DOCKER_BUILD_ARGS) --build-arg VERSION=$(VERSION) .
 
 # Toolbox image: <toolbox-repo>:<version>-<profile>.
 image-toolbox:
 	@echo "Building toolbox image $(TOOLBOX_PROFILE): $(TOOLBOX_IMAGE)-$(TOOLBOX_PROFILE)"
-	docker build -f tools/toolbox/Dockerfile --target $(TOOLBOX_PROFILE) -t $(TOOLBOX_IMAGE)-$(TOOLBOX_PROFILE) .
+	docker build -f tools/toolbox/Dockerfile --target $(TOOLBOX_PROFILE) -t $(TOOLBOX_IMAGE)-$(TOOLBOX_PROFILE) $(DOCKER_BUILD_ARGS) .
 
 # Host-side runtime service used by the recommended split deployment.
 image-runnerd:
 	@echo "Building runnerd image: $(RUNNERD_IMAGE)"
-	docker build -f Dockerfile --target runnerd -t $(RUNNERD_IMAGE) .
+	docker build -f Dockerfile --target runnerd -t $(RUNNERD_IMAGE) $(DOCKER_BUILD_ARGS) --build-arg VERSION=$(VERSION) .
 
 # Validate both deployment shapes without contacting a Docker daemon: the
 # profiles must render, and the default (no profile) must still select services
@@ -154,7 +161,9 @@ toolbox-build: image-toolbox
 
 # Build and run the self-test gate inside the resulting image.
 toolbox-verify: toolbox-build
-	docker run --rm --entrypoint /opt/xalgorix/bin/toolbox-selftest $(TOOLBOX_IMAGE)-$(TOOLBOX_PROFILE) --profile $(TOOLBOX_PROFILE) --json
+	docker run --rm --cap-add NET_RAW --cap-add NET_ADMIN --cap-add SYS_PTRACE \
+		--entrypoint /opt/xalgorix/bin/toolbox-selftest \
+		$(TOOLBOX_IMAGE)-$(TOOLBOX_PROFILE) --profile $(TOOLBOX_PROFILE) --json
 
 # Run the self-test against the local host (useful while iterating on the
 # manifest; most tools will be missing, which is the point).

@@ -143,6 +143,7 @@ type dockerHostConfig struct {
 	CapAdd         []string                       `json:"CapAdd,omitempty"`
 	SecurityOpt    []string                       `json:"SecurityOpt,omitempty"`
 	Tmpfs          map[string]string              `json:"Tmpfs,omitempty"`
+	StorageOpt     map[string]string              `json:"StorageOpt,omitempty"`
 	Resources      dockerResources                `json:"Resources"`
 	PortBindings   map[string][]dockerPortBinding `json:"PortBindings,omitempty"`
 	AutoRemove     bool                           `json:"AutoRemove"`

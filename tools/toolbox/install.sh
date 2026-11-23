@@ -25,16 +25,25 @@ flock 9
 log()  { printf '[toolbox] %s\n' "$*"; }
 warn() { printf '[toolbox] WARN %s\n' "$*" >&2; }
 
+# Force IPv4 and bound each fetch: a blackholed IPv6 route or a stalled CDN edge
+# otherwise hangs `apt-get update` for minutes with no output.
+APT_OPTS=(
+  -o Acquire::Retries=3
+  -o Acquire::http::Timeout=30
+  -o Acquire::https::Timeout=30
+  -o Acquire::ForceIPv4=true
+)
+
 apt_install() {
   local pkgs=("$@")
   log "apt install: ${pkgs[*]}"
-  DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 install -y --no-install-recommends "${pkgs[@]}"
+  DEBIAN_FRONTEND=noninteractive apt-get "${APT_OPTS[@]}" install -y --no-install-recommends "${pkgs[@]}"
 }
 
 apt_update_once() {
   [ -f "${CACHE}/.apt-updated" ] && return 0
   for i in 1 2 3; do
-    if apt-get -o Acquire::Retries=3 update; then
+    if apt-get "${APT_OPTS[@]}" -o APT::Update::Error-Mode=any update; then
       touch "${CACHE}/.apt-updated"
       return 0
     fi
@@ -47,11 +56,56 @@ apt_update_once() {
 
 go_install() {
   local pkg="$1" version="${2:-}"
-  if [ -n "${version}" ]; then
-    GOBIN=/root/go/bin go install "${pkg}@${version}" || warn "go install ${pkg}@${version} failed"
-  else
-    GOBIN=/root/go/bin go install "${pkg}" || warn "go install ${pkg} failed"
+  local spec="${pkg}@${version}"
+  # Go requires an explicit @version outside a module ("go install pkg" fails
+  # with "requires a version when current directory is not in a module").
+  [ -n "${version}" ] || spec="${pkg}@latest"
+  GOBIN=/root/go/bin go install "${spec}" || warn "go install ${spec} failed"
+}
+
+# gogo publishes replace directives in its go.mod, which `go install pkg@version`
+# refuses ("would be interpreted differently than if it were the main module").
+# Clone and build it as the main module instead.
+gogo_install() {
+  local dir=/tmp/gogo-src
+  rm -rf "$dir"
+  if ! git clone --depth 1 https://github.com/chainreactors/gogo "$dir"; then
+    warn "gogo clone failed"
+    return 1
   fi
+  # The module root is the v2/ subdirectory, not the repository root.
+  ( cd "$dir/v2" && GOBIN=/root/go/bin go install -tags goregexp . ) \
+    || warn "gogo build failed"
+  rm -rf "$dir"
+}
+
+# trufflehog's module also carries replace directives, and raw.githubusercontent
+# is not reachable from every build network. Fetch the release tarball through a
+# GitHub mirror instead.
+trufflehog_install() {
+  local arch tag version url tmp
+  case "$(uname -m)" in
+    x86_64) arch=amd64 ;;
+    aarch64|arm64) arch=arm64 ;;
+    *) warn "trufflehog: unsupported architecture $(uname -m)"; return 1 ;;
+  esac
+  tag=$(curl -fsSL --max-time 20 https://api.github.com/repos/trufflesecurity/trufflehog/releases/latest 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null) || true
+  if [ -z "${tag}" ]; then
+    warn "trufflehog: release lookup failed"
+    return 1
+  fi
+  version="${tag#v}"
+  url="https://gh-proxy.com/https://github.com/trufflesecurity/trufflehog/releases/download/${tag}/trufflehog_${version}_linux_${arch}.tar.gz"
+  tmp=$(mktemp -d)
+  if curl -fsSL --max-time 180 "${url}" -o "${tmp}/trufflehog.tgz" \
+     && tar -xzf "${tmp}/trufflehog.tgz" -C "${tmp}" trufflehog; then
+    install -m 0755 "${tmp}/trufflehog" /usr/local/bin/trufflehog
+    rm -rf "${tmp}"
+    return 0
+  fi
+  warn "trufflehog: download failed from gh-proxy.com"
+  rm -rf "${tmp}"
+  return 1
 }
 
 pipx_install() {
@@ -73,9 +127,11 @@ case "${1:-}" in
     apt_install \
       ca-certificates curl wget git jq unzip zip p7zip-full file tree bc xxd less procps \
       python3 python3-pip python3-venv pipx \
-      golang-go cargo nodejs npm \
+      cargo nodejs npm ripgrep \
       build-essential pkg-config libpcap-dev libcap2-bin \
       seclists wordlists
+    # The Go toolchain is copied from the golang:1.26 builder stage (see
+    # Dockerfile). Kali's golang-go lags behind what httpx/nuclei require.
     pipx ensurepath >/dev/null 2>&1 || true
     ;;
 
@@ -99,7 +155,6 @@ case "${1:-}" in
     go_install github.com/ffuf/ffuf/v2 || true
     go_install github.com/OJ/gobuster/v3 || true
     go_install github.com/tomnomnom/assetfinder || true
-    go_install github.com/tomnomnom/gau/v2/cmd/gau || true
     go_install github.com/tomnomnom/waybackurls || true
     go_install github.com/tomnomnom/qsreplace || true
     go_install github.com/tomnomnom/unfurl || true
@@ -109,7 +164,6 @@ case "${1:-}" in
     go_install github.com/lc/gau/v2/cmd/gau || true
     go_install github.com/hakluke/hakrawler || true
     go_install github.com/jaeles-project/gospider || true
-    go_install github.com/chainreactors/gogo/v2 || true
     pipx_install arjun
     pipx_install uro
     pipx_install dirsearch
@@ -122,12 +176,17 @@ case "${1:-}" in
   net)
     apt_update_once
     apt_install nmap masscan arp-scan netdiscover responder ettercap-text-only
+    gogo_install || true
     ;;
 
   exploit)
     apt_update_once
     apt_install sqlmap hydra medusa john hashcat exploitdb
     pipx_install impacket
+    # pipx exposes the script as secretsdump.py; publish the manifest name too.
+    if [ -x /root/.local/bin/secretsdump.py ]; then
+      ln -sf /root/.local/bin/secretsdump.py /root/.local/bin/impacket-secretsdump
+    fi
     ;;
 
   sast)
@@ -137,9 +196,10 @@ case "${1:-}" in
     pipx_install bandit
     pipx_install git-dumper
     gem install --no-document brakeman >/dev/null 2>&1 || warn "brakeman install failed"
-    go_install github.com/gitleaks/gitleaks/v8 || true
-    curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh \
-      | sh -s -- -b /usr/local/bin >/dev/null 2>&1 || warn "trufflehog install failed"
+    # The module still declares the historical zricethezav path; the new
+    # github.com/gitleaks path fails with "module declares its path as ...".
+    go_install github.com/zricethezav/gitleaks/v8 || true
+    trufflehog_install || true
     ;;
 
   browser)

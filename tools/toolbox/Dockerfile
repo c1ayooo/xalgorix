@@ -15,6 +15,10 @@
 
 # ── Stage 1: build the in-container helpers (static, pure Go) ────────────────
 FROM golang:1.26-bookworm AS gobuild
+# Same GOPROXY build argument as the platform image: a mirror can be selected
+# on networks where the default module proxy is unreachable.
+ARG GOPROXY=https://proxy.golang.org,direct
+ENV GOPROXY=${GOPROXY}
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
@@ -27,7 +31,11 @@ RUN go build -trimpath -ldflags "-s -w" -o /out/toolshim ./cmd/toolshim \
 # ── Stage 2: base runtime ────────────────────────────────────────────────────
 FROM kalilinux/kali-rolling AS base
 ARG TARGETARCH
-ARG KALI_MIRROR=http://kali.download/kali
+ARG KALI_MIRROR=http://mirrors.ustc.edu.cn/kali
+# Same module-proxy knob as the builder stage; install.sh runs `go install`
+# here for the core/net/sast tool sets.
+ARG GOPROXY=https://proxy.golang.org,direct
+ENV GOPROXY=${GOPROXY}
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Pin Kali's own CDN mirror instead of the geo redirector (a redirector outage
@@ -43,19 +51,22 @@ COPY tools/toolbox/versions.lock /opt/xalgorix/versions.lock
 COPY tools/toolbox/install.sh /opt/xalgorix/install.sh
 RUN chmod +x /opt/xalgorix/install.sh && /opt/xalgorix/install.sh base
 
+# Go 1.26 from the builder: Kali's golang-go lags behind the `go >= 1.26`
+# requirement of the ProjectDiscovery tools and makes `go install ...@latest`
+# fail silently. This also matches the toolpack's /usr/local/go/bin/go path.
+COPY --from=gobuild /usr/local/go /usr/local/go
+
 # Publish the repo-built helpers on a PATH directory that precedes distro bins.
 COPY --from=gobuild /out/toolshim /opt/xalgorix/bin/toolshim
 COPY --from=gobuild /out/toolbox-selftest /opt/xalgorix/bin/toolbox-selftest
 COPY tools/toolbox/toolpack.yaml /opt/xalgorix/toolpack.yaml
 
-# Strip file capabilities: the container runs as root with a *dropped* capability
-# bounding set, so a binary requesting an effective cap it does not hold fails
-# execve with EPERM (nmap/masscan/arping are the classic cases).
-RUN getcap -r / 2>/dev/null | awk '{print $1}' | while read -r f; do \
-      setcap -r "$f" 2>/dev/null || true; \
-    done || true
+# File capabilities are stripped AFTER each profile's package installs: apt
+# re-adds setcap capabilities when nmap/masscan/arping are installed again in
+# the net/exploit layers, and a binary requesting an effective cap outside the
+# container's bounding set fails execve with EPERM.
 
-ENV PATH="/opt/xalgorix/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/go/bin:/root/.local/bin:/root/.cargo/bin:/usr/local/go/bin" \
+ENV PATH="/opt/xalgorix/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/go/bin:/root/.local/bin:/root/.cargo/bin" \
     HOME=/root \
     LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
@@ -69,15 +80,18 @@ CMD ["sleep", "infinity"]
 
 # ── Stage 3: core profile ────────────────────────────────────────────────────
 FROM base AS core
-RUN /opt/xalgorix/install.sh core
+RUN /opt/xalgorix/install.sh core \
+ && getcap -r / 2>/dev/null | awk '{print $1}' | while read -r f; do setcap -r "$f" 2>/dev/null || true; done || true
 
 # ── Stage 4: full profile (raw sockets, exploitation, credentials) ───────────
 FROM core AS full
-RUN /opt/xalgorix/install.sh net && /opt/xalgorix/install.sh exploit && /opt/xalgorix/install.sh sast
+RUN /opt/xalgorix/install.sh net && /opt/xalgorix/install.sh exploit && /opt/xalgorix/install.sh sast \
+ && getcap -r / 2>/dev/null | awk '{print $1}' | while read -r f; do setcap -r "$f" 2>/dev/null || true; done || true
 
 # ── Stage 5: web profile (headless Chromium) ─────────────────────────────────
 FROM core AS web
-RUN /opt/xalgorix/install.sh browser
+RUN /opt/xalgorix/install.sh browser \
+ && getcap -r / 2>/dev/null | awk '{print $1}' | while read -r f; do setcap -r "$f" 2>/dev/null || true; done || true
 
 # ── Stage 6: self-test gate ──────────────────────────────────────────────────
 # CI builds this target and treats a non-zero exit as a failed image. The

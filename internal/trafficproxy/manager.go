@@ -46,6 +46,10 @@ type Manager struct {
 	mitm          bool // TLS interception active (enabled && CA loaded); false → legacy blind tunnel
 	tlsSkipVerify bool // XALGORIX_TLS_SKIP_VERIFY — target-side tls.Client semantics
 	ca            *CA
+	// bind is the listener address; advertise overrides the host:port handed
+	// to consumers when bind is unspecified (0.0.0.0/::).
+	bind      string
+	advertise string
 
 	startOnce sync.Once
 
@@ -100,9 +104,21 @@ func SetDialGuard(g DialGuardFunc) DialGuardFunc {
 // running; a CA is never silently re-signed, which would strand every
 // consumer trust store).
 func Configure(enabled bool, caDir string, tlsSkipVerify bool) error {
+	return ConfigureWithListen(enabled, caDir, tlsSkipVerify, "", "")
+}
+
+// ConfigureWithListen is Configure plus the listener address and the advertised
+// host:port. A containerised platform whose tools run in project containers
+// needs the proxy reachable from the project network: bind to an address on
+// that network (or 0.0.0.0) and advertise a host name the project can resolve,
+// such as host.docker.internal. Empty values preserve the historical loopback
+// behaviour.
+func ConfigureWithListen(enabled bool, caDir string, tlsSkipVerify bool, bind, advertise string) error {
 	m := &Manager{
 		enabled:                    enabled,
 		tlsSkipVerify:              tlsSkipVerify,
+		bind:                       strings.TrimSpace(bind),
+		advertise:                  strings.TrimSpace(advertise),
 		tunnels:                    make(map[*tunnel]struct{}),
 		upstreamTransports:         make(map[string]*http.Transport),
 		directTransports:           make(map[string]*http.Transport),
@@ -214,12 +230,16 @@ func LocalURL() (string, error) {
 			m.localErr = fmt.Errorf("traffic proxy manager is closed")
 			return
 		}
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		bind := m.bind
+		if bind == "" {
+			bind = "127.0.0.1:0"
+		}
+		ln, err := net.Listen("tcp", bind)
 		if err != nil {
-			m.localErr = fmt.Errorf("listen on loopback: %w", err)
+			m.localErr = fmt.Errorf("listen on %s: %w", bind, err)
 			return
 		}
-		m.localURL = "http://" + ln.Addr().String()
+		m.localURL = proxyURLForListener(ln.Addr(), m.advertise)
 		m.listener = ln
 		srv := &http.Server{
 			Handler:           &proxyHandler{m: m},
@@ -239,6 +259,32 @@ func LocalURL() (string, error) {
 		return "", fmt.Errorf("traffic proxy manager is closed")
 	}
 	return m.localURL, m.localErr
+}
+
+// proxyURLForListener builds the URL handed to consumers. An unspecified bind
+// (0.0.0.0/::) is not dialable, so it needs an explicit advertise host; without
+// one the URL falls back to loopback for in-process consumers.
+func proxyURLForListener(addr net.Addr, advertise string) string {
+	port := ""
+	if tcp, ok := addr.(*net.TCPAddr); ok {
+		port = strconv.Itoa(tcp.Port)
+	}
+	adv := strings.TrimSpace(advertise)
+	if adv != "" {
+		if strings.Contains(adv, "://") {
+			if u, err := url.Parse(adv); err == nil && u.Host != "" {
+				adv = u.Host
+			}
+		}
+		if _, _, err := net.SplitHostPort(adv); err != nil {
+			adv = net.JoinHostPort(adv, port)
+		}
+		return "http://" + adv
+	}
+	if tcp, ok := addr.(*net.TCPAddr); ok && !tcp.IP.IsUnspecified() {
+		return "http://" + addr.String()
+	}
+	return "http://127.0.0.1:" + port
 }
 
 // Close shuts down the manager: the loopback listener, the HTTP server, every

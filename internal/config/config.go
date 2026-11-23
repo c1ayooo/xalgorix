@@ -520,6 +520,13 @@ type Config struct {
 	// Traffic proxy (R2b, REDESIGN §4/D4)
 	TrafficProxy bool   // XALGORIX_TRAFFICPROXY — single-process loopback MITM proxy, default ON; "0"/"false"/"yes"-negatives turn it off
 	CADir        string // XALGORIX_CA_DIR — traffic-proxy CA directory (default ~/.xalgorix/ca)
+	// TrafficProxyBind is the listener address (default 127.0.0.1:0). Set it to
+	// a project-network-reachable address when tools run in containers.
+	TrafficProxyBind string // XALGORIX_TRAFFICPROXY_BIND
+	// TrafficProxyAdvertise overrides the URL host:port handed to consumers.
+	// Required when Bind is unspecified (0.0.0.0/::), because 0.0.0.0 is not a
+	// dialable address. It must be reachable from the project network.
+	TrafficProxyAdvertise string // XALGORIX_TRAFFICPROXY_ADVERTISE
 
 	// Goal analysis (REDESIGN §3.1, R-goal): the round-0 intent analysis that
 	// turns a task's unstructured goal into a decidable objective before the
@@ -787,8 +794,10 @@ func load() *Config {
 		// Traffic proxy (R2b): default ON; any explicitly non-truthy value
 		// ("0", "false", "off", ...) turns it off and restores the pre-R2b
 		// behavior byte-for-byte.
-		TrafficProxy: envOrBool("XALGORIX_TRAFFICPROXY", true),
-		CADir:        envOr("XALGORIX_CA_DIR", filepath.Join(xalgorixHome, "ca")),
+		TrafficProxy:          envOrBool("XALGORIX_TRAFFICPROXY", true),
+		CADir:                 envOr("XALGORIX_CA_DIR", filepath.Join(xalgorixHome, "ca")),
+		TrafficProxyBind:      envOr("XALGORIX_TRAFFICPROXY_BIND", "127.0.0.1:0"),
+		TrafficProxyAdvertise: envOr("XALGORIX_TRAFFICPROXY_ADVERTISE", ""),
 
 		// Goal analysis (R-goal): automatic round-0 analysis at task run
 		// start, default ON (see field comment).

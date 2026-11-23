@@ -58,6 +58,7 @@ func main() {
 		Profile:      *prof,
 		ProjectLimit: limit,
 		ExecLimit:    concurrency,
+		DiskEnforce:  envBool("XALGORIX_PROJECT_DISK_ENFORCE"),
 	})
 	if err != nil {
 		log.Fatalf("runnerd: %v", err)
@@ -120,6 +121,15 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+func envBool(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func dirOf(path string) string {

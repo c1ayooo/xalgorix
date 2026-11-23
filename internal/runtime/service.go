@@ -39,6 +39,10 @@ type Config struct {
 	Profile      string
 	ProjectLimit int
 	ExecLimit    int
+	// DiskEnforce applies each project's DiskMB budget as the Docker
+	// writable-layer StorageOpt. Off by default: unsupported daemons reject
+	// container creation.
+	DiskEnforce bool
 }
 
 // Open constructs the configured driver.
@@ -62,6 +66,7 @@ func Open(ctx context.Context, cfg Config) (Driver, error) {
 				Profile:      cfg.Profile,
 				ProjectLimit: cfg.ProjectLimit,
 				ExecLimit:    cfg.ExecLimit,
+				DiskEnforce:  cfg.DiskEnforce,
 			})
 			if err != nil {
 				return nil, err

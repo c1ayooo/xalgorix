@@ -55,6 +55,8 @@ type DockerDriver struct {
 	projectLimit int
 	// execLimit bounds simultaneous execs inside one container.
 	execLimit int
+	// diskEnforce applies DiskMB as the writable-layer StorageOpt.
+	diskEnforce bool
 
 	mu       sync.Mutex
 	projects map[string]*dockerProject
@@ -90,6 +92,7 @@ type DockerConfig struct {
 	Profile      string
 	ProjectLimit int
 	ExecLimit    int
+	DiskEnforce  bool
 }
 
 // NewDockerDriver builds the Docker driver and verifies the socket is present.
@@ -124,6 +127,7 @@ func NewDockerDriver(cfg DockerConfig) (*DockerDriver, error) {
 		profile:      orDefault(cfg.Profile, ProfileCore),
 		projectLimit: projectLimit,
 		execLimit:    execLimit,
+		diskEnforce:  cfg.DiskEnforce,
 		projects:     make(map[string]*dockerProject),
 		slots:        make(chan struct{}, projectLimit),
 		execSlots:    make(chan struct{}, execLimit),
@@ -354,6 +358,7 @@ func (d *DockerDriver) EnsureProject(ctx context.Context, spec ProjectSpec) (Pro
 		CapAdd:         capabilitiesFor(spec),
 		SecurityOpt:    []string{"no-new-privileges"},
 		Tmpfs:          map[string]string{"/tmp": fmt.Sprintf("rw,size=%dm,exec", tmpfsMB(spec.Limits))},
+		StorageOpt:     storageOpt(spec.Limits, d.diskEnforce),
 		PortBindings:   bindings,
 		Resources: dockerResources{
 			Memory:    spec.Limits.MemoryMB * 1024 * 1024,
@@ -442,6 +447,18 @@ func tmpfsMB(l ResourceLimits) int64 {
 		return l.TmpfsMB
 	}
 	return 512
+}
+
+// storageOpt applies the project's disk budget to the container writable
+// layer. It is opt-in because only overlay2 with project quotas honours it;
+// other storage drivers reject the container at create time. Bind-mounted scan
+// directories are outside the writable layer, so this is not a quota for the
+// whole scan directory.
+func storageOpt(l ResourceLimits, enforce bool) map[string]string {
+	if !enforce || l.DiskMB <= 0 {
+		return nil
+	}
+	return map[string]string{"size": fmt.Sprintf("%dm", l.DiskMB)}
 }
 
 func (d *DockerDriver) remember(projectID, containerID, state string) {
@@ -640,13 +657,7 @@ func (d *DockerDriver) ExecStream(ctx context.Context, spec ExecSpec, onFrame fu
 	argv := spec.Argv
 	// The exec itself cannot be killed through the Docker API, so the deadline is
 	// enforced inside the container. `timeout` is present in every toolbox profile.
-	if spec.Timeout > 0 {
-		secs := int(math.Ceil(spec.Timeout.Seconds()))
-		if secs < 1 {
-			secs = 1
-		}
-		argv = append([]string{"timeout", "-k", "5", strconv.Itoa(secs), "--"}, argv...)
-	}
+	argv = withInContainerTimeout(argv, spec.Timeout)
 
 	execID, err := d.client.createExec(runCtx, containerID, dockerExecConfig{
 		AttachStdout: true,
@@ -746,6 +757,21 @@ func (d *DockerDriver) ExecStream(ctx context.Context, spec ExecSpec, onFrame fu
 		}
 	}
 	return result, nil
+}
+
+// withInContainerTimeout wraps argv with the in-container deadline. GNU timeout
+// parses COMMAND after DURATION, so a `--` separator in that position is taken
+// as the command itself ("failed to run command '--'", exit 127). Do not add
+// one; far-future deadlines are still bounded by the platform's context.
+func withInContainerTimeout(argv []string, timeout time.Duration) []string {
+	if timeout <= 0 || len(argv) == 0 {
+		return argv
+	}
+	secs := int(math.Ceil(timeout.Seconds()))
+	if secs < 1 {
+		secs = 1
+	}
+	return append([]string{"timeout", "-k", "5", strconv.Itoa(secs)}, argv...)
 }
 
 // waitExec polls the exec state until it stops running.
@@ -1112,9 +1138,15 @@ func isImageInUseError(err error) bool {
 	return strings.Contains(msg, "conflict") || strings.Contains(msg, "being used")
 }
 
-// cdpContainerPort is the fixed DevTools port inside a `web` profile container.
-// The host port is ephemeral and retrieved from the container inspect document.
-const cdpContainerPort = 9222
+// cdpContainerPort is the forwarded, published DevTools port. Chromium itself
+// listens on cdpChromiumPort on loopback: modern Chromium ignores
+// --remote-debugging-address and binds 127.0.0.1 only, so a published Docker
+// port cannot reach it directly. A tiny in-container TCP forwarder bridges
+// 0.0.0.0:cdpContainerPort to 127.0.0.1:cdpChromiumPort.
+const (
+	cdpContainerPort = 9222
+	cdpChromiumPort  = 9223
+)
 
 // CDPEndpoint ensures Chromium is running inside the project container and
 // returns a DevTools websocket URL reachable from the platform.
@@ -1146,8 +1178,14 @@ func (d *DockerDriver) CDPEndpoint(ctx context.Context, projectID string, proxyU
 		"--no-sandbox",
 		"--disable-gpu",
 		"--disable-dev-shm-usage",
-		"--remote-debugging-address=0.0.0.0",
-		fmt.Sprintf("--remote-debugging-port=%d", cdpContainerPort),
+		// Crashpad needs a writable database; a rootfs-readable project HOME
+		// (or a rootless bind mount) otherwise aborts the browser before the
+		// DevTools port opens.
+		"--disable-crash-reporter",
+		"--disable-breakpad",
+		"--no-first-run",
+		"--remote-debugging-address=127.0.0.1",
+		fmt.Sprintf("--remote-debugging-port=%d", cdpChromiumPort),
 	}
 	if proxyURL != "" {
 		// Chromium does not honour HTTP_PROXY: the proxy must be passed as a
@@ -1155,14 +1193,66 @@ func (d *DockerDriver) CDPEndpoint(ctx context.Context, projectID string, proxyU
 		// can resolve (loopback inside the container is the container itself).
 		argv = append(argv, "--proxy-server="+proxyURL, "--ignore-certificate-errors")
 	}
-	argv = append(argv, "--user-data-dir=/tmp/chromium-profile", "about:blank")
+	// A crashed Chromium leaves SingletonLock in its profile directory and the
+	// next launch aborts ("Failed to create a ProcessSingleton"). The container
+	// is per-project and /tmp is tmpfs, so a unique profile per launch is
+	// cheaper than reaching into the container filesystem to clear the lock.
+	argv = append(argv,
+		fmt.Sprintf("--user-data-dir=/tmp/chromium-profile-%d", time.Now().UnixNano()),
+		"about:blank")
 
-	execID, err := d.client.createExec(ctx, containerID, dockerExecConfig{Cmd: argv})
+	// /tmp is a writable tmpfs in every profile; the project HOME can be a
+	// rootless bind mount that the browser cannot use for its profile.
+	env := []string{
+		"HOME=/tmp",
+		"XDG_CONFIG_HOME=/tmp/.config",
+		"XDG_CACHE_HOME=/tmp/.cache",
+		"TMPDIR=/tmp",
+	}
+	execID, err := d.client.createExec(ctx, containerID, dockerExecConfig{Cmd: argv, Env: env})
 	if err != nil {
 		return "", NewExecError(CodeExecSpawn, PhaseExec, "start chromium: %v", err)
 	}
 	if err := d.client.startExecDetached(ctx, execID); err != nil {
 		return "", NewExecError(CodeExecSpawn, PhaseExec, "start chromium: %v", err)
+	}
+
+	// Bridge the published port to Chromium's loopback listener. A stale
+	// forwarder from a previous launch may already hold the port; that is fine
+	// because it forwards to the same Chromium port, so a bind failure here is
+	// not fatal.
+	forwarder := fmt.Sprintf(`import socket, threading
+def pipe(a, b):
+    try:
+        while True:
+            d = a.recv(65536)
+            if not d:
+                break
+            b.sendall(d)
+    except Exception:
+        pass
+    try:
+        b.shutdown(socket.SHUT_WR)
+    except Exception:
+        pass
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("0.0.0.0", %d))
+s.listen(32)
+while True:
+    c, _ = s.accept()
+    try:
+        u = socket.create_connection(("127.0.0.1", %d), timeout=5)
+    except Exception:
+        c.close()
+        continue
+    threading.Thread(target=pipe, args=(c, u), daemon=True).start()
+    threading.Thread(target=pipe, args=(u, c), daemon=True).start()
+`, cdpContainerPort, cdpChromiumPort)
+	if relayExec, relayErr := d.client.createExec(ctx, containerID, dockerExecConfig{
+		Cmd: []string{"python3", "-c", forwarder},
+	}); relayErr == nil {
+		_ = d.client.startExecDetached(ctx, relayExec)
 	}
 
 	deadline := time.Now().Add(25 * time.Second)

@@ -186,6 +186,10 @@ func TestProfileMatching(t *testing.T) {
 		{[]string{"core"}, "core", true},
 		{[]string{"full"}, "core", false},
 		{[]string{"core", "full"}, "full", true},
+		{[]string{"core"}, "full", true},
+		{[]string{"core"}, "web", true},
+		{[]string{"full"}, "web", false},
+		{[]string{"web"}, "full", false},
 		{[]string{"web"}, "all", true},
 		{nil, "core", true},
 	}

@@ -81,7 +81,11 @@ jobs:
       # degrades every scan, which is worse than no image.
       - name: Self-test ${{ matrix.profile }}
         run: |
-          docker run --rm --entrypoint /opt/xalgorix/bin/toolbox-selftest \
+          # Full-profile tools (nmap/masscan/gdb/strace) need the same
+          # capabilities the platform grants; core/web ignore them.
+          docker run --rm \
+            --cap-add NET_RAW --cap-add NET_ADMIN --cap-add SYS_PTRACE \
+            --entrypoint /opt/xalgorix/bin/toolbox-selftest \
             xalgorix-toolbox:${{ matrix.profile }} \
             --profile ${{ matrix.profile }} --json | tee selftest-${{ matrix.profile }}.json
 

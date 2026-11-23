@@ -79,7 +79,10 @@ tools:
     purpose: 轻量爬虫，提取链接与表单
     capabilities: []
     profiles: [core]
-    smoke: ["hakrawler", "-h"]
+    # -h is the custom-headers flag (needs a value) and exits 2; -version is
+    # rejected with exit 2. Assert that exact rejection so a missing binary
+    # (127) or a crash still fails the gate.
+    smoke: ["sh", "-c", "hakrawler -version >/dev/null 2>&1; test $? -eq 2"]
 
   # ── HTTP probing / content discovery / fuzzing ───────────────────────────
   - name: httpx
@@ -112,7 +115,7 @@ tools:
     purpose: 目录/DNS/vhost 爆破
     capabilities: []
     profiles: [core]
-    smoke: ["gobuster", "version"]
+    smoke: ["gobuster", "--version"]
 
   - name: dirsearch
     bin: /root/.local/bin/dirsearch
@@ -250,7 +253,8 @@ tools:
     purpose: 大规模快速端口扫描
     capabilities: [NET_RAW, NET_ADMIN]
     profiles: [full]
-    smoke: ["masscan", "--version"]
+    # masscan prints its version but exits 1; assert the banner instead.
+    smoke: ["sh", "-c", "masscan --version 2>&1 | grep -q 'Masscan version'"]
 
   - name: naabu
     bin: /root/go/bin/naabu
@@ -269,7 +273,7 @@ tools:
     smoke: ["gogo", "-h"]
 
   - name: arp-scan
-    bin: /usr/bin/arp-scan
+    bin: /usr/sbin/arp-scan
     category: network
     purpose: 二层主机发现
     capabilities: [NET_RAW, NET_ADMIN]
@@ -277,15 +281,15 @@ tools:
     smoke: ["arp-scan", "--version"]
 
   - name: netdiscover
-    bin: /usr/bin/netdiscover
+    bin: /usr/sbin/netdiscover
     category: network
     purpose: 被动/主动 ARP 网段发现
     capabilities: [NET_RAW, NET_ADMIN]
     profiles: [full]
-    smoke: ["netdiscover", "-h"]
+    smoke: ["sh", "-c", "netdiscover -h 2>&1 | grep -q 'Netdiscover'"]
 
   - name: responder
-    bin: /usr/bin/responder
+    bin: /usr/sbin/responder
     category: mitm
     purpose: LLMNR/NBT-NS/mDNS 投毒与凭据捕获
     capabilities: [NET_RAW, NET_ADMIN]
@@ -315,7 +319,7 @@ tools:
     purpose: ExploitDB 本地检索
     capabilities: []
     profiles: [full]
-    smoke: ["searchsploit", "--version"]
+    smoke: ["sh", "-c", "searchsploit -h 2>&1 | grep -q 'Usage:'"]
 
   - name: hydra
     bin: /usr/bin/hydra
@@ -323,7 +327,7 @@ tools:
     purpose: 在线口令爆破（多协议）
     capabilities: []
     profiles: [full]
-    smoke: ["hydra", "-h"]
+    smoke: ["sh", "-c", "hydra -h 2>&1 | grep -q 'Hydra'"]
 
   - name: medusa
     bin: /usr/bin/medusa
@@ -331,10 +335,10 @@ tools:
     purpose: 并行在线口令爆破
     capabilities: []
     profiles: [full]
-    smoke: ["medusa", "-h"]
+    smoke: ["medusa", "-V"]
 
   - name: john
-    bin: /usr/bin/john
+    bin: /usr/sbin/john
     category: credentials
     purpose: 离线口令破解
     capabilities: []

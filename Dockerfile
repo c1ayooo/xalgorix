@@ -74,6 +74,11 @@ RUN cd webui && npm run build
 # a 1.25 builder makes `go install httpx@latest` fail (silently, via the `|| WARN`
 # in the tool loop) and the image ships without the ProjectDiscovery scanner.
 FROM golang:1.26-bookworm AS gobuild
+# GOPROXY is a build argument so a network that cannot reach the default Go
+# module proxy can build the same image with a reachable mirror. The default
+# stays the official proxy.
+ARG GOPROXY=https://proxy.golang.org,direct
+ENV GOPROXY=${GOPROXY}
 # libpcap-dev is needed to compile naabu (CGO); git for module fetches.
 RUN apt-get update && apt-get install -y --no-install-recommends libpcap-dev git \
     && rm -rf /var/lib/apt/lists/*
@@ -85,6 +90,64 @@ COPY --from=webui /src/internal/web/static ./internal/web/static
 ARG VERSION=docker
 RUN CGO_ENABLED=0 go build -ldflags "-s -w -X main.version=${VERSION}" \
     -o /out/xalgorix ./cmd/xalgorix/
+
+# ── Stage 3: platform-slim — control plane only, no security tooling ─────────
+# The split deployment's platform half. It carries the exact same embedded
+# binary as all-in-one; only the runtime payload differs (CA + timezone, no
+# scanners, no package managers). Tools execute in per-project toolbox
+# containers via XALGORIX_RUNTIME_BACKEND=docker, so this image never needs
+# --privileged and never runs the toolset itself.
+FROM debian:bookworm-slim AS platform-slim
+ENV DEBIAN_FRONTEND=noninteractive
+# openssl is required by docker-entrypoint.sh to generate the one-time admin
+# password when no dashboard auth is supplied; bash is already in the base.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates tzdata openssl \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=gobuild /out/xalgorix /usr/local/bin/xalgorix
+
+ENV XALGORIX_BIND=0.0.0.0 \
+    XALGORIX_DATA_DIR=/data \
+    XALGORIX_ALLOW_AUTO_INSTALL=0 \
+    XALGORIX_NO_AUTO_UPDATE=1
+
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh && mkdir -p /data
+VOLUME ["/data"]
+EXPOSE 9137
+ENTRYPOINT ["docker-entrypoint.sh"]
+CMD ["--web"]
+
+# ── Stage 4: runnerd — host-side runtime service for the split deployment ────
+# Stateless execution endpoint: owns /var/run/docker.sock and exposes only
+# ensure/exec/stop/remove/inspect/list/capacity over a unix socket. It has no
+# database access and no scan knowledge; the platform container talks to it via
+# a bind-mounted socket and never sees the daemon socket itself.
+FROM golang:1.26-bookworm AS runnerd-build
+ARG GOPROXY=https://proxy.golang.org,direct
+ENV GOPROXY=${GOPROXY}
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+ARG VERSION=docker
+RUN CGO_ENABLED=0 go build -ldflags "-s -w -X main.version=${VERSION}" \
+    -o /out/runnerd ./cmd/runnerd/
+
+# Debian slim instead of distroless: gcr.io is not reachable from every build
+# network, and runnerd needs nothing beyond the static binary (it speaks HTTP
+# over a unix socket and Docker over the mounted socket).
+FROM debian:bookworm-slim AS runnerd
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=runnerd-build /out/runnerd /usr/local/bin/runnerd
+ENTRYPOINT ["/usr/local/bin/runnerd"]
+
+# ── Stage 4b: Go security toolset (all-in-one runtime only) ──────────────────
+# Declared after slim/runnerd so those targets do not build it: the legacy
+# builder executes every stage up to the target, and this stage downloads and
+# compiles the whole Go tool set.
+FROM gobuild AS gotools
 
 # Latest versions of the Go tools the engine knows how to auto-install
 # (packageMap → goTools), into /go/bin. Best-effort per tool so one flaky
@@ -130,51 +193,6 @@ RUN set -eux; \
     GOBIN=/go/bin go install -tags goregexp github.com/chainreactors/gogo/v2@latest \
       || echo "WARN: gogo install failed (port_scan degrades to an install hint)"
 
-# ── Stage 3: platform-slim — control plane only, no security tooling ─────────
-# The split deployment's platform half. It carries the exact same embedded
-# binary as all-in-one; only the runtime payload differs (CA + timezone, no
-# scanners, no package managers). Tools execute in per-project toolbox
-# containers via XALGORIX_RUNTIME_BACKEND=docker, so this image never needs
-# --privileged and never runs the toolset itself.
-FROM debian:bookworm-slim AS platform-slim
-ENV DEBIAN_FRONTEND=noninteractive
-# openssl is required by docker-entrypoint.sh to generate the one-time admin
-# password when no dashboard auth is supplied; bash is already in the base.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates tzdata openssl \
-    && rm -rf /var/lib/apt/lists/*
-COPY --from=gobuild /out/xalgorix /usr/local/bin/xalgorix
-
-ENV XALGORIX_BIND=0.0.0.0 \
-    XALGORIX_DATA_DIR=/data \
-    XALGORIX_ALLOW_AUTO_INSTALL=0 \
-    XALGORIX_NO_AUTO_UPDATE=1
-
-COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh && mkdir -p /data
-VOLUME ["/data"]
-EXPOSE 9137
-ENTRYPOINT ["docker-entrypoint.sh"]
-CMD ["--web"]
-
-# ── Stage 4: runnerd — host-side runtime service for the split deployment ────
-# Stateless execution endpoint: owns /var/run/docker.sock and exposes only
-# ensure/exec/stop/remove/inspect/list/capacity over a unix socket. It has no
-# database access and no scan knowledge; the platform container talks to it via
-# a bind-mounted socket and never sees the daemon socket itself.
-FROM golang:1.26-bookworm AS runnerd-build
-WORKDIR /src
-COPY go.mod go.sum ./
-RUN go mod download
-COPY . .
-ARG VERSION=docker
-RUN CGO_ENABLED=0 go build -ldflags "-s -w -X main.version=${VERSION}" \
-    -o /out/runnerd ./cmd/runnerd/
-
-FROM gcr.io/distroless/static-debian12 AS runnerd
-COPY --from=runnerd-build /out/runnerd /usr/local/bin/runnerd
-ENTRYPOINT ["/usr/local/bin/runnerd"]
-
 # ── Stage 5: all-in-one runtime — Kali Linux, full toolset, runs as root ─────
 # MUST stay the last stage: `docker build .` with no --target keeps producing
 # this image, so existing users are unaffected by the new variants above.
@@ -187,10 +205,11 @@ ENV DEBIAN_FRONTEND=noninteractive
 # The redirector hands each client a geo-selected third-party mirror, and for
 # about a day it kept sending CI runners to a mirror they could not connect to,
 # so every image build died in apt. kali.download is Kali's own CDN-backed
-# mirror; override with --build-arg KALI_MIRROR=<url> if needed. Rewrites both
-# the deb822 (kali.sources) and legacy one-line formats, then fails fast if the
-# redirector is still referenced.
-ARG KALI_MIRROR=http://kali.download/kali
+# mirror; override with --build-arg KALI_MIRROR=<url> if needed. USTC is the
+# default because it is consistently reachable from this build environment;
+# any Kali mirror works. Rewrites both the deb822 (kali.sources) and legacy
+# one-line formats, then fails fast if the redirector is still referenced.
+ARG KALI_MIRROR=http://mirrors.ustc.edu.cn/kali
 RUN set -eux; \
     for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do \
       [ -f "$f" ] || continue; \
@@ -262,7 +281,7 @@ RUN getcap -r / 2>/dev/null | awk '{print $1}' | while read -r f; do \
 # Go toolchain at runtime so the agent can `go install` anything not baked in.
 COPY --from=gobuild /usr/local/go /usr/local/go
 # Prebuilt latest Go security tools → on PATH via /root/go/bin.
-COPY --from=gobuild /go/bin/ /root/go/bin/
+COPY --from=gotools /go/bin/ /root/go/bin/
 # The xalgorix binary itself.
 COPY --from=gobuild /out/xalgorix /usr/local/bin/xalgorix
 

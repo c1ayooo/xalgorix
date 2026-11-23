@@ -115,9 +115,25 @@ services:
       # Must be digest-pinned (repo@sha256:<64hex>); tag references are refused.
       XALGORIX_TOOLBOX_IMAGE: ${XALGORIX_TOOLBOX_IMAGE:-}
       XALGORIX_TOOLBOX_PROFILE: ${XALGORIX_TOOLBOX_PROFILE:-core}
+      # Opt-in: only overlay2 with project quotas honours StorageOpt; enabling
+      # it on an unsupported daemon fails container creation.
+      XALGORIX_PROJECT_DISK_ENFORCE: ${XALGORIX_PROJECT_DISK_ENFORCE:-0}
       # Reachable from the per-project network; the docker backend fails closed
       # when proxy is required and this is empty.
       XALGORIX_TOOLBOX_PROXY_URL: ${XALGORIX_TOOLBOX_PROXY_URL:-}
+      # To let project containers use this platform's traffic proxy, bind it on
+      # a project-network-reachable address and publish that port, e.g.
+      #   XALGORIX_TRAFFICPROXY_BIND=0.0.0.0:8081
+      #   XALGORIX_TRAFFICPROXY_ADVERTISE=host.docker.internal:8081
+      #   XALGORIX_TOOLBOX_PROXY_URL=http://host.docker.internal:8081
+      # Binding 0.0.0.0 exposes an intercepting proxy; firewall it and never
+      # expose it beyond the host. Defaults keep it on loopback.
+      # XALGORIX_TRAFFICPROXY_BIND: 0.0.0.0:8081
+      # XALGORIX_TRAFFICPROXY_ADVERTISE: host.docker.internal:8081
+    # Resolve the host from inside the platform container so the browser can
+    # reach runnerd's CDP relay (Linux: host-gateway).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       # 9138 by default so a stray `--profile split up` cannot collide with the
       # all-in-one app above; set XALGORIX_SPLIT_PORT=9137 if it is stopped.
@@ -135,12 +151,20 @@ services:
     profiles: ["split"]
     image: ${XALGORIX_RUNNERD_IMAGE:-xalgorix-runnerd:dev}
     restart: unless-stopped
+    # Linux only: host networking lets runnerd reach the host-published
+    # Chromium DevTools port (127.0.0.1:<ephemeral>) and bind its relay on the
+    # host. Without it the relay's upstream probe dials the runnerd container's
+    # own loopback and the containerised browser cannot be reached.
+    network_mode: host
     command: ["--socket", "/run/xalgorix/runner.sock"]
     environment:
       XALGORIX_TOOLBOX_IMAGE: ${XALGORIX_TOOLBOX_IMAGE:-}
       XALGORIX_TOOLBOX_PROFILE: ${XALGORIX_TOOLBOX_PROFILE:-core}
       XALGORIX_MAX_PROJECTS: ${XALGORIX_MAX_PROJECTS:-0}
       XALGORIX_TOOLBOX_CONCURRENCY: ${XALGORIX_TOOLBOX_CONCURRENCY:-4}
+      XALGORIX_PROJECT_DISK_ENFORCE: ${XALGORIX_PROJECT_DISK_ENFORCE:-0}
+      XALGORIX_RUNNERD_CDP_BIND: ${XALGORIX_RUNNERD_CDP_BIND:-0.0.0.0:0}
+      XALGORIX_RUNNERD_CDP_ADVERTISE: ${XALGORIX_RUNNERD_CDP_ADVERTISE:-host.docker.internal}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ${XALGORIX_RUNNERD_DIR:-/run/xalgorix}:/run/xalgorix
