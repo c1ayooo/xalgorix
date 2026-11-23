@@ -54,6 +54,11 @@ type StateEvent struct {
 	AgentID string
 	Lane    string
 	Status  string
+	// Task/Target travel with the lifecycle notification so the durable
+	// worker record (run_workers) carries what the worker was doing, not just
+	// its id — the session page lists history without a live graph.
+	Task   string
+	Target string
 	// Limit/Running/Queued snapshot the pool at emit time so a listener can
 	// render "2/3" without an extra fetch.
 	Limit   int
@@ -76,7 +81,7 @@ func (g *Graph) SetStateSink(fn func(StateEvent)) {
 
 // notify delivers one lifecycle event to the configured sink. Callers must not
 // hold g.mu (notify re-locks it to read the sink).
-func (g *Graph) notify(kind, agentID, lane, status string) {
+func (g *Graph) notify(kind, agentID, lane, status, task, target string) {
 	if g == nil {
 		return
 	}
@@ -89,6 +94,8 @@ func (g *Graph) notify(kind, agentID, lane, status string) {
 	ev := StateEvent{
 		Kind:    kind,
 		AgentID: agentID,
+		Task:    task,
+		Target:  target,
 		Lane:    lane,
 		Status:  status,
 		Limit:   g.maxConcurrent,

@@ -35,12 +35,26 @@ export interface ModuleData {
   onSelectLane: (lane?: string) => void;
 }
 
+/** 左栏子行：worker 组按「一个 worker 一行」展开，点击直达该 agent 的转录。 */
+export interface RailChild {
+  /** ?agent= 深链值（worker 的 agent_id）。 */
+  id: string;
+  label: string;
+  /** 行尾的稳定标识（agent_id），等宽小字。 */
+  meta?: string;
+  /** queued | running | completed | failed —— 决定状态点。 */
+  status?: string;
+  active?: boolean;
+}
+
 /** 左栏导航项（由模块自己决定是否出现、徽标与活跃状态）。 */
 export interface RailEntry {
   labelKey: string;
   /** 计数徽标，例如 "2/3" 或 "排队 1"；undefined 不渲染。 */
   badge?: string;
   live?: boolean;
+  /** 组内子行（Workers 组：每个 worker 一行，含历史）。 */
+  children?: RailChild[];
 }
 
 export interface ContentModule {

@@ -224,7 +224,7 @@ type Agent struct {
 	finishAccepted             atomic.Bool // set when the finish gate accepts a finish call; StopCheck reads it because AfterTool (completeWithFinish) can race the ADK's next model turn
 	goalAchievedEmitted        atomic.Bool // once-only guard for the R-goal auto-stop (goal_achieved)
 	forceContinuation          atomic.Bool
-	dwellMaxCalls              int // XALGORIX_DWELL_MAX_CALLS (0=off, dwell_guard.go)
+	dwellMaxCalls              int      // XALGORIX_DWELL_MAX_CALLS (0=off, dwell_guard.go)
 	controlPlaneHosts          []string // XALGORIX_CONTROL_PLANE_HOSTS (delegation_claim.go)
 	dwellMu                    sync.Mutex
 	dwellStats                 map[string]*dwellStat              // 1:1 re-open of a finished run (REDESIGN D11): suppress the plan-complete auto-finalize the restored checkpoint would re-fire
@@ -623,26 +623,26 @@ func NewAgent(cfg *config.Config, name string, events chan Event, localGuard sco
 	RegisterDefaultHooks(hookReg)
 
 	a := &Agent{
-		ID:            fmt.Sprintf("agent_%d", time.Now().UnixNano()),
-		Name:          name,
-		cfg:           cfg,
-		client:        llm.NewClient(cfg),
-		registry:      reg,
-		scanCtx:       sctx,
-		events:        events,
-		maxIter:       cfg.MaxIterations,
-		dwellMaxCalls: cfg.DwellMaxCalls,
+		ID:                fmt.Sprintf("agent_%d", time.Now().UnixNano()),
+		Name:              name,
+		cfg:               cfg,
+		client:            llm.NewClient(cfg),
+		registry:          reg,
+		scanCtx:           sctx,
+		events:            events,
+		maxIter:           cfg.MaxIterations,
+		dwellMaxCalls:     cfg.DwellMaxCalls,
 		controlPlaneHosts: cfg.ControlPlaneHosts,
-		ctx:           context.Background(),
-		lastActivity:  time.Now(),
-		hooks:         hookReg,
-		state:         NewScanState(),
-		localGuard:    localGuard,
-		targetAuth:    cfg.TargetAuth,
-		targetAuthB:   cfg.TargetAuthSecondary,
-		sourceRepo:    cfg.SourceRepo,
-		scanContext:   cfg.ScanContext,
-		children:      make(map[*Agent]struct{}),
+		ctx:               context.Background(),
+		lastActivity:      time.Now(),
+		hooks:             hookReg,
+		state:             NewScanState(),
+		localGuard:        localGuard,
+		targetAuth:        cfg.TargetAuth,
+		targetAuthB:       cfg.TargetAuthSecondary,
+		sourceRepo:        cfg.SourceRepo,
+		scanContext:       cfg.ScanContext,
+		children:          make(map[*Agent]struct{}),
 	}
 	// Redirect hops get the same local-machine and port-pin checks as the
 	// URL a tool is called with, and every direct connection gets the
@@ -929,6 +929,8 @@ func NewAgent(cfg *config.Config, name string, events chan Event, localGuard sco
 					"agent_id": ev.AgentID,
 					"lane":     ev.Lane,
 					"status":   ev.Status,
+					"task":     ev.Task,
+					"target":   ev.Target,
 					"limit":    ev.Limit,
 					"running":  ev.Running,
 					"queued":   ev.Queued,

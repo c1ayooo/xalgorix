@@ -1,10 +1,13 @@
 package web
 
 import (
+	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/c1ayooo/xalgorix/v4/internal/agent"
+	"github.com/c1ayooo/xalgorix/v4/internal/runstate"
 	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
 )
 
@@ -72,23 +75,38 @@ func (s *Server) instanceAgentsView(instanceID string) instanceAgentsView {
 		}
 	}
 
+	// Durable worker rows (run_workers, migration 0018). Written at every
+	// lifecycle boundary by processEvent, so they answer "which workers did
+	// this run ever have" without the live graph or the checkpoint — the
+	// session page's Workers list is run state and reads PG (charter §6/§7).
+	history := s.workerHistory(instanceID)
+
 	if !live {
-		// Terminal / released run: rebuild from the graph checkpoint the scanner
-		// already writes. Never replay "running" as live work.
-		dir, ok := s.resolveScanDirByID(instanceID)
-		if !ok {
-			empty.PartialReason = "no_run"
+		// Terminal / released run. PG rows are the authority when present; the
+		// graph checkpoint stays the fallback for pre-0018 runs and for tests
+		// that run without a registered backend.
+		dir, dirOK := s.resolveScanDirByID(instanceID)
+		checkpointOK := false
+		if dirOK {
+			if view, ok := agent.DelegationProjectionFromCheckpoint(dir); ok {
+				delegation = view
+				checkpointOK = true
+				empty.PartialReason = "checkpoint"
+			}
+		}
+		if len(history) > 0 {
+			delegation = delegationFromWorkerRows(history, delegation)
+			empty.PartialReason = ""
+		} else if !checkpointOK {
+			if !dirOK {
+				empty.PartialReason = "no_run"
+			} else {
+				// No delegation ever happened in this run (single-agent scan).
+				empty.Available = true
+				empty.Concurrency = concurrencyView{Limit: 0, Running: 0, Queued: 0}
+			}
 			return empty
 		}
-		view, ok := agent.DelegationProjectionFromCheckpoint(dir)
-		if !ok {
-			// No delegation ever happened in this run (single-agent scan).
-			empty.Available = true
-			empty.Concurrency = concurrencyView{Limit: 0, Running: 0, Queued: 0}
-			return empty
-		}
-		delegation = view
-		empty.PartialReason = "checkpoint"
 	}
 
 	claims := claimsByAgent(ledger)
@@ -99,16 +117,98 @@ func (s *Server) instanceAgentsView(instanceID string) instanceAgentsView {
 			Running: delegation.Running,
 			Queued:  delegation.Queued,
 		},
-		Agents:        make([]agentEntryView, 0, len(delegation.Agents)),
+		Agents:        make([]agentEntryView, 0, len(delegation.Agents)+len(history)),
 		PartialReason: empty.PartialReason,
 	}
+	seen := make(map[string]bool, len(delegation.Agents))
 	for _, worker := range delegation.Agents {
+		seen[worker.AgentID] = true
 		out.Agents = append(out.Agents, agentEntryView{
 			DelegatedAgent:    worker,
 			ClaimedHypotheses: claims[worker.AgentID],
 		})
 	}
+	// Sibling sessions of the same run (1:1 re-dispatch) contribute rows the
+	// live graph never saw. Oldest first, matching the graph's spawn order.
+	for i := len(history) - 1; i >= 0; i-- {
+		rec := history[i]
+		if seen[rec.AgentID] {
+			continue
+		}
+		seen[rec.AgentID] = true
+		out.Agents = append(out.Agents, agentEntryView{DelegatedAgent: workerRowToAgent(rec, live)})
+	}
 	return out
+}
+
+// workerHistory reads this run's durable worker rows; an unavailable backend
+// or a failed read degrades to the live/checkpoint projection.
+func (s *Server) workerHistory(instanceID string) []runstate.WorkerRecord {
+	backend := currentWorkerStateBackend()
+	if backend == nil {
+		return nil
+	}
+	ctx, cancel := eventStateCtx()
+	defer cancel()
+	rows, err := backend.ListWorkersByInstance(ctx, instanceID)
+	if err != nil {
+		log.Printf("[agents] worker history read for %s failed: %v", instanceID, err)
+		return nil
+	}
+	return rows
+}
+
+// delegationFromWorkerRows rebuilds the worker pool projection from durable
+// rows (newest-updated first on input, rendered oldest-first). Limit/MaxAgents
+// are kept from the checkpoint when one was readable.
+func delegationFromWorkerRows(rows []runstate.WorkerRecord, base agent.DelegationView) agent.DelegationView {
+	view := agent.DelegationView{
+		Available: true,
+		Limit:     base.Limit,
+		MaxAgents: base.MaxAgents,
+		Agents:    make([]agent.DelegatedAgent, 0, len(rows)),
+	}
+	for i := len(rows) - 1; i >= 0; i-- {
+		worker := workerRowToAgent(rows[i], false)
+		switch worker.Status {
+		case "running":
+			view.Running++
+		case "queued":
+			view.Queued++
+		}
+		view.Agents = append(view.Agents, worker)
+	}
+	return view
+}
+
+// workerRowToAgent projects one durable row onto the panel's worker shape.
+// In a run that is no longer live, a row still marked running/queued is stale
+// (the process died before the completion boundary) and renders as failed
+// instead of an eternal spinner.
+func workerRowToAgent(rec runstate.WorkerRecord, live bool) agent.DelegatedAgent {
+	status := rec.Status
+	errText := rec.Error
+	if !live && (status == "running" || status == "queued") {
+		status = "failed"
+		if errText == "" {
+			errText = "run ended before this worker finished"
+		}
+	}
+	worker := agent.DelegatedAgent{
+		AgentID: rec.AgentID,
+		Lane:    rec.Lane,
+		Status:  status,
+		Task:    rec.Task,
+		Target:  rec.Target,
+		Error:   errText,
+	}
+	if !rec.StartedAt.IsZero() {
+		worker.Started = rec.StartedAt.UTC().Format(time.RFC3339)
+	}
+	if !rec.FinishedAt.IsZero() {
+		worker.CompletedAt = rec.FinishedAt.UTC().Format(time.RFC3339)
+	}
+	return worker
 }
 
 // claimsByAgent groups the ledger's currently-owned hypotheses by agent id.

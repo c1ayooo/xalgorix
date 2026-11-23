@@ -247,12 +247,12 @@ func (g *Graph) syncDelegationNote() string {
 
 // notifyAgentStatus emits the admission notification for a freshly admitted
 // delegation: "agent_started" when it took a slot, "agent_queued" otherwise.
-func (g *Graph) notifyAgentStatus(agentID, lane string, started bool) {
+func (g *Graph) notifyAgentStatus(agentID, lane, task, target string, started bool) {
 	if started {
-		g.notify("agent_started", agentID, lane, "running")
+		g.notify("agent_started", agentID, lane, "running", task, target)
 		return
 	}
-	g.notify("agent_queued", agentID, lane, "queued")
+	g.notify("agent_queued", agentID, lane, "queued", task, target)
 }
 
 func (g *Graph) nextIDLocked(prefix string) string {
@@ -299,9 +299,10 @@ func (g *Graph) onAgentDone() {
 		}
 		g.wg.Add(1)
 		agentID, lane := next.ID, next.Name
+		task, target := next.Task, strings.Join(next.Targets, ",")
 		g.mu.Unlock()
 		go g.runAgent(next)
-		g.notify("agent_started", agentID, lane, "running")
+		g.notify("agent_started", agentID, lane, "running", task, target)
 		return
 	}
 	g.activeAgents--
@@ -359,7 +360,7 @@ func (g *Graph) createAgent(args map[string]string) (tools.Result, error) {
 	started := state.Status == "running"
 	g.mu.Unlock()
 
-	g.notifyAgentStatus(agentID, name, started)
+	g.notifyAgentStatus(agentID, name, task, strings.Join(targets, ","), started)
 	g.auditDelegation(domainjournal.OpAgentDelegat, fmt.Sprintf("create_agent id=%s role=%q task=%q", agentID, name, truncTask(task, 200)))
 
 	select {
@@ -438,7 +439,7 @@ func (g *Graph) spawnAgent(args map[string]string) (tools.Result, error) {
 	started := state.Status == "running"
 	g.mu.Unlock()
 
-	g.notifyAgentStatus(agentID, name, started)
+	g.notifyAgentStatus(agentID, name, task, strings.Join(targets, ","), started)
 	g.auditDelegation(domainjournal.OpAgentDelegat, fmt.Sprintf("spawn_agent id=%s role=%q task=%q", agentID, name, truncTask(task, 200)))
 
 	target := ""
@@ -489,12 +490,13 @@ func (g *Graph) complete(agentID, summary string, runErr error) {
 		}
 	}
 	lane, status := state.Name, state.Status
+	task, target := state.Task, strings.Join(state.Targets, ",")
 	g.mu.Unlock()
 	kind := "agent_completed"
 	if status == "failed" {
 		kind = "agent_failed"
 	}
-	g.notify(kind, agentID, lane, status)
+	g.notify(kind, agentID, lane, status, task, target)
 }
 
 type agentSnapshot struct {
@@ -749,13 +751,13 @@ func (g *Graph) Stop() {
 			state.Error = "parent scan stopped"
 			state.CompletedAt = now
 			state.doneOnce.Do(func() { close(state.done) })
-			stopped = append(stopped, AgentState{AgentID: state.ID, Lane: state.Name})
+			stopped = append(stopped, AgentState{AgentID: state.ID, Lane: state.Name, Task: state.Task, Target: strings.Join(state.Targets, ",")})
 		}
 	}
 	_ = g.persistLocked()
 	g.mu.Unlock()
 	for _, agent := range stopped {
-		g.notify("agent_failed", agent.AgentID, agent.Lane, "failed")
+		g.notify("agent_failed", agent.AgentID, agent.Lane, "failed", agent.Task, agent.Target)
 	}
 }
 

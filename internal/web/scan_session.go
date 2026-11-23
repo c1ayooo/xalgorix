@@ -875,6 +875,11 @@ func clonePhaseStatus(m map[string]string) map[string]string {
 }
 
 func (s *Server) processEvent(evt agent.Event, sess *scanSession) {
+	// Durable worker projection: every delegated-agent lifecycle boundary is
+	// upserted into run_workers so the session page can list this run's
+	// workers (finished ones included) after the live graph is gone.
+	s.persistWorkerLifecycle(evt, sess)
+
 	// Redact provider-internal control tokens from every event surface before
 	// the event is broadcast or persisted. A model occasionally leaks its
 	// transport's channel delimiters into prose; those artifacts must never

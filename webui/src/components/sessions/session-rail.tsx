@@ -126,7 +126,12 @@ export function SessionRail({
           <RailGroup role="main" label={t("sessions.groupMain")}>
             {runs.map((run) => {
               if (!run.instance_id) return null;
-              const workers = workersByInstance.get(run.instance_id) ?? [];
+              // 选中 run 的 worker 由下方 Workers 组逐行列出（含历史），这里
+              // 只为其它 run 保留历史快捷入口，避免同一条 worker 出现两次。
+              const workers =
+                run.instance_id === selectedInstanceId
+                  ? []
+                  : (workersByInstance.get(run.instance_id) ?? []);
               return (
                 <div key={run.id} className="flex flex-col">
                   <RailItem
@@ -186,6 +191,35 @@ export function SessionRail({
                 title={t(entry.labelKey)}
                 onClick={() => onLaneChange(module.id)}
               />
+              {entry.children && entry.children.length > 0 && (
+                // 一个 worker 一行：运行中/排队/已结束（PG 历史）都在，点击
+                // 直接打开该 agent 的转录，不需要先进组再点一次。
+                <div className="mb-1 ml-3 border-l border-border/60 pl-1">
+                  {entry.children.map((child) => (
+                    <div
+                      key={child.id}
+                      className={cn(
+                        "flex w-full items-center rounded-md transition-colors",
+                        child.active ? "bg-accent text-accent-foreground" : "hover:bg-accent/40",
+                      )}
+                    >
+                      <button
+                        type="button"
+                        onClick={() => onLaneChange(child.id)}
+                        aria-current={child.active ? "true" : undefined}
+                        title={child.label}
+                        className="flex min-w-0 flex-1 items-center gap-1.5 px-1.5 py-1 text-left"
+                      >
+                        <WorkerStatusDot status={child.status as DelegatedAgent["status"]} />
+                        <span className="min-w-0 flex-1 truncate font-medium text-[11px]">{child.label}</span>
+                        {child.meta && (
+                          <span className="shrink-0 font-mono text-[9px] text-muted-foreground">{child.meta}</span>
+                        )}
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
             </RailGroup>
           ))}
         </div>

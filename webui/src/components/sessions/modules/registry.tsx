@@ -135,10 +135,20 @@ const WORKERS_MODULE: ContentModule = {
   visible: (data) => !!data.instanceId,
   rail: (data) => {
     const view = data.agents;
+    // 一个 worker 一行（含已结束的历史行）：组不是"再点一次才看到 worker"
+    // 的入口，点击具体行直接打开该 agent 的转录。
+    const children = (view?.agents ?? []).map((worker) => ({
+      id: worker.agent_id,
+      label: worker.lane || worker.task || worker.agent_id,
+      meta: worker.agent_id,
+      status: worker.status,
+      active: data.lane === worker.agent_id,
+    }));
     return {
       labelKey: "sessions.groupWorker",
       badge: workerBadge(data),
       live: (view?.concurrency.running ?? 0) > 0,
+      children,
     };
   },
   render: (data) => (
