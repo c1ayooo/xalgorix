@@ -61,6 +61,7 @@ import type {
   ExplorationView,
   ScanPlanView,
   InstanceAgentsView,
+  TaskWorkersView,
   InfoContextParams,
   InfoContextResult,
   InfoRegionParams,
@@ -398,6 +399,10 @@ export const api = {
   // 面板读状态，不读事件（宪章 §5.1/§6）。
   instanceAgents: (id: string) =>
     http<InstanceAgentsView>(`/api/instances/${id}/agents`),
+  // 任务级 worker 历史：任务内每个 run 的委派 worker（含 completed/failed）。
+  // 会话页左栏据此逐 worker 列出，历史不随实时输出消失。
+  taskWorkers: (id: string, page = 1, size = 50) =>
+    http<TaskWorkersView>(`/api/tasks/${id}/workers?page=${page}&size=${size}`),
   // 计划状态投影：任务图/来源/计数；PlanRail 的唯一权威数据源。
   scanPlan: (id: string) => http<ScanPlanView>(`/api/scans/${id}/plan`),
   // 分页历史（会话控制台"加载更早"回翻；契约同 instances events 端点）。

@@ -711,6 +711,11 @@ func (s *Server) handleTaskDetail(w http.ResponseWriter, r *http.Request) {
 			}
 			s.handleTaskFindings(w, r, store, taskID)
 			return
+		case "workers":
+			// Task-scoped worker history for the session rail: every run's
+			// delegated workers, including completed/failed ones.
+			s.handleTaskWorkers(w, r, store, taskID)
+			return
 		case "guidance":
 			// R2a HITL-intent (API_CONTRACT §3.1): queued human turns merged
 			// into the next session briefing, or injected into a running agent.

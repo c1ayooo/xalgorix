@@ -16,6 +16,8 @@ import {
 import { EmptyState } from "@/components/states";
 import { Transcript } from "@/components/chat/transcript";
 import { SessionComposer } from "@/components/sessions/session-composer";
+import { PlanRail } from "@/components/plan-rail";
+import { planProgressFromProjection, planStateFromProjection } from "@/lib/plan-projection";
 import { findModule } from "@/components/sessions/modules/registry";
 import type { ModuleData } from "@/components/sessions/modules/types";
 import { ScanStatusPill } from "@/components/scan-status-pill";
@@ -187,13 +189,24 @@ export function SessionWorkspace({
       {module ? (
         module.render(data)
       ) : (
-        <Transcript
-          instanceId={instanceId}
-          running={running}
-          limit={500}
-          filter={laneFilter}
-          empty={emptyText}
-        />
+        <>
+          {/* 主会话视图直接暴露规划内容：引擎/模型产出的任务图 + 当前任务，
+              不必先点左栏 Planner 才知道"到底规划了什么"。 */}
+          {isMain && data.plan?.present && (
+            <PlanRail
+              plan={planStateFromProjection(data.plan)}
+              progress={planProgressFromProjection(data.plan)}
+              currentPhase={data.plan.current_phase}
+            />
+          )}
+          <Transcript
+            instanceId={instanceId}
+            running={running}
+            limit={500}
+            filter={laneFilter}
+            empty={emptyText}
+          />
+        </>
       )}
 
       {isMain && (

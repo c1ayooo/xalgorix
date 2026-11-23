@@ -26,7 +26,7 @@
 | `plan` | 2 信念（PlanTask = Intent） | engine | `GET /api/scans/{id}/plan` | `completed+skipped/total` | `present:false` → absent；`partial:true` → 琥珀横幅（not_persisted/truncated） |
 | `decision` | 2 信念（Hypothesis） | telemetry（事件流；账本权威见「账本」tab） | run-events（`record_hypothesis`/`add_hypothesis_evidence`） | 事件计数 | absent（本 run 无决策动作） |
 | `obligation` | 3 义务 | engine（只读投影，不重算闸门） | plan 未完成/跳过项 + agents 空闲行 | `counters.unfinished` | absent（无未完成义务） |
-| `workers` | 4 行动 | engine（agentsgraph） | `GET /api/instances/{id}/agents` | `running/limit(+queued)` | `available:false` / `agents:[]` / 全 completed / 部分 queued 四态分开 |
+| `workers` | 4 行动 | engine（agentsgraph） | `GET /api/instances/{id}/agents` + 左栏 `GET /api/tasks/{id}/workers` | `running/limit(+queued)` | `available:false` / `agents:[]` / 全 completed / 部分 queued 四态分开 |
 | `system` | 5 证据（审计投影） | telemetry | run-events（phase/paused/resumed/stopped/error/finished/recovery） | 事件计数 | absent |
 
 规则（代码里是 `ContentModule.visible`）：
@@ -35,6 +35,7 @@
    `plan` / `workers` 在任何有 Run 的情况下都可见——这正是"Planner 区域凭空消失"的修正。
 2. 每个模块必须声明 `ring` 与 `authority`，`registry.tsx` 的类型强制两者必填。
 3. 主区标题取 `titleKey ?? labelKey`；头部展示 `authority` 徽标，避免把遥测当状态。
+4. 主会话视图（无 `?agent=`）在转录上方直接渲染 `PlanRail`——同一份 `PlanView` 投影同时供 Planner 模块与主视图，避免"必须先点左栏才知道规划了什么"。
 
 ## 3. 扩展配方（新增模块）
 
@@ -55,6 +56,7 @@
 | 活跃判据 | 5s `live` 窗口（事件可能被 `safeSend(...,0)` 丢弃） | 状态点权威；`live` 仅作辅助提示 |
 | 做了什么 | 无 | `claimed_hypotheses`（当前认领的假设/端点） |
 | 终态 | 空 | checkpoint 重建；持久 `running` 降级为 `failed` |
+| 左栏 | 单个 Workers 入口，只显示运行中计数 | 每个 run 下**逐 worker 常驻一行**（任务级 `/workers` 聚合，含 completed/failed）；点击一次写入 `?run=&agent=` 打开该 worker 转录；`live` 只作状态点 |
 
 调度侧配套（P1/P2）：
 

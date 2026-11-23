@@ -8,7 +8,7 @@ import { findModule } from "@/components/sessions/modules/registry";
 import { useProjectionInvalidation } from "@/components/sessions/modules/use-projection-invalidation";
 import type { ModuleData } from "@/components/sessions/modules/types";
 import { useLiveSessionKeys } from "@/components/session-item";
-import { useInstanceAgents, useRunEvents, useScanPlan } from "@/api/queries";
+import { useInstanceAgents, useRunEvents, useScanPlan, useTaskWorkers } from "@/api/queries";
 import { cn } from "@/lib/utils";
 import { useI18n } from "@/i18n";
 import type { Run } from "@/types/api";
@@ -32,6 +32,7 @@ export function SessionsTab({
   onSelectRun,
   agentLaneName,
   onSelectAgentLane,
+  onOpenWorker,
 }: {
   taskId: string;
   runs: Run[];
@@ -40,14 +41,17 @@ export function SessionsTab({
   /** ?agent= 深链值：undefined=主会话；模块 id；或 worker 的 agent_id。 */
   agentLaneName?: string;
   onSelectAgentLane: (lane: string | undefined) => void;
+  /** 打开某个 run 下某个 worker：一次写入 ?run=&agent=，避免两次 setSearchParams 互相覆盖。 */
+  onOpenWorker: (instanceId: string, agentId: string) => void;
 }) {
   const { t } = useI18n();
   const [listOpen, setListOpen] = useState(false);
   const liveKeys = useLiveSessionKeys();
   const selectedRun = runs.find((run) => run.instance_id === selectedInstanceId);
   const running = selectedRun?.status === "running";
+  const anyRunActive = runs.some((run) => run.status === "running" || run.status === "pending");
 
-  useProjectionInvalidation(selectedInstanceId);
+  useProjectionInvalidation(selectedInstanceId, taskId);
 
   // 与角色会话工作区同一查询键 → 一份缓存同时供分组枚举与渲染。
   const { data: runEvents } = useRunEvents(selectedInstanceId, running);
@@ -55,6 +59,9 @@ export function SessionsTab({
 
   const plan = useScanPlan(selectedInstanceId, running);
   const agents = useInstanceAgents(selectedInstanceId, running);
+  // Task-scoped worker history: every delegating run's workers, terminal
+  // workers included, so the rail keeps the full history after output stops.
+  const taskWorkers = useTaskWorkers(taskId, anyRunActive);
 
   const lane = agentLaneName;
   const moduleData: ModuleData = useMemo(
@@ -119,6 +126,8 @@ export function SessionsTab({
         listOpen={listOpen}
         onToggleList={() => setListOpen((open) => !open)}
         activeTitle={activeTitle}
+        workerRuns={taskWorkers.data?.items}
+        onOpenWorker={onOpenWorker}
       />
 
       {selectedInstanceId ? (

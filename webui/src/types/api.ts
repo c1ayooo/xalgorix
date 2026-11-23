@@ -1836,3 +1836,16 @@ export interface InstanceAgentsView {
   agents: DelegatedAgent[];
   partial_reason?: "checkpoint" | "no_run" | string;
 }
+
+/** GET /api/tasks/{id}/workers 的一条 run：run 投影 + 该 run 的 worker 历史。 */
+export interface TaskWorkerRun extends Run {
+  workers: InstanceAgentsView;
+}
+
+/** GET /api/tasks/{id}/workers —— 任务级 worker 历史（会话页左栏）。 */
+export interface TaskWorkersView {
+  items: TaskWorkerRun[];
+  total: number;
+  page: number;
+  size: number;
+}

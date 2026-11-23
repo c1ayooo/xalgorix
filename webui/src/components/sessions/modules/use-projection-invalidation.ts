@@ -17,7 +17,7 @@ const INVALIDATING_TYPES = new Set([
   "plan_updated",
 ]);
 
-export function useProjectionInvalidation(instanceId?: string) {
+export function useProjectionInvalidation(instanceId?: string, taskId?: string) {
   const queryClient = useQueryClient();
   const events = useEventsStore((state) => state.events);
   const seenRef = useRef<number | null>(null);
@@ -36,5 +36,7 @@ export function useProjectionInvalidation(instanceId?: string) {
     const key = instanceId ?? "none";
     void queryClient.invalidateQueries({ queryKey: ["instance-agents", key] });
     void queryClient.invalidateQueries({ queryKey: ["scan-plan", key] });
-  }, [events, instanceId, queryClient]);
+    // Task-scoped worker history shares the same lifecycle signal.
+    if (taskId) void queryClient.invalidateQueries({ queryKey: ["task-workers", taskId] });
+  }, [events, instanceId, taskId, queryClient]);
 }

@@ -412,6 +412,7 @@ interface ApprovalRule {
 |---|---|---|
 | GET `/api/scans/{id}/plan` | — | `PlanView`（见下） |
 | GET `/api/instances/{id}/agents` | — | `{ available, concurrency:{limit,running,queued}, agents: AgentEntry[], partial_reason? }` |
+| GET `/api/tasks/{id}/workers` | `?page&size` | `{ items: [{ ...Run, workers: { available, concurrency, agents: AgentEntry[], partial_reason? } }], total, page, size }` |
 
 ```jsonc
 // PlanView
@@ -446,6 +447,7 @@ interface ApprovalRule {
 - **plan 解析顺序**：live agent 的 `PlanSnapshot()`（发布在 owner-loop 回合边界，immutable）→ 终态 `ScanRecord.PlanView`（与 plan 计数同一写入点持久化）→ 仅计数时 `partial:"not_persisted"` → `present:false`。**绝不把"明细缺失"渲染成"没有计划"**。
 - **agents 解析顺序**：`inst.agent.DelegationSnapshot()`（agentsgraph 内存状态）→ 终态读 `<scanDir>/execution-graph.json`（graph 自己写的 checkpoint，非第二套持久权威）；checkpoint 里的 `running/queued` 一律降级为 `failed`（进程/运行结束后不可能还在跑），并置 `partial_reason:"checkpoint"`。未知实例 → `available:false, partial_reason:"no_run"`，200 而非 404（面板需要中性态）。
 - **`claimed_hypotheses`** 是 ledger 的只读 join（仅 `status=testing` 且 `assigned_to` 非空），回答"这个 worker 现在到底在做什么"。
+- **`GET /api/tasks/{id}/workers`** 是任务级只读聚合：对任务内每个 run 复用上面同一 worker 投影（live agentsgraph → checkpoint），只返回委派过 worker 的 run。会话页左栏据此把**每个 run 的全部 worker（含 completed/failed）**常驻成行，历史不随实时输出消失；run 投影字段（title/status/时间）与 `/runs` 同源。
 - **限额语义**：`limit = min(XALGORIX_MAX_CONCURRENT_AGENTS(默认3,上限10), 生命周期委派上限)`；`running + queued` 不会超过 `limit`。
 - 只读：两个端点都不参与 finding 判定、闸门或收工结论。
 

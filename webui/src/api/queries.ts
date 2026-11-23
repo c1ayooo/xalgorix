@@ -899,6 +899,19 @@ export function useInstanceAgents(instanceId?: string, live = false) {
   });
 }
 
+// 任务级 worker 历史（会话页左栏）：任务内每个 run 的 worker，终态由 checkpoint
+// 投影，所以 run 停下来后历史仍在。有活跃 run 时低频兜底刷新。
+export function useTaskWorkers(taskId?: string, live = false) {
+  return useQuery({
+    queryKey: ["task-workers", taskId ?? "none"],
+    queryFn: () => api.taskWorkers(taskId!),
+    enabled: !!taskId,
+    retry: false,
+    refetchInterval: live ? 6000 : false,
+    placeholderData: (prev) => prev,
+  });
+}
+
 // 计划状态投影（Planner 组与 PlanRail 的权威来源）。计划变更很稀疏：
 // 运行中 10s 低频兜底 + plan_updated SSE 即时失效。
 export function useScanPlan(instanceId?: string, live = false) {

@@ -290,6 +290,12 @@ export default function TaskDetailPage() {
               onSelectRun={selectRun}
               agentLaneName={agentLaneParam}
               onSelectAgentLane={selectAgentLane}
+              onOpenWorker={(instanceId, agentId) =>
+                writeParams((sp) => {
+                  sp.set("run", instanceId);
+                  sp.set("agent", agentId);
+                })
+              }
             />
           </TabsContent>
 

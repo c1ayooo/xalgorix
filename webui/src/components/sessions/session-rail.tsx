@@ -3,6 +3,7 @@ import { cn } from "@/lib/utils";
 import { fmtTokens } from "@/components/chat/format";
 import { RailGroup, RailItem } from "@/components/sessions/session-item";
 import { isWorkerLane } from "@/components/sessions/modules/registry";
+import { WorkerStatusDot } from "@/components/sessions/modules/workers-module";
 import type {
   ContentModule,
   RailEntry,
@@ -10,7 +11,7 @@ import type {
 } from "@/components/sessions/modules/types";
 import { useStreamBadge } from "@/components/session-item";
 import { useI18n } from "@/i18n";
-import type { Run } from "@/types/api";
+import type { DelegatedAgent, Run, TaskWorkerRun } from "@/types/api";
 
 /**
  * 会话页左栏：折叠开关 / 链路章 / 任务 token 汇总 + 角色模块分组。
@@ -31,6 +32,8 @@ export function SessionRail({
   listOpen,
   onToggleList,
   activeTitle,
+  workerRuns,
+  onOpenWorker,
 }: {
   runs: Run[];
   selectedInstanceId?: string;
@@ -45,9 +48,19 @@ export function SessionRail({
   onToggleList: () => void;
   /** 折叠态标题栏显示的当前会话名。 */
   activeTitle: string;
+  /** 任务级 worker 历史（每个 run 的全部委派 worker，含已结束）。 */
+  workerRuns?: TaskWorkerRun[];
+  /** 打开某 run 下某 worker 的转录：一次写入 ?run=&agent=。 */
+  onOpenWorker?: (instanceId: string, agentId: string) => void;
 }) {
   const { t } = useI18n();
   const { live: sseLive, reconnecting: sseReconnecting } = useStreamBadge();
+  const workersByInstance = new Map<string, DelegatedAgent[]>();
+  for (const run of workerRuns ?? []) {
+    if (run.instance_id && run.workers.agents.length > 0) {
+      workersByInstance.set(run.instance_id, run.workers.agents);
+    }
+  }
 
   return (
     <div className="flex min-h-0 flex-col overflow-hidden rounded-lg border border-border bg-card">
@@ -111,21 +124,56 @@ export function SessionRail({
       >
         <div className="flex w-full flex-col gap-3 p-2">
           <RailGroup role="main" label={t("sessions.groupMain")}>
-            {runs.map((run) =>
-              run.instance_id ? (
-                <RailItem
-                  key={run.id}
-                  active={!lane && selectedInstanceId === run.instance_id}
-                  status={run.status}
-                  live={liveKeys.has(run.instance_id)}
-                  title={run.title || run.id}
-                  onClick={() => {
-                    onSelectRun(run.instance_id!);
-                    onLaneChange(undefined);
-                  }}
-                />
-              ) : null,
-            )}
+            {runs.map((run) => {
+              if (!run.instance_id) return null;
+              const workers = workersByInstance.get(run.instance_id) ?? [];
+              return (
+                <div key={run.id} className="flex flex-col">
+                  <RailItem
+                    active={!lane && selectedInstanceId === run.instance_id}
+                    status={run.status}
+                    live={liveKeys.has(run.instance_id)}
+                    title={run.title || run.id}
+                    onClick={() => {
+                      onSelectRun(run.instance_id!);
+                      onLaneChange(undefined);
+                    }}
+                  />
+                  {workers.length > 0 && (
+                    // 历史优先：该 run 委派过的每个 worker 都常驻一行（运行中/排队/
+                    // 已结束都在），点击直接打开它的转录，live 只是状态点不是过滤条件。
+                    <div className="mb-1 ml-3 border-l border-border/60 pl-1">
+                      {workers.map((worker) => {
+                        const workerActive = selectedInstanceId === run.instance_id && lane === worker.agent_id;
+                        return (
+                          <div
+                            key={worker.agent_id}
+                            className={cn(
+                              "flex w-full items-center rounded-md transition-colors",
+                              workerActive ? "bg-accent text-accent-foreground" : "hover:bg-accent/40",
+                            )}
+                          >
+                            <button
+                              type="button"
+                              onClick={() => onOpenWorker?.(run.instance_id!, worker.agent_id)}
+                              aria-current={workerActive ? "true" : undefined}
+                              title={worker.task || worker.lane}
+                              className="flex min-w-0 flex-1 items-center gap-1.5 px-1.5 py-1 text-left"
+                            >
+                              <WorkerStatusDot status={worker.status} />
+                              <span className="min-w-0 flex-1 truncate font-medium text-[11px]">{worker.lane}</span>
+                              <span className="shrink-0 font-mono text-[9px] text-muted-foreground">
+                                {worker.agent_id}
+                              </span>
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
             {runs.length === 0 && <p className="px-2 py-1 text-muted-foreground text-xs">{t("session.emptyRuns")}</p>}
           </RailGroup>
 
