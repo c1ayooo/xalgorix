@@ -19,6 +19,9 @@ build/
 !webui/tsconfig.node.json
 !webui/package-lock.json
 !internal/web/static/.eslintrc.json
+# go:embed asset: internal/honeydetect requires signatures.json at build time,
+# so the blanket *.json rule above must not swallow it.
+!internal/honeydetect/signatures.json
 xalgorix-data/
 *_assessment/
 
