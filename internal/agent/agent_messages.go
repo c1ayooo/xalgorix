@@ -754,8 +754,14 @@ func archiveToolResultMarker(id string) string {
 	return fmt.Sprintf("%s%s — call read_tool_output(id=\"%s\") for the untruncated original]", archiveMarkerPrefix, id, id)
 }
 
-// trimToValidUTF8 cuts s to at most maxBytes on a rune boundary.
+// trimToValidUTF8 cuts s to at most maxBytes on a rune boundary. A
+// non-positive budget means no space is left: return "" instead of slicing at
+// a negative offset (the context snapshot's remaining-budget arithmetic can go
+// negative, and that panic killed the whole process mid-scan).
 func trimToValidUTF8(s string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
 	if len(s) <= maxBytes {
 		return s
 	}
