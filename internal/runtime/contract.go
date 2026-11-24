@@ -181,11 +181,18 @@ type Mount struct {
 
 // NetworkSpec describes the per-project network and its only egress path.
 type NetworkSpec struct {
-	Name        string   `json:"name"`
-	Internal    bool     `json:"internal"`
-	ProxyURL    string   `json:"proxy_url,omitempty"`
-	CACertPath  string   `json:"ca_cert,omitempty"`
-	EgressCIDRs []string `json:"egress_cidrs,omitempty"`
+	Name     string `json:"name"`
+	Internal bool   `json:"internal"`
+	// Host shares the host network namespace (no project bridge). Used when
+	// tools must reach a VPN/target subnet directly; the platform-side
+	// security chain still applies before dispatch.
+	Host     bool   `json:"host,omitempty"`
+	ProxyURL string `json:"proxy_url,omitempty"`
+	// ProxyGatewayPort makes the driver address the proxy at the project
+	// network's gateway (http://<gateway>:<port>) after the network exists.
+	ProxyGatewayPort int      `json:"proxy_gateway_port,omitempty"`
+	CACertPath       string   `json:"ca_cert,omitempty"`
+	EgressCIDRs      []string `json:"egress_cidrs,omitempty"`
 }
 
 // ProjectSpec is the desired state of one project container.
@@ -211,6 +218,9 @@ type ProjectSpec struct {
 	// Chromium ignores HTTP_PROXY, so a containerised browser needs the address
 	// explicitly; it must be reachable from the project network (not loopback).
 	BrowserProxy string `json:"browser_proxy,omitempty"`
+	// HTTPWorkerSocket is the same-path unix socket the in-container httpworker
+	// listens on. Empty disables the worker (native mode, selftest containers).
+	HTTPWorkerSocket string `json:"http_worker_socket,omitempty"`
 }
 
 // ProjectHandle is the result of a successful EnsureProject.
@@ -220,6 +230,12 @@ type ProjectHandle struct {
 	State       string    `json:"state"`
 	Image       string    `json:"image"`
 	CreatedAt   time.Time `json:"created_at"`
+	// ProxyURL is the container-reachable egress proxy URL (project-network
+	// gateway + the run-scoped listener port) when the project uses the
+	// platform traffic proxy. Empty for direct egress or an external proxy
+	// configured by URL. Containerised Chromium needs it because it ignores
+	// HTTP_PROXY.
+	ProxyURL string `json:"proxy_url,omitempty"`
 }
 
 // ProjectState is the actual state read back from the runtime.
