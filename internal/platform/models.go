@@ -286,6 +286,11 @@ type Task struct {
 	// Objective is the structured goal: absent = "not structured". It never
 	// replaces Goal (free text) and never grants authority over findings.
 	Objective  *Objective     `json:"objective,omitempty"`
+	// LLMChain is the task's ordered model chain — "<provider>:<profileId>"
+	// keys, highest priority first. The run starts on ActiveLLM; the chain is
+	// operator intent, so an explicit per-run provider_profile still wins.
+	LLMChain  []string `json:"llm_chain,omitempty"`
+	ActiveLLM string   `json:"active_llm,omitempty"`
 	Context    map[string]any `json:"-"`
 	CreatedAt  time.Time      `json:"created_at"`
 	UpdatedAt  *time.Time     `json:"updated_at,omitempty"`
@@ -658,6 +663,9 @@ type TaskInput struct {
 	// Objective is the structured goal; nil = not structured.
 	Objective *Objective
 	Context   map[string]any
+	// LLMChain / ActiveLLM seed the task's model chain (order = priority).
+	LLMChain  []string
+	ActiveLLM string
 }
 
 // TaskUpdate is the PATCH body for a task (API_CONTRACT §2).
@@ -675,6 +683,10 @@ type TaskUpdate struct {
 	ClearObjective bool
 	Context        map[string]any
 	Archived       *bool
+	// LLMChain non-nil replaces the ordered chain (empty clears it);
+	// ActiveLLM non-nil replaces the chain head used by the next run.
+	LLMChain  *[]string
+	ActiveLLM *string
 }
 
 // normalizeContextPaths trims, drops empties and de-duplicates while keeping
@@ -1137,4 +1149,60 @@ func validateAgentProfile(role, focus, evidenceContract, stoppingRule string) er
 		return fmt.Errorf("%w: agent stopping_rule is required", ErrValidation)
 	}
 	return nil
+}
+
+// NormalizeTaskLLMChain trims, drops malformed and duplicate entries, and
+// falls back to the first entry when active names a profile outside the chain
+// (or names none). Order is priority: index 0 is the chain head. An empty chain
+// clears both values.
+func NormalizeTaskLLMChain(chain []string, active string) ([]string, string) {
+	out := make([]string, 0, len(chain))
+	seen := make(map[string]struct{}, len(chain))
+	for _, raw := range chain {
+		key := strings.TrimSpace(raw)
+		if key == "" {
+			continue
+		}
+		provider, profile, ok := strings.Cut(key, ":")
+		if !ok || strings.TrimSpace(provider) == "" || strings.TrimSpace(profile) == "" {
+			continue // not a "<provider>:<profileId>" key
+		}
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, key)
+	}
+	if len(out) == 0 {
+		return nil, ""
+	}
+	active = strings.TrimSpace(active)
+	if _, ok := seen[active]; !ok {
+		active = out[0]
+	}
+	return out, active
+}
+
+// hydrateTaskLLMChain exposes the context-stored model chain on the Task. The
+// chain lives in the task context (llm_chain / llm_active) so no schema change
+// is needed; Context itself stays off the wire.
+func hydrateTaskLLMChain(t *Task) {
+	if t == nil || t.Context == nil {
+		return
+	}
+	t.LLMChain = nil
+	t.ActiveLLM = ""
+	switch raw := t.Context["llm_chain"].(type) {
+	case []any:
+		for _, v := range raw {
+			if s, ok := v.(string); ok && s != "" {
+				t.LLMChain = append(t.LLMChain, s)
+			}
+		}
+	case []string:
+		t.LLMChain = append([]string(nil), raw...)
+	}
+	if v, ok := t.Context["llm_active"].(string); ok {
+		t.ActiveLLM = v
+	}
 }

@@ -364,6 +364,7 @@ func (s *FileStore) ListTasks(_ context.Context, projectID string) ([]Task, erro
 		}
 		task := t.Task
 		task.Context = t.Context
+		hydrateTaskLLMChain(&task)
 		out = append(out, task)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
@@ -378,6 +379,7 @@ func (s *FileStore) GetTask(_ context.Context, id string) (*Task, error) {
 		if t.ID == id {
 			returned := t.Task
 			returned.Context = t.Context
+			hydrateTaskLLMChain(&returned)
 			return &returned, nil
 		}
 	}
@@ -434,6 +436,30 @@ func (s *FileStore) UpdateTask(_ context.Context, id string, upd TaskUpdate) (*T
 				merged[k] = v
 			}
 			tw.Context = merged
+		}
+		if upd.LLMChain != nil || upd.ActiveLLM != nil {
+			chain := tw.LLMChain
+			active := tw.ActiveLLM
+			if upd.LLMChain != nil {
+				chain = *upd.LLMChain
+			}
+			if upd.ActiveLLM != nil {
+				active = *upd.ActiveLLM
+			}
+			chain, active = NormalizeTaskLLMChain(chain, active)
+			merged := tw.Context
+			if merged == nil {
+				merged = map[string]any{}
+			}
+			if len(chain) > 0 {
+				merged["llm_chain"] = chain
+				merged["llm_active"] = active
+			} else {
+				delete(merged, "llm_chain")
+				delete(merged, "llm_active")
+			}
+			tw.Context = merged
+			tw.LLMChain, tw.ActiveLLM = chain, active
 		}
 		if upd.Archived != nil {
 			if *upd.Archived {
@@ -929,6 +955,11 @@ func (s *FileStore) createTaskLocked(projectID string, in TaskInput, contextSeed
 	if _, has := contextMap["slug"]; !has {
 		contextMap["slug"] = uniqueSlug(slugify(in.Name, taskID), existing)
 	}
+	llmChain, activeLLM := NormalizeTaskLLMChain(in.LLMChain, in.ActiveLLM)
+	if len(llmChain) > 0 {
+		contextMap["llm_chain"] = llmChain
+		contextMap["llm_active"] = activeLLM
+	}
 	t := Task{
 		ID:           taskID,
 		ProjectID:    projectID,
@@ -939,6 +970,8 @@ func (s *FileStore) createTaskLocked(projectID string, in TaskInput, contextSeed
 		Schedule:     in.Schedule,
 		ContextPaths: normalizeContextPaths(in.ContextPaths),
 		Objective:    in.Objective,
+		LLMChain:     llmChain,
+		ActiveLLM:    activeLLM,
 		Context:      contextMap,
 		CreatedAt:    time.Now().UTC(),
 	}

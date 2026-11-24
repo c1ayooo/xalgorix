@@ -345,6 +345,7 @@ func hydrateTaskJSON(t *Task, contextPathsJSON, contextJSON, policyJSON, schedul
 	if len(contextJSON) > 0 {
 		_ = json.Unmarshal(contextJSON, &t.Context)
 	}
+	hydrateTaskLLMChain(t)
 	t.CreatedAt = t.CreatedAt.UTC()
 	if t.UpdatedAt != nil {
 		ts := t.UpdatedAt.UTC()
@@ -409,6 +410,11 @@ func (s *Store) createTaskInternal(ctx context.Context, projectID uuid.UUID, in 
 	}
 	if _, has := contextMap["slug"]; !has {
 		contextMap["slug"] = uniqueSlug(slugify(in.Name, id), siblingSlugs)
+	}
+	// Model chain: stored in the task context (llm_chain / llm_active).
+	if chain, active := NormalizeTaskLLMChain(in.LLMChain, in.ActiveLLM); len(chain) > 0 {
+		contextMap["llm_chain"] = chain
+		contextMap["llm_active"] = active
 	}
 	contextJSON, err := marshalJSON(contextMap)
 	if err != nil {
@@ -568,6 +574,30 @@ func (s *Store) UpdateTask(ctx context.Context, id string, upd TaskUpdate) (*Tas
 		for k, v := range upd.Context {
 			current.Context[k] = v
 		}
+	}
+	// Model chain: either field may move independently; normalization keeps the
+	// active head inside the chain (empty chain clears both).
+	if upd.LLMChain != nil || upd.ActiveLLM != nil {
+		chain := current.LLMChain
+		active := current.ActiveLLM
+		if upd.LLMChain != nil {
+			chain = *upd.LLMChain
+		}
+		if upd.ActiveLLM != nil {
+			active = *upd.ActiveLLM
+		}
+		chain, active = NormalizeTaskLLMChain(chain, active)
+		if current.Context == nil {
+			current.Context = map[string]any{}
+		}
+		if len(chain) > 0 {
+			current.Context["llm_chain"] = chain
+			current.Context["llm_active"] = active
+		} else {
+			delete(current.Context, "llm_chain")
+			delete(current.Context, "llm_active")
+		}
+		current.LLMChain, current.ActiveLLM = chain, active
 	}
 	if upd.Archived != nil {
 		if *upd.Archived {

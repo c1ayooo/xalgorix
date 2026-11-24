@@ -636,6 +636,9 @@ func (s *Server) handleProjectTasks(w http.ResponseWriter, r *http.Request, stor
 			Schedule     *platform.TaskSchedule `json:"schedule"`
 			ContextPaths []string               `json:"context_paths"`
 			Objective    *platform.Objective    `json:"objective"`
+			// Model chain ("<provider>:<profileId>", order = priority).
+			LLMChain  []string `json:"llm_chain"`
+			ActiveLLM string   `json:"active_llm"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 			writeJSONStatus(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
@@ -653,6 +656,8 @@ func (s *Server) handleProjectTasks(w http.ResponseWriter, r *http.Request, stor
 			Schedule:     in.Schedule,
 			ContextPaths: in.ContextPaths,
 			Objective:    in.Objective,
+			LLMChain:     in.LLMChain,
+			ActiveLLM:    in.ActiveLLM,
 		})
 		if err != nil {
 			writePlatformError(w, err)
@@ -676,6 +681,10 @@ type taskRequestBody struct {
 	// leave as is, explicit null = clear, object = replace.
 	Objective json.RawMessage `json:"objective"`
 	Archived  *bool           `json:"archived"`
+	// Model chain: llm_chain replaces the ordered chain (empty clears it);
+	// active_llm replaces the chain head. Absent leaves them unchanged.
+	LLMChain  *[]string `json:"llm_chain"`
+	ActiveLLM *string   `json:"active_llm"`
 }
 
 // handleTaskDetail serves /api/tasks/{id} (GET/PATCH/DELETE),
@@ -774,6 +783,8 @@ func (s *Server) handleTaskDetail(w http.ResponseWriter, r *http.Request) {
 			Schedule:     req.Schedule,
 			ContextPaths: req.ContextPaths,
 			Archived:     req.Archived,
+			LLMChain:     req.LLMChain,
+			ActiveLLM:    req.ActiveLLM,
 		}
 		if len(req.Objective) > 0 {
 			if strings.TrimSpace(string(req.Objective)) == "null" {
@@ -960,6 +971,12 @@ func (s *Server) handleTaskRunStart(w http.ResponseWriter, r *http.Request, stor
 	// agent starts (goal_analysis.go roundZeroGoalAnalysis).
 	req.ObjectiveGoal = task.Goal
 	req.ObjectiveInstruction = task.Instruction
+	// Task model chain: the active profile is the run's default credential.
+	// An explicit per-run provider_profile still wins (operator override), and
+	// an empty chain leaves the legacy server-default resolution untouched.
+	if strings.TrimSpace(req.ProviderProfile) == "" && strings.TrimSpace(task.ActiveLLM) != "" {
+		req.ProviderProfile = strings.TrimSpace(task.ActiveLLM)
+	}
 	// Task context_paths are the Context half of the Task model. They are
 	// additive with an explicit request scan_context and all enter the seeded
 	// attack surface (never silently reduced to the first path).

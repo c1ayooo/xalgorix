@@ -985,6 +985,13 @@ export interface Task {
   context_paths?: string[];
   /** Structured objective; absent = "not structured" (never inferred). */
   objective?: Objective;
+  /**
+   * Task model chain — "<provider>:<profileId>" keys, highest priority first.
+   * The run starts on active_llm; an explicit per-run provider_profile still
+   * wins.
+   */
+  llm_chain?: string[];
+  active_llm?: string;
   created_at: string;
   updated_at?: string;
   archived_at?: string;
@@ -1133,6 +1140,10 @@ export interface TaskRequest {
   context_paths?: string[];
   /** Structured objective; null clears it (PATCH), undefined leaves it. */
   objective?: Objective | null;
+  /** Ordered model chain; [] clears it (PATCH), undefined leaves it. */
+  llm_chain?: string[];
+  /** Chain head used by the next run; undefined leaves it. */
+  active_llm?: string;
 }
 
 export interface ProjectRequest {
@@ -1750,6 +1761,8 @@ export interface TranscriptItem {
   output?: string;
   status?: string;
   agent_id?: string;
+  /** Operator who produced a human turn / asked the answered question. */
+  created_by?: string;
   at: string;
   truncated?: boolean;
   /** Inferred methodology phase of tool events (absent = none); drives round dividers. */
