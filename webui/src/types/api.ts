@@ -574,6 +574,25 @@ export interface RateLimitSettings {
   window: number;
 }
 
+/** One key's masked row + process-wide circuit-breaker state (/api/pool). */
+export interface KeyPoolEntry {
+  id: string;
+  masked: string;
+  state: "ok" | "cooling";
+  open_until?: string;
+  trips?: number;
+  last_error?: string;
+  last_at?: string;
+}
+
+export interface KeyPoolView {
+  keys: number;
+  masked: string[];
+  strategy: "off" | "round_robin" | "sticky";
+  entries: KeyPoolEntry[];
+  restart_needed?: boolean;
+}
+
 export interface LLMSettings {
   model: string;
   apiBase: string;

@@ -61,6 +61,7 @@ import type {
   SettingsImportResult,
 } from "@/types/api";
 import OAuthModal from "./settings/oauth-modal";
+import { KeyPoolCard } from "./settings/key-pool-card";
 import { syncLanguageFromServer, useI18n } from "@/i18n";
 
 const settingsTabs = [
@@ -1017,6 +1018,10 @@ export default function SettingsPage() {
               onClose={() => setOAuthOpen(false)}
             />
           )}
+
+          {/* API key pool: masked health + breaker reset. The keys themselves
+              come from XALGORIX_API_KEY / XALGORIX_API_KEYS. */}
+          <KeyPoolCard className="mt-4" />
         </TabsContent>
 
         <TabsContent value="engagement">

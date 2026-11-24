@@ -1493,3 +1493,25 @@ export function useDeleteUser() {
 /** 类型仅作 API 返回形状标注的本地引用（避免 unused 告警由 hooks 消费）。 */
 export type { AgentProfile, McpServer, UserSkill };
 
+// ── LLM key pool (masked health + breaker reset) ────────────────────────────
+// Keys are configured via XALGORIX_API_KEY / XALGORIX_API_KEYS; this surface
+// only shows which key is cooling down (and why) and lets the operator clear a
+// breaker after topping up an account. Polled: health changes happen on the
+// request path, not through a pushed event.
+export function useKeyPool() {
+  return useQuery({
+    queryKey: ["llm", "keypool"],
+    queryFn: api.keyPool,
+    refetchInterval: 15000,
+  });
+}
+
+export function useResetKeyPool() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id?: string) => api.resetKeyPool(id),
+    onSuccess: (data) => {
+      qc.setQueryData(["llm", "keypool"], data);
+    },
+  });
+}

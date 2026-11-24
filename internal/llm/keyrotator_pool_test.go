@@ -7,6 +7,7 @@ import (
 )
 
 func TestKeyRotatorContains(t *testing.T) {
+	freshKeys(t)
 	r := NewKeyRotator([]string{"k1", "k2"})
 	if !r.Contains("k1") || !r.Contains("k2") {
 		t.Fatal("pool keys should be contained")
@@ -29,6 +30,7 @@ func TestKeyRotatorContains(t *testing.T) {
 // gate (ep.APIKey == cfg.APIKey) failed because the pooled key != empty primary,
 // so rotation never fired. It must now round-robin across BOTH keys.
 func TestApplyKeyRotation_PoolKeyEmptyPrimary(t *testing.T) {
+	freshKeys(t)
 	c := &Client{cfg: &config.Config{APIKey: ""}, keyRotator: NewKeyRotator([]string{"k1", "k2"})}
 	seen := map[string]int{}
 	for i := 0; i < 6; i++ {
@@ -54,6 +56,7 @@ func TestApplyKeyRotation_PoolKeyEmptyPrimary(t *testing.T) {
 // Legacy path regression: when the endpoint carries exactly cfg.APIKey, rotation
 // still fires (behavior unchanged).
 func TestApplyKeyRotation_LegacyPrimaryMatch(t *testing.T) {
+	freshKeys(t)
 	c := &Client{cfg: &config.Config{APIKey: "primary"}, keyRotator: NewKeyRotator([]string{"primary", "k2"})}
 	ep := c.applyKeyRotation(Endpoint{Auth: AuthAPIKey, APIKey: "primary"})
 	if ep.APIKey != "primary" && ep.APIKey != "k2" {
@@ -64,6 +67,7 @@ func TestApplyKeyRotation_LegacyPrimaryMatch(t *testing.T) {
 // Sticky/overflow mode: stay on one key until it rate-limits, then fail over to
 // the next and stay there (switch only on 429), instead of alternating.
 func TestKeyRotatorStickyFailover(t *testing.T) {
+	freshKeys(t)
 	r := NewKeyRotator([]string{"k1", "k2"})
 	r.SetSticky(true)
 	// Stays on the first key across many healthy picks (no alternation).
@@ -89,6 +93,7 @@ func TestKeyRotatorStickyFailover(t *testing.T) {
 
 // Round-robin (default) still alternates — sticky must be opt-in.
 func TestKeyRotatorDefaultRoundRobin(t *testing.T) {
+	freshKeys(t)
 	r := NewKeyRotator([]string{"k1", "k2"})
 	a, b := r.Pick(), r.Pick()
 	if a == b {
@@ -97,6 +102,7 @@ func TestKeyRotatorDefaultRoundRobin(t *testing.T) {
 }
 
 func TestClonePreservesKeyRotator(t *testing.T) {
+	freshKeys(t)
 	c := &Client{cfg: &config.Config{APIKey: ""}, keyRotator: NewKeyRotator([]string{"k1", "k2"})}
 	cl := c.Clone()
 	if cl.keyRotator != c.keyRotator {

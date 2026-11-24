@@ -906,6 +906,8 @@ var dashboardRoutes = []string{
 	"/api/settings/llm",
 	"/api/settings/llm/keys",
 	"/api/settings/llm/test-route",
+	"/api/pool",
+	"/api/pool/reset",
 	"/api/settings/environment",
 	"/api/queue/status",
 	"/api/queue/resume",
@@ -1670,6 +1672,7 @@ func (s *Server) Start() error {
 	// Scoped LLM key-pool API: machine tokens may manage exactly this knob
 	// (masked reads only); the full settings surface stays operator-only.
 	mux.HandleFunc("/api/pool", s.handleKeyPool)
+	mux.HandleFunc("/api/pool/reset", s.handleKeyPoolReset)
 	mux.HandleFunc("/api/queue/status", s.handleQueueStatus)
 	mux.HandleFunc("/api/queue/resume", s.handleQueueResume)
 	mux.HandleFunc("/api/queue/clear", s.handleQueueClear)

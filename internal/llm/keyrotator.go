@@ -3,14 +3,17 @@
 // KeyRotator spreads outbound API-key-authenticated requests across a
 // pool of operator-configured keys (XALGORIX_API_KEYS plus
 // XALGORIX_API_KEY). Picks advance round-robin, so a pool of N keys
-// raises the effective provider rate ceiling roughly N times. When a
-// request fails with a provider rate limit (429 / usage-window), the
-// key it used enters a short cooldown and subsequent picks skip it
-// until the cooldown expires, concentrating traffic on the remaining
-// keys.
+// raises the effective provider rate ceiling roughly N times.
+//
+// Cooldown state lives in the process-wide key-health registry
+// (keyhealth.go), so a key that is out of credit or rejected is skipped
+// by every scan — not just the client that discovered it. Quota and
+// authentication failures cool a key for minutes; transient rate limits
+// cool it for 90s.
 //
 // Thread-safe: concurrent chatWithRetry / ChatStream goroutines from
-// parallel scans share one rotator per llm.Client.
+// parallel scans share one rotator per llm.Client, and the registry is
+// shared by every client in the process.
 
 package llm
 
@@ -19,29 +22,13 @@ import (
 	"time"
 )
 
-// keyPoolCooldown is how long a rate-limited key is skipped before it
-// becomes eligible again. It exceeds chatWithRetry's 30s rate-limit
-// backoff so the retry immediately following a 429 lands on a
-// different key; the cooled key returns once the provider's window
-// has very likely reset.
-const keyPoolCooldown = 90 * time.Second
-
-// keyPoolQuotaCooldown is the longer cooldown applied when a key is rejected
-// with quota_exhausted (account balance / usage-window exhaustion). That state
-// lasts far longer than a transient per-minute rate limit, so the short
-// cooldown above would thrash requests straight back onto the dead key every
-// 90s. The longer cooldown keeps the key out of rotation and re-probes it only
-// occasionally, so it rejoins once the provider's usage window resets.
-const keyPoolQuotaCooldown = 15 * time.Minute
-
 // KeyRotator hands out keys from a fixed pool in round-robin order,
-// skipping keys that are cooling down after a rate limit.
+// skipping keys that are cooling down after a failure.
 type KeyRotator struct {
-	mu       sync.Mutex
-	keys     []string
-	idx      int
-	cooldown map[string]time.Time
-	last     string
+	mu   sync.Mutex
+	keys []string
+	idx  int
+	last string
 	// sticky selects overflow-failover instead of round-robin: keep using one key
 	// until it enters cooldown, then fail over to the next and stay there. Set once
 	// at construction via SetSticky.
@@ -67,10 +54,7 @@ func NewKeyRotator(keys []string) *KeyRotator {
 	if len(deduped) == 0 {
 		return nil
 	}
-	return &KeyRotator{
-		keys:     deduped,
-		cooldown: make(map[string]time.Time),
-	}
+	return &KeyRotator{keys: deduped}
 }
 
 // Pick returns the next eligible key, advancing round-robin and
@@ -88,15 +72,38 @@ func (r *KeyRotator) Pick() string {
 	return r.pickRoundRobinLocked(now)
 }
 
+// PickExcluding returns an eligible key other than exclude, used for the
+// immediate failover after the current request's key was marked dead. ok=false
+// means no other key can serve the request right now.
+func (r *KeyRotator) PickExcluding(exclude string) (string, bool) {
+	if r == nil {
+		return "", false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := time.Now()
+	for i := 0; i < len(r.keys); i++ {
+		j := (r.idx + i) % len(r.keys)
+		k := r.keys[j]
+		if k == exclude {
+			continue
+		}
+		if until := keyHealthUntil(KeyFingerprint(k)); until.IsZero() || now.After(until) {
+			r.idx = j + 1
+			r.last = k
+			return k, true
+		}
+	}
+	return "", false
+}
+
 // pickRoundRobinLocked advances one key per call, skipping cooling keys — both
 // keys carry load simultaneously, raising the effective rate ceiling.
 func (r *KeyRotator) pickRoundRobinLocked(now time.Time) string {
 	for range r.keys {
 		k := r.keys[r.idx%len(r.keys)]
 		r.idx++
-		until, cooling := r.cooldown[k]
-		if !cooling || now.After(until) {
-			delete(r.cooldown, k)
+		if until := keyHealthUntil(KeyFingerprint(k)); until.IsZero() || now.After(until) {
 			r.last = k
 			return k
 		}
@@ -106,14 +113,12 @@ func (r *KeyRotator) pickRoundRobinLocked(now time.Time) string {
 
 // pickStickyLocked keeps returning the current key until it enters cooldown, then
 // fails over to the next eligible key and stays there (overflow failover): one key
-// at a time, switching only on a rate limit, so an idle key is held in reserve.
+// at a time, switching only on a failure, so an idle key is held in reserve.
 func (r *KeyRotator) pickStickyLocked(now time.Time) string {
 	for i := 0; i < len(r.keys); i++ {
 		j := (r.idx + i) % len(r.keys)
 		k := r.keys[j]
-		until, cooling := r.cooldown[k]
-		if !cooling || now.After(until) {
-			delete(r.cooldown, k)
+		if until := keyHealthUntil(KeyFingerprint(k)); until.IsZero() || now.After(until) {
 			r.idx = j // stick to this key until it too cools
 			r.last = k
 			return k
@@ -129,7 +134,7 @@ func (r *KeyRotator) pickSoonestLocked() string {
 	best := ""
 	var bestUntil time.Time
 	for _, k := range r.keys {
-		until := r.cooldown[k]
+		until := keyHealthUntil(KeyFingerprint(k))
 		if best == "" || until.Before(bestUntil) {
 			best, bestUntil = k, until
 		}
@@ -154,27 +159,45 @@ func (r *KeyRotator) SetSticky(v bool) {
 // MarkLastRateLimited puts the key most recently returned by Pick into the
 // short transient-rate-limit cooldown so subsequent picks concentrate on the
 // remaining keys.
-func (r *KeyRotator) MarkLastRateLimited() {
-	r.markKey("", keyPoolCooldown)
-}
+func (r *KeyRotator) MarkLastRateLimited() { r.MarkRateLimitedKey("") }
 
 // MarkRateLimitedKey cools the exact key that failed. Concurrent requests
 // cannot then cool the wrong key through the shared `last` cursor.
 func (r *KeyRotator) MarkRateLimitedKey(key string) {
-	r.markKey(key, keyPoolCooldown)
+	r.markKey(key, false, "rate limited (429 / usage window)")
 }
 
-// MarkQuotaExhaustedKey is MarkRateLimitedKey with the longer quota cooldown.
+// MarkQuotaExhaustedKey is MarkRateLimitedKey with the long quota cooldown.
 func (r *KeyRotator) MarkQuotaExhaustedKey(key string) {
-	r.markKey(key, keyPoolQuotaCooldown)
+	r.markKey(key, true, "quota exhausted (balance / credit)")
 }
 
 // MarkLastQuotaExhausted puts the key most recently returned by Pick into the
-// longer quota-exhausted cooldown (see keyPoolQuotaCooldown), so the rotator
-// stops routing requests to a key whose usage window is drained until it very
-// likely resets, instead of thrashing back onto it every 90s.
-func (r *KeyRotator) MarkLastQuotaExhausted() {
-	r.markKey("", keyPoolQuotaCooldown)
+// longer quota-exhausted cooldown.
+func (r *KeyRotator) MarkLastQuotaExhausted() { r.MarkQuotaExhaustedKey("") }
+
+// MarkFailureKey records a request failure against the exact key it used,
+// classifying the window: quota/credit and authentication failures are hard
+// (long cooldown; auth also drops the key from the pool), everything else is a
+// transient rate-limit cooldown.
+func (r *KeyRotator) MarkFailureKey(key, errMsg string) {
+	if r == nil || key == "" {
+		return
+	}
+	classified := ClassifyErrorString(errMsg)
+	hard := classified.Class == ErrorClassQuotaExhausted || isAuthFailure(errMsg)
+	if isAuthFailure(errMsg) {
+		r.dropKey(key)
+	}
+	keyHealthTrip(KeyFingerprint(key), errMsg, hard)
+}
+
+// NoteSuccessKey clears the breaker for the key that just served a request.
+func (r *KeyRotator) NoteSuccessKey(key string) {
+	if r == nil || key == "" {
+		return
+	}
+	keyHealthPass(KeyFingerprint(key))
 }
 
 // MarkInvalidKey removes a key from the pool for the lifetime of the process.
@@ -185,14 +208,25 @@ func (r *KeyRotator) MarkLastQuotaExhausted() {
 // become empty; Pick then returns "" and the caller surfaces a clear error
 // instead of looping.
 func (r *KeyRotator) MarkInvalidKey(key string) {
+	if r == nil {
+		return
+	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if key == "" {
 		key = r.last
 	}
+	r.mu.Unlock()
 	if key == "" {
 		return
 	}
+	r.dropKey(key)
+	keyHealthTrip(KeyFingerprint(key), "invalid API key (401/403)", true)
+}
+
+// dropKey removes one key from the rotation pool.
+func (r *KeyRotator) dropKey(key string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	kept := r.keys[:0]
 	for _, k := range r.keys {
 		if k != key {
@@ -200,7 +234,6 @@ func (r *KeyRotator) MarkInvalidKey(key string) {
 		}
 	}
 	r.keys = kept
-	delete(r.cooldown, key)
 	if r.idx >= len(r.keys) {
 		r.idx = 0
 	}
@@ -209,16 +242,19 @@ func (r *KeyRotator) MarkInvalidKey(key string) {
 
 // markKey cools the supplied key, or the most recent Pick when key is empty
 // (compatibility for callers without an endpoint in scope).
-func (r *KeyRotator) markKey(key string, d time.Duration) {
+func (r *KeyRotator) markKey(key string, hard bool, msg string) {
+	if r == nil {
+		return
+	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if key == "" {
 		key = r.last
 	}
+	r.mu.Unlock()
 	if key == "" {
 		return
 	}
-	r.cooldown[key] = time.Now().Add(d)
+	keyHealthTrip(KeyFingerprint(key), msg, hard)
 }
 
 // Len reports how many distinct keys the pool holds.
@@ -247,4 +283,30 @@ func (r *KeyRotator) Contains(key string) bool {
 		}
 	}
 	return false
+}
+
+// Keys returns the current pool keys (read-only copy). Used by the status
+// endpoint; callers must never expose the key material.
+func (r *KeyRotator) Keys() []string {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]string, len(r.keys))
+	copy(out, r.keys)
+	return out
+}
+
+// Strategy renders the active rotation strategy for the status API.
+func (r *KeyRotator) Strategy() string {
+	if r == nil {
+		return "off"
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.sticky {
+		return "sticky"
+	}
+	return "round_robin"
 }

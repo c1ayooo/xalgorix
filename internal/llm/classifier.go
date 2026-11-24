@@ -88,6 +88,13 @@ func ClassifyErrorString(rawErr string) ClassifiedError {
 		strings.Contains(errStr, "credit balance is too low") ||
 		strings.Contains(errStr, "insufficient credits") ||
 		strings.Contains(errStr, "out of credits") ||
+		// OpenCode Go's balance rejection ("Insufficient balance; Go covers only
+		// OpenCode Go provider") carries no standard code — without this the key
+		// would be classified as invalid and dropped from the pool even after a
+		// top-up.
+		strings.Contains(errStr, "insufficient balance") ||
+		strings.Contains(errStr, "insufficient_balance") ||
+		strings.Contains(errStr, "余额不足") ||
 		strings.Contains(errStr, "billing account") ||
 		strings.Contains(errStr, "payment required") ||
 		apiErrorHasStatus(errStr, 402) ||

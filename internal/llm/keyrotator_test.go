@@ -6,6 +6,7 @@ import (
 )
 
 func TestMarkRateLimitedKeyCoolsExactKeyNotLastPick(t *testing.T) {
+	freshKeys(t)
 	r := NewKeyRotator([]string{"a", "b"})
 	if got := r.Pick(); got != "a" {
 		t.Fatalf("first pick = %q, want a", got)
@@ -23,6 +24,7 @@ func TestMarkRateLimitedKeyCoolsExactKeyNotLastPick(t *testing.T) {
 }
 
 func TestKeyRotatorRoundRobin(t *testing.T) {
+	freshKeys(t)
 	r := NewKeyRotator([]string{"a", "b", "c"})
 	seen := map[string]int{}
 	for range 6 {
@@ -36,6 +38,7 @@ func TestKeyRotatorRoundRobin(t *testing.T) {
 }
 
 func TestKeyRotatorDedupAndEmpty(t *testing.T) {
+	freshKeys(t)
 	if got := NewKeyRotator(nil); got != nil {
 		t.Fatal("nil input must yield nil rotator")
 	}
@@ -46,6 +49,7 @@ func TestKeyRotatorDedupAndEmpty(t *testing.T) {
 }
 
 func TestKeyRotatorCooldownSkip(t *testing.T) {
+	freshKeys(t)
 	r := NewKeyRotator([]string{"a", "b"})
 	first := r.Pick()
 	r.MarkLastRateLimited()
@@ -62,6 +66,7 @@ func TestKeyRotatorCooldownSkip(t *testing.T) {
 }
 
 func TestKeyRotatorAllCoolingFallsBack(t *testing.T) {
+	freshKeys(t)
 	r := NewKeyRotator([]string{"a"})
 	k := r.Pick()
 	r.MarkLastRateLimited()
@@ -71,6 +76,7 @@ func TestKeyRotatorAllCoolingFallsBack(t *testing.T) {
 }
 
 func TestKeyRotatorAllCoolingPicksPooled(t *testing.T) {
+	freshKeys(t)
 	r := NewKeyRotator([]string{"a", "b"})
 	a := r.Pick()
 	r.MarkLastRateLimited()
@@ -84,18 +90,21 @@ func TestKeyRotatorAllCoolingPicksPooled(t *testing.T) {
 }
 
 func TestKeyRotatorQuotaExhaustedLongerCooldown(t *testing.T) {
+	freshKeys(t)
+	ResetKeyPoolHealth("")
+	t.Cleanup(func() { ResetKeyPoolHealth("") })
 	r := NewKeyRotator([]string{"a", "b"})
 	// A key rejected with quota_exhausted gets a much longer cooldown than a
 	// transient rate limit, so the rotator stops thrashing requests back onto a
-	// key whose usage window is drained (every keyPoolCooldown) and instead
-	// concentrates on keys with available quota.
+	// key whose usage window is drained and instead concentrates on keys with
+	// available quota.
 	q := r.Pick()
 	r.MarkLastQuotaExhausted()
-	quotaUntil := r.cooldown[q]
+	quotaUntil := keyHealthUntil(KeyFingerprint(q))
 
 	rl := r.Pick()
 	r.MarkLastRateLimited()
-	rlUntil := r.cooldown[rl]
+	rlUntil := keyHealthUntil(KeyFingerprint(rl))
 
 	if q == rl {
 		t.Fatalf("precondition: expected two distinct keys, got %q twice", q)
@@ -110,4 +119,58 @@ func TestKeyRotatorQuotaExhaustedLongerCooldown(t *testing.T) {
 			t.Fatalf("quota-exhausted key %q must stay skipped while cooling", q)
 		}
 	}
+}
+
+// TestKeyHealthHardTripAndReset pins the process-wide breaker: a quota failure
+// opens the long window immediately, the status snapshot explains why, and a
+// manual reset makes the key eligible again.
+func TestKeyHealthHardTripAndReset(t *testing.T) {
+	freshKeys(t)
+	ResetKeyPoolHealth("")
+	t.Cleanup(func() { ResetKeyPoolHealth("") })
+	fp := KeyFingerprint("sk-hard")
+	keyHealthTrip(fp, "402 insufficient balance", true)
+	st, ok := KeyPoolHealthSnapshot()[fp]
+	if !ok || !st.Open() {
+		t.Fatalf("hard failure must open the breaker: %#v ok=%v", st, ok)
+	}
+	if st.LastError == "" || st.Trips != 1 {
+		t.Fatalf("state must carry the error and trip count: %#v", st)
+	}
+	if st.OpenUntil.Sub(time.Now()) < 10*time.Minute {
+		t.Fatalf("quota window too short: %v", st.OpenUntil.Sub(time.Now()))
+	}
+	ResetKeyPoolHealth(fp)
+	if _, ok := KeyPoolHealthSnapshot()[fp]; ok {
+		t.Fatal("reset must clear the key state")
+	}
+	if keyHealthOpen(fp) {
+		t.Fatal("reset key must be eligible again")
+	}
+}
+
+// TestKeyRotatorPickExcludingSkipsDeadKey pins the immediate-failover pick:
+// the request that just failed on key A must be retried on B, not A.
+func TestKeyRotatorPickExcludingSkipsDeadKey(t *testing.T) {
+	freshKeys(t)
+	ResetKeyPoolHealth("")
+	t.Cleanup(func() { ResetKeyPoolHealth("") })
+	r := NewKeyRotator([]string{"a", "b"})
+	r.MarkQuotaExhaustedKey("a")
+	next, ok := r.PickExcluding("a")
+	if !ok || next != "b" {
+		t.Fatalf("failover pick = %q ok=%v, want b", next, ok)
+	}
+	// Both keys dead: no eligible failover target.
+	r.MarkQuotaExhaustedKey("b")
+	if next, ok := r.PickExcluding("a"); ok {
+		t.Fatalf("no key should be eligible, got %q", next)
+	}
+}
+
+// freshKeys isolates the process-wide key-health registry between tests.
+func freshKeys(t *testing.T) {
+	t.Helper()
+	ResetKeyPoolHealth("")
+	t.Cleanup(func() { ResetKeyPoolHealth("") })
 }

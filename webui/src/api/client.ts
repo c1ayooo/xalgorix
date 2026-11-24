@@ -13,6 +13,7 @@ import type {
   EnvironmentSettings,
   InstancesResponse,
   IntelTriageStatus,
+  KeyPoolView,
   LLMSettings,
   LLMSettingsRequest,
   ListParams,
@@ -510,6 +511,15 @@ export const api = {
     http<EnvironmentSettings>("/api/settings/environment", {
       method: "POST",
       json: { values },
+    }),
+
+  // LLM key pool: masked status (health/rotation) and breaker reset. The keys
+  // themselves are configured via XALGORIX_API_KEY / XALGORIX_API_KEYS.
+  keyPool: () => http<KeyPoolView>("/api/pool"),
+  resetKeyPool: (id?: string) =>
+    http<KeyPoolView>("/api/pool/reset", {
+      method: "POST",
+      json: id ? { id } : {},
     }),
 
   // Settings backup & migration. Export is a file download (not JSON

@@ -20,6 +20,9 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
+
+	"github.com/c1ayooo/xalgorix/v4/internal/llm"
 )
 
 // maxKeyPoolSize bounds the pool the same way an operator would be bounded
@@ -29,9 +32,26 @@ const (
 	maxKeyPoolKeyLen = 1024
 )
 
+// keyPoolKeyView is one key's masked status row. The health fields are the
+// process-wide breaker state (llm keyhealth): why traffic moved off this key
+// and until when. No secret material is ever included.
+type keyPoolKeyView struct {
+	ID        string `json:"id"`
+	Masked    string `json:"masked"`
+	State     string `json:"state"` // ok | cooling
+	OpenUntil string `json:"open_until,omitempty"`
+	Trips     int    `json:"trips,omitempty"`
+	LastError string `json:"last_error,omitempty"`
+	LastAt    string `json:"last_at,omitempty"`
+}
+
 type keyPoolResponse struct {
 	Keys   int      `json:"keys"`
 	Masked []string `json:"masked"`
+	// Strategy is the rotation mode the clients run with: round_robin (default),
+	// sticky (overflow failover) or off (fewer than two keys).
+	Strategy string           `json:"strategy"`
+	Entries  []keyPoolKeyView `json:"entries"`
 	// RestartNeeded mirrors applyEnvironmentUpdates' verdict. The pool and
 	// the primary key apply to new scans immediately, so this is normally
 	// false; it is surfaced for completeness.
@@ -39,16 +59,57 @@ type keyPoolResponse struct {
 }
 
 // currentKeyPool renders the live pool (runtime config) with every key
-// masked. The response deliberately contains no secret material.
+// masked, plus each key's circuit-breaker state. The response deliberately
+// contains no secret material.
 func (s *Server) currentKeyPool() keyPoolResponse {
 	s.settingsMu.RLock()
 	defer s.settingsMu.RUnlock()
-	pool := append([]string(nil), s.cfg.APIKeys...)
+	pool := make([]string, 0, len(s.cfg.APIKeys)+1)
+	seen := make(map[string]bool, len(s.cfg.APIKeys)+1)
+	for _, k := range append([]string{s.cfg.APIKey}, s.cfg.APIKeys...) {
+		k = strings.TrimSpace(k)
+		if k == "" || seen[k] {
+			continue
+		}
+		seen[k] = true
+		pool = append(pool, k)
+	}
 	masked := maskedKeyPoolList(pool)
 	if masked == nil {
 		masked = []string{}
 	}
-	return keyPoolResponse{Keys: len(pool), Masked: masked}
+	strategy := "off"
+	if len(pool) > 1 {
+		strategy = "round_robin"
+		if strings.EqualFold(strings.TrimSpace(s.cfg.KeyPoolStrategy), "sticky") {
+			strategy = "sticky"
+		}
+	}
+	health := llm.KeyPoolHealthSnapshot()
+	entries := make([]keyPoolKeyView, 0, len(pool))
+	for i, k := range pool {
+		fp := llm.KeyFingerprint(k)
+		st := health[fp]
+		state := "ok"
+		if st.Open() {
+			state = "cooling"
+		}
+		view := keyPoolKeyView{
+			ID:        fp,
+			Masked:    masked[i],
+			State:     state,
+			Trips:     st.Trips,
+			LastError: st.LastError,
+		}
+		if !st.OpenUntil.IsZero() {
+			view.OpenUntil = st.OpenUntil.UTC().Format(time.RFC3339)
+		}
+		if !st.LastAt.IsZero() {
+			view.LastAt = st.LastAt.UTC().Format(time.RFC3339)
+		}
+		entries = append(entries, view)
+	}
+	return keyPoolResponse{Keys: len(pool), Masked: masked, Strategy: strategy, Entries: entries}
 }
 
 // cleanKeyPoolInput trims, drops empties, dedupes preserving order, and
@@ -125,4 +186,26 @@ func (s *Server) handleKeyPool(w http.ResponseWriter, r *http.Request) {
 			"error": "method not allowed",
 		})
 	}
+}
+
+// handleKeyPoolReset serves POST /api/pool/reset: clear one key's breaker
+// ({"id":"<fingerprint>"}) or every key's (empty body / empty id). This is the
+// operator's "try this key again now" action after topping up an account.
+func (s *Server) handleKeyPoolReset(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONStatus(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	var body struct {
+		ID string `json:"id"`
+	}
+	// An empty body means "reset everything"; malformed JSON is still a 400.
+	if r.ContentLength != 0 {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSONStatus(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+			return
+		}
+	}
+	llm.ResetKeyPoolHealth(strings.TrimSpace(body.ID))
+	writeJSONStatus(w, http.StatusOK, s.currentKeyPool())
 }

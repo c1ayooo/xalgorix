@@ -1614,6 +1614,10 @@ func (c *Client) chatWithRetry(messages []Message, tools []ToolDefinition, calls
 	// the failure is handled (a dead pooled key then survives every drop
 	// and 401s every other request for the rest of the scan).
 	var usedKey string
+	// fastRetry skips the backoff when the failure was a dead/exhausted key and
+	// another pooled key can serve the request immediately: waiting 30s to try a
+	// different account is pure lost time.
+	fastRetry := false
 
 	for attempt := range maxRetries {
 		if ctx := c.loadCtx(); ctx.Err() != nil {
@@ -1628,7 +1632,11 @@ func (c *Client) chatWithRetry(messages []Message, tools []ToolDefinition, calls
 
 			// Smart backoff based on error type
 			backoff := time.Duration(attempt*3) * time.Second
-			if lastErr != nil {
+			if fastRetry {
+				// Immediate failover onto another pooled key.
+				backoff = 0
+				fastRetry = false
+			} else if lastErr != nil {
 				errStr := lastErr.Error()
 				if isRateLimitError(errStr) {
 					backoff = 30 * time.Second // rate limit: wait longer
@@ -1656,6 +1664,9 @@ func (c *Client) chatWithRetry(messages []Message, tools []ToolDefinition, calls
 
 		result, usage, err := c.doChatWithUsage(messages, tools, callsOut, reasoningOut, &usedKey)
 		if err == nil {
+			if c.keyRotator != nil {
+				c.keyRotator.NoteSuccessKey(usedKey)
+			}
 			return result, usage, nil
 		}
 		lastErr = err
@@ -1690,12 +1701,19 @@ func (c *Client) chatWithRetry(messages []Message, tools []ToolDefinition, calls
 		// just like rate limits. Avoid replaying a full request inside both loops.
 		classified := ClassifyErrorString(errStr)
 		if classified.Class == ErrorClassOverloaded || classified.Class == ErrorClassQuotaExhausted {
-			// Cool the pooled key before handing off to the agent's bounded
-			// backoff, so the retry that follows picks a different key instead
-			// of round-robining back onto this one. Quota exhaustion gets the
-			// long cooldown (the usage window stays drained far longer than a
-			// transient overload).
+			// Cool the pooled key (quota gets the long window) and, when another
+			// key can serve this request, fail over immediately instead of
+			// handing the same dead account to the agent's backoff. A
+			// non-streaming request is atomic, so replaying it on another key is
+			// safe.
 			c.noteKeyRateLimitedForErrorForKey(errStr, usedKey)
+			if c.keyRotator != nil {
+				if next, ok := c.keyRotator.PickExcluding(usedKey); ok {
+					log.Printf("[llm] key pool failover after %s → %s…", classifyShort(errStr), maskKeyForLog(next))
+					fastRetry = true
+					continue
+				}
+			}
 			return "", nil, fmt.Errorf("upstream unavailable: %w", err)
 		}
 
@@ -1705,6 +1723,13 @@ func (c *Client) chatWithRetry(messages []Message, tools []ToolDefinition, calls
 			// 401s that abort the scan.
 			if isAuthFailure(errStr) {
 				c.noteKeyInvalidForKey(usedKey)
+				if c.keyRotator != nil {
+					if next, ok := c.keyRotator.PickExcluding(usedKey); ok {
+						log.Printf("[llm] key pool failover after auth failure → %s…", maskKeyForLog(next))
+						fastRetry = true
+						continue
+					}
+				}
 			}
 			log.Printf("[llm] Non-retryable LLM error, returning immediately: %v", err)
 			return "", nil, fmt.Errorf("LLM request failed: %w", err)
@@ -1713,6 +1738,15 @@ func (c *Client) chatWithRetry(messages []Message, tools []ToolDefinition, calls
 		// Track if last error was a rate limit for the post-loop wrapper
 		if isRateLimitError(errStr) {
 			c.noteKeyRateLimitedForErrorForKey(errStr, usedKey)
+			// A different key can often serve the request immediately; only fall
+			// back to the agent's bounded backoff when no key is eligible.
+			if c.keyRotator != nil {
+				if next, ok := c.keyRotator.PickExcluding(usedKey); ok {
+					log.Printf("[llm] key pool failover after rate limit → %s…", maskKeyForLog(next))
+					fastRetry = true
+					continue
+				}
+			}
 			// A 429/usage-window response is not made more likely to succeed by
 			// replaying the same full context three to five times immediately.
 			// Return to the agent loop so its bounded, interruptible backoff owns
