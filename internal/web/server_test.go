@@ -24,6 +24,7 @@ import (
 	"github.com/c1ayooo/xalgorix/v4/internal/auth"
 	"github.com/c1ayooo/xalgorix/v4/internal/config"
 	"github.com/c1ayooo/xalgorix/v4/internal/llm"
+	"github.com/c1ayooo/xalgorix/v4/internal/platform"
 	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
 	"github.com/c1ayooo/xalgorix/v4/internal/scopeguard"
 	"github.com/c1ayooo/xalgorix/v4/internal/tools/reporting"
@@ -981,6 +982,12 @@ func TestQueueState_PreservesAllConfig(t *testing.T) {
 		ScanContextPaths: []string{
 			"/uploads/ctx/a.yaml", "/uploads/ctx/b.har",
 		},
+		Objective:            &platform.Objective{Kind: platform.ObjectiveKindEngagement, Statement: "prove access"},
+		ObjectiveProjectID:   "proj-1",
+		ObjectiveTaskID:      "task-1",
+		ObjectiveGoal:        "raw goal",
+		ObjectiveInstruction: "raw instruction",
+		AuditMode:            platform.TaskAuditEnforce,
 	}
 	activeDir := filepath.Join(s.dataDir, "a.test", "2026-05-23", "scan-active")
 	activeSubDir := filepath.Join(s.dataDir, "api.a.test", "2026-05-23", "scan-child")
@@ -1045,6 +1052,12 @@ func TestQueueState_PreservesAllConfig(t *testing.T) {
 		restored.CodeScan != "review" || restored.SourceRepo != "https://git.example/repo.git" ||
 		len(restored.ScanContextPaths) != 2 {
 		t.Errorf("resume request lost execution config: %+v", restored)
+	}
+	if restored.ObjectiveProjectID != "proj-1" || restored.ObjectiveTaskID != "task-1" ||
+		restored.ObjectiveGoal != "raw goal" || restored.ObjectiveInstruction != "raw instruction" ||
+		restored.AuditMode != platform.TaskAuditEnforce || restored.Objective == nil ||
+		restored.Objective.Kind != platform.ObjectiveKindEngagement {
+		t.Errorf("resume request lost task coordinates/objective/audit posture: %+v", restored)
 	}
 	if state.ActiveTarget != "https://a.test" || state.ActiveScanDir != activeDir || state.ActiveScanID != "scan-active" {
 		t.Errorf("active scan progress not preserved: %#v", state)

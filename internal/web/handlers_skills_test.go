@@ -159,3 +159,71 @@ func TestSkillHandlersContract(t *testing.T) {
 		t.Fatalf("nested path = %d, want 404", rr.Code)
 	}
 }
+
+// TestBuiltinSkillHandlers pins the read-only corpus projection: the list is
+// served without a platform store, detail returns the markdown body with
+// frontmatter stripped, and unknown names are 404.
+func TestBuiltinSkillHandlers(t *testing.T) {
+	s := newTestServer(t, nil) // no platform store: corpus is compiled in
+
+	rr := httptest.NewRecorder()
+	s.handleBuiltinSkills(rr, httptest.NewRequest(http.MethodGet, "/api/skills/builtin", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("list = %d: %s", rr.Code, rr.Body.String())
+	}
+	var list struct {
+		Skills []struct {
+			Name     string   `json:"name"`
+			Category string   `json:"category"`
+			Tags     []string `json:"tags"`
+		} `json:"skills"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &list); err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Skills) < 100 {
+		t.Fatalf("builtin list = %d rows, want the embedded corpus", len(list.Skills))
+	}
+	first := list.Skills[0]
+
+	rr = httptest.NewRecorder()
+	s.handleBuiltinSkillDetail(rr, httptest.NewRequest(http.MethodGet,
+		"/api/skills/builtin/"+first.Name+"?category="+first.Category, nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("detail = %d: %s", rr.Code, rr.Body.String())
+	}
+	var detail struct {
+		Name string `json:"name"`
+		Body string `json:"body"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &detail); err != nil {
+		t.Fatal(err)
+	}
+	if detail.Name != first.Name || strings.TrimSpace(detail.Body) == "" {
+		t.Fatalf("detail wrong: name=%q bodyLen=%d", detail.Name, len(detail.Body))
+	}
+	if strings.HasPrefix(strings.TrimSpace(detail.Body), "---") {
+		t.Fatal("detail body still carries frontmatter")
+	}
+
+	// Unknown name → 404; nested path → 404; non-GET → 405.
+	for _, tc := range []struct {
+		name     string
+		method   string
+		path     string
+		wantCode int
+		call     func(w http.ResponseWriter, r *http.Request)
+	}{
+		{"unknown", http.MethodGet, "/api/skills/builtin/nope-not-a-skill", http.StatusNotFound, s.handleBuiltinSkillDetail},
+		{"nested", http.MethodGet, "/api/skills/builtin/a/b", http.StatusNotFound, s.handleBuiltinSkillDetail},
+		{"post", http.MethodPost, "/api/skills/builtin", http.StatusMethodNotAllowed, s.handleBuiltinSkills},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rr := httptest.NewRecorder()
+			tc.call(rr, httptest.NewRequest(tc.method, tc.path, nil))
+			if rr.Code != tc.wantCode {
+				t.Fatalf("%s code = %d, want %d", tc.name, rr.Code, tc.wantCode)
+			}
+		})
+	}
+}

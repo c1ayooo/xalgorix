@@ -7,6 +7,7 @@ package web
 import (
 	"context"
 	"errors"
+	"log"
 	"strings"
 
 	"github.com/c1ayooo/xalgorix/v4/internal/approval"
@@ -55,9 +56,22 @@ var _ engine.ApprovalWaiter = (*einoApprovalBroker)(nil)
 
 func (s *Server) einoApprovalBroker(instanceID string, sctx *scanctx.ScanContext) *einoApprovalBroker {
 	svc := s.approvalService()
-	if svc == nil || svc.policy.Mode != approval.ModeEnforce {
+	if svc == nil {
 		return nil
 	}
+	// Per-run posture: a task with audit=enforce is gated even when the process
+	// default is off (and a task with audit=off stays observe-only even when
+	// the process default is enforce).
+	mode := s.runAuditMode(sctx)
+	if mode != approval.ModeEnforce {
+		log.Printf("[approval] run %s: HITL observe-only (effective audit mode=%s)", instanceID, mode)
+		return nil
+	}
+	taskID := ""
+	if sctx != nil {
+		taskID = sctx.TaskID
+	}
+	log.Printf("[approval] run %s: HITL ENFORCED (effective audit mode=%s, task=%s)", instanceID, mode, taskID)
 	return &einoApprovalBroker{svc: svc, instanceID: instanceID, sctx: sctx, mcpExempt: s.mcpApprovalExemptSet()}
 }
 
@@ -100,7 +114,12 @@ func (b *einoApprovalBroker) RequestApproval(_ context.Context, req engine.Appro
 	if strings.HasPrefix(req.ToolName, "mcp_") && b.mcpServerExempt(req.Args["mcp_server"]) {
 		return "", nil
 	}
-	verdict := b.svc.policy.Evaluate(req.ToolName, req.Args)
+	// The broker only exists for enforce-mode runs, but evaluate with an
+	// explicit enforce policy so the global default cannot dilute the run's
+	// snapshotted posture.
+	policy := b.svc.policy
+	policy.Mode = approval.ModeEnforce
+	verdict := policy.Evaluate(req.ToolName, req.Args)
 	if verdict.Decision == approval.Allow {
 		return "", nil
 	}

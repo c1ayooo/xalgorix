@@ -93,8 +93,8 @@ func builtinToolCatalog() []ToolCatalogEntry {
 		},
 		{
 			Name: "list_requests", Category: "network",
-			Description: "List HTTP requests captured by the traffic proxy.",
-			Parameters:  []ToolCatalogParameter{param("count", false, "max rows"), param("filter", false, "URL substring")},
+			Description: "List this run's MITM traffic archive (raw request/response); seq=<n> returns one exchange's wire packets.",
+			Parameters:  []ToolCatalogParameter{param("count", false, "max rows"), param("filter", false, "URL substring"), param("method", false, "HTTP method"), param("seq", false, "exact exchange id")},
 		},
 
 		// ── Browser ─────────────────────────────────────────────────────
@@ -171,6 +171,48 @@ func builtinToolCatalog() []ToolCatalogEntry {
 			Name: "read_tool_output", Category: "notes",
 			Description: "Read an archived tool output that was spilled to disk and replaced by a reference id.",
 			Parameters:  []ToolCatalogParameter{param("id", true, "archive id")},
+		},
+
+		// ── Deterministic analysis ──────────────────────────────────────
+		{
+			Name: "detect_honeypot", Category: "analysis",
+			Description: "Score an observed service against the static honeypot signature library (0-1 plus matched signatures).",
+			Parameters: []ToolCatalogParameter{
+				param("port", false, "service port"), param("banner", false, "protocol banner / Server header"),
+				param("title", false, "HTTP title"), param("body", false, "response body excerpt"),
+				param("cert_subject", false, "TLS subject"), param("cert_issuer", false, "TLS issuer"),
+			},
+		},
+		{
+			Name: "assess_nuclei_hit", Category: "analysis",
+			Description: "Deterministically triage one scanner/nuclei hit: class, confirmed|needs_review verdict, reasons and review checklist.",
+			Parameters: []ToolCatalogParameter{
+				param("template_id", false, "template id"), param("name", false, "result name"),
+				param("tags", false, "comma-separated tags"), param("type", false, "result type"),
+				param("status", false, "HTTP status"), param("response", false, "response excerpt"),
+				param("extracted", false, "comma-separated extracted values"), param("matched_at", false, "matched URL"),
+				param("template", false, "template YAML"), param("template_path", false, "template file path"),
+			},
+		},
+		{
+			Name: "parse_poc_template", Category: "analysis",
+			Description: "Parse a nuclei template into normalized fields (id, severity, CVE/CWE, CVSS, tags, digest) keeping raw YAML intact.",
+			Parameters:  []ToolCatalogParameter{param("content", false, "raw YAML"), param("path", false, "template file path")},
+		},
+		{
+			Name: "diff_responses", Category: "analysis",
+			Description: "Structurally diff two captured HTTP responses or JSON bodies; filters timestamps and trace ids.",
+			Parameters:  []ToolCatalogParameter{param("file_a", true, "baseline file"), param("file_b", true, "comparison file")},
+		},
+		{
+			Name: "solve_slider_captcha", Category: "analysis",
+			Description: "Solve an image-based slider captcha from background + piece images; returns offset, distance and optional drag track.",
+			Parameters: []ToolCatalogParameter{
+				param("background", true, "background image path/data URL/base64"), param("piece", true, "piece image path/data URL/base64"),
+				param("initial_x", false, "piece visible left edge"), param("min_offset", false, "search lower bound"),
+				param("max_offset", false, "search upper bound"), param("with_track", false, "include drag track"),
+				param("seed", false, "track seed"),
+			},
 		},
 
 		// ── Skills ──────────────────────────────────────────────────────

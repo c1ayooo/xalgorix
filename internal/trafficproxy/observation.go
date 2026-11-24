@@ -36,6 +36,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/c1ayooo/xalgorix/v4/internal/approval"
+	"github.com/c1ayooo/xalgorix/v4/internal/assetobs"
 	"github.com/c1ayooo/xalgorix/v4/internal/infoitem"
 	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
 )
@@ -186,9 +187,17 @@ func observeTraffic(obs TrafficObservation) {
 			obs.Raw.Seq = seq
 		}
 	}
-	if err := sc.Ledger.AppendTrafficObservation(buildTrafficInfoItem(obs), trafficSummary(obs)); err != nil {
-		log.Printf("[trafficproxy] traffic observation for %s not journaled: %v", obs.ScanCtxID, err)
+	item := buildTrafficInfoItem(obs)
+	if projectID := strings.TrimSpace(sc.ProjectID); projectID != "" {
+		item.Coordinates.Context["project_id"] = projectID
 	}
+	if err := sc.Ledger.AppendTrafficObservation(item, trafficSummary(obs)); err != nil {
+		log.Printf("[trafficproxy] traffic observation for %s not journaled: %v", obs.ScanCtxID, err)
+		return
+	}
+	// Observed asset ingestion: the InfoItem is the provenance authority; the
+	// asset graph only records the normalized identity and this reference.
+	assetobs.IngestURL(sc, item.ID, obs.URL, "traffic_observed")
 }
 
 // trafficSummary renders the bounded human-readable summary stored alongside

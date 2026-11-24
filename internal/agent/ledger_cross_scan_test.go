@@ -40,6 +40,8 @@ type crossScanStubReader struct {
 	assocErr      error
 	regionQueries []infoitem.RegionQuery
 	assocQueries  []infoitem.AssociationQuery
+	byID          map[string]infoitem.Item
+	byIDErr       error
 }
 
 func (s *crossScanStubReader) Region(_ context.Context, q infoitem.RegionQuery) (infoitem.RegionResult, error) {
@@ -66,6 +68,17 @@ func (s *crossScanStubReader) Associate(_ context.Context, q infoitem.Associatio
 
 func (s *crossScanStubReader) ContextSlice(_ context.Context, _ infoitem.ContextQuery) (infoitem.ContextResult, error) {
 	return infoitem.ContextResult{}, nil
+}
+
+func (s *crossScanStubReader) GetByID(_ context.Context, scanID, id string) (infoitem.Item, error) {
+	if s.byIDErr != nil {
+		return infoitem.Item{}, s.byIDErr
+	}
+	item, ok := s.byID[scanID+"/"+id]
+	if !ok {
+		return infoitem.Item{}, infoitem.ErrNotFound
+	}
+	return item, nil
 }
 
 func crossScanItem(id, scanID string, nature infoitem.Nature) infoitem.Item {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"sort"
 	"strings"
 	"time"
@@ -120,6 +121,12 @@ func (s *Store) Apply(ctx context.Context, rec domainjournal.Record) error {
 			return err
 		}
 	}
+	// R8.3 association lighting: deterministic lexical candidates become
+	// explicit `references` edges. Best-effort: a recall failure must not fail
+	// the core cold-path upsert.
+	if err := inferRelationsTx(ctx, tx, rec); err != nil {
+		log.Printf("[infoitem] %s seq %d: relation inference skipped: %v", rec.ScanID, rec.Seq, err)
+	}
 	if err := advanceWatermark(ctx, tx, rec.ScanID); err != nil {
 		return err
 	}
@@ -130,6 +137,10 @@ func (s *Store) Apply(ctx context.Context, rec domainjournal.Record) error {
 }
 
 func upsertItem(ctx context.Context, tx pgx.Tx, item infoitem.Item) error {
+	// Rule-based coordinate derivation runs at the persistence boundary so a
+	// producer that omits a derivable purpose is stored with a truthful
+	// coordinate status instead of a hard-coded "complete".
+	item.Normalize()
 	content, err := json.Marshal(item.Coordinates.Content)
 	if err != nil {
 		return fmt.Errorf("infoitem/postgres: marshal content: %w", err)
@@ -161,13 +172,19 @@ func upsertItem(ctx context.Context, tx pgx.Tx, item infoitem.Item) error {
 	validFrom := optionalTime(item.ValidFrom)
 	status := item.CoordinateStatus
 	if status == "" {
-		status = infoitem.CoordinatesComplete
+		status = item.ClassifyCoordinateStatus()
 	}
 	_, err = tx.Exec(ctx, `
 		INSERT INTO info_items
 			(id, scan_id, source_seq, nature, content, coordinates, source, subject, purpose, context,
-			 relation_ids, supports, confidence, coordinate_status, valid_from, valid_until, observed_at, created_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+			 relation_ids, supports, confidence, coordinate_status, valid_from, valid_until, observed_at, created_at,
+			 instance_id)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
+			COALESCE((
+				SELECT NULLIF(j.instance_id, '')
+				FROM run_journal j
+				WHERE j.scan_id = $2 AND j.seq = $3
+			), ''))
 		ON CONFLICT (scan_id, id) DO UPDATE SET
 			source_seq = EXCLUDED.source_seq,
 			nature = EXCLUDED.nature,
@@ -184,7 +201,8 @@ func upsertItem(ctx context.Context, tx pgx.Tx, item infoitem.Item) error {
 			valid_from = EXCLUDED.valid_from,
 			valid_until = EXCLUDED.valid_until,
 			observed_at = EXCLUDED.observed_at,
-			created_at = EXCLUDED.created_at
+			created_at = EXCLUDED.created_at,
+			instance_id = COALESCE(NULLIF(EXCLUDED.instance_id, ''), info_items.instance_id)
 		WHERE info_items.source_seq <= EXCLUDED.source_seq`,
 		item.ID, item.ScanID, int64(item.SourceSeq), string(item.Nature), content, coordinates,
 		source, subject, item.Coordinates.Purpose, itemContext, relationIDs, supports,
@@ -207,6 +225,141 @@ func upsertRelation(ctx context.Context, tx pgx.Tx, rel infoitem.Relation) error
 		return fmt.Errorf("infoitem/postgres: upsert relation: %w", err)
 	}
 	return nil
+}
+
+const (
+	// relationRecallCandidates bounds the cold-path lexical comparison window.
+	relationRecallCandidates = 50
+	// relationRecallMin keeps only clearly similar candidates as edges.
+	relationRecallMin = 0.5
+	// relationRecallMinRunes avoids inferring edges from placeholder-short
+	// text (for example "observed response k-1"), where a few shared tokens
+	// are noise rather than evidence of a related observation.
+	relationRecallMinRunes = 40
+)
+
+// inferRelationsTx writes deterministic lexical `references` candidates for
+// the items in one journal record. It is not semantic inference: the score and
+// both IDs are stored, so a consumer can re-check and ignore an edge.
+func inferRelationsTx(ctx context.Context, tx pgx.Tx, rec domainjournal.Record) error {
+	items := make([]infoitem.Item, 0, 1+len(rec.InfoItems))
+	if rec.InfoItem != nil {
+		items = append(items, *rec.InfoItem)
+	}
+	items = append(items, rec.InfoItems...)
+	if len(items) == 0 {
+		return nil
+	}
+	for n := range items {
+		items[n].ScanID = rec.ScanID
+		if items[n].Coordinates.ObservedAt.IsZero() {
+			items[n].Coordinates.ObservedAt = rec.At
+		}
+	}
+	now := time.Now().UTC()
+	for _, item := range items {
+		text := strings.TrimSpace(item.Coordinates.Content.Text)
+		if len([]rune(text)) < relationRecallMinRunes || item.ID == "" {
+			continue
+		}
+		rows, err := tx.Query(ctx, `
+			SELECT id, COALESCE(content->>'text', '')
+			FROM info_items
+			WHERE scan_id = $1 AND id <> $2
+			ORDER BY source_seq DESC, id ASC
+			LIMIT $3`,
+			rec.ScanID, item.ID, relationRecallCandidates,
+		)
+		if err != nil {
+			return err
+		}
+		docs := make([]infoitem.Doc, 0, relationRecallCandidates)
+		for rows.Next() {
+			var id, body string
+			if err := rows.Scan(&id, &body); err != nil {
+				rows.Close()
+				return err
+			}
+			docs = append(docs, infoitem.Doc{ID: id, Title: id, Summary: body})
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		for _, hit := range infoitem.Rank(text, docs, 3) {
+			if hit.Score < relationRecallMin {
+				continue
+			}
+			if err := upsertRelation(ctx, tx, infoitem.Relation{
+				ScanID:    rec.ScanID,
+				SourceSeq: rec.Seq,
+				FromID:    item.ID,
+				ToID:      hit.ID,
+				Type:      infoitem.RelationReferences,
+				Weight:    hit.Score,
+				CreatedAt: now,
+			}); err != nil {
+				return err
+			}
+		}
+	}
+
+	// Deterministic structural edges: same subject, same producing session,
+	// and control-vs-positive contradictions. The lexical pass above only
+	// covers long prose; these edges need no text at all.
+	for _, item := range items {
+		if item.ID == "" {
+			continue
+		}
+		candidates, err := loadRelationCandidates(ctx, tx, rec.ScanID, item.ID, infoitem.RelationCandidateLimit)
+		if err != nil {
+			return err
+		}
+		for _, rel := range infoitem.InferRelations(item, candidates, rec.Seq, now) {
+			if err := upsertRelation(ctx, tx, rel); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// loadRelationCandidates reads the bounded recent window used by structural
+// relation inference. It selects only the fields inference compares, never
+// content bodies.
+func loadRelationCandidates(ctx context.Context, tx pgx.Tx, scanID, itemID string, limit int) ([]infoitem.RelationCandidate, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT id,
+		       COALESCE(subject->>'kind', ''),
+		       COALESCE(subject->>'identifier', ''),
+		       COALESCE(purpose, ''),
+		       COALESCE(context->>'evidence_kind', ''),
+		       COALESCE(source->>'agent_id', ''),
+		       COALESCE(context->>'hypothesis', '')
+		FROM info_items
+		WHERE scan_id = $1 AND id <> $2
+		ORDER BY source_seq DESC, id ASC
+		LIMIT $3`, scanID, itemID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("infoitem/postgres: load relation candidates: %w", err)
+	}
+	defer rows.Close()
+	out := make([]infoitem.RelationCandidate, 0, limit)
+	for rows.Next() {
+		var c infoitem.RelationCandidate
+		if err := rows.Scan(&c.ID, &c.Subject.Kind, &c.Subject.Identifier, &c.Purpose,
+			&c.EvidenceKind, &c.AgentID, &c.HypothesisID); err != nil {
+			return nil, fmt.Errorf("infoitem/postgres: scan relation candidate: %w", err)
+		}
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("infoitem/postgres: iterate relation candidates: %w", err)
+	}
+	return out, nil
 }
 
 func advanceWatermark(ctx context.Context, tx pgx.Tx, scanID string) error {
@@ -518,6 +671,25 @@ func (s *Store) ContextSlice(ctx context.Context, q infoitem.ContextQuery) (info
 		return infoitem.ContextResult{}, err
 	}
 	return infoitem.ContextResult{Items: items.items, Truncated: items.truncated, Incomplete: incomplete, GapReason: reason}, nil
+}
+
+// GetByID returns one exact cold-path item. Authorization of the scan id is
+// the caller's responsibility (project/task scope); this store only enforces
+// the (scan_id, id) lookup.
+func (s *Store) GetByID(ctx context.Context, scanID, id string) (infoitem.Item, error) {
+	id = strings.TrimSpace(id)
+	if strings.TrimSpace(scanID) == "" || id == "" {
+		return infoitem.Item{}, infoitem.ErrNotFound
+	}
+	items, err := s.itemsByIDs(ctx, scanID, []string{id})
+	if err != nil {
+		return infoitem.Item{}, err
+	}
+	item, ok := items[id]
+	if !ok {
+		return infoitem.Item{}, infoitem.ErrNotFound
+	}
+	return item, nil
 }
 
 func (s *Store) itemsByIDs(ctx context.Context, scanID string, ids []string) (map[string]infoitem.Item, error) {

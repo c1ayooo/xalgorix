@@ -355,7 +355,7 @@ func (s *ApprovalService) fenceDenial(instanceID string, sctx *scanctx.ScanConte
 	if store == nil {
 		return nil, false // fail-open: scanning never depends on the platform
 	}
-	ctx, cancel := storeCtx()
+	ctx, cancel := s.storeCtx()
 	defer cancel()
 	projectID, taskID, runID := s.resolveOwnership(ctx, store, instanceID)
 	reason := s.fenceReason(ctx, store, projectID, verdict)

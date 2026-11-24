@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/c1ayooo/xalgorix/v4/internal/graph"
 	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
 	"github.com/c1ayooo/xalgorix/v4/internal/tools/reporting"
 )
@@ -89,6 +90,23 @@ const defaultMaxFinishRejections = 15
 func scanCompletionAssessment(state *ScanState) (string, []string) {
 	if state == nil {
 		return CompletionStatusCompleted, nil
+	}
+	// R7 planner_worker: the graph frontier is the completion contract; the
+	// main agent's ScanState never holds the plan.
+	if state.PlannerWorkerMode {
+		if repo := graph.Backend(); repo != nil {
+			if scanID := planGraphID(state); scanID != "" {
+				ctx, cancel := planGraphContext()
+				counts, err := repo.Counts(ctx, scanID)
+				cancel()
+				if err == nil {
+					if counts.BlockedIntents > 0 {
+						return CompletionStatusCompletedWithBlocked, nil
+					}
+					return CompletionStatusCompleted, nil
+				}
+			}
+		}
 	}
 	var reasons []string
 

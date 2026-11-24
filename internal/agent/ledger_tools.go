@@ -31,12 +31,16 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/c1ayooo/xalgorix/v4/internal/infoitem"
 	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
 	"github.com/c1ayooo/xalgorix/v4/internal/tools"
 )
@@ -146,6 +150,211 @@ func (a *Agent) registerLedgerTools(reg *tools.Registry) {
 		},
 		Execute: a.claimNextHypothesisTool,
 	})
+
+	reg.Register(&tools.Tool{
+		Name: "read_info_item",
+		Description: "Read one ledger evidence / InfoItem in this scan at an explicit layer. " +
+			"index returns IDs and a bounded title/summary; detail returns the bounded body " +
+			"(request/response/supports); artifact returns references only (info_item_id, finding_id), " +
+			"never bytes. Use this instead of guessing from an earlier prompt: the index is what " +
+			"planners see, detail is an explicit fetch. If the ID is not in this scan's ledger, pass " +
+			"its scan_id (cross-scan reads require the run's project scope).",
+		Parameters: []tools.Parameter{
+			{Name: "id", Description: "Evidence ID (e.g. E-12), InfoItem ID, or the ID shown in an index line.", Required: true},
+			{Name: "layer", Description: "index (default), detail, or artifact.", Required: false},
+			{Name: "scan_id", Description: "Optional scan/run id for a cold-path lookup outside this scan; only same-project scans are accepted.", Required: false},
+		},
+		Execute: a.readInfoItemTool,
+	})
+
+	reg.Register(&tools.Tool{
+		Name: "record_deviation",
+		Description: "Record a concrete departure from the assigned intent: a target that behaved " +
+			"differently, a chain step skipped, a scope/blocker discovered, or a material change in " +
+			"the plan you actually executed. Audit-only — it does not change plan state. Use it when " +
+			"the honest work differs from the intent so the planner and report can explain why.",
+		Parameters: []tools.Parameter{
+			{Name: "deviation", Description: "What changed and why, with concrete evidence/refs.", Required: true},
+			{Name: "intent_id", Description: "The claimed intent id (PlanTask id), if known.", Required: false},
+		},
+		Execute: a.recordDeviationTool,
+	})
+}
+
+func (a *Agent) recordDeviationTool(args map[string]string) (tools.Result, error) {
+	if a.scanCtx == nil || a.scanCtx.Ledger == nil {
+		return tools.Result{Error: "ledger unavailable in this context"}, nil
+	}
+	deviation := strings.TrimSpace(args["deviation"])
+	if deviation == "" {
+		return tools.Result{Error: "deviation is required"}, nil
+	}
+	if err := a.scanCtx.Ledger.AppendDeviation(args["intent_id"], deviation, a.ID); err != nil {
+		return tools.Result{Error: err.Error()}, nil
+	}
+	return tools.Result{Output: "deviation recorded"}, nil
+}
+
+// SetCrossScanResolver installs the project-scope guard for read_info_item's
+// scan_id parameter. Without it, cross-scan detail is refused; same-scan
+// cold-path fallback still works.
+func (a *Agent) SetCrossScanResolver(fn func(scanID string) bool) {
+	a.crossScanMu.Lock()
+	a.crossScanAllowed = fn
+	a.crossScanMu.Unlock()
+}
+
+func (a *Agent) crossScanOK(scanID string) bool {
+	a.crossScanMu.RLock()
+	fn := a.crossScanAllowed
+	a.crossScanMu.RUnlock()
+	return fn != nil && fn(scanID)
+}
+
+// readInfoItemTool serves the L0/L1/L2 read views. It reads the shared ledger
+// first; on a miss it falls back to the cold-path Reader for the same scan
+// (or an explicitly authorized same-project scan). Cross-scan reads require a
+// resolver, because the tool argument is model-controlled and the Reader
+// itself does not know project membership.
+func (a *Agent) readInfoItemTool(args map[string]string) (tools.Result, error) {
+	id := strings.TrimSpace(args["id"])
+	if id == "" {
+		return tools.Result{Error: "id is required (evidence ID, InfoItem ID, or an index line ID)"}, nil
+	}
+	layer := strings.ToLower(strings.TrimSpace(args["layer"]))
+	if layer == "" {
+		layer = "index"
+	}
+	if layer != "index" && layer != "detail" && layer != "artifact" {
+		return tools.Result{Error: "layer must be index, detail, or artifact"}, nil
+	}
+	current := ""
+	if a.scanCtx != nil {
+		current = strings.TrimSpace(a.scanCtx.ID)
+	}
+	target := strings.TrimSpace(args["scan_id"])
+	if target == "" {
+		target = current
+	}
+	if target != "" && target != current {
+		if !a.crossScanOK(target) {
+			return tools.Result{Error: "cross-scan detail is not authorized for scan " + target}, nil
+		}
+	}
+
+	if current != "" && target == current {
+		if l := a.ledger(); l != nil {
+			for _, h := range l.All() {
+				for i := range h.Evidence {
+					ev := &h.Evidence[i]
+					if ev.ID != id && ev.InfoItemID != id {
+						continue
+					}
+					out, err := json.Marshal(infoItemView(h.ID, ev, layer))
+					if err != nil {
+						return tools.Result{Error: "encode info item: " + err.Error()}, nil
+					}
+					return tools.Result{Output: string(out)}, nil
+				}
+			}
+		}
+	}
+
+	reader := infoitem.DefaultReader()
+	if reader == nil || target == "" {
+		return tools.Result{Error: "info item not found in this scan: " + id}, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	item, err := reader.GetByID(ctx, target, id)
+	if errors.Is(err, infoitem.ErrNotFound) {
+		return tools.Result{Error: "info item not found: " + id + " (scan " + target + ")"}, nil
+	}
+	if err != nil {
+		return tools.Result{Error: "cold-path read failed: " + err.Error()}, nil
+	}
+	var payload any
+	switch layer {
+	case "detail":
+		payload = infoitem.DetailOf(item, 0)
+	case "artifact":
+		payload = infoitem.ArtifactOf(item)
+	default:
+		payload = infoitem.Index(item, 0, 0)
+	}
+	out, err := json.Marshal(payload)
+	if err != nil {
+		return tools.Result{Error: "encode info item: " + err.Error()}, nil
+	}
+	return tools.Result{Output: string(out)}, nil
+}
+
+func infoItemView(hypothesisID string, ev *scanctx.Evidence, layer string) map[string]any {
+	title := infoItemTitle(ev.Summary)
+	switch layer {
+	case "detail":
+		return map[string]any{
+			"layer":         "detail",
+			"id":            ev.ID,
+			"hypothesis_id": hypothesisID,
+			"kind":          ev.Kind,
+			"nature":        string(scanctx.NormalizeEvidenceNature(ev.Nature)),
+			"title":         title,
+			"summary":       infoItemClamp(ev.Summary, 4096),
+			"request":       infoItemClamp(ev.Request, 4096),
+			"response":      infoItemClamp(ev.Response, 4096),
+			"supports":      ev.Supports,
+			"source":        ev.Source,
+			"agent_id":      ev.AgentID,
+			"info_item_id":  ev.InfoItemID,
+			"finding_id":    ev.FindingID,
+			"confidence":    ev.Confidence,
+			"truncated":     len([]rune(ev.Request)) > 4096 || len([]rune(ev.Response)) > 4096 || len([]rune(ev.Summary)) > 4096,
+		}
+	case "artifact":
+		return map[string]any{
+			"layer":        "artifact",
+			"id":           ev.ID,
+			"info_item_id": ev.InfoItemID,
+			"finding_id":   ev.FindingID,
+			"has_request":  ev.Request != "",
+			"has_response": ev.Response != "",
+			"source":       ev.Source,
+		}
+	default:
+		return map[string]any{
+			"layer":         "index",
+			"id":            ev.ID,
+			"hypothesis_id": hypothesisID,
+			"kind":          ev.Kind,
+			"nature":        string(scanctx.NormalizeEvidenceNature(ev.Nature)),
+			"title":         title,
+			"summary":       infoItemClamp(infoItemFlat(ev.Summary), 240),
+			"has_detail":    ev.Summary != "" || ev.Request != "" || ev.Response != "",
+			"has_artifact":  ev.InfoItemID != "" || ev.FindingID != "",
+			"confidence":    ev.Confidence,
+		}
+	}
+}
+
+func infoItemTitle(s string) string {
+	line := strings.TrimSpace(s)
+	if i := strings.IndexAny(line, "\r\n"); i >= 0 {
+		line = strings.TrimSpace(line[:i])
+	}
+	return infoItemClamp(line, 80)
+}
+
+func infoItemFlat(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
+func infoItemClamp(s string, max int) string {
+	r := []rune(strings.TrimSpace(s))
+	if len(r) <= max {
+		return string(r)
+	}
+	return string(r[:max]) + "…"
 }
 
 func (a *Agent) recordHypothesisTool(args map[string]string) (tools.Result, error) {

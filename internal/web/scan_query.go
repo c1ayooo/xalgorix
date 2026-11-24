@@ -44,6 +44,8 @@ func vulnToSummary(v reporting.Vulnerability) VulnSummary {
 		VerificationMethod: v.VerificationMethod,
 		Verified:           v.Verified,
 		Tags:               v.Tags,
+		FoundAt:            v.Timestamp,
+		TrafficRefs:        v.TrafficRefs,
 	}
 }
 
@@ -107,6 +109,11 @@ func appendVulnSummaryUnique(vulns *[]VulnSummary, vuln VulnSummary) bool {
 			// physical provenance once the child copy is attached.
 			if existing.SourceScanID == "" && vuln.SourceScanID != "" {
 				existing.SourceScanID = vuln.SourceScanID
+			}
+			// Evidence refs are additive: a resumed/merged copy must not drop the
+			// raw packets an earlier copy already pinned.
+			if len(existing.TrafficRefs) == 0 && len(vuln.TrafficRefs) > 0 {
+				existing.TrafficRefs = vuln.TrafficRefs
 			}
 			return false
 		}

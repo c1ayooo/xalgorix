@@ -37,9 +37,10 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-
-	"github.com/c1ayooo/xalgorix/v4/internal/methodology"
 	"time"
+
+	"github.com/c1ayooo/xalgorix/v4/internal/chains"
+	"github.com/c1ayooo/xalgorix/v4/internal/methodology"
 )
 
 // TaskStatus is the lifecycle state of a single planned task.
@@ -1433,6 +1434,7 @@ func formatPlan(state *ScanState, p *Plan, gaps []CoverageGap) string {
 	next := p.NextTasks(3)
 	if len(next) > 0 {
 		sb.WriteString("Next tasks ready to run:\n")
+		emittedChain := map[string]bool{}
 		for _, t := range next {
 			sb.WriteString(fmt.Sprintf("  ▶ [Phase %d] %s — %s\n", t.Phase, t.ID, t.Title))
 			if ep := strings.TrimSpace(t.Endpoint); ep != "" {
@@ -1453,6 +1455,17 @@ func formatPlan(state *ScanState, p *Plan, gaps []CoverageGap) string {
 				if skill, ok := VulnClassSkill(t.VulnClass); ok && skill != "" && !skillCovered(state, skill) {
 					sb.WriteString(fmt.Sprintf("      methodology: read_skill(name=%q) before testing %s\n", skill, t.VulnClass))
 				}
+				// L3 technique chain (internal/chains): routed by CODE from the
+				// task's canonical class, so the model does not have to decide
+				// which chain applies and the per-brief cost is one chain per
+				// distinct class. Unknown classes fall back to the lane skill
+				// hint above.
+				if !emittedChain[t.VulnClass] {
+					if chain := chains.Skeleton(t.VulnClass); chain != "" {
+						emittedChain[t.VulnClass] = true
+						sb.WriteString(indentChain(chain))
+					}
+				}
 			}
 		}
 	} else if p.RemainingCount() == 0 {
@@ -1461,6 +1474,23 @@ func formatPlan(state *ScanState, p *Plan, gaps []CoverageGap) string {
 	if g := FormatGaps(gaps); g != "" {
 		sb.WriteString("\n")
 		sb.WriteString(g)
+	}
+	return sb.String()
+}
+
+// indentChain renders a chains.Skeleton block as an indented child of the
+// current plan task line. Empty input yields "", keeping the brief unchanged
+// for classes without a chain.
+func indentChain(block string) string {
+	block = strings.TrimSpace(block)
+	if block == "" {
+		return ""
+	}
+	var sb strings.Builder
+	for _, line := range strings.Split(block, "\n") {
+		sb.WriteString("      ")
+		sb.WriteString(line)
+		sb.WriteString("\n")
 	}
 	return sb.String()
 }

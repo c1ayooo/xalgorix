@@ -193,6 +193,28 @@ func (s *Store) Get(ctx context.Context, projectID string) (runtime.DesiredProje
 	return row, nil
 }
 
+// ListByProjectIDs implements runtime.DesiredStateStore.
+func (s *Store) ListByProjectIDs(ctx context.Context, projectIDs []string) ([]runtime.DesiredProject, error) {
+	if len(projectIDs) == 0 {
+		return nil, nil
+	}
+	const q = `SELECT ` + columns + ` FROM toolbox_projects WHERE project_id = ANY($1)`
+	rows, err := s.pool.Query(ctx, q, projectIDs)
+	if err != nil {
+		return nil, fmt.Errorf("runtime/postgres: list projects by id: %w", err)
+	}
+	defer rows.Close()
+	var out []runtime.DesiredProject
+	for rows.Next() {
+		row, scanErr := scanRow(rows)
+		if scanErr != nil {
+			return nil, fmt.Errorf("runtime/postgres: scan project: %w", scanErr)
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}
+
 // Delete implements runtime.DesiredStateStore.
 func (s *Store) Delete(ctx context.Context, projectID string) error {
 	if _, err := s.pool.Exec(ctx, `DELETE FROM toolbox_projects WHERE project_id = $1`, projectID); err != nil {

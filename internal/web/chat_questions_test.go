@@ -6,6 +6,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -177,6 +179,176 @@ func TestSideQuestionFailureKeepsRow(t *testing.T) {
 	s.handleTaskDetail(rr2, req2)
 	if rr2.Code != http.StatusAccepted {
 		t.Fatalf("retry code = %d, want 202", rr2.Code)
+	}
+}
+
+// waitForJournalEvent polls the run's persisted conversation journal — the
+// channel a run without a live instance actually uses (broadcastToInstance
+// only buffers when the instance is registered).
+func waitForJournalEvent(t *testing.T, dir string, match func(WSEvent) bool) WSEvent {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		events, _, ok := loadScanEventsWindow(dir, 0, 100)
+		if ok {
+			for _, evt := range events {
+				if match(evt) {
+					return evt
+				}
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("expected journal event in %s did not land within the deadline", dir)
+	return WSEvent{}
+}
+
+// TestSnapshotChatInstance_PersistedMultiRecordRun pins the finished/
+// re-dispatched run path: such a run has no live *ScanInstance (the D11 rebuild
+// refuses ambiguous external instance ids), so the side-question snapshot must
+// come from the durable scan records — newest session for status/timing, the
+// merged findings corpus across siblings, and every distinct target. The old
+// implementation returned nil here and the handler nil-dereferenced (500).
+func TestSnapshotChatInstance_PersistedMultiRecordRun(t *testing.T) {
+	s := newTestServer(t, nil)
+	id := "inst-multi-record"
+
+	writeRecord := func(scanID, target, started, finished, title string) {
+		t.Helper()
+		dir := filepath.Join(s.dataDir, scanID)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		s.saveScanRecordTo(&ScanRecord{
+			ID:         scanID,
+			InstanceID: id,
+			Target:     target,
+			Status:     "finished",
+			StartedAt:  started,
+			FinishedAt: finished,
+			Vulns: []VulnSummary{{
+				Severity: "high",
+				Title:    title,
+				Endpoint: target + "/login",
+			}},
+		}, dir)
+	}
+	writeRecord("multi-old", "https://old.example", "2026-01-01T00:00:00Z", "2026-01-01T01:00:00Z", "old finding")
+	writeRecord("multi-new", "https://new.example", "2026-01-02T00:00:00Z", "2026-01-02T01:00:00Z", "new finding")
+
+	snap := s.snapshotChatInstance(id)
+	if snap == nil {
+		t.Fatal("persisted snapshot must exist for a run whose records are on disk")
+	}
+	if snap.ID != id || snap.Status != "finished" {
+		t.Fatalf("snapshot identity/status = %q/%q", snap.ID, snap.Status)
+	}
+	if snap.StartedAt != "2026-01-01T00:00:00Z" || snap.FinishedAt != "2026-01-02T01:00:00Z" {
+		t.Fatalf("run timing must span all sessions: start=%q finish=%q", snap.StartedAt, snap.FinishedAt)
+	}
+	if snap.VulnCount != 2 || len(snap.Vulns) != 2 {
+		t.Fatalf("findings must merge across sibling records: count=%d rows=%d", snap.VulnCount, len(snap.Vulns))
+	}
+	if !strings.Contains(snap.Targets, "https://old.example") || !strings.Contains(snap.Targets, "https://new.example") {
+		t.Fatalf("targets must list every sibling target: %q", snap.Targets)
+	}
+}
+
+// TestSideQuestionFinishedRunUsesPersistedSnapshot pins the user-facing
+// regression: a run that is no longer live (finished, or rebuilt after a
+// restart / D11 re-dispatch) must still answer side questions from its durable
+// scan record — the responder receives the persisted snapshot, and the answer
+// lands as a chat_reply row instead of a 500.
+func TestSideQuestionFinishedRunUsesPersistedSnapshot(t *testing.T) {
+	s, store := newApprovalsTestServer(t, nil)
+	ctx := context.Background()
+	project, err := store.EnsureDefaultProject(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := store.CreateTask(ctx, project.ID, platform.TaskInput{Name: "finished chat"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	instanceID := "inst-finished-chat"
+	if _, err := store.CreateRun(ctx, task.ID, platform.RunMount{InstanceID: instanceID, Mode: "single"}); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(s.dataDir, "scan-finished-chat")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	s.saveScanRecordTo(&ScanRecord{
+		ID:            "scan-finished-chat",
+		InstanceID:    instanceID,
+		Target:        "https://finished.example",
+		Status:        "finished",
+		StartedAt:     "2026-01-01T00:00:00Z",
+		FinishedAt:    "2026-01-01T01:00:00Z",
+		EventsJournal: true,
+		Vulns:         []VulnSummary{{Severity: "critical", Title: "auth bypass", Endpoint: "https://finished.example/admin"}},
+	}, dir)
+
+	var gotSystem string
+	s.scanQuestionFn = func(ctx context.Context, systemPrompt, userMessage string) (string, error) {
+		gotSystem = systemPrompt
+		return "扫描已完成，存在一个认证绕过。", nil
+	}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/tasks/"+task.ID+"/questions",
+		strings.NewReader(`{"message":"有什么发现？","request_id":"rq-finished","instance_id":"`+instanceID+`"}`))
+	s.handleTaskDetail(rr, req)
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("code = %d body=%s, want 202", rr.Code, rr.Body.String())
+	}
+	reply := waitForJournalEvent(t, dir, func(e WSEvent) bool { return e.Type == "chat_reply" })
+	if reply.ResultMeta["status"] != "answered" || reply.Content == "" {
+		t.Fatalf("persisted-run answer missing: %#v", reply)
+	}
+	if !strings.Contains(gotSystem, "finished.example") || !strings.Contains(gotSystem, "auth bypass") {
+		t.Fatalf("responder prompt lost the persisted snapshot: %q", gotSystem)
+	}
+}
+
+// TestSideQuestionNoContextIs409 pins the honest failure: a mounted run with
+// neither a live instance nor durable scan records must be refused with a 409
+// and must not queue a chat_question row the responder can never answer.
+func TestSideQuestionNoContextIs409(t *testing.T) {
+	s, store := newApprovalsTestServer(t, nil)
+	ctx := context.Background()
+	project, err := store.EnsureDefaultProject(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := store.CreateTask(ctx, project.ID, platform.TaskInput{Name: "no context"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateRun(ctx, task.ID, platform.RunMount{InstanceID: "inst-noscan", Mode: "single"}); err != nil {
+		t.Fatal(err)
+	}
+	s.scanQuestionFn = func(ctx context.Context, systemPrompt, userMessage string) (string, error) {
+		t.Fatal("the responder must not run without a snapshot")
+		return "", nil
+	}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/tasks/"+task.ID+"/questions",
+		strings.NewReader(`{"message":"hi","request_id":"rq-nil","instance_id":"inst-noscan"}`))
+	s.handleTaskDetail(rr, req)
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("code = %d body=%s, want 409", rr.Code, rr.Body.String())
+	}
+}
+
+// TestQuestionPromptWithoutSnapshotDoesNotPanic pins the nil guard: even if a
+// future caller loses the snapshot, prompt assembly states the gap instead of
+// dereferencing nil in the request goroutine.
+func TestQuestionPromptWithoutSnapshotDoesNotPanic(t *testing.T) {
+	prompt := buildQuestionAnswerPrompt(nil, "en")
+	if !strings.Contains(prompt, "Snapshot unavailable") {
+		t.Fatalf("missing-snapshot prompt must state the gap: %q", prompt)
 	}
 }
 

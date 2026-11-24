@@ -105,6 +105,17 @@ type Vulnerability struct {
 	Tags      []string `json:"tags,omitempty"`
 	Timestamp string   `json:"timestamp"`
 	AgentName string   `json:"agent_name"`
+	// TrafficRefs pins the exact MITM-archived request/response packets the
+	// finding was proven with (session directory + archive sequence). Captured
+	// deterministically at report time from the run's traffic archive, so the
+	// report UI renders the wire packet behind the finding rather than a later
+	// endpoint-heuristic match. Empty when the run had no matching archive
+	// record (proxy off, browser/unattributed traffic, or a non-HTTP finding).
+	TrafficRefs []scanctx.TrafficRef `json:"traffic_refs,omitempty"`
+	// TrafficRefsSource records who supplied the refs: "model" (explicit
+	// traffic_refs argument) or "engine" (deterministic proof bridge / post-hoc
+	// endpoint match). Empty when no refs were bound.
+	TrafficRefsSource string `json:"traffic_refs_source,omitempty"`
 }
 
 // Finding tags (verification dimension). Exactly one is attached to every
@@ -305,27 +316,29 @@ func RegisterWithVerifier(r *tools.Registry, verifier FindingVerifier) {
    - Low (0.1-3.9): Clickjacking, missing cookie flags, CORS without credential theft, path disclosure
    - None/Info (0.0): Missing headers, version disclosure, self-XSS, DNS config issues`,
 		Parameters: []tools.Parameter{
-			{Name: "title", Description: "Vulnerability title", Required: true},
-			{Name: "severity", Description: "Severity per HackerOne CVSS ranges: critical (CVSS 9.0-10.0), high (7.0-8.9), medium (4.0-6.9), low (0.1-3.9), info (0.0). Must match your CVSS score. If omitted it is derived from cvss (or defaults to medium) so a real finding is never lost — but always set it explicitly.", Required: false},
-			{Name: "description", Description: "Detailed description of the vulnerability. Strongly recommended; if omitted it is synthesized from the title and proof so a real finding is never lost to a missing field.", Required: false},
-			{Name: "exploitation_proof", Description: "REQUIRED for medium+. Concrete evidence of exploitation: extracted data, reflected payload text, command output, timing measurement, callback confirmation. Paste actual output here.", Required: false},
-			{Name: "verification_method", Description: "How you verified: exploited, time_based, data_extracted, callback_received, error_based, blind_confirmed, reflected, authenticated, manual_verified", Required: false},
-			{Name: "oob_token", Description: "For callback-confirmed SSRF: the exact token returned by oob_callback generate. Required so the backend can reject scanner-origin and DNS-only interactions.", Required: false},
-			{Name: "impact", Description: "Real-world impact assessment", Required: false},
-			{Name: "target", Description: "Target URL/host", Required: false},
-			{Name: "endpoint", Description: "Affected endpoint", Required: false},
-			{Name: "method", Description: "HTTP method", Required: false},
-			{Name: "cve", Description: "CVE identifier if known", Required: false},
-			{Name: "cvss", Description: "CVSS 3.1 base score (0.0-10.0). MUST match severity: critical=9.0-10.0, high=7.0-8.9, medium=4.0-6.9, low=0.1-3.9, info=0.0. If omitted, a default is derived from severity.", Required: false},
-			{Name: "cvss_vector", Description: "CVSS 3.1 vector string, e.g. CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H. Components: AV(Attack Vector):N/A/L/P, AC(Attack Complexity):L/H, PR(Privileges Required):N/L/H, UI(User Interaction):N/R, S(Scope):U/C, C(Confidentiality):N/L/H, I(Integrity):N/L/H, A(Availability):N/L/H", Required: false},
-			{Name: "technical_analysis", Description: "Technical details of the vulnerability", Required: false},
-			{Name: "poc_description", Description: "Step-by-step PoC description", Required: false},
-			{Name: "poc_script_code", Description: "Reproducible PoC code (curl, python, etc.)", Required: false},
-			{Name: "remediation_steps", Description: "Remediation recommendations", Required: false},
-			{Name: "fix", Description: "CONCRETE fix — ideally a minimal code/config patch or diff the developer can apply directly (e.g. replace string-concatenated SQL with a parameterized query, add the missing authorization check, HTML-escape the output). Include the file/function when known from source. This is what makes the report actionable.", Required: false},
-			{Name: "cwe_id", Description: "CWE identifier if known, e.g. CWE-79 for XSS, CWE-89 for SQLi, CWE-78 for command injection", Required: false},
-			{Name: "owasp", Description: "OWASP Top 10 (2021) category if known, e.g. A03 for Injection, A01 for Broken Access Control", Required: false},
-			{Name: "hypothesis_id", Description: "Ledger hypothesis id this finding proves (e.g. H-3 from record_hypothesis / authz_matrix / verify_xss / verify_oob). Always pass it when reporting ledger work. A new finding or a duplicate of an existing finding is linked to that hypothesis and marked proven, satisfying the finish gate without a separate add_hypothesis_evidence call.", Required: false},
+			{Name: "title", Description: "Vulnerability title", Required: true, Type: "string"},
+			{Name: "severity", Description: "Severity per HackerOne CVSS ranges: critical (CVSS 9.0-10.0), high (7.0-8.9), medium (4.0-6.9), low (0.1-3.9), info (0.0). Must match your CVSS score. If omitted it is derived from cvss (or defaults to medium) so a real finding is never lost — but always set it explicitly.", Required: false, Type: "string", Enum: []string{"critical", "high", "medium", "low", "info"}},
+			{Name: "description", Description: "Detailed description of the vulnerability. Strongly recommended; if omitted it is synthesized from the title and proof so a real finding is never lost to a missing field.", Required: false, Type: "string"},
+			{Name: "exploitation_proof", Description: "REQUIRED for medium+. Concrete evidence of exploitation: extracted data, reflected payload text, command output, timing measurement, callback confirmation. Paste actual output here.", Required: false, Type: "string"},
+			{Name: "verification_method", Description: "How you verified: exploited, time_based, data_extracted, callback_received, error_based, blind_confirmed, reflected, authenticated, manual_verified", Required: false, Type: "string", Enum: []string{"exploited", "time_based", "data_extracted", "callback_received", "error_based", "blind_confirmed", "reflected", "authenticated", "manual_verified"}},
+			{Name: "oob_token", Description: "For callback-confirmed SSRF: the exact token returned by oob_callback generate. Required so the backend can reject scanner-origin and DNS-only interactions.", Required: false, Type: "string"},
+			{Name: "impact", Description: "Real-world impact assessment", Required: false, Type: "string"},
+			{Name: "target", Description: "Target URL/host", Required: false, Type: "string"},
+			{Name: "endpoint", Description: "Affected endpoint", Required: false, Type: "string"},
+			{Name: "method", Description: "HTTP method", Required: false, Type: "string", Enum: []string{"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"}},
+			{Name: "cve", Description: "CVE identifier if known", Required: false, Type: "string"},
+			{Name: "cvss", Description: "CVSS 3.1 base score (0.0-10.0). MUST match severity: critical=9.0-10.0, high=7.0-8.9, medium=4.0-6.9, low=0.1-3.9, info=0.0. If omitted, a default is derived from severity.", Required: false, Type: "number"},
+			{Name: "cvss_vector", Description: "CVSS 3.1 vector string, e.g. CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H. Components: AV(Attack Vector):N/A/L/P, AC(Attack Complexity):L/H, PR(Privileges Required):N/L/H, UI(User Interaction):N/R, S(Scope):U/C, C(Confidentiality):N/L/H, I(Integrity):N/L/H, A(Availability):N/L/H", Required: false, Type: "string"},
+			{Name: "technical_analysis", Description: "Technical details of the vulnerability", Required: false, Type: "string"},
+			{Name: "poc_description", Description: "Step-by-step PoC description", Required: false, Type: "string"},
+			{Name: "poc_script_code", Description: "Reproducible PoC code (curl, python, etc.)", Required: false, Type: "string"},
+			{Name: "remediation_steps", Description: "Remediation recommendations", Required: false, Type: "string"},
+			{Name: "fix", Description: "CONCRETE fix — ideally a minimal code/config patch or diff the developer can apply directly (e.g. replace string-concatenated SQL with a parameterized query, add the missing authorization check, HTML-escape the output). Include the file/function when known from source. This is what makes the report actionable.", Required: false, Type: "string"},
+			{Name: "cwe_id", Description: "CWE identifier if known, e.g. CWE-79 for XSS, CWE-89 for SQLi, CWE-78 for command injection", Required: false, Type: "string"},
+			{Name: "owasp", Description: "OWASP Top 10 (2021) category if known, e.g. A03 for Injection, A01 for Broken Access Control", Required: false, Type: "string"},
+			{Name: "hypothesis_id", Description: "Ledger hypothesis id this finding proves (e.g. H-3 from record_hypothesis / authz_matrix / verify_xss / verify_oob). Always pass it when reporting ledger work. A new finding or a duplicate of an existing finding is linked to that hypothesis and marked proven, satisfying the finish gate without a separate add_hypothesis_evidence call.", Required: false, Type: "string"},
+			{Name: "traffic_refs", Description: "REQUIRED for non-info findings unless engine-owned deterministic proof exists. The MITM archive exchange(s) that prove this finding, from list_requests: \"<seq>\" or \"<session>:<seq>\", comma-separated (baseline and exploit packets both help). The gate resolves every reference, hashes the exact bytes and stores an immutable copy.", Required: false, Type: "string"},
+			{Name: "evidence_outputs", Description: "Alternative evidence for non-HTTP findings: comma-separated read_tool_output archive ids whose captured output proves the finding. The gate stores an immutable copy alongside traffic evidence.", Required: false, Type: "string"},
 		},
 		Execute: func(args map[string]string) (tools.Result, error) {
 			return reportVulnForRegistryWithVerifier(r, verifier, args)
@@ -632,6 +645,40 @@ If you cannot exploit it, downgrade severity to 'info' and report as information
 		}, nil
 	}
 
+	// ── Gate 2b: wire evidence must be named (part of the proof gate) ──
+	// The proof text can be paraphrased; the captured packet cannot. A
+	// production session therefore requires at least one resolvable
+	// traffic_refs/evidence_outputs entry, except when the engine itself holds
+	// deterministic proof (verify_* bridge / browser XSS nonce), in which case
+	// the engine attaches the refs.
+	var reportEv reportEvidence
+	if requiresValidation {
+		if sc := scanctx.Get(contextID); sc != nil && sc.RequireEvidenceRefs {
+			var problem string
+			reportEv, problem = resolveReportEvidence(contextID, sc.ScanDir, args["traffic_refs"], args["evidence_outputs"])
+			if problem != "" {
+				return tools.Result{
+					Output:   "❌ REJECTED: " + problem + "\n\n" + evidenceRejection(title),
+					Metadata: map[string]any{"report_outcome": "validation_rejected"},
+				}, nil
+			}
+			if !reportEv.Explicit && !authoritativeDeterministicProof {
+				// No archive at all in this run means the capture plane never
+				// observed anything (proxy off, or the runtime bypassed it). No
+				// reference could resolve, and refusing every report would lose
+				// real findings; accept and record the gap instead.
+				if sc.Traffic == nil || sc.Traffic.Count() == 0 {
+					reportEv.CaptureUnavailable = true
+				} else {
+					return tools.Result{
+						Output:   evidenceRejection(title),
+						Metadata: map[string]any{"report_outcome": "validation_rejected"},
+					}, nil
+				}
+			}
+		}
+	}
+
 	// ── Gate 2.5: SSRF callback provenance ──
 	// Apply this regardless of the declared method whenever the claim uses OOB
 	// evidence. In-band internal data extraction remains valid without OOB.
@@ -922,6 +969,19 @@ If you cannot exploit it, downgrade severity to 'info' and report as information
 		Fix:                strings.TrimSpace(args["fix"]),
 		Timestamp:          time.Now().Format(time.RFC3339),
 	}
+	// Bind the finding to the wire packet that backs it, at confirmation time.
+	// Model-named refs win (they are the explicit evidence); otherwise the
+	// deterministic endpoint/method/host match attaches the packet that the run
+	// actually captured, so a report is never detached from its bytes.
+	if len(reportEv.Refs) > 0 {
+		vuln.TrafficRefs = reportEv.Refs
+		vuln.TrafficRefsSource = "model"
+	} else {
+		vuln.TrafficRefs = findingTrafficRefs(contextID, vuln)
+		if len(vuln.TrafficRefs) > 0 {
+			vuln.TrafficRefsSource = "engine"
+		}
+	}
 
 	store = getStoreByID(contextID) // re-resolve in case of race
 	store.mu.Lock()
@@ -978,12 +1038,35 @@ If you cannot exploit it, downgrade severity to 'info' and report as information
 	// finding can never be invisible to /api/info/*.
 	projectFindingInfoItem(contextID, vuln)
 
+	// Pin the referenced bytes as content-addressed immutable snapshots. A
+	// persistence fault is surfaced to the model but never drops the finding:
+	// losing a proven vulnerability because a disk filled is worse than a
+	// missing snapshot, which the GC/index can report.
+	evidenceNote := ""
+	if sc := scanctx.Get(contextID); sc != nil && (reportEv.Explicit || len(vuln.TrafficRefs) > 0) {
+		if version, err := recordFindingEvidence(contextID, sc.ScanDir, vuln.ID, reportEv); err != nil {
+			log.Printf("[reporting] evidence snapshot for %s not persisted: %v", vuln.ID, err)
+			evidenceNote = "\n⚠️ Evidence snapshot could not be persisted (" + err.Error() + "); the finding is kept."
+		} else if version > 0 {
+			evidenceNote = fmt.Sprintf("\n🔒 Evidence pinned as an immutable snapshot (version %d, sha256 verified).", version)
+		}
+	}
+	if len(reportEv.Skipped) > 0 {
+		evidenceNote += "\n⚠️ Ignored unusable evidence references: " + strings.Join(reportEv.Skipped, "; ")
+	}
+	if reportEv.CaptureUnavailable {
+		evidenceNote += "\n⚠️ 本 Run 没有任何 MITM 流量记录（捕获面不可用：代理关闭，或运行时未把代理环境注入执行环境）。本次 finding 已保存，但无法绑定报文证据；修复捕获面后重新报告可补绑。"
+	}
+
 	msg := fmt.Sprintf("✅ Vulnerability reported: [%s] %s (%s | CVSS %.1f) — Verified: %v", vuln.ID, vuln.Title, strings.ToUpper(vuln.Severity), vuln.CVSS, vuln.Verified)
 	if upgraded {
 		msg = fmt.Sprintf("✅ Vulnerability reported: upgraded with verified evidence: [%s] %s (%s | CVSS %.1f) — replaced unverified candidate %q", vuln.ID, vuln.Title, strings.ToUpper(vuln.Severity), vuln.CVSS, upgradeFrom)
 	}
 	if ledgerNote != "" {
 		msg += "\n" + ledgerNote
+	}
+	if evidenceNote != "" {
+		msg += evidenceNote
 	}
 	if verifierConfirmed {
 		msg += "\n✅ Independently CONFIRMED by the verifier."
@@ -1282,12 +1365,13 @@ func projectFindingInfoItem(contextID string, vuln Vulnerability) {
 			},
 			Purpose: "finding",
 			Context: map[string]string{
-				"finding_id": vuln.ID,
-				"severity":   vuln.Severity,
-				"cwe":        vuln.CWE,
-				"cve":        vuln.CVE,
-				"verified":   strconv.FormatBool(vuln.Verified),
-				"finding":    vuln.Title,
+				"finding_id":   vuln.ID,
+				"severity":     vuln.Severity,
+				"cwe":          vuln.CWE,
+				"cve":          vuln.CVE,
+				"verified":     strconv.FormatBool(vuln.Verified),
+				"finding":      vuln.Title,
+				"traffic_refs": trafficRefsContext(vuln.TrafficRefs),
 			},
 		},
 		CreatedAt: now,
@@ -1316,6 +1400,58 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+// findingTrafficRefs resolves the MITM traffic-archive records that back a
+// finding: the newest exchanges matching the finding's endpoint, method and
+// asset host. Deterministic and bounded; a finding with no HTTP coordinates,
+// or a run whose archive has no match, simply carries no refs (the UI keeps
+// its endpoint heuristic as a fallback).
+func findingTrafficRefs(contextID string, vuln Vulnerability) []scanctx.TrafficRef {
+	sc := scanctx.Get(contextID)
+	if sc == nil || strings.TrimSpace(sc.ScanDir) == "" {
+		return nil
+	}
+	endpoint := strings.TrimSpace(vuln.Endpoint)
+	host := findingAssetHost(vuln.Target, endpoint)
+	if endpoint == "" && host == "" {
+		return nil
+	}
+	refs, _ := scanctx.MatchTrafficRefs(sc.ScanDir, endpoint, vuln.Method, host, 20)
+	return refs
+}
+
+// findingAssetHost derives the asset hostname from a finding's target (or its
+// endpoint when the target is empty) so evidence matching stays pinned to the
+// asset the finding belongs to.
+func findingAssetHost(target, endpoint string) string {
+	for _, raw := range []string{target, endpoint} {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		candidate := raw
+		if !strings.Contains(candidate, "://") {
+			candidate = "https://" + candidate
+		}
+		if u, err := url.Parse(candidate); err == nil && u.Hostname() != "" {
+			return strings.ToLower(u.Hostname())
+		}
+	}
+	return ""
+}
+
+// trafficRefsContext renders refs in the "session:seq,session:seq" form used by
+// the audit projection and the traffic API.
+func trafficRefsContext(refs []scanctx.TrafficRef) string {
+	parts := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		if ref.Seq <= 0 {
+			continue
+		}
+		parts = append(parts, ref.Session+":"+strconv.FormatInt(ref.Seq, 10))
+	}
+	return strings.Join(parts, ",")
 }
 
 func containsFold(values []string, want string) bool {

@@ -11,14 +11,15 @@ package trafficproxy
 //
 // What is adjudicated here, and what deliberately is not:
 //
-//   - ONLY the subprocess channel (Basic credentials minted to
-//     curl/wget/python). Bearer traffic is 100% produced by the Go tool
-//     transports whose every request already met the registry-level approval
-//     gate — re-adjudicating it would double-charge one intent and park the
-//     verifier's transport-level retests (which ride Bearer) on the operator
-//     queue, colliding with the verifier timing invariant. Unattributed
-//     traffic never gates either: system-level red line (observation.go) —
-//     no attribution, no approval row, no InfoItem.
+//   - ONLY the non-bearer channel (ChannelSubprocess): Basic credentials minted
+//     to curl/wget/python, plus anything arriving on a run-scoped listener
+//     (Chromium, container tools) whose port already implies the run. Bearer
+//     traffic is 100% produced by the Go tool transports whose every request
+//     already met the registry-level approval gate — re-adjudicating it would
+//     double-charge one intent and park the verifier's transport-level retests
+//     (which ride Bearer) on the operator queue, colliding with the verifier
+//     timing invariant. Unattributed traffic never gates either: system-level
+//     red line (observation.go) — no attribution, no approval row, no InfoItem.
 //   - ONLY high-risk verdicts (approval.AssessHTTP = Pend on a write method).
 //     Read methods pass by construction.
 //   - Upgrade requests are assessed on the VISIBLE method+URL before the

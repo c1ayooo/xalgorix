@@ -90,7 +90,30 @@ func (a *Agent) registerPlanTools(reg *tools.Registry) {
 
 // claimNextTaskTool claims the next ready plan task for this agent.
 func (a *Agent) claimNextTaskTool(args map[string]string) (tools.Result, error) {
-	if a.state == nil || a.state.Plan == nil || a.state.Plan.IsEmpty() {
+	if a.state == nil {
+		return tools.Result{Output: "No plan exists yet. Build one with build_plan, then claim from it."}, nil
+	}
+	// R7/M1: the graph is the authority. Claim through the PG CAS so two
+	// workers can never take the same intent.
+	if a.hasPlanGraph() && !a.state.DelegatedAgent {
+		task, err := a.claimNextTaskFromGraph()
+		if err != nil {
+			return tools.Result{Output: "Claim failed: " + err.Error()}, nil
+		}
+		if task == nil {
+			return tools.Result{Output: "No claimable pending task: the graph frontier is empty. Check the plan; unblock a dependency or finish open tasks."}, nil
+		}
+		return tools.Result{Output: fmt.Sprintf(
+			"Claimed task %s (phase %d, class %s) — owner %s, lease until %s. Subject: %s. Work it now; mark it completed or dispositioned via update_plan when done.",
+			task.ID, task.Phase, func() string {
+				if task.VulnClass != "" {
+					return task.VulnClass
+				}
+				return "-"
+			}(), task.Owner,
+			task.LeaseUntil.Format("15:04:05Z"), taskSubject(task))}, nil
+	}
+	if a.state.Plan == nil || a.state.Plan.IsEmpty() {
 		return tools.Result{Output: "No plan exists yet. Build one with build_plan, then claim from it."}, nil
 	}
 	owner := a.claimOwner()
@@ -100,7 +123,12 @@ func (a *Agent) claimNextTaskTool(args map[string]string) (tools.Result, error) 
 	}
 	return tools.Result{Output: fmt.Sprintf(
 		"Claimed task %s (phase %d, class %s) — owner %s, lease until %s. Subject: %s. Work it now; mark it completed or dispositioned via update_plan when done.",
-		task.ID, task.Phase, func() string { if task.VulnClass != "" { return task.VulnClass }; return "-" }(), owner,
+		task.ID, task.Phase, func() string {
+			if task.VulnClass != "" {
+				return task.VulnClass
+			}
+			return "-"
+		}(), owner,
 		task.LeaseUntil.Format("15:04:05Z"), taskSubject(task))}, nil
 }
 
@@ -238,6 +266,8 @@ func (a *Agent) buildPlanTool(args map[string]string) (tools.Result, error) {
 	}
 	pending, active, completed, skipped := plan.Counts()
 	sb.WriteString(fmt.Sprintf("\nStatus: %d pending, %d active, %d completed, %d skipped. Work the tasks in dependency order; the engine tracks completion and gates finish on a complete plan.", pending, active, completed, skipped))
+	// R7/M1: graph first. The in-memory plan above is the view this turn.
+	a.persistCurrentPlan()
 	return tools.Result{Output: sb.String()}, nil
 }
 
@@ -409,6 +439,8 @@ func (a *Agent) updatePlanTool(args map[string]string) (tools.Result, error) {
 	if disposition != "" {
 		label += " (" + disposition + ")"
 	}
+	// R7/M1: graph first so the next claim sees the settled state.
+	a.persistTaskToGraph(t)
 	return tools.Result{Output: fmt.Sprintf("Task %q → %s. Plan: %d pending, %d active, %d completed, %d skipped (%d%% executed; skips are not executed coverage).", id, label, pending, active, completed, skipped, plan.ProgressPct())}, nil
 }
 

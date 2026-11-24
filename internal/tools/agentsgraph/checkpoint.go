@@ -14,6 +14,7 @@ import (
 type savedAgent struct {
 	ID          string    `json:"id"`
 	Name        string    `json:"name"`
+	UnitID      string    `json:"unit_id,omitempty"`
 	Task        string    `json:"task"`
 	Targets     []string  `json:"targets"`
 	Status      string    `json:"status"`
@@ -39,8 +40,10 @@ func (g *Graph) persistLocked() error {
 	saved := graphCheckpoint{Version: 1, Counter: g.counter, Delegated: g.delegated}
 	for _, state := range g.agents {
 		saved.Agents = append(saved.Agents, savedAgent{
-			state.ID, state.Name, state.Task, state.Targets, state.Status,
-			state.StartedAt, state.CompletedAt, state.Result, state.Error, state.Observed, state.Partial,
+			ID: state.ID, Name: state.Name, UnitID: state.UnitID,
+			Task: state.Task, Targets: state.Targets, Status: state.Status,
+			StartedAt: state.StartedAt, CompletedAt: state.CompletedAt,
+			Result: state.Result, Error: state.Error, Observed: state.Observed, Partial: state.Partial,
 		})
 	}
 	sort.Slice(saved.Agents, func(i, j int) bool { return saved.Agents[i].ID < saved.Agents[j].ID })
@@ -101,7 +104,8 @@ func (g *Graph) RestoreCheckpoint(dir string) error {
 			return fmt.Errorf("invalid or duplicate checkpoint agent")
 		}
 		restored := &subAgentState{
-			ID: state.ID, Name: state.Name, Task: state.Task, Targets: state.Targets,
+			ID: state.ID, Name: state.Name, UnitID: state.UnitID,
+			Task: state.Task, Targets: state.Targets,
 			Status: state.Status, StartedAt: state.StartedAt, CompletedAt: state.CompletedAt,
 			Result: state.Result, Error: state.Error, Observed: state.Observed, Partial: state.Partial,
 			done: make(chan struct{}),

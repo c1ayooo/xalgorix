@@ -199,3 +199,19 @@ func TestReadRecordsRejectsMalformedCompleteLine(t *testing.T) {
 		t.Fatal("expected malformed complete line error")
 	}
 }
+
+func TestProjectCollectsDeviations(t *testing.T) {
+	now := time.Now().UTC()
+	recs := []Record{
+		{ScanID: "s", Seq: 1, At: now, Actor: Actor{Kind: ActorAgent, ID: "a"}, Operation: OpRecordDeviation, IntentID: "T-1", Summary: "target redirected"},
+		{ScanID: "s", Seq: 2, At: now, Actor: Actor{Kind: ActorAgent, ID: "a"}, Operation: OpSetStatus, HypothesisID: "H-1", Summary: "testing"},
+	}
+	p := Project("s", recs)
+	if len(p.Deviations) != 1 {
+		t.Fatalf("deviations = %+v", p.Deviations)
+	}
+	d := p.Deviations[0]
+	if d.IntentID != "T-1" || d.Summary != "target redirected" || d.Seq != 1 {
+		t.Fatalf("deviation = %+v", d)
+	}
+}

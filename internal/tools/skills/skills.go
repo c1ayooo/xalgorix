@@ -95,13 +95,14 @@ func Register(r *tools.Registry, _ string, userSkills []UserSkill) {
 }
 
 // skillMeta is one indexed skill: its category, canonical name, a
-// human-readable description, and a lowercased haystack (name + description +
-// tags + category) used for keyword scoring.
+// human-readable description, its frontmatter tags, and a lowercased haystack
+// (name + description + tags + category) used for keyword scoring.
 type skillMeta struct {
 	category    string
 	name        string
 	description string
 	intent      string
+	tags        []string
 	haystack    string
 }
 
@@ -165,6 +166,7 @@ func buildSkillIndexFor(fsys fs.FS) []skillMeta {
 				name:        name,
 				description: desc,
 				intent:      parseSkillIntent(fm),
+				tags:        parseSkillTags(fm),
 				haystack:    hay,
 			})
 		}
@@ -211,6 +213,55 @@ func parseSkillFrontmatter(content string) (string, string) {
 		desc = desc[:297] + "..."
 	}
 	return desc, strings.Join(fm, "\n")
+}
+
+// parseSkillTags extracts the `tags:` YAML list from a SKILL.md frontmatter
+// block. Supports block style (`tags:` followed by `- item` lines) and inline
+// flow style (`tags: [a, b]`). Returns nil when the skill carries no tags.
+func parseSkillTags(frontmatter string) []string {
+	var (
+		out    []string
+		inTags bool
+	)
+	for _, raw := range strings.Split(frontmatter, "\n") {
+		trimmed := strings.TrimSpace(raw)
+		if inTags {
+			if strings.HasPrefix(trimmed, "-") {
+				item := strings.Trim(strings.TrimSpace(strings.TrimPrefix(trimmed, "-")), `"'`)
+				if item != "" {
+					out = append(out, item)
+				}
+				continue
+			}
+			if trimmed == "" {
+				continue
+			}
+			// A non-indented, non-item line starts the next top-level key.
+			if !strings.HasPrefix(raw, " ") && !strings.HasPrefix(raw, "\t") {
+				inTags = false
+			} else {
+				continue
+			}
+		}
+		if !strings.HasPrefix(trimmed, "tags:") {
+			continue
+		}
+		v := strings.TrimSpace(strings.TrimPrefix(trimmed, "tags:"))
+		if v == "" {
+			inTags = true
+			continue
+		}
+		for _, part := range strings.Split(strings.Trim(v, "[]"), ",") {
+			item := strings.Trim(strings.TrimSpace(part), `"'`)
+			if item != "" {
+				out = append(out, item)
+			}
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // parseSkillIntent extracts the optional `intent:` frontmatter tag

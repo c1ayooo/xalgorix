@@ -278,6 +278,7 @@ func sortTaskFindings(findings []flatFinding) {
 		if ri != rj {
 			return ri > rj
 		}
-		return findings[i].ScanStartedAt > findings[j].ScanStartedAt
+		return findingRecency(findings[i].FoundAt, findings[i].ScanStartedAt).
+			After(findingRecency(findings[j].FoundAt, findings[j].ScanStartedAt))
 	})
 }

@@ -319,11 +319,6 @@ func (s *Server) handleTaskGuidance(w http.ResponseWriter, r *http.Request, stor
 			writeJSONStatus(w, http.StatusBadRequest, map[string]string{"error": terr.Error()})
 			return
 		}
-		canInject := false
-		if instanceID != "" {
-			canInject = s.instanceCanReceiveGuidance(instanceID)
-		}
-
 		createdBy := ""
 		if claims, ok := sessionClaimsFrom(r); ok {
 			createdBy = claims.Username
@@ -355,29 +350,34 @@ func (s *Server) handleTaskGuidance(w http.ResponseWriter, r *http.Request, stor
 		// sidebar stops reading like a timestamped auto-mount.
 		s.maybeTitleFromGuidance(r.Context(), store, instanceID, g.Message)
 
+		// Inject only AFTER the row exists: the run may still be attaching its
+		// agent (the normal "open a new conversation" flow sends the first turn
+		// right after dispatch). The session-start drain and this path share a
+		// delivered marker, so whichever observes the queued row first wins and
+		// the turn lands exactly once.
 		status := platform.GuidanceQueued
-		if canInject {
-			// Path A: the stable gi:<id> marker (guidance_observer.go) makes
-			// the turn attributable from engine output, which is what lets the
-			// journal observer flip the row to consumed later.
-			if _, serr := s.instanceAgent(instanceID).SendMessage(operatorGuidanceMessage(g.ID, g.Message)); serr == nil {
+		if instanceID != "" && s.instanceCanReceiveGuidance(instanceID) {
+			// The stable gi:<id> marker (guidance_observer.go) makes the turn
+			// attributable from engine output, which is what lets the journal
+			// observer flip the row to consumed later.
+			if s.injectGuidanceToMain(instanceID, *g, s.instanceAgent(instanceID)) {
 				status = platform.GuidanceInjected
-				if _, uerr := store.UpdateGuidanceStatus(r.Context(), g.ID, platform.GuidanceInjected); uerr != nil {
-					log.Printf("[platform] guidance %s flip to injected failed: %v", g.ID, uerr)
-					status = platform.GuidanceQueued
-				} else {
-					g.Status = platform.GuidanceInjected
-					s.broadcastToInstance(instanceID, WSEvent{Type: "guidance_injected", Guidance: g, Content: "Operator guidance delivered to the running scan"})
-					s.watchGuidanceConsumption(instanceID, g.ID)
-				}
-			} else {
-				log.Printf("[platform] guidance %s injection into run %s failed: %v — queued", g.ID, runID, serr)
+			} else if s.guidanceDeliveredAlready(g.ID) {
+				// The session-start drain won the race and already delivered it.
+				status = platform.GuidanceInjected
 			}
 		}
 		if status == platform.GuidanceQueued {
 			// No live agent to receive it: dashboard-scope event (no instance
 			// subscription), merged into the next session's briefing instead.
 			s.broadcastDashboard(WSEvent{Type: "guidance_queued", Guidance: g, Content: "Operator guidance queued for the next run"})
+		}
+		// R7/M1: only QUEUED guidance becomes an active hint. Live guidance is
+		// interpreted by the main chat first (propose_intent → operator
+		// confirmation); projecting it as an active hint would let the planner
+		// create the intent directly and bypass that confirmation.
+		if status == platform.GuidanceQueued {
+			s.projectGuidanceHint(r.Context(), g)
 		}
 		writeJSONStatus(w, http.StatusOK, map[string]any{
 			"status":      status,

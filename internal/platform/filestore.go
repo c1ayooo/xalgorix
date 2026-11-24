@@ -56,6 +56,11 @@ type fileSnapshot struct {
 	// never write records — their summaries fall back to the legacy scan.json
 	// walk byte-identically.
 	RunScanRecords []runScanRecordWire `json:"run_scan_records,omitempty"`
+	// Manual report delivery metadata (REPORT_DELIVERY_SPEC §3). Rendered
+	// PDF/MD/HTML stay on disk; the snapshot holds only status/version rows and
+	// the artifact index pointers.
+	Reports         []Report         `json:"reports,omitempty"`
+	ReportArtifacts []ReportArtifact `json:"report_artifacts,omitempty"`
 }
 
 // approvalWire persists the approval record while suppressing the projected
@@ -365,6 +370,7 @@ func (s *FileStore) ListTasks(_ context.Context, projectID string) ([]Task, erro
 		task := t.Task
 		task.Context = t.Context
 		hydrateTaskLLMChain(&task)
+		hydrateTaskProxy(&task)
 		out = append(out, task)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
@@ -380,6 +386,7 @@ func (s *FileStore) GetTask(_ context.Context, id string) (*Task, error) {
 			returned := t.Task
 			returned.Context = t.Context
 			hydrateTaskLLMChain(&returned)
+			hydrateTaskProxy(&returned)
 			return &returned, nil
 		}
 	}
@@ -417,6 +424,13 @@ func (s *FileStore) UpdateTask(_ context.Context, id string, upd TaskUpdate) (*T
 		if upd.ContextPaths != nil {
 			tw.ContextPaths = normalizeContextPaths(upd.ContextPaths)
 		}
+		if upd.AuditMode != nil {
+			mode := NormalizeTaskAuditMode(*upd.AuditMode)
+			if mode == "" {
+				return nil, fmt.Errorf("%w: audit_mode must be inherit, off or enforce", ErrValidation)
+			}
+			tw.AuditMode = mode
+		}
 		if upd.ClearObjective {
 			tw.Objective = nil
 		}
@@ -436,6 +450,19 @@ func (s *FileStore) UpdateTask(_ context.Context, id string, upd TaskUpdate) (*T
 				merged[k] = v
 			}
 			tw.Context = merged
+		}
+		if upd.Proxy != nil {
+			merged := tw.Context
+			if merged == nil {
+				merged = map[string]any{}
+			}
+			if proxy := NormalizeTaskProxy(*upd.Proxy); proxy != "" {
+				merged["proxy"] = proxy
+			} else {
+				delete(merged, "proxy")
+			}
+			tw.Context = merged
+			tw.Proxy = NormalizeTaskProxy(*upd.Proxy)
 		}
 		if upd.LLMChain != nil || upd.ActiveLLM != nil {
 			chain := tw.LLMChain
@@ -484,6 +511,28 @@ func (s *FileStore) UpdateTask(_ context.Context, id string, upd TaskUpdate) (*T
 	return nil, ErrNotFound
 }
 
+// SetTaskRunRevision implements Repository.SetTaskRunRevision. Like the PG
+// store it only mutates tasks.context (never updated_at).
+func (s *FileStore) SetTaskRunRevision(_ context.Context, id, revision string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.data.Tasks {
+		tw := &s.data.Tasks[i]
+		if tw.ID != id {
+			continue
+		}
+		merged := tw.Context
+		if merged == nil {
+			merged = map[string]any{}
+		}
+		merged[TaskRunRevisionKey] = strings.TrimSpace(revision)
+		tw.Context = merged
+		tw.Task.Context = merged
+		return s.save()
+	}
+	return ErrNotFound
+}
+
 // DeleteTask implements Repository.DeleteTask.
 func (s *FileStore) DeleteTask(_ context.Context, id string) error {
 	s.mu.Lock()
@@ -507,6 +556,25 @@ func (s *FileStore) DeleteTask(_ context.Context, id string) error {
 		keptRuns = append(keptRuns, r)
 	}
 	s.data.Runs = keptRuns
+	// Report rows cascade with the task, mirroring the PG FK.
+	reportIDs := map[string]struct{}{}
+	keptReports := s.data.Reports[:0]
+	for _, r := range s.data.Reports {
+		if r.TaskID == id {
+			reportIDs[r.ID] = struct{}{}
+			continue
+		}
+		keptReports = append(keptReports, r)
+	}
+	s.data.Reports = keptReports
+	keptArtifacts := s.data.ReportArtifacts[:0]
+	for _, a := range s.data.ReportArtifacts {
+		if _, drop := reportIDs[a.ReportID]; drop {
+			continue
+		}
+		keptArtifacts = append(keptArtifacts, a)
+	}
+	s.data.ReportArtifacts = keptArtifacts
 	return s.save()
 }
 
@@ -928,6 +996,11 @@ func (s *FileStore) createTaskLocked(projectID string, in TaskInput, contextSeed
 	if in.Name == "" {
 		return nil, fmt.Errorf("%w: task name is required", ErrValidation)
 	}
+	auditMode := NormalizeTaskAuditMode(in.AuditMode)
+	if auditMode == "" {
+		return nil, fmt.Errorf("%w: audit_mode must be inherit, off or enforce", ErrValidation)
+	}
+	in.AuditMode = auditMode
 	objective, err := NormalizeObjective(in.Objective)
 	if err != nil {
 		return nil, err
@@ -955,6 +1028,9 @@ func (s *FileStore) createTaskLocked(projectID string, in TaskInput, contextSeed
 	if _, has := contextMap["slug"]; !has {
 		contextMap["slug"] = uniqueSlug(slugify(in.Name, taskID), existing)
 	}
+	if proxyPin := NormalizeTaskProxy(in.Proxy); proxyPin != "" {
+		contextMap["proxy"] = proxyPin
+	}
 	llmChain, activeLLM := NormalizeTaskLLMChain(in.LLMChain, in.ActiveLLM)
 	if len(llmChain) > 0 {
 		contextMap["llm_chain"] = llmChain
@@ -969,6 +1045,7 @@ func (s *FileStore) createTaskLocked(projectID string, in TaskInput, contextSeed
 		PhasePolicy:  in.PhasePolicy,
 		Schedule:     in.Schedule,
 		ContextPaths: normalizeContextPaths(in.ContextPaths),
+		AuditMode:    auditMode,
 		Objective:    in.Objective,
 		LLMChain:     llmChain,
 		ActiveLLM:    activeLLM,

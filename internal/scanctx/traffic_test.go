@@ -90,6 +90,57 @@ func TestTrafficArchiveAppendReadMatch(t *testing.T) {
 	}
 }
 
+// TestTrafficNewestWindowAndRefs covers the live-panel read path and the
+// finding evidence refs: only the newest window is parsed (total still
+// reported), one record can be loaded by sequence, and MatchTrafficRefs stamps
+// the owning session on each ref.
+func TestTrafficNewestWindowAndRefs(t *testing.T) {
+	scanDir := t.TempDir()
+	a := NewTrafficArchive(scanDir)
+	base := time.Now().UTC()
+	for i := 0; i < 5; i++ {
+		ex := TrafficExchange{
+			At:     base.Add(time.Duration(i) * time.Second),
+			Method: "GET",
+			URL:    "https://target.example/p/" + string(rune('a'+i)),
+			Status: 200,
+		}
+		if _, err := a.Append(&ex); err != nil {
+			t.Fatalf("append: %v", err)
+		}
+	}
+
+	newest, total, err := ReadTrafficExchangesNewest(scanDir, 2)
+	if err != nil {
+		t.Fatalf("newest read: %v", err)
+	}
+	if total != 5 || len(newest) != 2 {
+		t.Fatalf("newest window: total=%d n=%d, want 5/2", total, len(newest))
+	}
+	if newest[0].Seq != 4 || newest[1].Seq != 5 {
+		t.Fatalf("window = %d..%d, want 4..5", newest[0].Seq, newest[1].Seq)
+	}
+
+	one, err := ReadTrafficExchangeAt(scanDir, 3)
+	if err != nil || one == nil || one.Seq != 3 {
+		t.Fatalf("read seq 3: %v %+v", err, one)
+	}
+	if missing, err := ReadTrafficExchangeAt(scanDir, 99); err != nil || missing != nil {
+		t.Fatalf("missing seq: %v %+v", err, missing)
+	}
+
+	refs, total := MatchTrafficRefs(scanDir, "/p/c", "GET", "target.example", 10)
+	if total != 1 || len(refs) != 1 {
+		t.Fatalf("refs match: total=%d refs=%+v", total, refs)
+	}
+	if refs[0].Session != filepath.Base(scanDir) || refs[0].Seq != 3 {
+		t.Fatalf("ref identity = %+v, want session %q seq 3", refs[0], filepath.Base(scanDir))
+	}
+	if refs, _ := MatchTrafficRefs(scanDir, "/p/c", "GET", "other.example", 10); len(refs) != 0 {
+		t.Fatalf("host pin must reject another asset: %+v", refs)
+	}
+}
+
 // TestTrafficHostBinding covers the asset join key: HostOf strips the port and
 // lowercases, and FilterTrafficExchangesWith pins traffic to one host so a
 // finding's evidence cannot pick up packets from another asset.

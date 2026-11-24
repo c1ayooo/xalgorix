@@ -54,6 +54,14 @@ func (s *Server) saveQueueStateDurable(idx int, req ScanRequest, progress ...que
 		SourceRepo:       req.SourceRepo,
 		ScanContext:      req.ScanContext,
 		ScanContextPaths: append([]string(nil), req.ScanContextPaths...),
+
+		// Resume must restore the run's task coordinates and HITL posture.
+		Objective:            req.Objective,
+		ObjectiveProjectID:   req.ObjectiveProjectID,
+		ObjectiveTaskID:      req.ObjectiveTaskID,
+		ObjectiveGoal:        req.ObjectiveGoal,
+		ObjectiveInstruction: req.ObjectiveInstruction,
+		AuditMode:            req.AuditMode,
 	}
 	if len(progress) > 0 {
 		p := progress[0]
@@ -371,6 +379,16 @@ func scanRequestFromQueueState(state *QueueState, sourcePath string) ScanRequest
 		ResumeIterations:     state.Iterations,
 		ResumeTotalTokens:    state.TotalTokens,
 		ResumeToolCalls:      state.ToolCalls,
+
+		// Resumed runs keep their task/project coordinates, structured
+		// objective and task-level HITL posture. Without these, the new
+		// ScanContext is project-less and task-scoped features go dark.
+		Objective:            state.Objective,
+		ObjectiveProjectID:   state.ObjectiveProjectID,
+		ObjectiveTaskID:      state.ObjectiveTaskID,
+		ObjectiveGoal:        state.ObjectiveGoal,
+		ObjectiveInstruction: state.ObjectiveInstruction,
+		AuditMode:            state.AuditMode,
 	}
 }
 

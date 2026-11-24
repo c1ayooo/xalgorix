@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -77,6 +78,55 @@ func EnvFilePath() string {
 		home = "/root"
 	}
 	return filepath.Join(home, ".xalgorix.env")
+}
+
+// LiveWorkerConcurrency returns the worker-pool size for a NEW scan, reading
+// the env file on every call so an operator edit/settings save takes effect
+// without restarting the server. Process env remains the fallback for
+// deployments that configure the value only in the environment.
+func LiveWorkerConcurrency(fallback int) int {
+	raw := ""
+	if v, ok := readEnvFileValue(EnvFilePath(), "XALGORIX_WORKER_CONCURRENCY"); ok {
+		raw = v
+	} else {
+		raw = os.Getenv("XALGORIX_WORKER_CONCURRENCY")
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil {
+		n = fallback
+	}
+	if n < 1 {
+		n = 1
+	}
+	if n > 10 {
+		n = 10
+	}
+	return n
+}
+
+// readEnvFileValue returns the last assignment of key in the env file.
+func readEnvFileValue(path, key string) (string, bool) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", false
+	}
+	defer f.Close()
+	value := ""
+	found := false
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") || !strings.Contains(line, "=") {
+			continue
+		}
+		k, v, _ := strings.Cut(line, "=")
+		if strings.TrimSpace(k) != key {
+			continue
+		}
+		value = strings.Trim(strings.TrimSpace(v), `"'`)
+		found = true
+	}
+	return value, found
 }
 
 // ReadEnvFile parses a dotenv-style file without changing the process

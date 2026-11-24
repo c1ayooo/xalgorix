@@ -45,10 +45,35 @@ type Message struct {
 }
 
 // StreamChunk is a piece of streaming response.
+//
+// A chunk carries exactly one kind of payload: text (Content), incremental
+// tool-call fragments (ToolCalls), or the terminal usage snapshot (Usage with
+// Done). Fragments are keyed by their provider Index so the consumer can
+// accumulate arguments across chunks; the adapter reassembles the complete
+// call once the stream ends.
 type StreamChunk struct {
-	Content string
-	Done    bool
-	Err     error
+	Content   string
+	ToolCalls []StreamToolCall
+	// Reasoning is an incremental slice of the model's raw reasoning text
+	// (reasoning_content / reasoning / Anthropic thinking deltas). Empty for
+	// non-reasoning models.
+	Reasoning string
+	// Usage is set on the terminal (Done) chunk and reports what this stream
+	// actually counted into the client totals — not a running sum.
+	Usage *TokenUsage
+	Done  bool
+	Err   error
+}
+
+// StreamToolCall is one incremental tool-call fragment from a streaming
+// response. OpenAI-compatible providers split a single call across chunks:
+// the first carries ID and Name, later ones append a slice of the JSON
+// Arguments string. Index identifies which call the fragment belongs to.
+type StreamToolCall struct {
+	Index     int
+	ID        string
+	Name      string
+	Arguments string
 }
 
 // Client is the LLM API client.
@@ -634,6 +659,10 @@ type chatChoice struct {
 	Delta struct {
 		Content   contentField   `json:"content"`
 		ToolCalls []chatToolCall `json:"tool_calls"`
+		// Reasoning streams incremental thinking on reasoning models.
+		// Raw form tolerates string/list/object shapes.
+		Reasoning        json.RawMessage `json:"reasoning,omitempty"`
+		ReasoningContent json.RawMessage `json:"reasoning_content,omitempty"`
 	} `json:"delta"`
 	Message struct {
 		Content   contentField   `json:"content"`
@@ -825,6 +854,8 @@ type anthropicResponse struct {
 	Message anthropicMessage `json:"message,omitempty"`
 	Delta   struct {
 		Text string `json:"text"`
+		// Thinking is the Anthropic extended-thinking delta.
+		Thinking string `json:"thinking,omitempty"`
 	} `json:"delta,omitempty"`
 	Index int `json:"index,omitempty"`
 	// Usage at the top level (message_delta events carry final output token count here).
@@ -1595,6 +1626,25 @@ func (c *Client) buildAnthropicSystem(systemPrompt string) any {
 	return systemPrompt
 }
 
+// SetChainEndpoints hot-swaps the endpoints of an ordered task model chain. It
+// reports false for fixed/composite resolvers (nothing to update).
+func (c *Client) SetChainEndpoints(eps []Endpoint) bool {
+	r, ok := c.resolver.(*ChainResolver)
+	if !ok {
+		return false
+	}
+	r.SetEndpoints(eps)
+	return true
+}
+
+// advanceModelChain moves an ordered per-task model chain (ChainResolver) to
+// its next endpoint. Fixed/composite resolvers do not implement Advance, so
+// this is a no-op for every non-chain scan.
+func (c *Client) advanceModelChain(reason string) bool {
+	adv, ok := c.resolver.(interface{ Advance(string) bool })
+	return ok && adv.Advance(reason)
+}
+
 // chatWithRetry owns the retry/backoff loop around a single chat call.
 //
 // tools carries the native tool definitions (nil on the legacy XML path), and
@@ -1710,9 +1760,16 @@ func (c *Client) chatWithRetry(messages []Message, tools []ToolDefinition, calls
 			if c.keyRotator != nil {
 				if next, ok := c.keyRotator.PickExcluding(usedKey); ok {
 					log.Printf("[llm] key pool failover after %s → %s…", classifyShort(errStr), maskKeyForLog(next))
+					RecordKeyFailover(string(classified.Class), usedKey, next)
 					fastRetry = true
 					continue
 				}
+			}
+			// Profile-level chain: when every key in this profile is dead, the
+			// task's next model profile may still serve the request.
+			if c.advanceModelChain(string(classified.Class)) {
+				fastRetry = true
+				continue
 			}
 			return "", nil, fmt.Errorf("upstream unavailable: %w", err)
 		}
@@ -1726,9 +1783,14 @@ func (c *Client) chatWithRetry(messages []Message, tools []ToolDefinition, calls
 				if c.keyRotator != nil {
 					if next, ok := c.keyRotator.PickExcluding(usedKey); ok {
 						log.Printf("[llm] key pool failover after auth failure → %s…", maskKeyForLog(next))
+						RecordKeyFailover("auth", usedKey, next)
 						fastRetry = true
 						continue
 					}
+				}
+				if c.advanceModelChain("auth") {
+					fastRetry = true
+					continue
 				}
 			}
 			log.Printf("[llm] Non-retryable LLM error, returning immediately: %v", err)
@@ -1743,9 +1805,14 @@ func (c *Client) chatWithRetry(messages []Message, tools []ToolDefinition, calls
 			if c.keyRotator != nil {
 				if next, ok := c.keyRotator.PickExcluding(usedKey); ok {
 					log.Printf("[llm] key pool failover after rate limit → %s…", maskKeyForLog(next))
+					RecordKeyFailover("rate_limit", usedKey, next)
 					fastRetry = true
 					continue
 				}
+			}
+			if c.advanceModelChain("rate_limit") {
+				fastRetry = true
+				continue
 			}
 			// A 429/usage-window response is not made more likely to succeed by
 			// replaying the same full context three to five times immediately.
@@ -1764,7 +1831,18 @@ func (c *Client) chatWithRetry(messages []Message, tools []ToolDefinition, calls
 }
 
 // ChatStream sends a streaming chat request and returns a channel of chunks.
+// It is ChatStreamWithTools without native tool definitions, so the request
+// body stays byte-identical to the legacy streaming path.
 func (c *Client) ChatStream(messages []Message) <-chan StreamChunk {
+	return c.ChatStreamWithTools(messages, nil)
+}
+
+// ChatStreamWithTools streams a chat request carrying native tool definitions.
+// tools are only sent on the OpenAI-compatible branch; the Anthropic, Gemini
+// and Responses endpoints keep their existing streaming shape (the caller is
+// expected to use the XML dialect there). Passing nil is identical to
+// ChatStream.
+func (c *Client) ChatStreamWithTools(messages []Message, tools []ToolDefinition) <-chan StreamChunk {
 	ch := make(chan StreamChunk, 64)
 
 	// Spawn the streaming goroutine under safe.Go (R1.2 / R1.5) so a
@@ -1854,6 +1932,9 @@ func (c *Client) ChatStream(messages []Message) <-chan StreamChunk {
 			body, _ = json.Marshal(anReq)
 		} else {
 			reqBody := c.buildChatRequest(model, messages, endpoint, true)
+			if len(tools) > 0 {
+				reqBody.Tools = buildChatTools(tools)
+			}
 			body, _ = json.Marshal(reqBody)
 		}
 
@@ -1895,9 +1976,35 @@ func (c *Client) ChatStream(messages []Message) <-chan StreamChunk {
 		scanner.Buffer(buf, 1024*1024)
 
 		if isAnthropic {
-			// Anthropic SSE: each line is "event: TYPE" followed by "data: JSON"
-			var currentEvent string
-			var anResp anthropicResponse
+			// Anthropic SSE: each line is "event: TYPE" followed by "data: JSON".
+			//
+			// Usage accounting: message_start carries the real input-token count
+			// plus an in-flight output_tokens estimate (typically 1), while the
+			// terminal message_delta restates output_tokens as the final
+			// cumulative count. Adding both double-counts output, so the
+			// message_start value is only a fallback for streams that never emit
+			// message_delta, and the merged snapshot is committed exactly once.
+			var (
+				currentEvent string
+				anResp       anthropicResponse
+				anIn         int
+				anOut        int
+				anCached     int
+			)
+			commitUsage := func() *TokenUsage {
+				c.mu.Lock()
+				c.totalIn += anIn
+				c.totalOut += anOut
+				c.totalCached += anCached
+				c.mu.Unlock()
+				return &TokenUsage{
+					PromptTokens:     anIn,
+					CompletionTokens: anOut,
+					TotalTokens:      anIn + anOut,
+					CachedTokens:     anCached,
+					HasCachedTokens:  anCached > 0,
+				}
+			}
 			for scanner.Scan() {
 				line := scanner.Text()
 				line = strings.TrimSpace(line)
@@ -1920,45 +2027,93 @@ func (c *Client) ChatStream(messages []Message) <-chan StreamChunk {
 
 				switch currentEvent {
 				case "message_start":
-					c.mu.Lock()
-					c.totalIn += anResp.Message.Usage.InputTokens
-					c.totalOut += anResp.Message.Usage.OutputTokens
-					c.totalCached += anResp.Message.Usage.CacheReadInputTokens
-					c.mu.Unlock()
+					if v := anResp.Message.Usage.InputTokens; v > anIn {
+						anIn = v
+					}
+					if v := anResp.Message.Usage.OutputTokens; v > anOut {
+						anOut = v // provisional; superseded by message_delta
+					}
+					if v := anResp.Message.Usage.CacheReadInputTokens; v > anCached {
+						anCached = v
+					}
 				case "content_block_delta":
+					if anResp.Delta.Thinking != "" {
+						ch <- StreamChunk{Reasoning: anResp.Delta.Thinking}
+					}
 					if anResp.Delta.Text != "" {
 						ch <- StreamChunk{Content: anResp.Delta.Text}
 					}
 				case "message_delta":
-					// Final usage update — output_tokens arrives at the top level here.
-					if anResp.Usage.OutputTokens > 0 || anResp.Usage.CacheReadInputTokens > 0 {
-						c.mu.Lock()
-						c.totalOut += anResp.Usage.OutputTokens
-						c.totalCached += anResp.Usage.CacheReadInputTokens
-						c.mu.Unlock()
+					// Cumulative final usage: replace the output estimate, never
+					// add to it, so message_start + message_delta count once.
+					if v := anResp.Usage.InputTokens; v > anIn {
+						anIn = v
+					}
+					if anResp.Usage.OutputTokens > 0 {
+						anOut = anResp.Usage.OutputTokens
+					}
+					if v := anResp.Usage.CacheReadInputTokens; v > anCached {
+						anCached = v
 					}
 				case "message_stop":
-					ch <- StreamChunk{Done: true}
+					ch <- StreamChunk{Usage: commitUsage(), Done: true}
 					return
 				}
 			}
-			ch <- StreamChunk{Done: true}
+			ch <- StreamChunk{Usage: commitUsage(), Done: true}
 			return
 		}
 
 		// OpenAI/Google streaming: "data: JSON" lines. Gemini reports token usage
 		// under usageMetadata (cumulative per chunk); keep the latest values and
 		// add them to the running totals once, after the stream ends.
-		var gemPromptTokens, gemCandidateTokens, gemCachedTokens int
+		var (
+			gemPromptTokens, gemCandidateTokens, gemCachedTokens int
+			sseUsage                                             TokenUsage
+			sawSSEUsage                                          bool
+		)
+		doneChunk := func() StreamChunk {
+			if gemPromptTokens > 0 || gemCandidateTokens > 0 {
+				c.mu.Lock()
+				c.totalIn += gemPromptTokens
+				c.totalOut += gemCandidateTokens
+				c.totalCached += gemCachedTokens
+				c.mu.Unlock()
+			}
+			switch {
+			case isGoogle && (gemPromptTokens > 0 || gemCandidateTokens > 0 || gemCachedTokens > 0):
+				return StreamChunk{Usage: &TokenUsage{
+					PromptTokens:     gemPromptTokens,
+					CompletionTokens: gemCandidateTokens,
+					TotalTokens:      gemPromptTokens + gemCandidateTokens,
+					CachedTokens:     gemCachedTokens,
+					HasCachedTokens:  gemCachedTokens > 0,
+				}, Done: true}
+			case sawSSEUsage:
+				u := sseUsage
+				return StreamChunk{Usage: &u, Done: true}
+			default:
+				return StreamChunk{Done: true}
+			}
+		}
+		// A gateway may ignore stream=true and answer with one plain JSON body.
+		// Buffer non-SSE lines so that shape still yields a complete turn
+		// instead of a silently empty stream.
+		var fallbackBody strings.Builder
+		dataSeen := false
 		for scanner.Scan() {
 			line := scanner.Text()
 			if !strings.HasPrefix(line, "data: ") {
+				if !isGoogle && fallbackBody.Len() < 4<<20 {
+					fallbackBody.WriteString(line)
+				}
 				continue
 			}
+			dataSeen = true
 
 			data := strings.TrimPrefix(line, "data: ")
 			if data == "[DONE]" {
-				ch <- StreamChunk{Done: true}
+				ch <- doneChunk()
 				return
 			}
 
@@ -1999,24 +2154,91 @@ func (c *Client) ChatStream(messages []Message) <-chan StreamChunk {
 					c.totalCached += cached
 					c.totalCostNanoUSD += usdToNano(sseResp.Usage.ReportedCostUSD())
 					c.mu.Unlock()
+					// Mirror exactly what was counted so the terminal chunk
+					// reports this stream's contribution, not a provider sum.
+					sawSSEUsage = true
+					sseUsage.PromptTokens += sseResp.Usage.PromptTokens
+					sseUsage.CompletionTokens += sseResp.Usage.CompletionTokens
+					sseUsage.CachedTokens += cached
+					sseUsage.TotalTokens = sseUsage.PromptTokens + sseUsage.CompletionTokens
+					sseUsage.HasCachedTokens = sseUsage.HasCachedTokens || sseResp.Usage.HasCachedTokens
 				}
 				if len(sseResp.Choices) > 0 {
-					content := sseResp.Choices[0].Delta.Content
-					if content != "" {
-						ch <- StreamChunk{Content: string(content)}
+					delta := sseResp.Choices[0].Delta
+					if r := reasoningText(delta.Reasoning, delta.ReasoningContent); r != "" {
+						ch <- StreamChunk{Reasoning: r}
+					}
+					if delta.Content != "" {
+						ch <- StreamChunk{Content: string(delta.Content)}
+					}
+					// Tool calls arrive as fragments keyed by Index: the first
+					// carries ID/Name, later ones append the arguments JSON.
+					if len(delta.ToolCalls) > 0 {
+						parts := make([]StreamToolCall, 0, len(delta.ToolCalls))
+						for _, tc := range delta.ToolCalls {
+							parts = append(parts, StreamToolCall{
+								Index:     tc.Index,
+								ID:        tc.ID,
+								Name:      tc.Function.Name,
+								Arguments: string(tc.Function.Arguments),
+							})
+						}
+						ch <- StreamChunk{ToolCalls: parts}
 					}
 				}
 			}
+
 		}
 
-		if gemPromptTokens > 0 || gemCandidateTokens > 0 {
-			c.mu.Lock()
-			c.totalIn += gemPromptTokens
-			c.totalOut += gemCandidateTokens
-			c.totalCached += gemCachedTokens
-			c.mu.Unlock()
+		// Non-SSE fallback: no data: line arrived, but the body carries a
+		// complete chat completion. Emit it as one turn so callers never see a
+		// silent empty stream from a gateway that ignored stream=true.
+		if !dataSeen && !isGoogle && fallbackBody.Len() > 0 {
+			var resp chatResponse
+			if err := json.Unmarshal([]byte(fallbackBody.String()), &resp); err == nil && len(resp.Choices) > 0 {
+				choice := resp.Choices[0]
+				if r := reasoningText(choice.Message.Reasoning, choice.Message.ReasoningContent); r != "" {
+					ch <- StreamChunk{Reasoning: r}
+				}
+				if choice.Message.Content != "" {
+					ch <- StreamChunk{Content: string(choice.Message.Content)}
+				}
+				if len(choice.Message.ToolCalls) > 0 {
+					parts := make([]StreamToolCall, 0, len(choice.Message.ToolCalls))
+					for i, tc := range choice.Message.ToolCalls {
+						parts = append(parts, StreamToolCall{
+							Index:     i,
+							ID:        tc.ID,
+							Name:      tc.Function.Name,
+							Arguments: string(tc.Function.Arguments),
+						})
+					}
+					ch <- StreamChunk{ToolCalls: parts}
+				}
+				var usage *TokenUsage
+				if resp.Usage != nil {
+					resp.Usage.HasCachedTokens = resp.Usage.hasAnyCachedField()
+					cached := resp.Usage.GetCachedTokens()
+					c.mu.Lock()
+					c.totalIn += resp.Usage.PromptTokens
+					c.totalOut += resp.Usage.CompletionTokens
+					c.totalCached += cached
+					c.totalCostNanoUSD += usdToNano(resp.Usage.ReportedCostUSD())
+					c.mu.Unlock()
+					u := TokenUsage{
+						PromptTokens:     resp.Usage.PromptTokens,
+						CompletionTokens: resp.Usage.CompletionTokens,
+						TotalTokens:      resp.Usage.PromptTokens + resp.Usage.CompletionTokens,
+						CachedTokens:     cached,
+						HasCachedTokens:  resp.Usage.HasCachedTokens,
+					}
+					usage = &u
+				}
+				ch <- StreamChunk{Usage: usage, Done: true}
+				return
+			}
 		}
-		ch <- StreamChunk{Done: true}
+		ch <- doneChunk()
 	})
 
 	return ch

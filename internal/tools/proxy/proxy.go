@@ -2,7 +2,6 @@
 package proxy
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -18,6 +17,7 @@ import (
 	"github.com/c1ayooo/xalgorix/v4/internal/config"
 	"github.com/c1ayooo/xalgorix/v4/internal/proxy"
 	"github.com/c1ayooo/xalgorix/v4/internal/ratelimit"
+	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
 	"github.com/c1ayooo/xalgorix/v4/internal/tools"
 	"github.com/c1ayooo/xalgorix/v4/internal/trafficproxy"
 )
@@ -64,12 +64,16 @@ func Register(r *tools.Registry) {
 
 	r.Register(&tools.Tool{
 		Name:        "list_requests",
-		Description: "List HTTP requests captured by Caido proxy.",
+		Description: "List the HTTP exchanges captured by this run's MITM traffic proxy (the same raw archive the dashboard shows). Returns the newest `count` rows matching an optional URL substring / method. Pass seq=<n> to read one exchange's full raw request and response — use it to quote exact wire evidence in exploitation_proof.",
 		Parameters: []tools.Parameter{
-			{Name: "count", Description: "Number of requests to list (default: 20)", Required: false},
-			{Name: "filter", Description: "Filter by URL substring", Required: false},
+			{Name: "count", Description: "Number of exchanges to list (default: 20, max: 100)", Required: false},
+			{Name: "filter", Description: "Case-insensitive URL substring", Required: false},
+			{Name: "method", Description: "Exact HTTP method filter (e.g. POST)", Required: false},
+			{Name: "seq", Description: "Return the full raw request/response of one archived exchange (the #n id from the list)", Required: false},
 		},
-		Execute: listRequests,
+		Execute: func(args map[string]string) (tools.Result, error) {
+			return listRequests(r.GetScanContextID(), args)
+		},
 	})
 }
 
@@ -79,6 +83,9 @@ func Register(r *tools.Registry) {
 // tools.GuardDials); the proxy pool's shared client is left as it is, since
 // the proxy resolves and connects to the destination.
 func httpClient(scanCtxID string, dialGuard tools.DialGuard) (*http.Client, error) {
+	if rt, ok := tools.ContainerHTTPTransport(scanCtxID); ok {
+		return &http.Client{Transport: rt, Timeout: 60 * time.Second}, nil
+	}
 	cfg := config.Get()
 	if cfg.ProxyRequired && !proxy.Required() {
 		return nil, fmt.Errorf("proxy-required mode is not initialized")
@@ -87,12 +94,34 @@ func httpClient(scanCtxID string, dialGuard tools.DialGuard) (*http.Client, erro
 	// through the shared loopback traffic proxy (also in proxy-required
 	// mode) so the MITM owns upstream selection and observation. The
 	// fail-closed required checks above stay byte-identical.
-	if trafficproxy.Enabled() && trafficproxy.MITMEnabled() {
+	if trafficproxy.Enabled() {
 		return trafficProxyClient(cfg, scanCtxID, dialGuard)
+	}
+	// Egress pool (not the MITM): honor this task's pin when it has one.
+	if p, direct, ok := proxy.UpstreamFor(scanCtxID); !direct && ok && p != nil {
+		client := proxy.NewDirectClient(cfg.TLSSkipVerify)
+		tr, ok := client.Transport.(*http.Transport)
+		if !ok {
+			return nil, fmt.Errorf("egress client transport cannot be configured")
+		}
+		pinned, err := p.URL()
+		if err != nil {
+			return nil, fmt.Errorf("invalid configured proxy: %w", err)
+		}
+		tr.Proxy = http.ProxyURL(pinned)
+		// No run-token attribution here: a remote egress proxy must never see
+		// the token that only the local MITM consumes.
+		if err := tools.GuardDials(tr, dialGuard); err != nil {
+			return nil, err
+		}
+		return client, nil
 	}
 	// A settings edit cannot disable the live required route before restart.
 	if proxy.Required() {
-		return proxy.GetClient()
+		if viaProxyPool(cfg) {
+			return proxy.GetClient()
+		}
+		return nil, fmt.Errorf("proxy-required mode has no upstream")
 	}
 	if viaProxyPool(cfg) {
 		return proxy.GetClient()
@@ -218,6 +247,9 @@ func sendRequestGuardedCtx(parent context.Context, scanCtxID string, guard tools
 	if err != nil {
 		return tools.Result{}, fmt.Errorf("invalid request: %w", err)
 	}
+	// send_request historically allowed 32MB; carry that bound into the
+	// container-side worker.
+	req = req.WithContext(tools.WithHTTPWorkerBodyLimit(req.Context(), 32<<20))
 
 	if headersJSON := args["headers"]; headersJSON != "" {
 		headers, err := parseHeaders(headersJSON)
@@ -321,48 +353,145 @@ func sendRequestGuardedCtx(parent context.Context, scanCtxID string, guard tools
 	}, nil
 }
 
-func listRequests(args map[string]string) (tools.Result, error) {
-	cfg := config.Get()
-	if cfg.CaidoAPIToken == "" {
-		return tools.Result{Output: "Caido API token not configured. Set CAIDO_API_TOKEN in ~/.xalgorix.env"}, nil
+// listRequests reads the run's MITM traffic archive — the exact raw packets
+// the dashboard renders — so the agent can consult what it actually sent and
+// quote wire evidence instead of recalling it from context. Without seq it
+// lists the newest exchanges; with seq it returns that exchange's full raw
+// request/response, bounded so one tool result cannot blow the context.
+func listRequests(scanCtxID string, args map[string]string) (tools.Result, error) {
+	sc := scanctx.Get(scanCtxID)
+	if sc == nil || strings.TrimSpace(sc.ScanDir) == "" {
+		return tools.Result{Output: "No live scan context: the traffic archive is per run and only readable while that run is active."}, nil
 	}
 
+	if rawSeq := strings.TrimSpace(args["seq"]); rawSeq != "" {
+		seq, err := strconv.ParseInt(rawSeq, 10, 64)
+		if err != nil || seq <= 0 {
+			return tools.Result{Error: fmt.Sprintf("invalid seq %q (expected the #n id from the listing)", rawSeq)}, nil
+		}
+		ex, err := scanctx.ReadTrafficExchangeAt(sc.ScanDir, seq)
+		if err != nil {
+			return tools.Result{Error: fmt.Sprintf("read archived exchange #%d: %v", seq, err)}, nil
+		}
+		if ex == nil {
+			return tools.Result{Output: fmt.Sprintf("No archived exchange #%d in this session. Call list_requests without seq to see the available ids.", seq)}, nil
+		}
+		return tools.Result{
+			Output:   renderTrafficExchange(*ex),
+			Metadata: map[string]any{"traffic_seq": ex.Seq, "status": ex.Status, "method": ex.Method, "url": ex.URL},
+		}, nil
+	}
+
+	all, err := scanctx.ReadTrafficExchanges(sc.ScanDir)
+	if err != nil {
+		return tools.Result{Error: fmt.Sprintf("read traffic archive: %v", err)}, nil
+	}
+	if len(all) == 0 {
+		return tools.Result{Output: "This run has no captured HTTP exchanges yet. Target traffic must go through the traffic proxy (http_request/send_request, curl/wget, Python, or the browser)."}, nil
+	}
+
+	filter := strings.ToLower(strings.TrimSpace(args["filter"]))
+	method := strings.ToUpper(strings.TrimSpace(args["method"]))
+	matched := make([]scanctx.TrafficExchange, 0, len(all))
+	for _, ex := range all {
+		if method != "" && strings.ToUpper(ex.Method) != method {
+			continue
+		}
+		if filter != "" && !strings.Contains(strings.ToLower(ex.URL), filter) {
+			continue
+		}
+		matched = append(matched, ex)
+	}
 	count := clampRequestCount(args["count"])
-
-	query := `query { requests(first: ` + strconv.Itoa(count) + `) { edges { node { id method url response { statusCode } } } } }`
-
-	gqlReq := map[string]any{"query": query}
-	body, err := json.Marshal(gqlReq)
-	if err != nil {
-		return tools.Result{Error: fmt.Sprintf("Failed to marshal GraphQL query: %v", err)}, nil
+	if len(matched) > count {
+		matched = matched[len(matched)-count:] // newest window, ascending
 	}
 
-	gqlURL := fmt.Sprintf("http://127.0.0.1:%d/graphql", caidoPort())
-	req, err := http.NewRequest(http.MethodPost, gqlURL, bytes.NewReader(body))
-	if err != nil {
-		return tools.Result{Error: fmt.Sprintf("Failed to create GraphQL request: %v", err)}, nil
+	var b strings.Builder
+	fmt.Fprintf(&b, "%d captured HTTP exchanges in this run's traffic proxy archive", len(all))
+	if len(matched) != len(all) {
+		fmt.Fprintf(&b, " (%d match)", len(matched))
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+cfg.CaidoAPIToken)
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return tools.Result{Output: fmt.Sprintf("Failed to query Caido GraphQL API at %s: %v\nMake sure Caido is running and accessible.", gqlURL, err)}, nil
+	b.WriteString(". Use list_requests seq=<n> for the full raw request/response.\n")
+	for _, ex := range matched {
+		status := "failed"
+		if ex.Status != 0 {
+			status = strconv.Itoa(ex.Status)
+		}
+		b.WriteString("#")
+		b.WriteString(strconv.FormatInt(ex.Seq, 10))
+		b.WriteByte(' ')
+		b.WriteString(ex.Method)
+		b.WriteByte(' ')
+		b.WriteString(ex.URL)
+		b.WriteString(" -> ")
+		b.WriteString(status)
+		if ex.Channel != "" {
+			b.WriteString(" [")
+			b.WriteString(ex.Channel)
+			b.WriteByte(']')
+		}
+		if ex.HighRisk != "" {
+			b.WriteString(" high-risk: ")
+			b.WriteString(ex.HighRisk)
+		}
+		if ex.Denied {
+			b.WriteString(" DENIED")
+		}
+		b.WriteByte('\n')
 	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return tools.Result{Error: fmt.Sprintf("Failed to read Caido response: %v", err)}, nil
-	}
-	return tools.Result{Output: string(respBody)}, nil
+	return tools.Result{Output: b.String(), Metadata: map[string]any{
+		"total":   len(all),
+		"matched": len(matched),
+	}}, nil
 }
 
-// caidoPort returns the configured or auto-detected Caido port.
-func caidoPort() int {
-	if p := config.Get().CaidoPort; p > 0 {
-		return p
+// listRequestsRawLimit bounds one raw exchange dump (request + response +
+// framing) so a single tool result cannot swallow the context window.
+const listRequestsRawLimit = 192 << 10
+
+// renderTrafficExchange formats one archived exchange as wire text. Bodies are
+// already capped by the proxy (128 KiB per side); the combined rendering is
+// capped again here.
+func renderTrafficExchange(ex scanctx.TrafficExchange) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "#%d %s %s -> %d", ex.Seq, ex.Method, ex.URL, ex.Status)
+	if ex.Channel != "" {
+		fmt.Fprintf(&b, " [%s]", ex.Channel)
 	}
-	return 8080
+	if ex.Upstream != "" {
+		fmt.Fprintf(&b, " via %s", ex.Upstream)
+	}
+	if ex.HighRisk != "" {
+		fmt.Fprintf(&b, " high-risk: %s", ex.HighRisk)
+	}
+	if ex.Denied {
+		b.WriteString(" DENIED (upstream never contacted)")
+	}
+	b.WriteString("\n")
+	if ex.RequestRaw != "" {
+		b.WriteString("--- request ---\n")
+		b.WriteString(ex.RequestRaw)
+		if !strings.HasSuffix(ex.RequestRaw, "\n") {
+			b.WriteByte('\n')
+		}
+		if ex.ReqTruncated {
+			b.WriteString("… (request truncated at the capture limit)\n")
+		}
+	}
+	if ex.ResponseRaw != "" {
+		b.WriteString("--- response ---\n")
+		b.WriteString(ex.ResponseRaw)
+		if !strings.HasSuffix(ex.ResponseRaw, "\n") {
+			b.WriteByte('\n')
+		}
+		if ex.RespTruncated {
+			b.WriteString("… (response truncated at the capture limit)\n")
+		}
+	}
+	out := b.String()
+	if len(out) > listRequestsRawLimit {
+		out = out[:listRequestsRawLimit] + "\n… (tool output truncated; the full packet is in the traffic archive)\n"
+	}
+	return out
 }

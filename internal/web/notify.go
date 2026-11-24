@@ -209,11 +209,6 @@ func (s *Server) sendDiscordTo(webhook string, color int, title, description str
 	s.sendDiscordWithFileTo(webhook, color, title, description, "")
 }
 
-// sendDiscordWithFile sends to the global endpoint for legacy callers.
-func (s *Server) sendDiscordWithFile(color int, title, description, filePath string) {
-	s.sendDiscordWithFileTo(s.discordWebhook, color, title, description, filePath)
-}
-
 // sendDiscordWithFileTo captures an immutable per-scan endpoint before the
 // asynchronous send. Concurrent scans can never overwrite each other's URL.
 func (s *Server) sendDiscordWithFileTo(webhook string, color int, title, description, filePath string) {

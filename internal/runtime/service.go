@@ -3,8 +3,10 @@ package runtime
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -158,7 +160,10 @@ type ProjectOptions struct {
 	Image      string
 	Profile    string
 	NetProfile string
-	ProxyURL   string
+	// NetworkMode selects internal (project bridge + proxy egress) or host
+	// (share the host namespace for direct VPN/target reachability).
+	NetworkMode string
+	ProxyURL    string
 	// ProxyGatewayPort selects the per-project network gateway as the proxy
 	// address (http://<gateway>:<port>). It is used when the platform's proxy
 	// listens on 0.0.0.0 and an --internal project network can reach only its
@@ -223,8 +228,16 @@ func BuildProject(opt ProjectOptions) (ProjectSpec, error) {
 		return ProjectSpec{}, fmt.Errorf("runtime: proxy-only projects require a proxy URL")
 	}
 
+	// The image rootfs is read-only and HOME points into the writable scan
+	// mount. Tools expect $HOME to exist (curl reads ~/.curlrc, wget reads
+	// ~/.wgetrc, Python writes user site/cache), so create it before start.
+	homeDir := filepath.Join(absScan, "home")
+	if err := os.MkdirAll(homeDir, 0o700); err != nil {
+		return ProjectSpec{}, fmt.Errorf("runtime: prepare container home: %w", err)
+	}
+
 	env := []string{
-		"HOME=" + filepath.Join(absScan, "home"),
+		"HOME=" + homeDir,
 		"TMPDIR=/tmp",
 		"PATH=" + defaultContainerPath(),
 		"LANG=C.UTF-8",
@@ -233,14 +246,26 @@ func BuildProject(opt ProjectOptions) (ProjectSpec, error) {
 		"XALGORIX_SCAN_ID=" + opt.ScanID,
 		"XALGORIX_PROJECT_CONTAINER=1",
 	}
-	if strings.TrimSpace(opt.ProxyURL) != "" {
+	// Host networking shares the platform's network namespace, so a proxy that
+	// only published a bridge-gateway port is reachable at loopback instead.
+	// Resolve it before the environment is built: dropping the port here made
+	// every in-container curl/ffuf/nuclei bypass the MITM proxy (no traffic
+	// archive, no live HTTP feed).
+	hostNetwork := strings.EqualFold(strings.TrimSpace(opt.NetworkMode), "host")
+	proxyURL := strings.TrimSpace(opt.ProxyURL)
+	proxyGatewayPort := opt.ProxyGatewayPort
+	if hostNetwork && proxyURL == "" && proxyGatewayPort > 0 {
+		proxyURL = "http://" + net.JoinHostPort("127.0.0.1", strconv.Itoa(proxyGatewayPort))
+		proxyGatewayPort = 0
+	}
+	if proxyURL != "" {
 		env = append(env,
-			"HTTP_PROXY="+opt.ProxyURL,
-			"HTTPS_PROXY="+opt.ProxyURL,
-			"ALL_PROXY="+opt.ProxyURL,
-			"http_proxy="+opt.ProxyURL,
-			"https_proxy="+opt.ProxyURL,
-			"all_proxy="+opt.ProxyURL,
+			"HTTP_PROXY="+proxyURL,
+			"HTTPS_PROXY="+proxyURL,
+			"ALL_PROXY="+proxyURL,
+			"http_proxy="+proxyURL,
+			"https_proxy="+proxyURL,
+			"all_proxy="+proxyURL,
 			"NO_PROXY=127.0.0.1,localhost,::1",
 		)
 	}
@@ -258,27 +283,40 @@ func BuildProject(opt ProjectOptions) (ProjectSpec, error) {
 	}
 	env = append(env, opt.Env...)
 
+	network := NetworkSpec{
+		Name:             "xalg-proj-" + sanitizeNetName(opt.ScanID),
+		Internal:         netProfile == NetProfileProxyOnly,
+		ProxyURL:         proxyURL,
+		ProxyGatewayPort: proxyGatewayPort,
+		CACertPath:       opt.CACertPath,
+		EgressCIDRs:      opt.EgressCIDRs,
+	}
+	if hostNetwork {
+		// No project bridge: the container joins the host namespace and can
+		// reach VPN/target subnets directly. The resolved proxy URL is the
+		// loopback address of the run-scoped listener; the platform-side
+		// security chain is unchanged.
+		network = NetworkSpec{
+			Host:        true,
+			ProxyURL:    proxyURL,
+			CACertPath:  opt.CACertPath,
+			EgressCIDRs: opt.EgressCIDRs,
+		}
+	}
 	spec := ProjectSpec{
-		ProjectID:  opt.ScanID,
-		ScanID:     opt.ScanID,
-		InstanceID: opt.InstanceID,
-		Image:      opt.Image,
-		Profile:    orDefault(opt.Profile, ProfileCore),
-		NetProfile: netProfile,
-		Limits:     opt.Limits,
-		Mounts:     plan.Mounts,
-		WorkDir:    absScan,
-		Env:        env,
-		Network: NetworkSpec{
-			Name:             "xalg-proj-" + sanitizeNetName(opt.ScanID),
-			Internal:         netProfile == NetProfileProxyOnly,
-			ProxyURL:         opt.ProxyURL,
-			ProxyGatewayPort: opt.ProxyGatewayPort,
-			CACertPath:       opt.CACertPath,
-			EgressCIDRs:      opt.EgressCIDRs,
-		},
+		ProjectID:        opt.ScanID,
+		ScanID:           opt.ScanID,
+		InstanceID:       opt.InstanceID,
+		Image:            opt.Image,
+		Profile:          orDefault(opt.Profile, ProfileCore),
+		NetProfile:       netProfile,
+		Limits:           opt.Limits,
+		Mounts:           plan.Mounts,
+		WorkDir:          absScan,
+		Env:              env,
+		Network:          network,
 		Capabilities:     capabilitiesForProfile(opt.Profile, netProfile),
-		PublishCDP:       orDefault(opt.Profile, ProfileCore) == ProfileWeb,
+		PublishCDP:       !hostNetwork && orDefault(opt.Profile, ProfileCore) == ProfileWeb,
 		BrowserProxy:     opt.BrowserProxy,
 		HTTPWorkerSocket: opt.HTTPWorkerSocket,
 	}
@@ -295,7 +333,10 @@ func capabilitiesForProfile(profile, netProfile string) []string {
 	// file DAC and cannot write its own workspace.
 	caps := []string{"CAP_DAC_OVERRIDE", "CAP_DAC_READ_SEARCH"}
 	if profile == ProfileFull {
-		caps = append(caps, "NET_RAW", "NET_ADMIN")
+		// SYS_PTRACE backs the full-profile debug tools (gdb/strace in
+		// tools/toolbox/toolpack.yaml declare it); without it they install
+		// but cannot attach inside the container.
+		caps = append(caps, "NET_RAW", "NET_ADMIN", "SYS_PTRACE")
 	}
 	if netProfile == NetProfileRaw && profile != ProfileFull {
 		caps = append(caps, "NET_RAW")

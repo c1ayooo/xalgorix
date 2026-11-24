@@ -43,6 +43,7 @@ import (
 	"time"
 
 	"github.com/c1ayooo/xalgorix/v4/internal/platform"
+	"github.com/c1ayooo/xalgorix/v4/internal/proxy"
 )
 
 // runProjectionPageSize caps how many runs a single task view / findings
@@ -65,6 +66,18 @@ func (s *Server) SetPlatformStore(store platform.Repository) {
 	if store != nil {
 		if svc := s.approvalService(); svc != nil {
 			svc.ReconcilePending()
+		}
+		// No report job survives a process restart: queued/generating rows
+		// found at startup are ghosts. Mark them failed so the operator can
+		// regenerate instead of waiting on a job that no longer exists.
+		if reconciler, ok := store.(platform.ReportReconciler); ok {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if n, err := reconciler.ReconcileActiveReports(ctx, "interrupted by process restart"); err != nil {
+				log.Printf("[report] reconcile interrupted reports: %v", err)
+			} else if n > 0 {
+				log.Printf("[report] marked %d interrupted report(s) failed", n)
+			}
+			cancel()
 		}
 	}
 }
@@ -326,6 +339,23 @@ func (s *Server) taskTerminalRun(ctx context.Context, store platform.Repository,
 	return runs[0], true
 }
 
+// recordTaskRunRevision stamps the runnable-content revision an accepted
+// dispatch consumed. It is best-effort: a failed marker write only means the
+// task keeps reading as "content changed" (the run button stays available),
+// never that a run is blocked or lost. The task object must be the one the
+// dispatch was built from — that is the content actually consumed.
+func (s *Server) recordTaskRunRevision(store platform.Repository, task *platform.Task) {
+	if store == nil || task == nil || strings.TrimSpace(task.ID) == "" {
+		return
+	}
+	revision := platform.TaskContentRevision(*task)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := store.SetTaskRunRevision(ctx, task.ID, revision); err != nil {
+		log.Printf("[platform] task %s dispatched but run revision not recorded: %v", task.ID, err)
+	}
+}
+
 // scanDirForRun resolves the on-disk scan dir for a run's instance from the
 // shared events-free summary walk (instance_id first, legacy scan id as the
 // fallback key), so a 1:1 re-dispatch can bind to the same scan dir and keep
@@ -434,8 +464,18 @@ func (s *Server) attachTaskProjections(ctx context.Context, store platform.Repos
 			if tasks[i].LastRunAt == "" || rec.StartedAt > tasks[i].LastRunAt {
 				tasks[i].LastRunAt = rec.StartedAt
 				tasks[i].LastRunStatus = rec.Status
+				tasks[i].LastRunCompletion = rec.Completion
 			}
 		}
+		// Run gate (用户裁决): a task owns one run, so once a dispatch has
+		// consumed this exact content a plain re-run would replay it. The
+		// revision comparison is content-based (not a timestamp), so a no-op
+		// edit cannot unlock a replay and an edit made during a run still
+		// counts. Never-run tasks and unrecorded markers stay runnable.
+		revision := platform.TaskContentRevision(tasks[i])
+		changed := tasks[i].RunCount == 0 || revision == "" ||
+			platform.DispatchedRunRevision(tasks[i]) != revision
+		tasks[i].ContentChangedSinceRun = &changed
 		if hasProjection {
 			if count, err := fs.CountTaskFindings(ctx, tasks[i].ID); err == nil {
 				tasks[i].FindingCount = count
@@ -532,6 +572,10 @@ func (s *Server) handleProjectDetail(w http.ResponseWriter, r *http.Request) {
 	projectID := parts[0]
 	if len(parts) > 1 && parts[1] == "tasks" {
 		s.handleProjectTasks(w, r, store, projectID)
+		return
+	}
+	if len(parts) > 1 && parts[1] == "assets" {
+		s.handleProjectAssets(w, r, store, projectID, parts[2:])
 		return
 	}
 	if len(parts) > 1 && parts[1] == "conversations" {
@@ -635,10 +679,13 @@ func (s *Server) handleProjectTasks(w http.ResponseWriter, r *http.Request, stor
 			PhasePolicy  *platform.PhasePolicy  `json:"phase_policy"`
 			Schedule     *platform.TaskSchedule `json:"schedule"`
 			ContextPaths []string               `json:"context_paths"`
+			AuditMode    string                 `json:"audit_mode"`
 			Objective    *platform.Objective    `json:"objective"`
 			// Model chain ("<provider>:<profileId>", order = priority).
 			LLMChain  []string `json:"llm_chain"`
 			ActiveLLM string   `json:"active_llm"`
+			// Outbound proxy pin: "" inherit, "direct", or a pool index.
+			Proxy string `json:"proxy"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 			writeJSONStatus(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
@@ -648,6 +695,25 @@ func (s *Server) handleProjectTasks(w http.ResponseWriter, r *http.Request, stor
 			writeJSONStatus(w, http.StatusBadRequest, map[string]string{"error": "name is required"})
 			return
 		}
+		// Normalize + verify the model chain before persisting: a chain entry
+		// that cannot resolve to a live profile would otherwise fail the first
+		// run instead of the save.
+		if chain, active := platform.NormalizeTaskLLMChain(in.LLMChain, in.ActiveLLM); len(chain) > 0 {
+			if err := s.validateTaskLLMChain(r.Context(), chain); err != nil {
+				writeJSONStatus(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				return
+			}
+			in.LLMChain, in.ActiveLLM = chain, active
+		}
+		if pin := platform.NormalizeTaskProxy(in.Proxy); pin != "" {
+			if err := s.validateTaskProxyPin(pin); err != nil {
+				writeJSONStatus(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				return
+			}
+			in.Proxy = pin
+		} else {
+			in.Proxy = ""
+		}
 		task, err := store.CreateTask(r.Context(), projectID, platform.TaskInput{
 			Name:         in.Name,
 			Goal:         in.Goal,
@@ -655,9 +721,11 @@ func (s *Server) handleProjectTasks(w http.ResponseWriter, r *http.Request, stor
 			PhasePolicy:  in.PhasePolicy,
 			Schedule:     in.Schedule,
 			ContextPaths: in.ContextPaths,
+			AuditMode:    in.AuditMode,
 			Objective:    in.Objective,
 			LLMChain:     in.LLMChain,
 			ActiveLLM:    in.ActiveLLM,
+			Proxy:        in.Proxy,
 		})
 		if err != nil {
 			writePlatformError(w, err)
@@ -677,6 +745,8 @@ type taskRequestBody struct {
 	PhasePolicy  *platform.PhasePolicy  `json:"phase_policy"`
 	Schedule     *platform.TaskSchedule `json:"schedule"`
 	ContextPaths []string               `json:"context_paths"`
+	// AuditMode is the task-level HITL switch (inherit/off/enforce).
+	AuditMode *string `json:"audit_mode"`
 	// Objective is raw so the three states stay distinguishable: absent =
 	// leave as is, explicit null = clear, object = replace.
 	Objective json.RawMessage `json:"objective"`
@@ -685,6 +755,8 @@ type taskRequestBody struct {
 	// active_llm replaces the chain head. Absent leaves them unchanged.
 	LLMChain  *[]string `json:"llm_chain"`
 	ActiveLLM *string   `json:"active_llm"`
+	// Proxy non-nil replaces the outbound proxy pin ("" = inherit).
+	Proxy *string `json:"proxy"`
 }
 
 // handleTaskDetail serves /api/tasks/{id} (GET/PATCH/DELETE),
@@ -712,6 +784,12 @@ func (s *Server) handleTaskDetail(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			writeJSONStatus(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		case "reports":
+			// Manual report delivery (REPORT_DELIVERY_SPEC): GET list / POST
+			// generate a task-level report revision. No scan lifecycle hook
+			// creates reports.
+			s.handleTaskReports(w, r, store, taskID)
 			return
 		case "findings":
 			if r.Method != http.MethodGet {
@@ -782,9 +860,28 @@ func (s *Server) handleTaskDetail(w http.ResponseWriter, r *http.Request) {
 			PhasePolicy:  req.PhasePolicy,
 			Schedule:     req.Schedule,
 			ContextPaths: req.ContextPaths,
+			AuditMode:    req.AuditMode,
 			Archived:     req.Archived,
 			LLMChain:     req.LLMChain,
 			ActiveLLM:    req.ActiveLLM,
+			Proxy:        req.Proxy,
+		}
+		// PATCH names the replacement chain wholesale; validate what will be
+		// stored (empty means "clear", which is always valid).
+		if req.Proxy != nil {
+			if pin := platform.NormalizeTaskProxy(*req.Proxy); pin != "" {
+				if err := s.validateTaskProxyPin(pin); err != nil {
+					writeJSONStatus(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+					return
+				}
+			}
+		}
+		if req.LLMChain != nil && len(*req.LLMChain) > 0 {
+			chain, _ := platform.NormalizeTaskLLMChain(*req.LLMChain, "")
+			if err := s.validateTaskLLMChain(r.Context(), chain); err != nil {
+				writeJSONStatus(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				return
+			}
 		}
 		if len(req.Objective) > 0 {
 			if strings.TrimSpace(string(req.Objective)) == "null" {
@@ -798,13 +895,30 @@ func (s *Server) handleTaskDetail(w http.ResponseWriter, r *http.Request) {
 				upd.Objective = &obj
 			}
 		}
+		// Snapshot the pre-edit task so the live run (if any) can be told
+		// exactly what changed; the PATCH itself is still wholesale.
+		existing, gerr := store.GetTask(r.Context(), taskID)
+		if gerr != nil {
+			writePlatformError(w, gerr)
+			return
+		}
 		task, err := store.UpdateTask(r.Context(), taskID, upd)
 		if err != nil {
 			writePlatformError(w, err)
 			return
 		}
+		// Hot-apply to an active run (planner brief + main agent + model +
+		// egress + audit). Persisted first; the run is never restarted.
+		s.applyTaskConfigToLiveRuns(r.Context(), existing, task)
 		writeJSONStatus(w, http.StatusOK, task)
 	case http.MethodDelete:
+		if s.taskHasActiveReport(r.Context(), taskID) {
+			writeJSONStatus(w, http.StatusConflict, map[string]string{"error": "该任务有报告正在生成，请先取消或等待完成"})
+			return
+		}
+		// Report metadata rows cascade with the task in the repository; the
+		// rendered artifacts live on disk and must be removed here.
+		s.deleteTaskReportDirs(r.Context(), taskID)
 		if err := store.DeleteTask(r.Context(), taskID); err != nil {
 			writePlatformError(w, err)
 			return
@@ -848,6 +962,80 @@ func (s *Server) handleTaskRunList(w http.ResponseWriter, r *http.Request, store
 // → saveQueueStateDurable → go runMultiScan — without restructuring
 // handleScan. The response "status" carries the real dispatch state
 // (queued as "pending" until admission), same semantics as /api/scan.
+// orderedTaskLLMChain returns the task chain with the active entry first
+// (deduped), so the run starts on the operator's current choice and advances
+// through the remaining priority order.
+func orderedTaskLLMChain(chain []string, active string) []string {
+	active = strings.TrimSpace(active)
+	out := make([]string, 0, len(chain)+1)
+	seen := map[string]bool{}
+	if active != "" {
+		out = append(out, active)
+		seen[active] = true
+	}
+	for _, key := range chain {
+		key = strings.TrimSpace(key)
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, key)
+	}
+	return out
+}
+
+// validateTaskProxyPin checks that a task's outbound proxy pin is usable in the
+// CURRENT process configuration: "direct" conflicts with proxy-required mode,
+// and a pool index must still exist after a settings change.
+func (s *Server) validateTaskProxyPin(pin string) error {
+	switch pin {
+	case "":
+		return nil
+	case "direct":
+		if proxy.Required() {
+			return fmt.Errorf("the process requires a proxy (XALGORIX_PROXY_REQUIRED); choose a proxy entry instead of direct")
+		}
+		return nil
+	default:
+		idx, err := strconv.Atoi(pin)
+		if err != nil || idx <= 0 {
+			return fmt.Errorf("proxy pin must be \"direct\", \"\" (inherit) or a positive pool index")
+		}
+		if proxy.EntryAt(idx) == nil {
+			return fmt.Errorf("proxy entry %d does not exist in the current pool", idx)
+		}
+		return nil
+	}
+}
+
+// validateTaskLLMChain rejects a chain entry that does not resolve to a live
+// auth profile and catalog entry. Saving is the right failure point: a bad
+// downstream entry would otherwise only surface when the run tries to fail over
+// mid-scan.
+func (s *Server) validateTaskLLMChain(ctx context.Context, chain []string) error {
+	if len(chain) == 0 {
+		return nil
+	}
+	if s.profiles == nil || s.catalog == nil {
+		return fmt.Errorf("%w: provider stores are not configured", errUnknownProviderProfile)
+	}
+	for _, key := range chain {
+		prof, ok, err := s.profiles.Get(ctx, key)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("%w: %q", errUnknownProviderProfile, key)
+		}
+		if _, ok, err := s.catalog.Get(ctx, prof.Provider); err != nil {
+			return err
+		} else if !ok {
+			return fmt.Errorf("%w: %q references unknown provider %q", errUnknownProviderProfile, key, prof.Provider)
+		}
+	}
+	return nil
+}
+
 func (s *Server) handleTaskRunStart(w http.ResponseWriter, r *http.Request, store platform.Repository, taskID string) {
 	limitJSONBody(w, r)
 	var override ScanRequest
@@ -966,6 +1154,10 @@ func (s *Server) handleTaskRunStart(w http.ResponseWriter, r *http.Request, stor
 	req.Objective = task.Objective
 	req.ObjectiveProjectID = project.ID
 	req.ObjectiveTaskID = task.ID
+	// Task-level HITL switch: snapshot the effective posture (task override or
+	// process default) onto the run. The agent gate and the MITM wire gate both
+	// read it from the ScanContext.
+	req.AuditMode = effectiveTaskAuditMode(task, s.cfg)
 	// Round-0 raw material (R-goal): when the task carries no structured
 	// objective, the dispatch goroutine analyzes the raw goal before the
 	// agent starts (goal_analysis.go roundZeroGoalAnalysis).
@@ -977,9 +1169,28 @@ func (s *Server) handleTaskRunStart(w http.ResponseWriter, r *http.Request, stor
 	if strings.TrimSpace(req.ProviderProfile) == "" && strings.TrimSpace(task.ActiveLLM) != "" {
 		req.ProviderProfile = strings.TrimSpace(task.ActiveLLM)
 	}
+	// The full chain rides along (active entry first) so the LLM client can
+	// fail over at the profile level after quota/auth exhaustion, exactly like
+	// the key pool does one level down. A single-entry chain stays inert.
+	if strings.TrimSpace(req.ProviderProfile) == "" {
+		req.ProviderProfileChain = nil
+	} else {
+		req.ProviderProfileChain = orderedTaskLLMChain(task.LLMChain, req.ProviderProfile)
+	}
 	// Task context_paths are the Context half of the Task model. They are
 	// additive with an explicit request scan_context and all enter the seeded
 	// attack surface (never silently reduced to the first path).
+	// Task-level outbound proxy pin: validated again here because the pool may
+	// have changed since the task was saved (hot-applied settings, restarted
+	// process). An unresolvable pin fails the dispatch instead of silently
+	// falling back to the global pool.
+	req.Proxy = platform.NormalizeTaskProxy(task.Proxy)
+	if req.Proxy != "" {
+		if err := s.validateTaskProxyPin(req.Proxy); err != nil {
+			writeJSONStatus(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+	}
 	req.ScanContextPaths = taskRunContextPaths(task, override)
 	req.ScanContext = ""
 	if len(req.ScanContextPaths) > 0 {
@@ -1108,6 +1319,10 @@ func (s *Server) handleTaskRunStart(w http.ResponseWriter, r *http.Request, stor
 			writeJSONStatus(w, http.StatusInternalServerError, map[string]string{"error": "could not durably persist resumable dispatch"})
 			return
 		}
+		// The task's content is now consumed by an accepted dispatch. Record
+		// its revision so the UI stops offering a plain re-run of the exact
+		// same content until the operator edits it (内容变了才给跑).
+		s.recordTaskRunRevision(store, task)
 		go func() {
 			defer s.releaseDispatchID(instanceID)
 			s.runMultiScan(req, &scanCfg, instanceID)
@@ -1142,6 +1357,9 @@ func (s *Server) handleTaskRunStart(w http.ResponseWriter, r *http.Request, stor
 		writeJSONStatus(w, http.StatusInternalServerError, map[string]string{"error": "could not durably persist resumable dispatch"})
 		return
 	}
+	// Accepted: this exact content has now been dispatched. The revision
+	// marker is what lets the task API answer "content_changed_since_run".
+	s.recordTaskRunRevision(store, task)
 	go func() {
 		defer s.releaseDispatchID(instanceID)
 		s.runMultiScan(req, &scanCfg, instanceID)

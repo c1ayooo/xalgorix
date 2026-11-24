@@ -118,6 +118,14 @@ func TestAgentProfileHandlersContract(t *testing.T) {
 	for _, p := range list.Profiles {
 		if p.Builtin {
 			builtinCount++
+			// The console must be able to show the full canonical contract,
+			// not just the role name.
+			if p.Focus == "" || p.EvidenceContract == "" || p.StoppingRule == "" {
+				t.Fatalf("builtin row %q missing canonical contract fields: %+v", p.Role, p)
+			}
+			if p.ToolScopeHidden == nil {
+				t.Fatalf("builtin row %q has nil tool_scope_hidden (want [] at minimum)", p.Role)
+			}
 		}
 	}
 	if builtinCount != len(agent.BuiltinSpecialistRoles()) {

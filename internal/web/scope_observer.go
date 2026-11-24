@@ -58,7 +58,7 @@ func (s *ApprovalService) observeScope(instanceID string, verdict approval.Verdi
 	if store == nil {
 		return scopeObservation{Decision: scopeDefer}
 	}
-	ctx, cancel := storeCtx()
+	ctx, cancel := s.storeCtx()
 	defer cancel()
 	projectID, _, _ := s.resolveOwnership(ctx, store, instanceID)
 	if projectID == "" {
@@ -106,7 +106,7 @@ func (s *ApprovalService) observeScope(instanceID string, verdict approval.Verdi
 // ruleDecision records the hit (best effort), broadcasts the audit projection
 // and returns the observation.
 func (s *ApprovalService) ruleDecision(instanceID string, r *platform.ApprovalRule, decision string) scopeObservation {
-	ctx, cancel := storeCtx()
+	ctx, cancel := s.storeCtx()
 	if err := s.srv.currentPlatformStore().RecordApprovalRuleHit(ctx, r.ID); err != nil {
 		log.Printf("[scope-observer] rule hit bookkeeping for %s: %v", r.ID, err)
 	}
@@ -147,7 +147,7 @@ func (s *ApprovalService) submitScopeDenial(instanceID string, verdict approval.
 	if store == nil {
 		return nil, fmt.Errorf("approval store unavailable")
 	}
-	ctx, cancel := storeCtx()
+	ctx, cancel := s.storeCtx()
 	defer cancel()
 	projectID, taskID, runID := s.resolveOwnership(ctx, store, instanceID)
 	input := platform.ApprovalInput{

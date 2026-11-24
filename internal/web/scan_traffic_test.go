@@ -187,3 +187,98 @@ func TestScanTrafficEndpoint_ReadsFilesNotLiveContext(t *testing.T) {
 		t.Fatalf("file-backed match = %+v", view)
 	}
 }
+
+// A run can own several sibling session directories (checkpoint restore /
+// re-dispatch) and each session restarts its archive sequence. The run-scoped
+// read must merge them, expose the owning session on every row, and let a
+// finding fetch its exact persisted (session, seq) evidence refs.
+func TestScanTrafficEndpoint_MergesSiblingSessionsAndRefs(t *testing.T) {
+	s := newTestServer(t, nil)
+	instanceID := "traffic-instance-1"
+	parent := filepath.Join(s.dataDir, "target.example", "2026-01-01")
+	olderDir := filepath.Join(parent, "target.example_older")
+	newerDir := filepath.Join(parent, "target.example_newer")
+	for _, dir := range []string{olderDir, newerDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	base := time.Now().UTC()
+	s.saveScanRecordTo(&ScanRecord{
+		ID: "traffic-older", InstanceID: instanceID, Target: "https://target.example",
+		Status: "finished", StartedAt: base.Add(-time.Hour).Format(time.RFC3339),
+	}, olderDir)
+	s.saveScanRecordTo(&ScanRecord{
+		ID: "traffic-newer", InstanceID: instanceID, Target: "https://target.example",
+		Status: "finished", StartedAt: base.Format(time.RFC3339),
+	}, newerDir)
+
+	olderArchive := scanctx.NewTrafficArchive(olderDir)
+	if _, err := olderArchive.Append(&scanctx.TrafficExchange{
+		At: base.Add(-time.Hour), Method: "POST", URL: "https://target.example/api/vuln",
+		Status: 200, Channel: "bearer",
+		RequestRaw: "POST /api/vuln HTTP/1.1\r\nHost: target.example\r\n\r\npayload", ResponseRaw: "HTTP/1.1 200 OK\r\n\r\nvulnerable",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	newerArchive := scanctx.NewTrafficArchive(newerDir)
+	for i := 0; i < 2; i++ {
+		if _, err := newerArchive.Append(&scanctx.TrafficExchange{
+			At: base.Add(time.Duration(i) * time.Minute), Method: "GET",
+			URL: "https://target.example/health", Status: 200, Channel: "subprocess",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var view scanTrafficView
+	rr := trafficGet(t, s, "/api/scans/"+instanceID+"/traffic")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("code = %d body=%s", rr.Code, rr.Body.String())
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &view); err != nil {
+		t.Fatal(err)
+	}
+	if !view.Present || view.TotalMatched != 3 || len(view.Exchanges) != 3 {
+		t.Fatalf("merged view = present:%v total:%d n:%d", view.Present, view.TotalMatched, len(view.Exchanges))
+	}
+	sessions := map[string]bool{}
+	for _, ex := range view.Exchanges {
+		sessions[ex.Session] = true
+	}
+	if !sessions["target.example_older"] || !sessions["target.example_newer"] {
+		t.Fatalf("merged rows must carry both sessions: %+v", sessions)
+	}
+	// Chronological order across sessions (the older packet comes first).
+	if !strings.Contains(view.Exchanges[0].RequestRaw, "payload") {
+		t.Fatalf("merged order lost the older session's packet: %+v", view.Exchanges[0])
+	}
+
+	// Newest-window limit is global across sessions, not per session.
+	rr = trafficGet(t, s, "/api/scans/"+instanceID+"/traffic?limit=1")
+	if err := json.Unmarshal(rr.Body.Bytes(), &view); err != nil {
+		t.Fatal(err)
+	}
+	if !view.Truncated || len(view.Exchanges) != 1 || view.Exchanges[0].Session != "target.example_newer" || view.Exchanges[0].Seq != 2 {
+		t.Fatalf("global limit = %+v", view.Exchanges)
+	}
+
+	// Exact evidence refs: the older session's seq 1, despite the run's newest
+	// session being the other directory.
+	rr = trafficGet(t, s, "/api/scans/"+instanceID+"/traffic?refs=target.example_older:1")
+	if err := json.Unmarshal(rr.Body.Bytes(), &view); err != nil {
+		t.Fatal(err)
+	}
+	if len(view.Exchanges) != 1 || !strings.Contains(view.Exchanges[0].RequestRaw, "payload") {
+		t.Fatalf("ref evidence = %+v", view.Exchanges)
+	}
+
+	// Path-traversal in a ref session is refused.
+	rr = trafficGet(t, s, "/api/scans/"+instanceID+"/traffic?refs=../etc:1")
+	if err := json.Unmarshal(rr.Body.Bytes(), &view); err != nil {
+		t.Fatal(err)
+	}
+	if len(view.Exchanges) != 3 {
+		t.Fatalf("traversal ref should fall back to the heuristic read, got %d", len(view.Exchanges))
+	}
+}

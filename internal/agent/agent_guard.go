@@ -412,17 +412,19 @@ func (a *Agent) shouldBlockForActivityPolicy(toolName string, toolArgs map[strin
 // because they don't probe targets.
 //
 // Activity_Hosts (a.activityHosts) is intentionally NOT consulted
-// here. Engagement-scope policing is no longer the agent guard's
-// job; this function only protects the operator's machine and
-// listener (per design.md → "Open Question: Requirement 3.7"). The
+// here. This function protects the operator's machine and listener
+// (per design.md → "Open Question: Requirement 3.7"); the
 // Local_Or_Listener_Host check fires regardless of whether scope is
-// populated.
+// populated. When the project's fence is enforced, the explicit
+// engagement scope (a.engagementScope) adds a second, opt-in layer
+// (scope_guard.go); without it this function behaves exactly as before.
 //
 // Returns (false, "") when:
 //
 //   - the tool is not in the gated list,
 //   - the args don't reference any host-shaped token,
-//   - none of the referenced hosts are Local_Or_Listener_Hosts.
+//   - none of the referenced hosts are Local_Or_Listener_Hosts (and, when a
+//     scope is enforced, every destination is inside it).
 func (a *Agent) shouldBlockForOutOfScope(toolName string, toolArgs map[string]string) (bool, string) {
 	lowerTool := strings.ToLower(toolName)
 	switch lowerTool {
@@ -437,6 +439,17 @@ func (a *Agent) shouldBlockForOutOfScope(toolName string, toolArgs map[string]st
 							"Refusing to send an HTTP request to localhost / this machine / "+
 							"the dashboard's listener.", dest,
 					)
+				}
+			}
+		}
+		// Engagement scope (opt-in project fence): a second layer after the
+		// operator-machine rule. It only constrains the request's destination,
+		// exactly like the local guard, so hosts named in payloads stay the
+		// target application's business.
+		for _, raw := range []string{toolArgs["url"], toolArgs["_raw"]} {
+			for _, dest := range httpToolDestinations(raw) {
+				if blocked, reason := a.engagementScopeBlocked(dest); blocked {
+					return true, reason
 				}
 			}
 		}
@@ -506,13 +519,35 @@ func (a *Agent) shouldBlockForOutOfScope(toolName string, toolArgs map[string]st
 		)
 	}
 
+	// Engagement scope (opt-in project fence) for command-class tools: every
+	// host the command names must be in scope and not denied. Bare host tokens
+	// carry no port; explicit URL references are checked as well so allow_ports
+	// is honoured when the command names one.
+	if a.engagementScope != nil && (lowerTool == "terminal_execute" || lowerTool == "python_action") {
+		for _, h := range hosts {
+			if !scopeHostNeedsCheck(a.engagementScope, h) {
+				continue
+			}
+			if blocked, reason := a.engagementScopeBlocked(h); blocked {
+				return true, reason
+			}
+		}
+		for _, raw := range toolArgs {
+			for _, ref := range scopeURLPattern.FindAllString(raw, -1) {
+				if blocked, reason := a.engagementScopeBlocked(ref); blocked {
+					return true, reason
+				}
+			}
+		}
+	}
+
 	// Belt-and-braces leg for report_vulnerability: validate the
 	// explicit `target` and `endpoint` arguments directly against
 	// the Local_Or_Listener_Host classifier. The findings handler
 	// must not file a report against the operator's own machine
 	// even if extractHostsFromArgs missed the token shape.
-	// Activity_Hosts is NOT consulted here — engagement-scope
-	// policing is no longer this guard's job.
+	// Activity_Hosts is NOT consulted here; the opt-in engagement scope
+	// (when enforced) is applied above for command-class tools.
 	if lowerTool == "report_vulnerability" {
 		rawTarget := strings.TrimSpace(toolArgs["target"])
 		rawEndpoint := strings.TrimSpace(toolArgs["endpoint"])
@@ -559,6 +594,25 @@ func (a *Agent) checkHTTPHop(rawURL string) error {
 	if scopeguard.IsLocalOrListener(a.localGuard, rawURL) {
 		return fmt.Errorf("it points at the operator's machine or the dashboard's listener")
 	}
+	// Lane separation: the control-plane/orchestrator lane may only call the
+	// configured control-plane hosts. Container attacks must be separate
+	// container intents with the execution surface; otherwise the API lane
+	// degenerates into an HTTP-only attack lane without terminal/browser.
+	if a.toolSurface == SurfaceOrchestrator {
+		host, _ := referenceHostPort(rawURL)
+		if !agentControlPlaneHost(host, a.controlPlaneHosts) {
+			return fmt.Errorf("the control-plane lane may only call configured control-plane hosts (%q is not one)", host)
+		}
+	}
+	// The reverse direction (round-5 §4.6): an execution/analysis lane must not
+	// reach the platform API. The control-plane host is orchestration state, not
+	// attack surface, and round 5's API-lane drives all went through lanes that
+	// were never meant to touch it.
+	if a.toolSurface == SurfaceWorker || a.toolSurface == SurfaceAnalysis {
+		if host, _ := referenceHostPort(rawURL); agentControlPlaneHost(host, a.controlPlaneHosts) {
+			return fmt.Errorf("the platform control-plane host belongs to the control-plane lane; a container/analysis lane must not call it")
+		}
+	}
 	if pins := pinnedTargetPorts(a.targets); len(pins) > 0 {
 		if host, port := referenceHostPort(rawURL); outsidePinnedPort(pins, host, port) {
 			return fmt.Errorf("%s is in scope only on port %s, the port the scan target names",
@@ -566,6 +620,36 @@ func (a *Agent) checkHTTPHop(rawURL string) error {
 		}
 	}
 	return nil
+}
+
+func agentControlPlaneHost(host string, controlPlane []string) bool {
+	host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	if host == "" {
+		return false
+	}
+	for _, raw := range controlPlane {
+		cp := normalizeAgentHost(raw)
+		if cp != "" && (host == cp || strings.HasSuffix(host, "."+cp)) {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeAgentHost(raw string) string {
+	raw = strings.TrimSpace(strings.ToLower(raw))
+	if raw == "" {
+		return ""
+	}
+	if strings.Contains(raw, "://") {
+		if u, err := url.Parse(raw); err == nil && u.Hostname() != "" {
+			return strings.TrimSuffix(u.Hostname(), ".")
+		}
+	}
+	if h, _, err := net.SplitHostPort(raw); err == nil {
+		return strings.TrimSuffix(h, ".")
+	}
+	return strings.TrimSuffix(raw, ".")
 }
 
 // checkDialAddr is the dial guard the agent installs on its tool registries

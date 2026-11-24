@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/c1ayooo/xalgorix/v4/internal/graph"
 	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
 )
 
@@ -120,6 +121,13 @@ type ScanState struct {
 	SkillsLoaded        int
 	UniqueToolsUsed     map[string]bool
 	ReconDone           bool
+	// GraphUnavailable is set when the authoritative graph cannot be read or
+	// written. R7/M1 posture: the run pauses (resumable) instead of silently
+	// continuing on a divergent in-memory plan.
+	GraphUnavailable bool
+	// PlannerWorkerMode marks the root as the main observer (R7/M2). Workers
+	// execute; the root's finish gate defers to the graph frontier.
+	PlannerWorkerMode bool
 	// ReconCoverage tracks evidence per recon dimension. Unlike the simple
 	// booleans above (which fire from a single command), the coverage model
 	// distinguishes what was ACTUALLY done so the completion gate can demand
@@ -768,6 +776,8 @@ func RegisterDefaultHooks(reg *HookRegistry) {
 	// Recon completion attribution runs before detectors so every result
 	// hook sees the freshly validated coverage state.
 	reg.Register(OnToolResult, hookReconResultTracker)
+	reg.Register(OnToolResult, hookProgressLedger)
+	reg.Register(OnToolResult, hookPlatformFinished)
 	reg.Register(OnToolResult, hookSkillLoadTracker)
 	reg.Register(OnToolResult, hookMcpCallAuditor)
 	reg.Register(OnToolResult, hookAuthCoverageTracker)
@@ -2558,7 +2568,9 @@ var localOnlyTools = map[string]bool{
 	"report_vulnerability": true, "submit_verdict": true, "finish": true,
 	"str_replace_editor": true, "list_files": true, "search_files": true,
 	"read_tool_output": true, "scan_source_sinks": true, "scan_source_routes": true,
-	"ingest_har": true,
+	"ingest_har":      true,
+	"detect_honeypot": true, "assess_nuclei_hit": true, "parse_poc_template": true,
+	"diff_responses": true, "solve_slider_captcha": true,
 }
 
 var targetNetworkCommandPattern = regexp.MustCompile(`(?i)\b(?:curl|wget|httpx|nmap|ffuf|nuclei|nikto|sqlmap|dig|nslookup|ping)\b|\b(?:requests\.|urllib\.|aiohttp\.|http\.client|fetch\()`)
@@ -2577,6 +2589,87 @@ func targetHealthNetworkCall(args map[string]string) bool {
 	default:
 		return true
 	}
+}
+
+// hookPlatformFinished stops the CURRENT worker when a platform API call
+// reports that the external benchmark task itself is over. It deliberately
+// does not treat every "invalid_state" as a task end: the platform also returns
+// invalid_state for ordinary slot throttling ("max active challenge instances
+// reached"), and local note/ledger reads often quote such past errors. Either
+// case would kill a live benchmark early. Only a real control-plane HTTP call
+// (or a curl/python command against /challenges) can trigger this.
+//
+// It stops only the worker that observed the signal (StopReason → stopForHook
+// cancels that agent), and it NEVER cancels the scan context: benchmark task
+// completion means "stop submitting", not "end the whole run" (§6). Whether to
+// finish is the planner/main agent's decision.
+func hookPlatformFinished(state *ScanState, args map[string]string) HookResult {
+	if state == nil || state.ScanContextID == "" {
+		return HookResult{}
+	}
+	tool := strings.TrimSpace(args["tool_name"])
+	if localOnlyTools[tool] {
+		return HookResult{}
+	}
+	switch tool {
+	case "http_request":
+		if !strings.Contains(strings.ToLower(args["url"]), "/challenges") {
+			return HookResult{}
+		}
+	case "terminal_execute", "python_action":
+		cmd := strings.ToLower(args["command"])
+		if strings.TrimSpace(cmd) == "" {
+			cmd = strings.ToLower(args["code"])
+		}
+		if !strings.Contains(cmd, "/challenges") && !strings.Contains(cmd, "openapi/v1") {
+			return HookResult{}
+		}
+	default:
+		// Any other tool (notes, ledger, browser, local shell) cannot certify a
+		// platform-level end.
+		return HookResult{}
+	}
+	combined := strings.ToLower(args["output"] + " " + args["error"])
+	// Normal slot throttling asks us to close a challenge, not to stop the
+	// benchmark. This is the false positive that killed run 5 at minute 15.
+	if strings.Contains(combined, "max active challenge") ||
+		strings.Contains(combined, "challenge instances") ||
+		strings.Contains(combined, "close an existing challenge") {
+		return HookResult{}
+	}
+	taskLevel := strings.Contains(combined, "task") ||
+		strings.Contains(combined, "任务") ||
+		strings.Contains(combined, "评测")
+	finishedSignal := containsAny(combined,
+		"already finished", "task finished", "task has finished", "task is finished",
+		"task has ended", "task ended", "task is over", "deadline reached", "time is up",
+		"任务结束", "任务已结束", "评测结束", "评测已结束")
+	if !taskLevel || !finishedSignal {
+		return HookResult{}
+	}
+	sc := scanctx.Get(state.ScanContextID)
+	if sc == nil {
+		return HookResult{}
+	}
+	if sc.Notes != nil {
+		_ = sc.Notes.Set("platform_finished", "platform task finished; stop submitting")
+	}
+	// Do NOT cancel the scan context here (charter §6 / PLANNER doc §6): the
+	// task-level end degrades to a "stop submitting" signal. The StopReason
+	// below stops this worker only; the planner decides whether the run ends.
+	return HookResult{
+		StopReason:  "platform_finished",
+		EmitMessage: "平台任务结束，停止提交；扫描继续。Platform task finished: stop submitting; the scan continues.",
+	}
+}
+
+func containsAny(haystack string, needles ...string) bool {
+	for _, n := range needles {
+		if strings.Contains(haystack, n) {
+			return true
+		}
+	}
+	return false
 }
 
 func hookTargetHealthDetector(state *ScanState, args map[string]string) HookResult {
@@ -2802,8 +2895,64 @@ func hookOASTVerificationWorkflow(state *ScanState, args map[string]string) Hook
 // Decides if the agent has done enough work. Uses proportional coverage
 // tracking: the gate checks how many UNIQUE endpoints were tested per
 // vuln class, not just "did you run sqlmap once?".
+// hookPlannerWorkerFinishGate is the main observer's finish contract in R7
+// planner_worker mode. It blocks while the authoritative graph frontier still
+// has open/running/paused intents and requires at least one settled intent,
+// then lets the ordinary ledger/goal gates run.
+func hookPlannerWorkerFinishGate(state *ScanState) HookResult {
+	if state == nil {
+		return HookResult{}
+	}
+	maxRejections := state.MaxFinishRejections
+	if maxRejections <= 0 {
+		maxRejections = 15
+	}
+	if state.FinishAttempts > maxRejections {
+		return HookResult{} // deadlock valve, same as the legacy gate
+	}
+	repo := graph.Backend()
+	runID := planGraphID(state)
+	if repo == nil || runID == "" {
+		return HookResult{}
+	}
+	ctx, cancel := planGraphContext()
+	defer cancel()
+	counts, err := repo.Counts(ctx, runID)
+	if err != nil {
+		return HookResult{
+			Block:       true,
+			BlockReason: "the authoritative graph is unavailable; the run must pause instead of finishing.",
+		}
+	}
+	active := counts.OpenIntents + counts.RunningIntents + counts.PausedIntents
+	if active > 0 {
+		return HookResult{
+			Block: true,
+			BlockReason: fmt.Sprintf(
+				"⏳ %d intent(s) are still open/claimed (%d open, %d running, %d paused). Wait for the worker pool to settle them before finishing.",
+				active, counts.OpenIntents, counts.RunningIntents, counts.PausedIntents),
+			Nudge: "Continue observing the graph; the workers are executing the plan. Do not call finish until the frontier is drained.",
+		}
+	}
+	if counts.DoneIntents+counts.BlockedIntents == 0 {
+		return HookResult{
+			Block:       true,
+			BlockReason: "no intent has been executed yet — the worker pool has not produced a settled result.",
+			Nudge:       "Wait for at least one worker to settle, then review the graph and findings before finishing.",
+		}
+	}
+	return HookResult{}
+}
+
 func hookFinishGatekeeper(state *ScanState, args map[string]string) HookResult {
 	state.FinishAttempts++
+
+	// R7/M2 main-observer finish: workers execute the plan, so the root's
+	// execution floors (iterations/tool calls/recon dimensions) do not apply.
+	// The graph frontier is the completion contract instead.
+	if state.PlannerWorkerMode {
+		return hookPlannerWorkerFinishGate(state)
+	}
 
 	// A malformed report must be recoverable, but it must not create a second
 	// infinite loop in which the model calls finish forever and waits for a
@@ -3770,6 +3919,9 @@ func hookPlanner(state *ScanState, args map[string]string) HookResult {
 	if state == nil || state.ReconOnlyMode {
 		return HookResult{}
 	}
+	// R7/M1: the exploration graph is the plan authority. Reload the root
+	// plan at the start of the turn and persist any mutation this hook makes.
+	defer beginPlanGraphTurn(state)()
 
 	// Refresh discovered endpoints from notes once an inventory has been saved
 	// (hookWorkTracker flips EndpointInventorySaved). The notes inventory is

@@ -2,29 +2,42 @@ package web
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"os"
 	"regexp"
 	"runtime/debug"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
 
 	"github.com/c1ayooo/xalgorix/v4/internal/agent"
+	"github.com/c1ayooo/xalgorix/v4/internal/config"
 	"github.com/c1ayooo/xalgorix/v4/internal/egress"
 	"github.com/c1ayooo/xalgorix/v4/internal/engine"
+	"github.com/c1ayooo/xalgorix/v4/internal/graph"
 	"github.com/c1ayooo/xalgorix/v4/internal/llm"
+	"github.com/c1ayooo/xalgorix/v4/internal/orchestrator"
 	"github.com/c1ayooo/xalgorix/v4/internal/platform"
+	"github.com/c1ayooo/xalgorix/v4/internal/proxy"
 	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
 	"github.com/c1ayooo/xalgorix/v4/internal/scopeguard"
 	"github.com/c1ayooo/xalgorix/v4/internal/tools/intelligence"
 	"github.com/c1ayooo/xalgorix/v4/internal/tools/notes"
 	"github.com/c1ayooo/xalgorix/v4/internal/tools/reporting"
 	"github.com/c1ayooo/xalgorix/v4/internal/trafficproxy"
-	"sort"
 )
+
+// workerKillWithReason is an optional root-agent capability. The planner's
+// kill_work path prefers it so the validated reason code reaches the worker
+// audit trail; roots without it fall back to KillWorker.
+type workerKillWithReason interface {
+	KillWorkerWithReason(unitID, reasonCode, reason string) error
+}
 
 // vulnNotificationDetails renders the Markdown body pushed to Telegram/Discord
 // for a reported vulnerability. It includes the concrete exploitation evidence
@@ -237,6 +250,66 @@ func (s *Server) registerSessionAgent(sess *scanSession, sctx *scanctx.ScanConte
 	return true
 }
 
+// backfillSessionTaskCoordinates repairs a resumed session whose queue state
+// predates task-coordinate persistence (or whose resume path did not carry
+// them). It only fills missing values and only for runs mounted on a task, so
+// ad-hoc /api/scan runs keep their empty project scope.
+func (s *Server) backfillSessionTaskCoordinates(sess *scanSession, sctx *scanctx.ScanContext) {
+	if sess == nil || sctx == nil || strings.TrimSpace(sctx.ProjectID) != "" {
+		return
+	}
+	instanceID := strings.TrimSpace(sess.instanceID)
+	store := s.currentPlatformStore()
+	if instanceID == "" || store == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	runs, err := store.RunsByInstanceID(ctx, instanceID)
+	if err != nil || len(runs) == 0 {
+		return
+	}
+	task, err := store.GetTask(ctx, runs[0].TaskID)
+	if err != nil || task == nil {
+		return
+	}
+	if projectID := strings.TrimSpace(task.ProjectID); projectID != "" {
+		sctx.ProjectID = projectID
+		if strings.TrimSpace(sess.objectiveProjectID) == "" {
+			sess.objectiveProjectID = projectID
+		}
+	}
+	if sctx.TaskID == "" {
+		sctx.TaskID = task.ID
+	}
+	if strings.TrimSpace(sess.objectiveTaskID) == "" {
+		sess.objectiveTaskID = task.ID
+	}
+	if strings.TrimSpace(sess.auditMode) == "" {
+		sess.auditMode = effectiveTaskAuditMode(task, s.cfg)
+		sctx.AuditMode = strings.TrimSpace(sess.auditMode)
+		// Task-level outbound proxy pin: snapshotted for the run like audit_mode.
+		// The MITM upstream selector reads this per exchange, so a task can use a
+		// different pool entry (or explicit direct egress) without changing the
+		// process-wide default. An unresolvable entry was rejected at dispatch.
+		if pin := strings.TrimSpace(sess.proxyPin); pin != "" {
+			switch pin {
+			case "direct":
+				proxy.SetScanUpstream(sctx.ID, proxy.ScanUpstream{Direct: true})
+			default:
+				if idx, err := strconv.Atoi(pin); err == nil {
+					if entry := proxy.EntryAt(idx); entry != nil {
+						proxy.SetScanUpstream(sctx.ID, proxy.ScanUpstream{Entry: entry})
+					}
+				}
+			}
+		}
+	}
+	if sess.objective == nil && task.Objective != nil {
+		sess.objective = task.Objective
+	}
+}
+
 // executeScanSession runs a single scan in complete isolation.
 // It NEVER panics upward — all panics are caught and logged.
 func (s *Server) executeScanSession(sess *scanSession) {
@@ -257,6 +330,27 @@ func (s *Server) executeScanSession(sess *scanSession) {
 	// 0. Create and activate a per-session ScanContext for isolation.
 	//    This must happen BEFORE any tool state is touched.
 	sctx := scanctx.New(sess.id, sess.scanDir)
+	// Production runs enforce the wire-evidence requirement: a non-info finding
+	// must name the captured packet (or an archived tool output) that proves it.
+	sctx.RequireEvidenceRefs = true
+	// Stamp the run identity on the shared context. The authoritative dual
+	// graph is keyed by this identity, so a re-dispatch/sibling session sees
+	// the same plan instead of an empty per-session one (R7/M1).
+	sctx.SetInstanceID(sess.instanceID)
+	sctx.ProjectID = strings.TrimSpace(sess.objectiveProjectID)
+	sctx.TaskID = strings.TrimSpace(sess.objectiveTaskID)
+	// The task's HITL switch is snapshotted for the whole session: the agent's
+	// tool gate and the MITM wire gate read this one field, so a task with
+	// audit=enforce is gated end-to-end even when the process default is off.
+	sctx.AuditMode = strings.TrimSpace(sess.auditMode)
+	// Defensive resume repair: queue states written by older binaries (and
+	// ad-hoc resume paths) may carry no project/task coordinates. Without them
+	// the session is project-less, which silently disables project-scoped
+	// features (asset ingestion, cross-scan cold-path whitelist, objective
+	// projection) and drops the task's HITL posture. Fill from the run's task
+	// when the run is mounted on one; ad-hoc /api/scan runs have no run row and
+	// stay unchanged.
+	s.backfillSessionTaskCoordinates(sess, sctx)
 	// Stamp the run identity on the ledger (D11): with the PG backend the
 	// snapshot carries it, and a re-dispatched session's first ledger load
 	// inherits the previous sibling session's chain (charter v3.0 §6.3).
@@ -266,6 +360,22 @@ func (s *Server) executeScanSession(sess *scanSession) {
 	sctx.Notes.SetInstanceID(sess.instanceID)
 	sctx.Coverage.SetInstanceID(sess.instanceID)
 	intelligence.SetInstanceIDForContext(sctx.ID, sess.instanceID)
+	// A crashed/restarted session must not leave phantom claims behind. The
+	// graph is the authority, so reset this run's running intents to open
+	// before the agent loop reads the frontier.
+	if repo := graph.Backend(); repo != nil {
+		runID := strings.TrimSpace(sctx.InstanceID)
+		if runID == "" {
+			runID = sctx.ID
+		}
+		resetCtx, resetCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if n, err := repo.ResetRunning(resetCtx, runID); err != nil {
+			log.Printf("[graph] reset stale running units for %s failed: %v", runID, err)
+		} else if n > 0 {
+			log.Printf("[graph] reset %d stale running units for %s", n, runID)
+		}
+		resetCancel()
+	}
 	// Link the platform run to the scan-data identity. Runs are mounted at
 	// dispatch time, before this directory exists, so without this write
 	// ProjectScanIDs never learns the id the domain journal and the InfoItem
@@ -424,6 +534,41 @@ func (s *Server) executeScanSession(sess *scanSession) {
 	if mcpSpecs := s.scanMcpServers(); len(mcpSpecs) > 0 {
 		agentOpts = append(agentOpts, agent.WithMcpServers(mcpSpecs))
 	}
+	// Project engagement scope (REDESIGN D7): an explicitly enforced fence
+	// narrows every network destination this run — and every delegated worker —
+	// may touch. A project without an enforced fence, and every benchmark /
+	// control-plane run, keeps the pre-scope behavior byte-for-byte; the option
+	// is only installed when the fence opts in.
+	var engagementScope *agent.EngagementScope
+	if projectID := strings.TrimSpace(sctx.ProjectID); projectID != "" {
+		if store := s.currentPlatformStore(); store != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			project, err := store.GetProject(ctx, projectID)
+			cancel()
+			switch {
+			case err != nil:
+				log.Printf("[scope] %s: project %s unavailable — engagement scope not enforced: %v", sess.instanceID, projectID, err)
+			case project != nil && project.Scope.Fence != nil && project.Scope.Fence.Enforce:
+				engagementScope = &agent.EngagementScope{
+					Targets:    append([]string(nil), project.Scope.Targets...),
+					Deny:       append([]string(nil), project.Scope.Fence.DenyTargets...),
+					AllowPorts: append([]int(nil), project.Scope.AllowPorts...),
+				}
+				log.Printf("[scope] %s: enforced project scope: %d target(s), %d denied, %d allowed port(s)",
+					sess.instanceID, len(engagementScope.Targets), len(engagementScope.Deny), len(engagementScope.AllowPorts))
+			}
+		}
+	}
+	if engagementScope != nil {
+		agentOpts = append(agentOpts, agent.WithEngagementScope(engagementScope.Targets, engagementScope.Deny, engagementScope.AllowPorts))
+	}
+	var scopeTargets, scopeDeny []string
+	var scopePorts []int
+	if engagementScope != nil {
+		scopeTargets = engagementScope.Targets
+		scopeDeny = engagementScope.Deny
+		scopePorts = engagementScope.AllowPorts
+	}
 	// HITL approval is an execution-time obligation implemented by the Eino
 	// interrupt/resume protocol. The broker binds the agent's secret registry
 	// after construction (HIGH-1: by-value payload redaction before
@@ -456,6 +601,37 @@ func (s *Server) executeScanSession(sess *scanSession) {
 		brokerOpts = b
 	}
 	agentOpts = append(agentOpts, agent.WithRuntime(store, einoBroker))
+	// R7/M2: planner_worker is the default built-in topology (config.go
+	// default). The root agent becomes the main observer/controller (no
+	// attack tools); workers get the execution surface. Legacy is a hidden
+	// emergency rollback only, not offered on the settings page.
+	plannerWorker := false
+	workerCount := 3
+	if sess.cfg != nil {
+		plannerWorker = strings.EqualFold(strings.TrimSpace(sess.cfg.Orchestrator), "planner_worker")
+		workerCount = sess.cfg.WorkerConcurrency
+	}
+	// Hot setting: read the env file at scan start so a settings-page save or
+	// an operator edit applies to the next scan without a server restart.
+	workerCount = config.LiveWorkerConcurrency(workerCount)
+	if workerCount < 1 {
+		workerCount = 1
+	}
+	if workerCount > 10 {
+		workerCount = 10
+	}
+	// Without the graph authority the pool has nothing to claim; stay legacy.
+	if graph.Backend() == nil {
+		plannerWorker = false
+	}
+	if plannerWorker {
+		agentOpts = append(agentOpts,
+			agent.WithToolSurface(agent.SurfaceMain),
+			agent.WithWorkerSurface(agent.SurfaceWorker),
+			agent.WithWorkerPoolSize(workerCount),
+			agent.WithPlannerWorkerMode(),
+		)
+	}
 	agnt := agent.NewAgent(sess.cfg, "XalgorixAgent", events, scopeguard.Config{
 		BindAddr:           cfg.BindAddr,
 		Port:               s.port,
@@ -469,6 +645,31 @@ func (s *Server) executeScanSession(sess *scanSession) {
 		brokerOpts.BindSecrets(agnt.SecretValues)
 	}
 	agnt.SetPhaseRestrictions(sess.phases)
+	// read_info_item cross-scan detail is model-controlled, so the tool asks
+	// this resolver before reading another scan's cold-path item. Only scans
+	// belonging to the same project (D7) are accepted.
+	agnt.SetCrossScanResolver(func(target string) bool {
+		target = strings.TrimSpace(target)
+		if target == "" || target == sctx.ID || target == sctx.InstanceID {
+			return true
+		}
+		store := s.currentPlatformStore()
+		if store == nil || strings.TrimSpace(sctx.ProjectID) == "" {
+			return false
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		ids, err := store.ProjectScanIDs(ctx, sctx.ProjectID)
+		if err != nil {
+			return false
+		}
+		for _, id := range ids {
+			if id == target {
+				return true
+			}
+		}
+		return false
+	})
 	// The operator objective (REDESIGN 3.1) is intent for the loop: the
 	// engine marks the plan tasks that serve a criterion, and the objective
 	// statement travels in its own prompt section. It never changes what
@@ -514,6 +715,15 @@ func (s *Server) executeScanSession(sess *scanSession) {
 		// preparing source or touching the target.
 		agnt.Stop()
 		return
+	}
+	// R7 main chat: a human turn must be answered, not silently folded into the
+	// instruction. Guidance that arrived while the run was starting (the normal
+	// "open a conversation" flow sends the first message right after dispatch)
+	// is still queued in the platform store; deliver it to the main agent now
+	// that the instance can receive messages. In legacy mode guidance keeps the
+	// merge-into-briefing semantics.
+	if plannerWorker {
+		s.deliverQueuedGuidanceToMain(sess, agnt)
 	}
 
 	// 4. Initialize scan record. Resume paths preserve previously persisted
@@ -619,7 +829,19 @@ func (s *Server) executeScanSession(sess *scanSession) {
 	// section — human intent (source=human) entering the loop's field of
 	// view before the first iteration. Session start only, never an
 	// iteration hot path.
-	instruction = s.mergeQueuedGuidance(sess, instruction)
+	// planner_worker is a chat topology: queued guidance is delivered as a
+	// main-agent turn (deliverQueuedGuidanceToMain) instead of being absorbed
+	// into the task instruction, which produced no reply at all.
+	if !plannerWorker {
+		instruction = s.mergeQueuedGuidance(sess, instruction)
+	}
+	if plannerWorker {
+		instruction = "[MAIN AGENT MODE — R7]\n" +
+			"You are the main observing/coordinating agent. Workers execute the plan; you do not run attack tools. " +
+			"Observe the graph, ledger, coverage, and findings; add intents/hints; steer or kill workers; and call finish only when the graph frontier is drained " +
+			"(no open/running/paused intents). The worker pool and planner own execution and intent generation.\n\n" +
+			instruction
+	}
 
 	// 7. Run agent (blocks until finished or stopped). Recheck the parent after
 	// record setup; a stop racing this point either makes this check fail or
@@ -627,6 +849,154 @@ func (s *Server) executeScanSession(sess *scanSession) {
 	if status, _ := s.instanceRunStatus(sess.instanceID); sess.instanceID != "" && status != "running" {
 		log.Printf("[RESUME-GATE] instance %s observed status %q before Run — stopping agent", sess.instanceID, status)
 		agnt.Stop()
+	}
+	// R7/M2: the worker pool claims authoritative intents and dispatches them
+	// through the root's graph while the main agent observes. The planner loop
+	// adds/retires intents from the graph overview; a settled worker wakes both.
+	if plannerWorker {
+		runID := strings.TrimSpace(sctx.InstanceID)
+		if runID == "" {
+			runID = sctx.ID
+		}
+		var planner *orchestrator.Planner
+		plannerClient := sess.llmClient
+		if plannerClient != nil {
+			// The root agent owns the request-scoped client; the planner runs
+			// concurrently, so give it an isolated clone.
+			plannerClient = plannerClient.Clone()
+		} else if cfg != nil {
+			plannerClient = llm.NewClient(cfg)
+		}
+		goalText := strings.TrimSpace(sess.goal)
+		objStatement := ""
+		var objConstraints []string
+		var objCriteria []orchestrator.PlannerCriterion
+		if sess.objective != nil {
+			objStatement = strings.TrimSpace(sess.objective.Statement)
+			objConstraints = append([]string(nil), sess.objective.Constraints...)
+			for _, c := range sess.objective.Criteria {
+				objCriteria = append(objCriteria, orchestrator.PlannerCriterion{
+					ID: c.ID, Kind: c.Kind, VulnClass: c.VulnClass,
+					Capability: c.Capability, VerifyBy: c.VerifyBy, Required: c.Required,
+				})
+			}
+		}
+		if goalText == "" {
+			// Structured analysis is the fallback only when the task has no
+			// human goal text; it never replaces a real GOAL.
+			goalText = objStatement
+		}
+		if plannerClient != nil {
+			planner = orchestrator.NewPlanner(sctx.Ctx, orchestrator.PlannerConfig{
+				ScanID:               runID,
+				SessionID:            sctx.ID,
+				Target:               sess.target,
+				Goal:                 goalText,
+				Instruction:          sess.instruction,
+				UserInstruction:      sess.userInstruction,
+				ObjectiveStatement:   objStatement,
+				ObjectiveConstraints: objConstraints,
+				ObjectiveCriteria:    objCriteria,
+				Client:               plannerClient,
+				Repo:                 graph.Backend(),
+				ScanCtx:              sctx,
+				ControlPlaneHosts:    sess.cfg.ControlPlaneHosts,
+				ScopeTargets:         scopeTargets,
+				ScopeDeny:            scopeDeny,
+				ScopeAllowPorts:      scopePorts,
+				Emit: func(kind, content string, meta map[string]any) {
+					select {
+					case events <- agent.Event{Type: kind, Content: content, Meta: meta, AgentID: "planner", Timestamp: time.Now()}:
+					default:
+					}
+				},
+				Interval: time.Minute,
+				Steer: func(unitID, message string) error {
+					if agnt == nil {
+						return fmt.Errorf("root agent unavailable")
+					}
+					return agnt.SteerWorker(unitID, message)
+				},
+				Kill: func(unitID, reasonCode, reason string) error {
+					if agnt == nil {
+						return fmt.Errorf("root agent unavailable")
+					}
+					// Prefer the reason-carrying kill path when the agent
+					// provides it; fall back to the plain kill otherwise.
+					if killer, ok := any(agnt).(workerKillWithReason); ok {
+						return killer.KillWorkerWithReason(unitID, reasonCode, reason)
+					}
+					return agnt.KillWorker(unitID, reason)
+				},
+				OnDrained: func() {
+					if agnt != nil {
+						agnt.NotifyMainSystem("The planner produced no new intent and the frontier is drained. If the user's goal is complete, call finish; otherwise insert the next intent or ask the user.")
+					}
+				},
+			})
+			defer planner.Stop()
+		}
+		pool, poolErr := orchestrator.New(sctx.Ctx, orchestrator.Config{
+			ScanID:            runID,
+			Workers:           workerCount,
+			Targets:           []string{sess.target},
+			Repo:              graph.Backend(),
+			Root:              agnt,
+			ControlPlaneHosts: sess.cfg.ControlPlaneHosts,
+			ScopeTargets:      scopeTargets,
+			ScopeDeny:         scopeDeny,
+			ScopeAllowPorts:   scopePorts,
+			// Round-5 P0-1: how long an execution-lane worker may produce no
+			// information-layer increment before the engine reclaims its slot.
+			WorkerProgressTimeout: workerProgressTimeoutFromEnv(),
+			Goal:                  goalText,
+			Instruction:           sess.instruction,
+			UserInstruction:       sess.userInstruction,
+			ScanCtx:               sctx,
+			OnSettled: func(unitID string) {
+				if planner != nil {
+					planner.Notify()
+				}
+				_ = unitID
+			},
+			OnStalled: func() {
+				if planner != nil {
+					planner.Stall()
+				}
+			},
+		})
+		if poolErr != nil {
+			log.Printf("[orchestrator] pool unavailable for %s: %v — continuing without workers", sess.instanceID, poolErr)
+		} else {
+			// Register the live handles so a task edit can be applied to this
+			// run without a restart (task_config_live.go).
+			s.registerLiveRun(&liveRunHandles{
+				instanceID: sess.instanceID,
+				scanCtx:    sctx,
+				agent:      agnt,
+				planner:    planner,
+				pool:       pool,
+				llmClient:  sess.llmClient,
+			})
+			defer s.unregisterLiveRun(sess.instanceID)
+			// Planner-first: the planner derives the first intents from the task
+			// goal/instruction; the pool starts with an empty frontier and
+			// claims whatever the planner writes. The planner blocks once all
+			// configured workers are busy, so open intents stay bounded by the
+			// pool size instead of accumulating ahead of execution.
+			if planner != nil {
+				planner.SetMaxIntents(workerCount)
+				planner.SetWaitForCapacity(pool.WaitForSlot)
+				planner.SetStallReport(pool.StallReport)
+			}
+			s.registerWorkerPool(runID, pool)
+			defer s.unregisterWorkerPool(runID, pool)
+			pool.Start()
+			defer pool.Stop()
+			if planner != nil {
+				planner.Start()
+			}
+		}
 	}
 	agnt.Run([]string{sess.target}, instruction)
 
@@ -773,55 +1143,10 @@ func (s *Server) executeScanSession(sess *scanSession) {
 	// content).
 	s.finalizeTokenUsage(sess)
 
-	// 10. Generate report if requested (always generate, even for clean scans)
-	if sess.genReport {
-		if p, err := s.generateReportAt(sess.record, sess.scanDir); err == nil {
-			log.Printf("PDF report saved: %s", p)
-			// Scan-completion summary ("Scan Finished") is opt-in via
-			// XALGORIX_NOTIFY_SCAN_COMPLETE (default off) so operators get only
-			// per-vulnerability alerts, not a summary after every scan (including
-			// clean scans). Per-finding notifications are sent separately in
-			// processEvent and are unaffected by this toggle.
-			if s.notifyScanComplete.Load() {
-				vulnCount := len(sess.record.Vulns)
-				if vulnCount > 0 {
-					desc := fmt.Sprintf("**Target:** %s\n**Vulnerabilities:** %d found\n\n%s\n**Completed at:** %s",
-						sess.target, vulnCount, vulnDigestList(sess.record.Vulns, 8), time.Now().Format("15:04:05 MST"))
-					if s.telegramConfigured() {
-						s.sendTelegramWithFile(0x3b82f6, "✅ Scan Finished - Report Ready", desc, p)
-					}
-					s.sendDomesticIM("", 0x3b82f6, "✅ Scan Finished - Report Ready", desc)
-				} else {
-					desc := fmt.Sprintf("**Target:** %s\n**Result:** No vulnerabilities found (clean scan)\n**Completed at:** %s",
-						sess.target, time.Now().Format("15:04:05 MST"))
-					if s.telegramConfigured() {
-						s.sendTelegramWithFile(0x2dd4bf, "✅ Scan Finished - Clean Report", desc, p)
-					}
-					s.sendDomesticIM("", 0x2dd4bf, "✅ Scan Finished - Clean Report", desc)
-				}
-			}
-			// The report being generated IS phase-22 work: record it on the phase
-			// ledger so a completed scan never shows "Final report" as pending.
-			if sess.record != nil && phaseAllowed(sess.phases, 22) {
-				sess.record.markPhaseWorked(22)
-				if sess.record.CurrentPhase < 22 {
-					sess.record.CurrentPhase = 22
-				}
-				s.saveScanRecordTo(sess.record, sess.scanDir)
-			}
-			if sess.instanceID != "" {
-				reportEvt := WSEvent{Type: "report_ready", Content: fmt.Sprintf("/api/report/%s", sess.id)}
-				if phaseAllowed(sess.phases, 22) {
-					reportEvt.CurrentPhase = 22
-				}
-				s.broadcastToInstance(sess.instanceID, reportEvt)
-			} else {
-				s.broadcast(WSEvent{Type: "report_ready", Content: fmt.Sprintf("/api/report/%s", sess.id)})
-			}
-		} else {
-			log.Printf("Failed to generate PDF report: %v", err)
-		}
-	}
+	// Reports are operator-triggered only (REPORT_DELIVERY_SPEC §0/§2). The
+	// scan lifecycle no longer renders a PDF, emits report_ready, or sends a
+	// report attachment; Phase 22 stays a terminal disposition derived from
+	// the accepted finish (phase_disposition.go), not an artifact trigger.
 }
 
 // processEvent handles a single agent event — forwards to WebSocket, updates scan record, sends Discord.
@@ -889,6 +1214,8 @@ func (s *Server) processEvent(evt agent.Event, sess *scanSession) {
 	wsEvt := WSEvent{
 		Type:        evt.Type,
 		Content:     llm.StripProviderControlTokens(evt.Content),
+		MessageID:   evt.MessageID,
+		Delta:       llm.StripProviderControlTokens(evt.Delta),
 		ToolName:    evt.ToolName,
 		ToolArgs:    evt.ToolArgs,
 		AgentID:     evt.AgentID,
@@ -983,6 +1310,18 @@ func (s *Server) processEvent(evt agent.Event, sess *scanSession) {
 					// Always persist to the record (report + on-disk source of truth).
 					if appendVulnSummaryUnique(&sess.record.Vulns, vs) {
 						log.Printf("[VULN] Vuln persisted to record: %s %s", vs.Severity, vs.Title)
+						// A finding is a durable event, not just another feed
+						// line: save the record NOW instead of waiting for the
+						// every-10-events checkpoint, so the project findings
+						// page (which reads the durable record) shows it on its
+						// next poll rather than after an unrelated batch.
+						s.saveScanRecordTo(sess.record, sess.scanDir)
+						// Refresh the task-level projection too. run_findings is
+						// the cold-path replica the task findings tab and the
+						// task's finding_count read; without this it only
+						// catches up at session cleanup, so a run in flight
+						// looked like "findings sync after the run finishes".
+						s.queueRunFindingProjection(sess.instanceID, sess.record)
 						// Broadcast + notify only when the severity filter allows it.
 						if allowed {
 							wsEvt.Vulns = []VulnSummary{vs}
@@ -1435,6 +1774,65 @@ func mapValues(values map[string]string) []string {
 	return out
 }
 
+// latestDigestBriefing returns the most recent active context-digest snapshots
+// for the run, newest first, bounded to 12 KiB. These nodes are engine
+// projections of the authoritative ledger/graph/finding/coverage state written
+// at compaction time; they deliberately contain IDs rather than raw bodies, so
+// the resumed agent must re-fetch details before acting.
+func latestDigestBriefing(rec *ScanRecord, contextID string) string {
+	repo := graph.Backend()
+	if repo == nil {
+		return ""
+	}
+	scanID := strings.TrimSpace(rec.InstanceID)
+	if scanID == "" {
+		scanID = strings.TrimSpace(rec.ID)
+	}
+	if scanID == "" {
+		scanID = strings.TrimSpace(contextID)
+	}
+	if scanID == "" {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	nodes, err := repo.ListNodes(ctx, scanID, graph.KindDigest, graph.StateActive)
+	if err != nil || len(nodes) == 0 {
+		return ""
+	}
+	sort.SliceStable(nodes, func(i, j int) bool { return nodes[i].CreatedAt.After(nodes[j].CreatedAt) })
+
+	const budget = 12 * 1024
+	var sb strings.Builder
+	sb.WriteString("Engine state snapshot from before the restart (authoritative projection; re-fetch IDs before relying on them):\n")
+	written := 0
+	for _, n := range nodes {
+		var payload map[string]any
+		_ = json.Unmarshal([]byte(n.Payload), &payload)
+		snapshot, _ := payload["snapshot"].(string)
+		if strings.TrimSpace(snapshot) == "" {
+			continue
+		}
+		if written > 0 && written+len(snapshot) > budget {
+			break
+		}
+		if len(snapshot) > budget-written {
+			snapshot = snapshot[:budget-written] + "\n… (truncated to the resume budget)"
+		}
+		sb.WriteString("\n")
+		sb.WriteString(snapshot)
+		sb.WriteString("\n")
+		written += len(snapshot)
+		if written >= budget {
+			break
+		}
+	}
+	if written == 0 {
+		return ""
+	}
+	return sb.String()
+}
+
 func formatResumeBriefing(rec *ScanRecord, contextID string) string {
 	if rec == nil {
 		return ""
@@ -1457,11 +1855,19 @@ func formatResumeBriefing(rec *ScanRecord, contextID string) string {
 		sb.WriteString("No vulnerabilities reported yet.\n")
 	}
 
-	notesData := notes.FormatForContextID(contextID)
+	notesData := notes.FormatForContextBudgetID(contextID, notes.NotesContextBudgetBytes)
 	if notesData != "" {
 		sb.WriteString("\nDiscovered Endpoints & Target Notes:\n")
 		sb.WriteString(notesData)
 		sb.WriteString("\n")
+	}
+
+	// IG6d: a resumed run starts from the last engine projection of the
+	// authoritative state (ledger/graph/findings/coverage), not from a replay
+	// of raw transcript bytes. Bounded to 12 KiB.
+	if digest := latestDigestBriefing(rec, contextID); digest != "" {
+		sb.WriteString("\n")
+		sb.WriteString(digest)
 	}
 
 	var lastEvents []string
@@ -1506,7 +1912,10 @@ func isProviderPauseReason(reason string) bool {
 	return reason == "provider_rate_limited" ||
 		reason == "provider_quota_exhausted" ||
 		reason == "provider_overloaded" ||
-		reason == "llm_rate_limited"
+		reason == "llm_rate_limited" ||
+		// R7/M1: the authoritative graph is unavailable; the run pauses
+		// (resumable) instead of proceeding on a divergent in-memory plan.
+		reason == "graph_unavailable"
 }
 
 func isRootAgentEvent(sess *scanSession, evt agent.Event) bool {
@@ -1527,23 +1936,61 @@ func (s *Server) capturePlanDisposition(sess *scanSession) {
 	if sess == nil || sess.record == nil || sess.agent == nil {
 		return
 	}
-	sess.record.PlanTasksTotal, sess.record.PlanTasksCompleted,
-		sess.record.PlanTasksSkipped, sess.record.PlanTasksUnfinished = sess.agent.PlanDisposition()
-	sess.record.PlanPresent = sess.agent.HasPlan()
-	// Persist the plan projection next to its counters (same write point, same
-	// atomic record save). Without it a terminal run can only report numbers,
-	// which is exactly the "Planner pane is empty" failure this endpoint fixes.
-	if view := sess.agent.PlanSnapshot(); view.Present {
-		snapshot := view
-		sess.record.PlanView = &snapshot
+	// R7 planner_worker: the main agent does not own the plan. Capture terminal
+	// plan counters/detail from the authoritative graph instead of the empty
+	// main-agent ScanState.
+	planFromGraph := false
+	if sess.cfg != nil && strings.EqualFold(strings.TrimSpace(sess.cfg.Orchestrator), "planner_worker") {
+		if repo := graph.Backend(); repo != nil {
+			runID := strings.TrimSpace(sess.instanceID)
+			if runID == "" {
+				runID = sess.id
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			counts, cerr := repo.Counts(ctx, runID)
+			tasks, terr := repo.PlanTasks(ctx, runID)
+			cancel()
+			if cerr == nil {
+				total := counts.OpenIntents + counts.RunningIntents + counts.PausedIntents + counts.DoneIntents + counts.BlockedIntents
+				sess.record.PlanTasksTotal = total
+				sess.record.PlanTasksCompleted = counts.DoneIntents
+				sess.record.PlanTasksSkipped = counts.BlockedIntents
+				sess.record.PlanTasksUnfinished = counts.OpenIntents + counts.RunningIntents + counts.PausedIntents
+				sess.record.PlanPresent = total > 0
+				planFromGraph = true
+			}
+			if terr == nil && len(tasks) > 0 {
+				view := planViewFromGraphTasks(tasks)
+				sess.record.PlanView = &view
+				for _, t := range tasks {
+					if t.Status == "completed" && t.Phase > 0 {
+						sess.record.markPhaseWorked(t.Phase)
+					}
+				}
+			}
+		}
+	}
+	if !planFromGraph {
+		sess.record.PlanTasksTotal, sess.record.PlanTasksCompleted,
+			sess.record.PlanTasksSkipped, sess.record.PlanTasksUnfinished = sess.agent.PlanDisposition()
+		sess.record.PlanPresent = sess.agent.HasPlan()
+		// Persist the plan projection next to its counters (same write point, same
+		// atomic record save). Without it a terminal run can only report numbers,
+		// which is exactly the "Planner pane is empty" failure this endpoint fixes.
+		if view := sess.agent.PlanSnapshot(); view.Present {
+			snapshot := view
+			sess.record.PlanView = &snapshot
+		}
 	}
 	sess.record.AssessmentProgress = max(sess.record.AssessmentProgress, sess.agent.AssessmentProgress())
 	// Completed plan tasks carry explicit phase numbers - the richest
 	// per-phase work evidence (auth=5, business-logic=12, classes the command
 	// heuristics never see). Merge them into the worked ledger so terminal
 	// records are complete.
-	for _, phase := range sess.agent.PlanWorkedPhases() {
-		sess.record.markPhaseWorked(phase)
+	if !planFromGraph {
+		for _, phase := range sess.agent.PlanWorkedPhases() {
+			sess.record.markPhaseWorked(phase)
+		}
 	}
 	// Final authoritative dispositions: Phase 20 (verification) and 22
 	// (reporting) settle here alongside the task-derived phases.
@@ -1637,6 +2084,97 @@ func (s *Server) finalizeScanSessionRecord(sess *scanSession) bool {
 // prove the engine acted on a specific turn (no observer on the message
 // path), so rows stay injected until a cold-path observer flips them via
 // UpdateGuidanceStatus (R2a decision, documented in the platform repository).
+// deliverQueuedGuidanceToMain hands every still-queued human turn of this run
+// to the R7 main agent, in chronological order. The main chat answers each one
+// as a normal conversation turn; without this, a message sent during dispatch
+// (before the instance was registered) never reached the agent and the
+// operator saw a sent message with no reply.
+func (s *Server) deliverQueuedGuidanceToMain(sess *scanSession, agnt *agent.Agent) {
+	store := s.currentPlatformStore()
+	if store == nil || sess == nil || sess.instanceID == "" || agnt == nil {
+		return
+	}
+	ctx := context.Background()
+	runs, err := store.RunsByInstanceID(ctx, sess.instanceID)
+	if err != nil || len(runs) == 0 {
+		return
+	}
+	items, err := store.ListGuidance(ctx, runs[0].TaskID, 50)
+	if err != nil || len(items) == 0 {
+		return
+	}
+	for i := len(items) - 1; i >= 0; i-- { // newest-first list → chronological
+		g := items[i]
+		if g.Status != platform.GuidanceQueued || g.InstanceID != sess.instanceID {
+			continue
+		}
+		s.injectGuidanceToMain(sess.instanceID, g, agnt)
+	}
+}
+
+// injectGuidanceToMain delivers one human turn to the R7 main chat exactly
+// once per process. The session-start drain and the guidance POST can both
+// observe the same queued row (the POST's readiness check may run a moment
+// before the agent attaches); the delivered marker makes the loser a no-op.
+func (s *Server) injectGuidanceToMain(instanceID string, g platform.Guidance, agnt *agent.Agent) bool {
+	if agnt == nil || strings.TrimSpace(g.ID) == "" {
+		return false
+	}
+	s.guidanceDeliveredMu.Lock()
+	if s.guidanceDelivered == nil {
+		s.guidanceDelivered = make(map[string]struct{})
+	}
+	if _, done := s.guidanceDelivered[g.ID]; done {
+		s.guidanceDeliveredMu.Unlock()
+		return false
+	}
+	// Only queued rows are ever injected, so clearing a huge map cannot
+	// re-deliver anything.
+	if len(s.guidanceDelivered) > 4096 {
+		s.guidanceDelivered = make(map[string]struct{})
+	}
+	s.guidanceDelivered[g.ID] = struct{}{}
+	s.guidanceDeliveredMu.Unlock()
+
+	if _, err := agnt.SendMessage(operatorGuidanceMessage(g.ID, g.Message)); err != nil {
+		s.guidanceDeliveredMu.Lock()
+		delete(s.guidanceDelivered, g.ID)
+		s.guidanceDeliveredMu.Unlock()
+		log.Printf("[platform] queued guidance %s delivery to %s failed: %v", g.ID, instanceID, err)
+		return false
+	}
+	// Information-layer projection: delivered guidance is a source=human
+	// observation, not only an R7 hint node.
+	s.projectGuidanceInfoItem(agnt.ScanContext(), g)
+
+	if store := s.currentPlatformStore(); store != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if _, err := store.UpdateGuidanceStatus(ctx, g.ID, platform.GuidanceInjected); err != nil {
+			// The turn is already in the main agent's inbox; keep the delivered
+			// marker so it is not sent twice. The row stays queued on disk.
+			log.Printf("[platform] queued guidance %s flip to injected failed: %v", g.ID, err)
+		}
+		cancel()
+	}
+	g.Status = platform.GuidanceInjected
+	s.broadcastToInstance(instanceID, WSEvent{
+		Type:     "guidance_injected",
+		Content:  "Operator guidance delivered to the main agent",
+		Guidance: &g,
+	})
+	s.watchGuidanceConsumption(instanceID, g.ID)
+	return true
+}
+
+// guidanceDeliveredAlready reports whether this process already handed the row
+// to the main agent (the loser of a delivery race).
+func (s *Server) guidanceDeliveredAlready(id string) bool {
+	s.guidanceDeliveredMu.Lock()
+	defer s.guidanceDeliveredMu.Unlock()
+	_, ok := s.guidanceDelivered[id]
+	return ok
+}
+
 func (s *Server) mergeQueuedGuidance(sess *scanSession, instruction string) string {
 	store := s.currentPlatformStore()
 	if store == nil || sess.instanceID == "" {
@@ -1674,6 +2212,7 @@ func (s *Server) mergeQueuedGuidance(sess *scanSession, instruction string) stri
 			continue
 		}
 		g.Status = platform.GuidanceInjected
+		s.projectGuidanceInfoItem(sess.sctx, *g)
 		s.broadcastToInstance(sess.instanceID, WSEvent{
 			Type:     "guidance_injected",
 			Content:  "Queued operator guidance merged into this run",
@@ -1681,4 +2220,22 @@ func (s *Server) mergeQueuedGuidance(sess *scanSession, instruction string) stri
 		})
 	}
 	return b.String()
+}
+
+// workerProgressTimeoutFromEnv reads XALGORIX_WORKER_PROGRESS_TIMEOUT (Go
+// duration, e.g. "20m"). Unset or invalid leaves the orchestrator default
+// (20m); "0" or "off" disables the reclaim clock for this deployment.
+func workerProgressTimeoutFromEnv() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("XALGORIX_WORKER_PROGRESS_TIMEOUT"))
+	if raw == "" {
+		return 0
+	}
+	if raw == "0" || strings.EqualFold(raw, "off") || strings.EqualFold(raw, "disabled") {
+		return -time.Second
+	}
+	if d, err := time.ParseDuration(raw); err == nil {
+		return d
+	}
+	log.Printf("[orchestrator] XALGORIX_WORKER_PROGRESS_TIMEOUT=%q is not a duration; using the default", raw)
+	return 0
 }

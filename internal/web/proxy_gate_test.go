@@ -46,6 +46,14 @@ func newProxyGateRig(t *testing.T, timeoutSec int) (*Server, platform.Repository
 		ApprovalTimeoutSeconds: timeoutSec,
 		ApprovalMaxPending:     1,
 	}
+	return newProxyGateRigWithConfig(t, cfg)
+}
+
+// newProxyGateRigWithConfig is the rig constructor for tests that need a
+// specific process default (the per-run task switch is set on the returned
+// scan context).
+func newProxyGateRigWithConfig(t *testing.T, cfg *config.Config) (*Server, platform.Repository, *scanctx.ScanContext, *http.Client, string) {
+	t.Helper()
 	s, store := newApprovalsTestServer(t, cfg)
 	// NewServer installed the enforce adapter into the process-global hook;
 	// drop it again when the test ends so later tests start clean.
@@ -455,11 +463,16 @@ func TestSetApprovalServiceReinstallsProxyHook(t *testing.T) {
 		t.Fatal("enforce NewServer did not install the proxy hook")
 	}
 
-	// Swap in an off-mode service: the hook must be cleared.
+	// Swap in an off-mode service: the adapter stays installed (it resolves the
+	// PER-RUN task switch, so an off global default can still gate a task with
+	// audit=enforce) but it wraps the CURRENT service.
 	offSvc := &ApprovalService{srv: s, policy: approval.Policy{Mode: approval.ModeOff}}
 	s.SetApprovalService(offSvc)
-	if trafficproxy.HighRiskGateInstalled() {
-		t.Fatal("hook survived a swap to an off-mode service")
+	if !trafficproxy.HighRiskGateInstalled() {
+		t.Fatal("off-mode service must keep the adapter installed (per-run switch)")
+	}
+	if got := offSvc.srv.runAuditMode(nil); got != approval.ModeOff {
+		t.Fatalf("off service run mode = %q, want off", got)
 	}
 
 	// Swap back to the enforce service: the hook wraps it again.

@@ -1,10 +1,13 @@
 package web
 
 import (
+	"context"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/c1ayooo/xalgorix/v4/internal/agent"
+	"github.com/c1ayooo/xalgorix/v4/internal/graph"
 )
 
 // handleScanPlan serves GET /api/scans/{id}/plan — the read projection of the
@@ -28,6 +31,25 @@ func (s *Server) handleScanPlan(w http.ResponseWriter, r *http.Request) {
 	if scanID == "" || strings.Contains(scanID, "/") {
 		http.Error(w, `{"error":"scan id is required"}`, http.StatusBadRequest)
 		return
+	}
+
+	// R7/M1: the exploration graph is the plan authority. Read intent nodes
+	// first; a zero-row graph falls through to the live/record path while the
+	// legacy plan is still being seeded.
+	if repo := graph.Backend(); repo != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		tasks, err := repo.PlanTasks(ctx, s.graphRunID(scanID))
+		cancel()
+		if err != nil {
+			writeJSONStatus(w, http.StatusServiceUnavailable, map[string]any{
+				"error": "graph plan read failed", "detail": err.Error(), "scan_id": scanID,
+			})
+			return
+		}
+		if len(tasks) > 0 {
+			writeJSONStatus(w, http.StatusOK, planViewFromGraphTasks(tasks))
+			return
+		}
 	}
 
 	// A live agent without a published plan yet (fresh start, or resumed and
@@ -72,6 +94,89 @@ func (s *Server) livePlanView(instanceID string) (agent.PlanView, bool) {
 // planViewFromRecord projects a persisted record. Counters are authoritative
 // even when the task detail was never captured; the partial flag keeps that
 // distinction visible instead of rendering an empty plan.
+// planViewFromGraphTasks projects authoritative intent nodes onto the legacy
+// PlanView shape (source/counters/current phase included). The graph is the
+// authority; this adapter only renames fields for existing consumers.
+func planViewFromGraphTasks(tasks []graph.PlanTask) agent.PlanView {
+	view := agent.PlanView{
+		Present: len(tasks) > 0,
+		Source:  "none",
+		Tasks:   make([]agent.PlanTaskView, 0, len(tasks)),
+	}
+	engineTasks, modelTasks := 0, 0
+	activePhase, lastCompletedPhase := 0, 0
+	var completed, skipped int
+	for _, t := range tasks {
+		origin := strings.ToLower(strings.TrimSpace(t.Origin))
+		if strings.HasPrefix(origin, "llm") || origin == "model" {
+			modelTasks++
+		} else {
+			engineTasks++
+		}
+		switch t.Status {
+		case "active":
+			if t.Phase > activePhase {
+				activePhase = t.Phase
+			}
+		case "completed":
+			completed++
+			if t.Phase > lastCompletedPhase {
+				lastCompletedPhase = t.Phase
+			}
+		case "skipped":
+			skipped++
+		}
+		status := t.Status
+		if status == "" {
+			status = "pending"
+		}
+		var lease time.Time
+		if t.LeaseUntil != nil {
+			lease = *t.LeaseUntil
+		}
+		view.Tasks = append(view.Tasks, agent.PlanTaskView{
+			ID:           t.TaskID,
+			Title:        t.Title,
+			Phase:        t.Phase,
+			VulnClass:    t.VulnClass,
+			Endpoint:     t.Endpoint,
+			Status:       status,
+			DependsOn:    append([]string(nil), t.DependsOn...),
+			Notes:        t.Notes,
+			Disposition:  t.Disposition,
+			Origin:       t.Origin,
+			Prerequisite: t.Prerequisite,
+			WholeTarget:  t.WholeTarget,
+			Owner:        t.Owner,
+			LeaseUntil:   lease,
+		})
+	}
+	switch {
+	case engineTasks > 0 && modelTasks > 0:
+		view.Source = "mixed"
+	case modelTasks > 0:
+		view.Source = "model"
+	case engineTasks > 0:
+		view.Source = "engine"
+	}
+	unfinished := len(tasks) - completed - skipped
+	if unfinished < 0 {
+		unfinished = 0
+	}
+	view.Counters = agent.PlanCountersView{
+		Total:      len(tasks),
+		Completed:  completed,
+		Skipped:    skipped,
+		Unfinished: unfinished,
+	}
+	if activePhase > 0 {
+		view.CurrentPhase = activePhase
+	} else {
+		view.CurrentPhase = lastCompletedPhase
+	}
+	return view
+}
+
 func planViewFromRecord(rec *ScanRecord) agent.PlanView {
 	if rec == nil {
 		return agent.PlanView{Source: "none", Tasks: []agent.PlanTaskView{}}

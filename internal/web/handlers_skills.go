@@ -22,6 +22,7 @@ import (
 	"strings"
 
 	"github.com/c1ayooo/xalgorix/v4/internal/platform"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools/skills"
 )
 
 // handleSkills serves GET (list) and POST (create) on /api/skills.
@@ -142,4 +143,37 @@ func (s *Server) handleSkillDetail(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSONStatus(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 	}
+}
+
+// handleBuiltinSkills serves GET /api/skills/builtin — the read-only index of
+// the embedded skill corpus (the same catalog read_skill/list_skills serve).
+// It needs no platform store: the corpus is compiled into the binary. No
+// mutation verbs exist; operator-authored skills live under /api/skills.
+func (s *Server) handleBuiltinSkills(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSONStatus(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	writeJSONStatus(w, http.StatusOK, map[string]any{"skills": skills.Catalog()})
+}
+
+// handleBuiltinSkillDetail serves GET /api/skills/builtin/{name}?category= —
+// one built-in skill with its markdown body (frontmatter stripped). Unknown
+// names are 404; there is no fuzzy/alias resolution on this read path.
+func (s *Server) handleBuiltinSkillDetail(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSONStatus(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	name := strings.TrimPrefix(r.URL.Path, "/api/skills/builtin/")
+	if name == "" || strings.Contains(name, "/") {
+		writeJSONStatus(w, http.StatusNotFound, map[string]string{"error": "skill not found"})
+		return
+	}
+	skill, ok := skills.ReadCatalogSkill(name, r.URL.Query().Get("category"))
+	if !ok {
+		writeJSONStatus(w, http.StatusNotFound, map[string]string{"error": "skill not found"})
+		return
+	}
+	writeJSONStatus(w, http.StatusOK, skill)
 }

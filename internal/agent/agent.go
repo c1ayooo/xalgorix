@@ -28,10 +28,14 @@ import (
 	"github.com/c1ayooo/xalgorix/v4/internal/scopeguard"
 	"github.com/c1ayooo/xalgorix/v4/internal/tools"
 	"github.com/c1ayooo/xalgorix/v4/internal/tools/agentsgraph"
+	assettools "github.com/c1ayooo/xalgorix/v4/internal/tools/assetgraph"
 	"github.com/c1ayooo/xalgorix/v4/internal/tools/browser"
+	captchatool "github.com/c1ayooo/xalgorix/v4/internal/tools/captcha"
 	"github.com/c1ayooo/xalgorix/v4/internal/tools/codesearch"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools/diffresponses"
 	"github.com/c1ayooo/xalgorix/v4/internal/tools/fileedit"
 	"github.com/c1ayooo/xalgorix/v4/internal/tools/finish"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools/honeypot"
 	"github.com/c1ayooo/xalgorix/v4/internal/tools/httpclient"
 	"github.com/c1ayooo/xalgorix/v4/internal/tools/intelligence"
 	mcptool "github.com/c1ayooo/xalgorix/v4/internal/tools/mcp"
@@ -42,6 +46,7 @@ import (
 	"github.com/c1ayooo/xalgorix/v4/internal/tools/proxy"
 	"github.com/c1ayooo/xalgorix/v4/internal/tools/python"
 	"github.com/c1ayooo/xalgorix/v4/internal/tools/reporting"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools/scannerhits"
 	skillstool "github.com/c1ayooo/xalgorix/v4/internal/tools/skills"
 	"github.com/c1ayooo/xalgorix/v4/internal/tools/terminal"
 	"github.com/c1ayooo/xalgorix/v4/internal/tools/websearch"
@@ -159,8 +164,15 @@ func isExecChannelTool(name string) bool {
 
 // Event represents an agent event (for UI updates).
 type Event struct {
-	Type        string // "thinking", "tool_call", "tool_result", "message", "error", "finished"
-	Content     string
+	Type    string // "thinking", "tool_call", "tool_result", "message", "error", "finished"
+	Content string
+	// MessageID groups one streamed assistant turn: every assistant_delta and
+	// the closing assistant_done carry the same id, so live clients append
+	// deltas to one bubble instead of rendering fragments as separate rows.
+	MessageID string
+	// Delta carries the incremental assistant text of an assistant_delta frame
+	// (Content holds the same text for consumers that only know Content).
+	Delta       string
 	ToolName    string
 	ToolArgs    map[string]string
 	ToolResult  tools.Result
@@ -218,32 +230,39 @@ type Agent struct {
 	// checkpointStore/approvalBroker are the durable ADK seams. scan_session
 	// injects them at construction; a caller that omits them gets a per-scan
 	// file/memory store at run time.
-	checkpointStore            adk.CheckPointStore
-	approvalBroker             engine.ApprovalBroker
-	scanFinished               atomic.Bool
-	finishAccepted             atomic.Bool // set when the finish gate accepts a finish call; StopCheck reads it because AfterTool (completeWithFinish) can race the ADK's next model turn
-	goalAchievedEmitted        atomic.Bool // once-only guard for the R-goal auto-stop (goal_achieved)
-	forceContinuation          atomic.Bool
-	dwellMaxCalls              int      // XALGORIX_DWELL_MAX_CALLS (0=off, dwell_guard.go)
-	controlPlaneHosts          []string // XALGORIX_CONTROL_PLANE_HOSTS (delegation_claim.go)
-	dwellMu                    sync.Mutex
-	dwellStats                 map[string]*dwellStat              // 1:1 re-open of a finished run (REDESIGN D11): suppress the plan-complete auto-finalize the restored checkpoint would re-fire
-	runCancel                  atomic.Pointer[context.CancelFunc] // set by runLoop; completeWithFinish cancels it so the ADK graph stops before another model call
-	nextTemperature            atomic.Pointer[float64]            // one-shot per-role temperature for the next model turn
-	scanCtx                    *scanctx.ScanContext               // per-session state (vulns, notes, terminal, browser)
-	userSkills                 []skillstool.UserSkill             // operator-authored skills injected for THIS scan only
-	userProfiles               []specialistProfile                // operator-authored delegation profiles injected for THIS scan only
-	mcpServers                 []mcptool.ServerSpec               // operator-registered MCP servers for THIS scan only
-	mcpManager                 *mcptool.Manager                   // per-scan MCP session owner (nil until Run)
-	messages                   []llm.Message                      // Run-start conversation seed; the only reader is einoMessages() before rt.Run
-	msgMu                      sync.Mutex                         // guards messages AND pendingInjects
-	pendingInjects             []string                           // mid-run injections (operator messages via SendMessage, hook nudges); drained by BeforeTurn into the ADK turn nudge
-	events                     chan Event
-	maxIter                    int
-	stopped                    atomic.Bool
-	iterationDelayMs           atomic.Int64
-	droppedTelemetry           atomic.Int64
-	uncooperativeTimeouts      atomic.Int64
+	checkpointStore       adk.CheckPointStore
+	approvalBroker        engine.ApprovalBroker
+	scanFinished          atomic.Bool
+	finishAccepted        atomic.Bool // set when the finish gate accepts a finish call; StopCheck reads it because AfterTool (completeWithFinish) can race the ADK's next model turn
+	goalAchievedEmitted   atomic.Bool // once-only guard for the R-goal auto-stop (goal_achieved)
+	forceContinuation     atomic.Bool
+	dwellMaxCalls         int      // XALGORIX_DWELL_MAX_CALLS (0=off, dwell_guard.go)
+	controlPlaneHosts     []string // XALGORIX_CONTROL_PLANE_HOSTS (delegation_claim.go)
+	dwellMu               sync.Mutex
+	dwellStats            map[string]*dwellStat              // 1:1 re-open of a finished run (REDESIGN D11): suppress the plan-complete auto-finalize the restored checkpoint would re-fire
+	runCancel             atomic.Pointer[context.CancelFunc] // set by runLoop; completeWithFinish cancels it so the ADK graph stops before another model call
+	nextTemperature       atomic.Pointer[float64]            // one-shot per-role temperature for the next model turn
+	scanCtx               *scanctx.ScanContext               // per-session state (vulns, notes, terminal, browser)
+	conformanceMu         sync.Mutex                         // guards lastConformanceCheck (projection conformance throttle)
+	lastConformanceCheck  time.Time                          // last read-only projection reconciliation
+	crossScanMu           sync.RWMutex                       // guards crossScanAllowed
+	crossScanAllowed      func(scanID string) bool           // optional project-scope guard for read_info_item scan_id
+	userSkills            []skillstool.UserSkill             // operator-authored skills injected for THIS scan only
+	userProfiles          []specialistProfile                // operator-authored delegation profiles injected for THIS scan only
+	mcpServers            []mcptool.ServerSpec               // operator-registered MCP servers for THIS scan only
+	mcpManager            *mcptool.Manager                   // per-scan MCP session owner (nil until Run)
+	messages              []llm.Message                      // Run-start conversation seed; the only reader is einoMessages() before rt.Run
+	msgMu                 sync.Mutex                         // guards messages AND pendingInjects
+	pendingInjects        []string                           // mid-run injections (operator messages via SendMessage, hook nudges); drained by BeforeTurn into the ADK turn nudge
+	events                chan Event
+	maxIter               int
+	stopped               atomic.Bool
+	iterationDelayMs      atomic.Int64
+	droppedTelemetry      atomic.Int64
+	uncooperativeTimeouts atomic.Int64
+	// streamMsgSeq numbers streamed assistant turns within this agent so the
+	// delta/done pair of one turn shares a stable MessageID.
+	streamMsgSeq               atomic.Int64
 	childrenMu                 sync.Mutex
 	children                   map[*Agent]struct{}
 	ctx                        context.Context
@@ -268,6 +287,11 @@ type Agent struct {
 	state                      *ScanState        // shared mutable scan state for hooks
 	localGuard                 scopeguard.Config // operator's listener identity, consulted by shouldBlockForOutOfScope to detect Local_Or_Listener_Host references in Gated_Tool args
 	oobPollFn                  oobPollFunc       // optional per-agent poller; nil uses the live OOB backend
+	// engagementScope is the project's enforced authorization boundary. It is
+	// nil unless the project fence is enforced, so runs without an explicit
+	// fence keep the pre-scope behavior. Delegated workers inherit the same
+	// scope (see delegatedAgentOptions).
+	engagementScope *EngagementScope
 
 	// Per-scan whitebox/auth config. Default to the global cfg values but can
 	// be overridden PER SCAN via SetTargetAuth/SetSourceRepo before Run() so a
@@ -319,6 +343,28 @@ type Agent struct {
 	agentGraph        *agentsgraph.Graph
 	ownsAgentGraph    bool
 	delegatedAgentID  string
+	toolSurface       ToolSurface
+	workerSurface     ToolSurface
+	workerPoolSize    atomic.Int64
+	plannerWorkerMode bool
+	// mainInbox carries human messages to the R7 main-chat loop. In legacy
+	// mode mainInbox is nil and SendMessage uses the iterator nudge queue.
+	mainInbox chan string
+	// mainSystemInbox wakes the main chat for a non-human completion check
+	// (frontier drained). It never carries work or execution.
+	mainSystemInbox chan string
+	// mainTurn is the current human-turn ordinal in the R7 main-chat loop.
+	// A proposal may only be confirmed in a LATER turn than the one that
+	// created it, so the model cannot propose and auto-confirm in one turn.
+	mainTurn int64
+	// mainProposals holds intent drafts awaiting explicit operator
+	// confirmation. Drafts are process memory only: they are not plan state
+	// and never reach the exploration graph until the operator confirms.
+	mainProposalsMu sync.Mutex
+	mainProposals   map[string]*mainIntentProposal
+	mainProposalSeq int64
+	// taskInstruction is the task-creation prompt for the R7 main chat.
+	taskInstruction   string
 	ctfMission        bool
 	benchmarkIsolated bool
 	scanBudget        *scanBudget
@@ -330,7 +376,12 @@ type Agent struct {
 	lastBudgetCostNanoUSD int64
 	budgetMu              sync.Mutex
 	compactionCount       int
-	rateLimitBackoffFn    func(int) time.Duration
+	// lastPromptTokens is the provider-reported prompt size of the most recent
+	// model response. Compaction uses it as the primary trigger because it is
+	// exact for the actually-serialized buffer; the 4-bytes/token heuristic is
+	// only a first-request fallback.
+	lastPromptTokens   atomic.Int64
+	rateLimitBackoffFn func(int) time.Duration
 
 	// execTimeoutStreak counts consecutive exec-channel tools
 	// (terminal_execute/python_action) that hit the agent-level hard-timeout
@@ -373,6 +424,60 @@ func WithLLMClient(c *llm.Client) AgentOption {
 func WithBenchmarkIsolation() AgentOption {
 	return func(a *Agent) {
 		a.benchmarkIsolated = true
+	}
+}
+
+// WithEngagementScope installs the project's enforced authorization boundary
+// (REDESIGN D7). Callers pass it only when the project fence is enforced;
+// an empty targets list is a no-op, preserving the scope-less behavior of
+// benchmark and ad-hoc runs. Every delegated worker inherits the same scope.
+func WithEngagementScope(targets, deny []string, allowPorts []int) AgentOption {
+	return func(a *Agent) {
+		if len(targets) == 0 {
+			return
+		}
+		a.engagementScope = &EngagementScope{
+			Targets:    append([]string(nil), targets...),
+			Deny:       append([]string(nil), deny...),
+			AllowPorts: append([]int(nil), allowPorts...),
+		}
+	}
+}
+
+// WithToolSurface selects the executable tool surface for this agent role
+// (R7/M2). The zero value keeps the historical full surface.
+func WithToolSurface(surface ToolSurface) AgentOption {
+	return func(a *Agent) {
+		a.toolSurface = surface
+	}
+}
+
+// WithWorkerPoolSize sets the graph's concurrent worker slots for the R7
+// worker pool (1–10). The pool uses Dispatch, not the lifetime spawn budget.
+func WithWorkerPoolSize(n int) AgentOption {
+	return func(a *Agent) {
+		if n < 1 {
+			n = 1
+		}
+		if n > 10 {
+			n = 10
+		}
+		a.workerPoolSize.Store(int64(n))
+	}
+}
+
+// WithWorkerSurface selects the tool surface for dispatched workers.
+func WithWorkerSurface(surface ToolSurface) AgentOption {
+	return func(a *Agent) {
+		a.workerSurface = surface
+	}
+}
+
+// WithPlannerWorkerMode marks the root as the R7 main observer. Its finish
+// gate defers to the graph frontier instead of the root-execution floors.
+func WithPlannerWorkerMode() AgentOption {
+	return func(a *Agent) {
+		a.plannerWorkerMode = true
 	}
 }
 
@@ -512,13 +617,19 @@ func withParentContext(parent context.Context) AgentOption {
 	}
 }
 
-func delegatedAgentOptions(ctx context.Context, graph *agentsgraph.Graph, budget *scanBudget, agentID string, benchmarkIsolated bool) []AgentOption {
+func delegatedAgentOptions(ctx context.Context, graph *agentsgraph.Graph, budget *scanBudget, agentID string, benchmarkIsolated bool, scope ...*EngagementScope) []AgentOption {
 	opts := []AgentOption{
 		withParentContext(ctx),
 		withAgentGraph(graph, budget, agentID),
 	}
 	if benchmarkIsolated {
 		opts = append(opts, WithBenchmarkIsolation())
+	}
+	// Delegated workers must inherit the root's enforced engagement scope: a
+	// child agent is another path to the same network, not an exemption.
+	if len(scope) > 0 && scope[0] != nil {
+		s := scope[0]
+		opts = append(opts, WithEngagementScope(s.Targets, s.Deny, s.AllowPorts))
 	}
 	return opts
 }
@@ -609,6 +720,7 @@ func NewAgent(cfg *config.Config, name string, events chan Event, localGuard sco
 	// and overwrote the enhanced rod browser with a weaker curl-based stub.
 	notes.Register(reg)
 	intelligence.Register(reg)
+	assettools.Register(reg)
 	finish.Register(reg)
 	python.Register(reg)
 	websearch.Register(reg)
@@ -617,6 +729,12 @@ func NewAgent(cfg *config.Config, name string, events chan Event, localGuard sco
 	// into the per-scan skill state.
 	oobtool.Register(reg)
 	codesearch.Register(reg)
+	// Deterministic decision aids: they only read text/bytes the agent already
+	// observed, make no target requests, and carry no approval class.
+	honeypot.Register(reg, filepath.Join(cfg.DataDir, "signatures", "honeypot.json"))
+	scannerhits.Register(reg)
+	diffresponses.Register(reg)
+	captchatool.Register(reg)
 	reg.SetLeanSchema(cfg.LeanToolSchema)
 
 	hookReg := NewHookRegistry()
@@ -660,6 +778,17 @@ func NewAgent(cfg *config.Config, name string, events chan Event, localGuard sco
 	for _, opt := range opts {
 		opt(a)
 	}
+	// R7/M2 executable surface: prune the tools registered above (base
+	// packages) and filter every later registration (skills, plan/ledger,
+	// reporting, MCP, delegation). The zero value keeps the legacy surface.
+	if a.toolSurface != SurfaceLegacyRoot {
+		reg.SetToolFilter(a.toolSurface.Allows)
+		reg.Retain(a.toolSurface.Allows)
+	}
+	if a.plannerWorkerMode {
+		a.mainInbox = make(chan string, 32)
+		a.mainSystemInbox = make(chan string, 1)
+	}
 	// Skill tools register after the option tail: the per-scan
 	// operator-authored skill set (WithUserSkills) must be on the agent
 	// before the per-scan skill state is built.
@@ -677,6 +806,11 @@ func NewAgent(cfg *config.Config, name string, events chan Event, localGuard sco
 	// (live recon output the engine can't fully parse); the auto-plan + the
 	// per-iteration nudge + the finish gate all consult the same plan.
 	a.registerPlanTools(reg)
+	// R7/M2: the main/planner surfaces can steer or cancel the worker that
+	// owns a plan intent. SurfaceWorker never gets these (no global control).
+	if a.toolSurface == SurfaceMain || a.toolSurface == SurfacePlanner {
+		a.registerWorkerControlTools(reg)
+	}
 
 	// Register the durable hypothesis/evidence ledger tools (record_hypothesis,
 	// add_hypothesis_evidence, update_hypothesis, read_ledger). Unlike the plan
@@ -805,15 +939,34 @@ func NewAgent(cfg *config.Config, name string, events chan Event, localGuard sco
 		// model-spawned agent: the early recon-discovery lane launches before
 		// the testing wave, so the old default (3) would strand the wave.
 		// Operator-authored profiles join the wave, so the merged set sizes
-		// the cap.
-		a.agentGraph = agentsgraph.NewWithLimit(a.ctx, len(a.mergedSpecialistProfiles())+1, func(ctx context.Context, agentID, subName string, targets []string, task string) (string, error) {
+		// the cap. In planner_worker mode the concurrency is the configurable
+		// worker-pool size instead of the env default.
+		maxConcurrent := agentsgraph.EffectiveMaxConcurrentAgents()
+		lifetimeCap := len(a.mergedSpecialistProfiles()) + 1
+		if poolSize := int(a.workerPoolSize.Load()); poolSize > 0 {
+			maxConcurrent = poolSize
+			// NewWithConfig clamps maxConcurrent to maxAgents; the pool must
+			// be able to run all N configured slots.
+			if lifetimeCap < maxConcurrent {
+				lifetimeCap = maxConcurrent
+			}
+		}
+		a.agentGraph = agentsgraph.NewWithConfig(a.ctx, lifetimeCap, maxConcurrent, func(ctx context.Context, agentID, subName string, targets []string, task string) (string, error) {
 			subEvents := make(chan Event, 256)
 			// All descendants join this root's graph and inherit its cancellation
 			// context. Creating a child therefore cannot overwrite another scan's
 			// runner or leave an uncancellable worker behind.
 			subArgs := []any{sctx}
-			for _, opt := range delegatedAgentOptions(ctx, a.agentGraph, a.scanBudget, agentID, a.benchmarkIsolated) {
+			for _, opt := range delegatedAgentOptions(ctx, a.agentGraph, a.scanBudget, agentID, a.benchmarkIsolated, a.engagementScope) {
 				subArgs = append(subArgs, opt)
+			}
+			if a.workerSurface != SurfaceLegacyRoot {
+				subArgs = append(subArgs, WithToolSurface(a.workerSurface))
+			}
+			// Per-dispatch surface (R7 orchestration): control-plane API lanes
+			// get a different tool surface than execution workers.
+			if surface := a.agentGraph.SurfaceFor(agentID); surface != "" {
+				subArgs = append(subArgs, WithToolSurface(ToolSurface(surface)))
 			}
 			// Specialists run the same runtime as the coordinator. Their unique
 			// delegatedAgentID gives them a per-agent checkpoint namespace.
@@ -826,6 +979,12 @@ func NewAgent(cfg *config.Config, name string, events chan Event, localGuard sco
 			subAgent := NewAgent(cfg, subName, subEvents, a.localGuard, subArgs...)
 			a.registerChildAgent(subAgent)
 			defer a.unregisterChildAgent(subAgent)
+			// R7/M2: steer_work addresses a dispatched worker by its unit; bind
+			// the child's message queue to the graph while it runs.
+			a.agentGraph.RegisterSteer(agentID, func(msg string) error {
+				_, err := subAgent.SendMessage(msg)
+				return err
+			})
 			subAgent.SetPhaseRestrictions(a.allowedPhases)
 			// The specialist inherits the operator objective so its lane plan
 			// marks the tasks that serve a criterion (marking only).
@@ -927,6 +1086,7 @@ func NewAgent(cfg *config.Config, name string, events chan Event, localGuard sco
 				Content: ev.Lane,
 				Meta: map[string]any{
 					"agent_id": ev.AgentID,
+					"unit_id":  ev.UnitID,
 					"lane":     ev.Lane,
 					"status":   ev.Status,
 					"task":     ev.Task,
@@ -1084,6 +1244,31 @@ func (a *Agent) reconIncompleteReasons() []string {
 // authorization work is not launched without a configured or ingested
 // authenticated identity, because an anonymous-only specialist otherwise
 // degenerates into password spraying and disabled-signup probing.
+// noteSingleAgentMode emits the one-time notice that the deterministic
+// specialist wave is off. Manual spawn_agent remains available; the message
+// says "automatic wave" rather than "delegation" so the two are not confused.
+func (a *Agent) noteSingleAgentMode() {
+	if a == nil || a.state == nil || a.state.SingleAgentNoted {
+		return
+	}
+	a.state.SingleAgentNoted = true
+	a.emit(Event{Type: "message", Content: a.op(
+		"🧭 Single-agent mode: the automatic specialist wave is disabled by configuration. The root agent owns the complete methodology — reconnaissance, plan, testing, verification, and reporting — and every coverage gate applies unchanged. No specialist wave will be launched.",
+		"🧭 单代理模式：自动专家组（wave）已被配置禁用。根代理独立完成全方法论——侦察、规划、测试、验证与报告——所有覆盖闸门照常生效，不会启动专家组。",
+	)})
+}
+
+// singleAgentPromptMode reports whether the system prompt must present the
+// single-agent contract. Manual delegation may still be available when only the
+// automatic wave is disabled, but the prompt must not instruct the root to
+// launch a coordinator wave.
+func (a *Agent) singleAgentPromptMode() bool {
+	if !a.delegationEnabled() {
+		return true
+	}
+	return a.cfg != nil && a.cfg.DisableAutoDelegate
+}
+
 func (a *Agent) maybeAutoDelegate(targets []string) string {
 	if a == nil || a.state == nil || a.registry == nil || a.agentGraph == nil ||
 		a.delegatedAgentID != "" || a.ctfDelegationBlocked() || a.state.DiscoveryMode ||
@@ -1091,7 +1276,10 @@ func (a *Agent) maybeAutoDelegate(targets []string) string {
 		return ""
 	}
 	// DisableAutoDelegate = no deterministic wave; manual spawn stays open.
+	// The one-time notice is still useful: the operator should know that the
+	// engine will not launch a wave even though manual spawn remains available.
 	if a.cfg != nil && a.cfg.DisableAutoDelegate {
+		a.noteSingleAgentMode()
 		return ""
 	}
 	// Opt-in bounded reschedule (P2, XALGORIX_WAVE_RESCHEDULE): after the first
@@ -1117,10 +1305,7 @@ func (a *Agent) maybeAutoDelegate(targets []string) string {
 	// requirements for a scan that never had specialists. The root agent
 	// owns the complete methodology; every coverage gate applies unchanged.
 	if !a.state.DelegationEnabled {
-		if !a.state.SingleAgentNoted {
-			a.state.SingleAgentNoted = true
-			a.emit(Event{Type: "message", Content: a.op("🧭 Single-agent mode: specialist delegation is disabled by configuration. The root agent owns the complete methodology — reconnaissance, plan, testing, verification, and reporting — and every coverage gate applies unchanged. No specialist wave will be launched.", "🧭 单代理模式：专家委派已被配置禁用。根代理独立完成全方法论——侦察、规划、测试、验证与报告——所有覆盖闸门照常生效，不会启动专家组。")})
-		}
+		a.noteSingleAgentMode()
 		return ""
 	}
 	if _, ok := a.registry.Get("spawn_agent"); !ok {
@@ -1904,6 +2089,12 @@ func (a *Agent) Run(targets []string, instruction string) {
 	if a.stopped.Load() {
 		return
 	}
+	// R7 main-chat mode: no scan checkpoint, source clone, browser, watchdog or
+	// offensive prompt. The root only serves the human message channel.
+	if a.plannerWorkerMode {
+		a.runMainChatOnly(targets, instruction)
+		return
+	}
 	if _, err := a.RestoreExecutionCheckpoint(); err != nil {
 		a.stopForHook(HookResult{StopReason: "checkpoint_restore_failed", EmitMessage: a.op("Scan stopped: execution checkpoint could not be restored safely; saved findings are preserved.", "扫描已停止：执行检查点无法安全恢复；已保存的发现不受影响。")})
 		return
@@ -2020,6 +2211,7 @@ func (a *Agent) Run(targets []string, instruction string) {
 	a.state.ScanContextID = a.scanCtx.ID
 	a.state.DelegatedAgent = a.delegatedAgentID != ""
 	a.state.DelegatedAgentID = a.delegatedAgentID
+	a.state.PlannerWorkerMode = a.plannerWorkerMode && a.delegatedAgentID == ""
 	a.state.LaneScoped = a.laneScoped
 	a.state.AssignedClasses = append([]string(nil), a.assignedClasses...)
 	// Delegation vocabulary (builtin + operator-authored profiles) is frozen
@@ -2183,6 +2375,22 @@ func (a *Agent) SendMessage(message string) (string, error) {
 		return "", fmt.Errorf("agent is not running")
 	}
 
+	if a.mainInbox != nil {
+		// R7 main-chat mode: the root no longer owns an autonomous loop. A
+		// human message wakes exactly one chat turn; it never becomes a scan
+		// iteration nudge.
+		select {
+		case a.mainInbox <- message:
+		case <-a.ctx.Done():
+			return "", fmt.Errorf("agent is not running")
+		default:
+			return "", fmt.Errorf("main agent inbox is full")
+		}
+		// The persisted guidance row is the human turn; do not add a second
+		// "user message received" bubble to the transcript.
+		return "Message queued for the main agent.", nil
+	}
+
 	a.queueUserMessage("[USER MESSAGE DURING SCAN]: " + message)
 
 	// Emit as a visible event so it appears in the feed
@@ -2204,6 +2412,9 @@ func (a *Agent) emit(evt Event) {
 	// don't leak into the live event stream, scan logs, or PDF reports.
 	if len(a.secretValues) > 0 {
 		evt.Content = a.redactSecrets(evt.Content)
+		if evt.Delta != "" {
+			evt.Delta = a.redactSecrets(evt.Delta)
+		}
 		if evt.ToolResult.Output != "" {
 			evt.ToolResult.Output = a.redactSecrets(evt.ToolResult.Output)
 		}
@@ -2371,6 +2582,16 @@ func (a *Agent) SetCodeScanMode(m CodeScanMode) { a.codeScanMode = m }
 // SetSourceRepo sets the per-scan whitebox source (git URL or local path),
 // overriding the global default. Call before Run().
 func (a *Agent) SetSourceRepo(s string) { a.sourceRepo = strings.TrimSpace(s) }
+
+// ScanContext returns the per-session state store this agent owns. It is
+// read-only for callers: web code uses it to append audit/InfoItem records
+// (for example delivered operator guidance) to the same scan the agent runs.
+func (a *Agent) ScanContext() *scanctx.ScanContext {
+	if a == nil {
+		return nil
+	}
+	return a.scanCtx
+}
 
 // SetScanContext sets the per-scan context artifact path (OpenAPI/HAR/Postman
 // file or directory) used to seed the attack surface. Call before Run().
@@ -2812,7 +3033,16 @@ func reasoningRequestCategory(state *ScanState) string {
 }
 
 func (a *Agent) recordTokenAttribution(usage *llm.TokenUsage, msgs []llm.Message, iter int, category string, retryAttempt int) {
-	if a == nil || a.scanCtx == nil || a.scanCtx.Tokens == nil {
+	if a == nil {
+		return
+	}
+	// Provider usage is the authoritative size of the buffer that was just
+	// serialized, so record it even when token attribution itself is not wired
+	// (CLI/tests) — compaction depends on it.
+	if usage != nil && usage.PromptTokens > 0 {
+		a.lastPromptTokens.Store(int64(usage.PromptTokens))
+	}
+	if a.scanCtx == nil || a.scanCtx.Tokens == nil {
 		return
 	}
 	totBytes, sysBytes, usrBytes, asstBytes, tCount, tBytes, sCount, sBytes := calculateMessageMetrics(msgs)

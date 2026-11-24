@@ -55,7 +55,7 @@ func (g *proxyHighRiskGate) Adjudicate(attr trafficproxy.Attribution, verdict ap
 		// system-level. Never create rows for either.
 		return true, "", nil
 	}
-	if g.svc == nil || g.svc.policy.Mode != approval.ModeEnforce {
+	if g.svc == nil {
 		return true, "", nil
 	}
 	sctx := scanctx.Get(attr.ScanCtxID)
@@ -64,6 +64,11 @@ func (g *proxyHighRiskGate) Adjudicate(attr trafficproxy.Attribution, verdict ap
 		// attribution and the verdict) — nothing to attach the row to, and
 		// submit needs the context's cancellation channel. Fail open.
 		log.Printf("[approval] proxy gate: scan context %s gone — failing open", attr.ScanCtxID)
+		return true, "", nil
+	}
+	// Per-run posture: the task's audit switch (snapshotted on the context)
+	// decides, falling back to the process default for manual/CLI runs.
+	if g.svc.srv.runAuditMode(sctx) != approval.ModeEnforce {
 		return true, "", nil
 	}
 	// Project fence first (scope_fence.go): the wire layer is part of the same
@@ -109,15 +114,16 @@ func (s *Server) secretValuesForInstance(instanceID string) []string {
 	return ag.SecretValues()
 }
 
-// installProxyHighRiskGate wires the adapter into the trafficproxy package
-// hook. enforce mode → adapter; off (the default) → nil, which keeps the
-// proxy observe-only (its behavior is byte-identical to the pre-closed-loop
-// posture). Called from NewServer so every server instance (tests included)
-// leaves the hook in a deterministic state.
+// installProxyHighRiskGate wires the adapter whenever an approval service
+// exists. The adapter itself resolves the PER-RUN posture (task audit switch,
+// falling back to the process default), so a task-level enforce switch works
+// even when XALGORIX_APPROVAL_MODE is off. No service → nil, which keeps the
+// proxy observe-only. Called from NewServer / SetApprovalService so every
+// server instance (tests included) leaves the hook in a deterministic state.
 func (s *Server) installProxyHighRiskGate() {
-	if s.approvalSvc != nil && s.approvalSvc.policy.Mode == approval.ModeEnforce {
-		trafficproxy.SetHighRiskGate(&proxyHighRiskGate{svc: s.approvalSvc})
+	if s.approvalSvc == nil {
+		trafficproxy.SetHighRiskGate(nil)
 		return
 	}
-	trafficproxy.SetHighRiskGate(nil)
+	trafficproxy.SetHighRiskGate(&proxyHighRiskGate{svc: s.approvalSvc})
 }

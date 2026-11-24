@@ -1,0 +1,253 @@
+package imhub
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// telegram.go Telegram 适配器：Bot API 长轮询收消息 + sendMessage 回发。
+// 轮询不需要公网回调；国内网络可在配置里填出口代理（http/https）。
+
+const (
+	imTelegramPollTimeoutSec = 50 // 长轮询挂起时长，断线窗口内保持连接
+	imTelegramMaxText        = 4000
+	imTelegramRetryDelay     = 5 * time.Second
+)
+
+// imTelegramOffsetsKey 存 Telegram 轮询 offset（按 bot token 指纹分桶，不存原始
+// token）：进程/配置重启后从服务端保留窗口恢复，不重放已确认消息（2026-11-06 增强）。
+// 保存时机=每 30s 且有推进、以及循环退出（配置热更/停用）；硬崩溃最多重放 30s 窗口。
+const imTelegramOffsetsKey = "offset:" // stored per token fingerprint under platform "telegram"
+
+// imTokenFingerprint bot token 的 sha256 前 16 hex——持久层里不落原始凭据。
+func imTokenFingerprint(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:8])
+}
+
+func (h *Hub) loadTelegramOffset(fp string) int64 {
+	if h.store == nil || fp == "" {
+		return 0
+	}
+	value, ok, err := h.store.GetOffset(context.Background(), "telegram", imTelegramOffsetsKey+fp)
+	if err != nil || !ok {
+		return 0
+	}
+	offset, _ := strconv.ParseInt(value, 10, 64)
+	return offset
+}
+
+func (h *Hub) saveTelegramOffset(fp string, offset int64) {
+	if h.store == nil || fp == "" {
+		return
+	}
+	_ = h.store.SetOffset(context.Background(), "telegram", imTelegramOffsetsKey+fp, strconv.FormatInt(offset, 10))
+}
+
+// imTelegramLoop 长轮询主循环；ctx 取消即退出（配置热更/停用）。
+func (h *Hub) imTelegramLoop(ctx context.Context, cfg Config) {
+	token := cfg.Telegram.BotToken
+	fp := imTokenFingerprint(token)
+	offset := h.loadTelegramOffset(fp)
+	if offset > 0 {
+		log.Printf("[im telegram] 恢复轮询 offset=%d", offset)
+	}
+	dirty := false
+	save := func() {
+		if !dirty {
+			return
+		}
+		h.saveTelegramOffset(fp, offset)
+		dirty = false
+	}
+	defer save()
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			save()
+			return
+		case <-ticker.C:
+			save()
+		default:
+		}
+		updates, err := h.imTelegramGetUpdates(ctx, token, offset)
+		if err != nil {
+			if ctx.Err() != nil {
+				save()
+				return
+			}
+			log.Printf("[im telegram] 拉取消息失败: %v", err)
+			select {
+			case <-ctx.Done():
+				save()
+				return
+			case <-time.After(imTelegramRetryDelay):
+			}
+			continue
+		}
+		for _, u := range updates {
+			if u.UpdateID >= offset {
+				offset = u.UpdateID + 1
+				dirty = true
+			}
+			if u.Message == nil || strings.TrimSpace(u.Message.Text) == "" {
+				continue
+			}
+			chatID := strconv.FormatInt(u.Message.Chat.ID, 10)
+			userID := ""
+			if u.Message.From != nil {
+				userID = strconv.FormatInt(u.Message.From.ID, 10)
+			}
+			text := imTelegramNormalize(u.Message.Text)
+			if text == "" {
+				continue
+			}
+			go h.HandleText("telegram", chatID, userID, strconv.FormatInt(u.Message.MessageID, 10), text)
+		}
+	}
+}
+
+// imTelegramNormalize 归一化 Telegram 消息文本：剥掉群聊里的 /cmd@BotName 后缀。
+func imTelegramNormalize(text string) string {
+	text = strings.TrimSpace(text)
+	if strings.HasPrefix(text, "/") {
+		fields := strings.SplitN(text, " ", 2)
+		if i := strings.Index(fields[0], "@"); i > 1 {
+			fields[0] = fields[0][:i]
+		}
+		if len(fields) == 1 {
+			return fields[0]
+		}
+		return fields[0] + " " + strings.TrimSpace(fields[1])
+	}
+	return text
+}
+
+func (h *Hub) imTelegramClient(cfg Config) *http.Client {
+	base, ok := http.DefaultTransport.(*http.Transport)
+	if !ok || base == nil {
+		base = &http.Transport{}
+	}
+	transport := base.Clone()
+	if p := strings.TrimSpace(cfg.Telegram.Proxy); p != "" {
+		if u, err := url.Parse(p); err == nil {
+			transport.Proxy = http.ProxyURL(u)
+		}
+	}
+	return &http.Client{Transport: transport, Timeout: (imTelegramPollTimeoutSec + 15) * time.Second}
+}
+
+func (h *Hub) imTelegramGetUpdates(ctx context.Context, token string, offset int64) ([]imTelegramUpdate, error) {
+	api := "https://api.telegram.org/bot" + token + "/getUpdates"
+	q := url.Values{}
+	q.Set("offset", strconv.FormatInt(offset, 10))
+	q.Set("timeout", strconv.Itoa(imTelegramPollTimeoutSec))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, api+"?"+q.Encode(), nil)
+	if err != nil {
+		return nil, err
+	}
+	var payload struct {
+		OK     bool               `json:"ok"`
+		Desc   string             `json:"description"`
+		Result []imTelegramUpdate `json:"result"`
+	}
+	if err := h.imTelegramDo(ctx, req, &payload); err != nil {
+		return nil, err
+	}
+	if !payload.OK {
+		return nil, fmt.Errorf("telegram: %s", payload.Desc)
+	}
+	return payload.Result, nil
+}
+
+// imTelegramDo 复用同一代理客户端发请求并解析 JSON。轮询请求用长超时客户端，
+// 发送请求也走它（超时上限一致，可接受）。
+func (h *Hub) imTelegramDo(ctx context.Context, req *http.Request, out any) error {
+	cfg := h.LoadConfig()
+	resp, err := h.imTelegramClient(cfg).Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("telegram http %d: %s", resp.StatusCode, imSnippet(body))
+	}
+	if out == nil {
+		return nil
+	}
+	return json.Unmarshal(body, out)
+}
+
+func (h *Hub) imTelegramSend(ctx context.Context, cfg Config, chatID, text string) error {
+	chat, err := strconv.ParseInt(chatID, 10, 64)
+	if err != nil {
+		return fmt.Errorf("telegram: 非法 chat_id %q", chatID)
+	}
+	payload := map[string]any{
+		"chat_id":                  chat,
+		"text":                     imTruncateRunes(text, imTelegramMaxText),
+		"disable_web_page_preview": true,
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		"https://api.telegram.org/bot"+cfg.Telegram.BotToken+"/sendMessage", bytes.NewReader(raw))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	return h.imTelegramDo(ctx, req, nil)
+}
+
+// imTruncateRunes 按字符截断（不切断 UTF-8），超限给省略标记。
+func imTruncateRunes(s string, max int) string {
+	rs := []rune(strings.TrimSpace(s))
+	if len(rs) <= max {
+		return strings.TrimSpace(s)
+	}
+	return string(rs[:max]) + "\n…（已截断）"
+}
+
+// imSnippet 报错用的响应片段（截 200 字节）。
+func imSnippet(b []byte) string {
+	s := strings.TrimSpace(string(b))
+	if len(s) > 200 {
+		s = s[:200] + "…"
+	}
+	return s
+}
+
+type imTelegramUpdate struct {
+	UpdateID int64                    `json:"update_id"`
+	Message  *imTelegramUpdateMessage `json:"message"`
+}
+
+type imTelegramUpdateMessage struct {
+	MessageID int64  `json:"message_id"`
+	Text      string `json:"text"`
+	Chat      struct {
+		ID int64 `json:"id"`
+	} `json:"chat"`
+	From *struct {
+		ID int64 `json:"id"`
+	} `json:"from"`
+}

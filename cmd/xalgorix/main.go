@@ -19,9 +19,13 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/c1ayooo/xalgorix/v4/internal/assets"
 	"github.com/c1ayooo/xalgorix/v4/internal/coldpath"
 	"github.com/c1ayooo/xalgorix/v4/internal/config"
 	"github.com/c1ayooo/xalgorix/v4/internal/domainjournal"
+	"github.com/c1ayooo/xalgorix/v4/internal/evidence"
+	"github.com/c1ayooo/xalgorix/v4/internal/graph"
+	"github.com/c1ayooo/xalgorix/v4/internal/imhub"
 	"github.com/c1ayooo/xalgorix/v4/internal/jobs"
 	"github.com/c1ayooo/xalgorix/v4/internal/platform"
 	"github.com/c1ayooo/xalgorix/v4/internal/proxy"
@@ -384,6 +388,18 @@ func main() {
 		web.SetWorkerStateBackend(rsStore)
 		scanctx.SetStateFilesBackend(rsStore)
 		intelligence.SetBackend(rsStore)
+		// Finding evidence: sha256-pinned copies of the wire packets behind each
+		// reported finding. The platform store owns the metadata; blobs live
+		// under DataDir/evidence. The gate's wire-evidence requirement applies to
+		// production contexts (web sessions set it directly, CLI here).
+		if db, ok := platformStore.(evidence.DB); ok {
+			evStore := evidence.New(db, filepath.Join(cfg.DataDir, "evidence"))
+			evidence.SetDefault(evStore)
+			go evStore.RunGC(context.Background())
+		}
+		if sc := scanctx.Default(); sc != nil {
+			sc.RequireEvidenceRefs = true
+		}
 		// Scan record → PG (R6.1 runs-table takeover of scan.json, charter
 		// §5.1/D12). Every record safe point lands the verbatim record in
 		// run_scan_records plus the runs mount row's takeover columns
@@ -393,6 +409,29 @@ func main() {
 		// backend (tests) keeps the legacy scan.json file path byte-for-byte.
 		web.SetScanStateBackend(rsStore)
 		defer rsStore.Close()
+
+		// Dual-graph authority (R7/M1): exploration + asset graph is the
+		// real-time PG authority. The store runs the shared migrator, so the
+		// new graph tables/views are present before any scan reads them.
+		graphStore, graphErr := graph.Open(context.Background(), cfg.DatabaseURL)
+		if graphErr != nil {
+			fmt.Fprintf(os.Stderr, "❌ graph authority failed to start (R7): %v\n", graphErr)
+			fmt.Fprintln(os.Stderr, "   Fix the DSN / database, then start again — the graph has no file fallback.")
+			os.Exit(1)
+		}
+		graph.SetBackend(graphStore)
+		defer graphStore.Close()
+
+		// Asset graph authority (R7/M1): project-scoped identity/dedup is the
+		// authority; InfoItem keeps the observed/inferred provenance.
+		assetStore, assetErr := assets.Open(context.Background(), cfg.DatabaseURL)
+		if assetErr != nil {
+			fmt.Fprintf(os.Stderr, "❌ asset authority failed to start (R7): %v\n", assetErr)
+			fmt.Fprintln(os.Stderr, "   Fix the DSN / database, then start again — the asset graph has no file fallback.")
+			os.Exit(1)
+		}
+		assets.SetBackend(assetStore)
+		defer assetStore.Close()
 	}
 
 	// -------------------------------------------------------------------------
@@ -423,15 +462,41 @@ func main() {
 	// restores the pre-R2b behavior byte-for-byte). XALGORIX_CA_DIR points
 	// at the interception CA (default ~/.xalgorix/ca).
 	// -------------------------------------------------------------------------
-	if err := trafficproxy.ConfigureWithListen(cfg.TrafficProxy, cfg.CADir, cfg.TLSSkipVerify, cfg.TrafficProxyBind, cfg.TrafficProxyAdvertise); err != nil {
-		fmt.Fprintf(os.Stderr, "[trafficproxy] init warning: %v\n", err)
+	// Recording (MITM) is one mode; the forward-only egress router is the
+	// other. The router keeps a task's egress proxy hot-swappable (and
+	// containers stable) while recording is OFF. XALGORIX_EGRESS_ROUTER=off
+	// preserves the legacy "off means direct" behaviour.
+	trafficModeErr := func() error {
+		switch {
+		case cfg.TrafficProxy:
+			return trafficproxy.ConfigureWithListen(cfg.TrafficProxy, cfg.CADir, cfg.TLSSkipVerify, cfg.TrafficProxyBind, cfg.TrafficProxyAdvertise)
+		case !strings.EqualFold(strings.TrimSpace(cfg.EgressRouter), "off") && (cfg.UseProxy || cfg.ProxyRequired):
+			return trafficproxy.ConfigureForwardOnly(cfg.TrafficProxyBind, cfg.TrafficProxyAdvertise)
+		default:
+			return trafficproxy.ConfigureWithListen(false, cfg.CADir, cfg.TLSSkipVerify, cfg.TrafficProxyBind, cfg.TrafficProxyAdvertise)
+		}
+	}()
+	if trafficModeErr != nil {
+		fmt.Fprintf(os.Stderr, "[trafficproxy] init warning: %v\n", trafficModeErr)
 		// Non-fatal: a broken CA already degrades to blind forwarding inside
 		// Configure; scanning continues.
 	}
-	if cfg.ProxyRequired {
+	// Egress usage audit (per run + masked proxy label), independent of
+	// recording. Flushed periodically to PostgreSQL when the platform store is
+	// available.
+	if store, ok := platformStore.(trafficproxy.EgressUsageSink); ok {
+		trafficproxy.SetEgressUsageSink(store)
+		go trafficproxy.RunEgressUsageFlusher(context.Background(), 30*time.Second)
+	}
+	if cfg.ProxyRequired || cfg.TrafficProxy {
+		// Start the listener eagerly: containerised tools receive the proxy URL
+		// before the first platform-side request would otherwise lazily bind it.
 		if _, err := trafficproxy.LocalURL(); err != nil {
-			fmt.Fprintf(os.Stderr, "[proxy] required local proxy unavailable: %v\n", err)
-			os.Exit(1)
+			if cfg.ProxyRequired {
+				fmt.Fprintf(os.Stderr, "[proxy] required local proxy unavailable: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Fprintf(os.Stderr, "[trafficproxy] listener unavailable: %v\n", err)
 		}
 	}
 	if proxy.Enabled() {
@@ -484,6 +549,10 @@ func main() {
 		// Wire the platform store (nil keeps /api/projects|tasks at 503).
 		if platformStore != nil {
 			srv.SetPlatformStore(platformStore)
+			// Inbound IM gateway: chats bind to tasks and deliver guidance.
+			if imStore, ok := platformStore.(imhub.Store); ok {
+				srv.StartIMGateway(context.Background(), imStore)
+			}
 		}
 		if err := srv.Start(); err != nil {
 			fmt.Fprintf(os.Stderr, "Server error: %v\n", err)

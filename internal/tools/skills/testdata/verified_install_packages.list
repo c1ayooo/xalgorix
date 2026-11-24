@@ -15,6 +15,7 @@
 # crate names are lowercase with _ written as -.
 
 pypi analyzemft
+pypi arjun
 pypi bandit
 pypi bleak
 pypi boto3
@@ -35,6 +36,7 @@ pypi geoip2
 pypi git-dumper
 pypi git-filter-repo
 pypi gophish
+pypi graphw00f
 pypi guardrails-ai
 pypi impacket
 pypi jefferson
@@ -109,11 +111,13 @@ pypi watchdog
 pypi websockets
 pypi wfuzz
 pypi windowsprefetch
+pypi wsrepl
 pypi xlmmacrodeobfuscator
 pypi xsrfprobe
 pypi yara-python
 
 npm bgpalerter
+npm graphql-voyager
 npm snyk
 npm wappalyzer
 npm wscat

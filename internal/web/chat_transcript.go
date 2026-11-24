@@ -68,6 +68,26 @@ type transcriptItem struct {
 	// Approval carries the structured decision so the UI can render the row in
 	// the operator's language instead of the server's.
 	Approval *approvalView `json:"approval,omitempty"`
+	// Proposal carries a main-chat intent draft (pending) or its resolution.
+	// It is a transcript projection of the intent_proposed/
+	// intent_proposal_resolved events, never plan state.
+	Proposal *proposalView `json:"proposal,omitempty"`
+}
+
+// proposalView is the transcript projection of a main-chat intent draft. The
+// card is actionable only while status=pending; the confirm/reject endpoints
+// live under /api/conversations/{instanceID}/intent-proposals/.
+type proposalView struct {
+	ID         string `json:"id"`
+	TaskID     string `json:"task_id,omitempty"`
+	Title      string `json:"title,omitempty"`
+	Target     string `json:"target,omitempty"`
+	TargetKind string `json:"target_kind,omitempty"`
+	Phase      int    `json:"phase,omitempty"`
+	VulnClass  string `json:"vuln_class,omitempty"`
+	Endpoint   string `json:"endpoint,omitempty"`
+	Notes      string `json:"notes,omitempty"`
+	Status     string `json:"status,omitempty"`
 }
 
 // approvalView is the transcript projection of an approval event.
@@ -220,6 +240,10 @@ func (s *Server) handleConversationDetail(w http.ResponseWriter, r *http.Request
 		s.handleTranscript(w, r, store, instanceID)
 	case len(parts) == 2 && parts[1] == "attachments" && r.Method == http.MethodPost:
 		s.handleConversationAttachment(w, r)
+	case len(parts) == 4 && parts[1] == "intent-proposals" && parts[3] == "confirm" && r.Method == http.MethodPost:
+		s.handleIntentProposalDecision(w, r, store, instanceID, parts[2], true)
+	case len(parts) == 4 && parts[1] == "intent-proposals" && parts[3] == "reject" && r.Method == http.MethodPost:
+		s.handleIntentProposalDecision(w, r, store, instanceID, parts[2], false)
 	case len(parts) == 1 && r.Method == http.MethodPatch:
 		s.handleInstancePatch(w, r, store, instanceID)
 	default:
@@ -300,6 +324,21 @@ func (s *Server) handleTranscript(w http.ResponseWriter, r *http.Request, store 
 	if r.URL.Query().Get("human") == "1" {
 		items = humanTranscriptItems(items)
 	}
+	// ?unit=<intent> narrows the projection to one work-unit lane. A unit can
+	// be dispatched more than once (lease reclaim, retry, re-dispatch), so the
+	// lane is the union of all its agent ids: one worker session spans every
+	// attempt instead of splitting history across agent lanes.
+	if unit := strings.TrimSpace(r.URL.Query().Get("unit")); unit != "" {
+		items = unitTranscriptItems(items, s.unitAgentIDs(ctx, instanceID, unit))
+	} else if agent := strings.TrimSpace(r.URL.Query().Get("agent")); agent != "" {
+		// ?agent=<agent_id> is the legacy single-instance lane (model-initiated
+		// spawns and old deep links). The session rail opens a worker's
+		// transcript directly, and the full transcript's newest page may contain
+		// nothing from that agent (long runs, many lanes), which used to render
+		// as "no activity" with no way to page back. Filtering before pagination
+		// makes the lane's own history the page authority.
+		items = agentTranscriptItems(items, agent)
+	}
 	total := len(items)
 
 	end := total
@@ -354,10 +393,36 @@ func (s *Server) buildTranscript(ctx context.Context, store platform.Repository,
 	sort.SliceStable(items, func(i, j int) bool {
 		return items[i].At.Before(items[j].At)
 	})
+	items = collapseProposalStatuses(items)
 	for i := range items {
 		items[i].Seq = i + 1
 	}
 	return items
+}
+
+// collapseProposalStatuses keeps one card per proposal id and folds a later
+// resolution event into it. Without this, confirming a proposal would append
+// a second "confirmed" card next to the still-pending one.
+func collapseProposalStatuses(items []transcriptItem) []transcriptItem {
+	out := make([]transcriptItem, 0, len(items))
+	index := make(map[string]int)
+	for _, item := range items {
+		if item.Kind != "proposal" || item.Proposal == nil || strings.TrimSpace(item.Proposal.ID) == "" {
+			out = append(out, item)
+			continue
+		}
+		id := item.Proposal.ID
+		if at, seen := index[id]; seen {
+			if status := strings.TrimSpace(item.Proposal.Status); status != "" && status != "pending" {
+				out[at].Proposal.Status = status
+				out[at].Proposal.TaskID = item.Proposal.TaskID
+			}
+			continue
+		}
+		index[id] = len(out)
+		out = append(out, item)
+	}
+	return out
 }
 
 // transcriptEvents reads the scan journals behind this run. The conversation
@@ -469,8 +534,20 @@ func foldTranscriptLine(line []byte, seen map[string]struct{}, out *[]transcript
 		AbortReason string             `json:"abort_reason"`
 		Approval    *platform.Approval `json:"approval"`
 		ResultMeta  struct {
-			CreatedBy  string `json:"created_by"`
-			AnsweredBy string `json:"answered_by"`
+			CreatedBy  string   `json:"created_by"`
+			AnsweredBy string   `json:"answered_by"`
+			Surface    string   `json:"surface"`
+			ProposalID string   `json:"proposal_id"`
+			TaskID     string   `json:"task_id"`
+			Title      string   `json:"title"`
+			Target     string   `json:"target"`
+			TargetKind string   `json:"target_kind"`
+			Phase      int      `json:"phase"`
+			VulnClass  string   `json:"vuln_class"`
+			Endpoint   string   `json:"endpoint"`
+			Notes      string   `json:"notes"`
+			DependsOn  []string `json:"depends_on"`
+			Status     string   `json:"status"`
 		} `json:"result_meta"`
 	}
 	if err := json.Unmarshal(line, &ev); err != nil {
@@ -487,11 +564,64 @@ func foldTranscriptLine(line []byte, seen map[string]struct{}, out *[]transcript
 	seen[key] = struct{}{}
 
 	switch ev.Type {
-	case "message":
+	case "message", "assistant_done":
+		// assistant_done carries the full text of a streamed turn; the deltas
+		// before it have no transcript case on purpose, so the turn lands as
+		// exactly one assistant row (live clients fold the deltas themselves
+		// via message_id).
 		if strings.TrimSpace(ev.Content) == "" || isToolEcho(ev.Content) {
 			return
 		}
-		*out = append(*out, transcriptItem{Kind: "assistant", Role: "agent", Text: ev.Content, AgentID: ev.AgentID, At: at})
+		// surface=main marks the R7 main agent's own replies. The human
+		// projection includes them (it is a conversation), while worker
+		// narration keeps role=agent and stays in the full trace.
+		role := "agent"
+		if strings.EqualFold(strings.TrimSpace(ev.ResultMeta.Surface), "main") {
+			role = "main"
+		}
+		*out = append(*out, transcriptItem{Kind: "assistant", Role: role, Text: ev.Content, AgentID: ev.AgentID, At: at})
+	case "intent_proposed":
+		if strings.TrimSpace(ev.ResultMeta.ProposalID) == "" {
+			return
+		}
+		status := strings.TrimSpace(ev.ResultMeta.Status)
+		if status == "" {
+			status = "pending"
+		}
+		*out = append(*out, transcriptItem{
+			Kind: "proposal",
+			At:   at,
+			Proposal: &proposalView{
+				ID:         ev.ResultMeta.ProposalID,
+				TaskID:     ev.ResultMeta.TaskID,
+				Title:      ev.ResultMeta.Title,
+				Target:     ev.ResultMeta.Target,
+				TargetKind: ev.ResultMeta.TargetKind,
+				Phase:      ev.ResultMeta.Phase,
+				VulnClass:  ev.ResultMeta.VulnClass,
+				Endpoint:   ev.ResultMeta.Endpoint,
+				Notes:      ev.ResultMeta.Notes,
+				Status:     status,
+			},
+		})
+	case "intent_proposal_resolved":
+		if strings.TrimSpace(ev.ResultMeta.ProposalID) == "" {
+			return
+		}
+		status := strings.TrimSpace(ev.ResultMeta.Status)
+		if status == "" {
+			status = "confirmed"
+		}
+		*out = append(*out, transcriptItem{
+			Kind: "proposal",
+			At:   at,
+			Proposal: &proposalView{
+				ID:     ev.ResultMeta.ProposalID,
+				TaskID: ev.ResultMeta.TaskID,
+				Title:  ev.ResultMeta.Title,
+				Status: status,
+			},
+		})
 	case "chat_question":
 		// Operator side-question (chat_questions.go): renders like a
 		// human turn; no guidance lifecycle status behind it.
@@ -563,19 +693,123 @@ func foldTranscriptLine(line []byte, seen map[string]struct{}, out *[]transcript
 
 // transcriptGuidance folds the operator's own turns in. Guidance rows carry
 // both run_id and instance_id; matching on either keeps older rows visible.
-// humanTranscriptItems keeps only the operator conversation: human turns
-// (guidance and side questions) and the side-question answers. Seq is
+// humanTranscriptItems keeps the operator conversation: human turns (guidance
+// and side questions), side-question answers, the main agent's own replies
+// (role=main), and intent proposal cards (the confirmation affordance). Tool
+// calls, plans, workers and lifecycle rows stay in the full transcript. Seq is
 // renumbered so the pagination contract ("1-based contiguous") still holds
 // for the narrowed projection.
 func humanTranscriptItems(items []transcriptItem) []transcriptItem {
 	out := make([]transcriptItem, 0, len(items))
 	for _, item := range items {
-		if item.Kind == "human" || item.Role == "chat" {
+		if item.Kind == "human" || item.Kind == "proposal" || item.Role == "chat" || item.Role == "main" {
 			out = append(out, item)
 		}
 	}
 	for i := range out {
 		out[i].Seq = i + 1
+	}
+	return out
+}
+
+// agentTranscriptItems keeps only rows emitted by one delegated agent, then
+// renumbers seq contiguously so before_seq pagination over the filtered view
+// stays coherent (same discipline as humanTranscriptItems).
+func agentTranscriptItems(items []transcriptItem, agent string) []transcriptItem {
+	agent = strings.TrimSpace(agent)
+	if agent == "" {
+		return items
+	}
+	out := make([]transcriptItem, 0, len(items))
+	for _, item := range items {
+		id := strings.TrimSpace(item.AgentID)
+		// Event agent ids are usually the bare sub id; a sibling-session or
+		// prefixed id ("<instance>/sub_1") must match the same lane.
+		if id == agent || strings.HasSuffix(id, "/"+agent) {
+			out = append(out, item)
+		}
+	}
+	for i := range out {
+		out[i].Seq = i + 1
+	}
+	return out
+}
+
+// unitTranscriptItems keeps only rows emitted by any agent that ran one work
+// unit, then renumbers seq contiguously. Retries append to the same lane, so
+// the unit's transcript is the union of its attempts, not the newest one.
+func unitTranscriptItems(items []transcriptItem, agentIDs []string) []transcriptItem {
+	if len(agentIDs) == 0 {
+		return []transcriptItem{}
+	}
+	want := make(map[string]bool, len(agentIDs))
+	for _, id := range agentIDs {
+		if id = strings.TrimSpace(id); id != "" {
+			want[id] = true
+		}
+	}
+	out := make([]transcriptItem, 0, len(items))
+	for _, item := range items {
+		id := strings.TrimSpace(item.AgentID)
+		if id == "" {
+			continue
+		}
+		matched := want[id]
+		if !matched {
+			for agentID := range want {
+				if strings.HasSuffix(id, "/"+agentID) {
+					matched = true
+					break
+				}
+			}
+		}
+		if matched {
+			out = append(out, item)
+		}
+	}
+	for i := range out {
+		out[i].Seq = i + 1
+	}
+	return out
+}
+
+// unitAgentIDs resolves a work unit to every agent that ran it: the live
+// agentsgraph first (a dispatch may not have reached its lifecycle boundary
+// yet), then the durable run_workers rows.
+func (s *Server) unitAgentIDs(ctx context.Context, instanceID, unitID string) []string {
+	unitID = strings.TrimSpace(unitID)
+	if unitID == "" {
+		return nil
+	}
+	seen := make(map[string]bool)
+	out := make([]string, 0, 2)
+	add := func(id string) {
+		id = strings.TrimSpace(id)
+		if id == "" || seen[id] {
+			return
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	s.instancesMu.RLock()
+	inst := s.instances[instanceID]
+	s.instancesMu.RUnlock()
+	if inst != nil {
+		inst.mu.RLock()
+		live := inst.agent
+		inst.mu.RUnlock()
+		if live != nil {
+			for _, a := range live.DelegationSnapshot().Agents {
+				if a.UnitID == unitID {
+					add(a.AgentID)
+				}
+			}
+		}
+	}
+	for _, rec := range s.workerHistory(instanceID) {
+		if rec.UnitID == unitID {
+			add(rec.AgentID)
+		}
 	}
 	return out
 }

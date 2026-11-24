@@ -771,16 +771,31 @@ func prepareTrafficProxyClientConfig(workDir, scanCtxID string) error {
 		{".curlrc", curlrc},
 		{".wgetrc", wgetrc},
 	}
-	for _, cfg := range configs {
-		path := filepath.Join(workDir, cfg[0])
-		if existing, err := os.ReadFile(path); err == nil && string(existing) == cfg[1] {
-			continue
-		}
-		if err := storage.WriteAtomic(path, []byte(cfg[1])); err != nil {
-			return fmt.Errorf("write %s: %w", cfg[0], err)
+	// Container projects root HOME at <scanDir>/home (internal/runtime
+	// BuildProject). Writing the client config there as well makes the CA and
+	// the run token visible to in-container curl/wget; the workspace-root copy
+	// stays for native commands, whose HOME is the workspace.
+	dirs := []string{workDir}
+	if home := filepath.Join(workDir, "home"); dirExists(home) {
+		dirs = append(dirs, home)
+	}
+	for _, dir := range dirs {
+		for _, cfg := range configs {
+			path := filepath.Join(dir, cfg[0])
+			if existing, err := os.ReadFile(path); err == nil && string(existing) == cfg[1] {
+				continue
+			}
+			if err := storage.WriteAtomic(path, []byte(cfg[1])); err != nil {
+				return fmt.Errorf("write %s: %w", cfg[0], err)
+			}
 		}
 	}
 	return nil
+}
+
+func dirExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
 }
 
 func writePythonRateLimiter(pythonPath string, memLimitBytes int64) error {
@@ -1306,7 +1321,7 @@ func Register(r *tools.Registry) {
 		Name:        "terminal_execute",
 		Description: "Execute a shell command in the terminal. Returns stdout, stderr, and exit code. Automatically installs missing tools. Commands have a 10-minute timeout by default (30 minutes for heavy tools like nmap/nuclei). Use targeted scans to stay within limits.",
 		Parameters: []tools.Parameter{
-			{Name: "command", Description: "The shell command to execute", Required: true},
+			{Name: "command", Description: "The shell command to execute", Required: true, Type: "string"},
 		},
 		Execute: func(args map[string]string) (tools.Result, error) {
 			return executeCommandForRegistry(r, args)
@@ -1790,11 +1805,20 @@ func runShellInternalContext(parent context.Context, contextID string, command s
 	defer cancel()
 
 	cmdEnv := commandEnv(homeDir, goPath, workDir, rateRuntime)
-	if config.Get().ProxyRequired || egressproxy.Required() || trafficproxy.Enabled() {
+	if trafficproxy.Enabled() {
 		cmdEnv, err = trafficproxy.Environment(cmdEnv)
 		if err != nil {
 			return commandNotice + fmt.Sprintf("[ERROR] required proxy unavailable: %v", err), -1
 		}
+	} else {
+		// MITM off: the child still leaves through the same EGRESS the run
+		// pinned (task proxy selector), or the global pool, fail-closed when
+		// required.
+		egressEnv, eerr := egressproxy.EgressEnv(contextID, config.Get().ProxyRequired)
+		if eerr != nil {
+			return commandNotice + fmt.Sprintf("[ERROR] required proxy unavailable: %v", eerr), -1
+		}
+		cmdEnv = append(cmdEnv, egressEnv...)
 	}
 	cmdEnv = append(cmdEnv, egress.EnvForChild(contextID)...)
 

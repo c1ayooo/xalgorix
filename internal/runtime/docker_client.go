@@ -227,6 +227,7 @@ type dockerContainerInspect struct {
 	Config struct {
 		Image  string            `json:"Image"`
 		Labels map[string]string `json:"Labels"`
+		Env    []string          `json:"Env"`
 	} `json:"Config"`
 	NetworkSettings struct {
 		Ports map[string][]dockerPortBinding `json:"Ports"`
@@ -433,6 +434,32 @@ func (c *dockerClient) createNetwork(ctx context.Context, req dockerNetworkCreat
 		return nil
 	}
 	return err
+}
+
+type dockerNetworkInspect struct {
+	Name string `json:"Name"`
+	IPAM struct {
+		Config []struct {
+			Subnet  string `json:"Subnet"`
+			Gateway string `json:"Gateway"`
+		} `json:"Config"`
+	} `json:"IPAM"`
+}
+
+// networkGateway returns the bridge gateway a project container can use to
+// reach a host-bound proxy. An --internal network has no default route but the
+// gateway itself is on-link.
+func (c *dockerClient) networkGateway(ctx context.Context, name string) (string, error) {
+	var out dockerNetworkInspect
+	if err := c.do(ctx, http.MethodGet, "/networks/"+url.PathEscape(name), nil, &out); err != nil {
+		return "", err
+	}
+	for _, cfg := range out.IPAM.Config {
+		if strings.TrimSpace(cfg.Gateway) != "" {
+			return cfg.Gateway, nil
+		}
+	}
+	return "", fmt.Errorf("docker: network %s has no gateway", name)
 }
 
 func (c *dockerClient) removeNetwork(ctx context.Context, name string) error {

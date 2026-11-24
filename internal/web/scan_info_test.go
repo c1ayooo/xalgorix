@@ -41,6 +41,13 @@ func (f *fakeInfoReader) ContextSlice(_ context.Context, q infoitem.ContextQuery
 	return f.contextRes, f.err
 }
 
+func (f *fakeInfoReader) GetByID(_ context.Context, _ string, _ string) (infoitem.Item, error) {
+	if f.err != nil {
+		return infoitem.Item{}, f.err
+	}
+	return infoitem.Item{}, infoitem.ErrNotFound
+}
+
 func infoTestServer(t *testing.T) (*Server, *platform.Project, *platform.Project) {
 	t.Helper()
 	s := newPlatformTestServer(t)

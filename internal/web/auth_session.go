@@ -18,6 +18,8 @@ import (
 
 	cryptorand "crypto/rand"
 	"encoding/hex"
+
+	"github.com/c1ayooo/xalgorix/v4/internal/imhub"
 )
 
 const sessionCookieName = "xalgorix_session"
@@ -450,7 +452,7 @@ func authMiddleware(s *Server) func(http.Handler) http.Handler {
 			// whether auth is configured. This blocks an attacker page from
 			// triggering a scan via the cookie even when no password is set
 			// for local-loopback deployments.
-			if strings.HasPrefix(path, "/api/") && path != "/api/auth/login" {
+			if strings.HasPrefix(path, "/api/") && path != "/api/auth/login" && path != imhub.WecomCallbackPath {
 				if !isCSRFSafe(r) {
 					w.Header().Set("Content-Type", "application/json")
 					w.WriteHeader(http.StatusForbidden)
@@ -473,6 +475,7 @@ func authMiddleware(s *Server) func(http.Handler) http.Handler {
 			// before a session exists; /api/auth/setup is the first-run
 			// bootstrap (guarded server-side by the empty-store check).
 			if path == "/api/auth/login" || path == "/api/auth/status" || path == "/api/auth/setup" ||
+				path == imhub.WecomCallbackPath ||
 				isStaticWebAssetPath(path) || strings.HasPrefix(path, "/uploads/") {
 				next.ServeHTTP(w, r)
 				return

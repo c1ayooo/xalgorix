@@ -251,23 +251,23 @@ ACTIONS:
   7. wait selector=".success" OR wait type=navigation
   8. get_cookies → save session tokens for authenticated testing⟦/ex⟧`,
 		Parameters: []tools.Parameter{
-			{Name: "command", Description: "Browser action (see list above). Always provide it; only unambiguous omitted actions can be recovered.", Required: false},
-			{Name: "url", Description: "URL to navigate to (launch/goto/verify_xss), or the discovered route prefix for verify_path_template_xss", Required: false},
-			{Name: "selector", Description: "CSS selector or semantic @eX ID from snapshot (for click/type/submit/wait/iframe/get_html/select)", Required: false},
-			{Name: "text", Description: "Text to type (for type), option value (for select), or cookie value (for set_cookie)", Required: false},
-			{Name: "code", Description: "JavaScript code to execute (for execute_js)", Required: false},
-			{Name: "nonce", Description: "Unique marker your XSS payload emits (for verify_xss) via a dialog (alert/confirm/prompt), console.log(), or a DOM marker (document.title / window.name). Execution is confirmed only if this nonce is observed executing.", Required: false},
-			{Name: "parameter", Description: "The injected parameter under test (for verify_xss), used to label the ledger hypothesis.", Required: false},
-			{Name: "data", Description: "Request body for POST-based verify_xss: a urlencoded form body like search=<payload>&x=1 (values are decoded once, then the browser re-encodes them at submit). Providing data makes verify_xss submit a real form POST to url and confirm POST-reflected XSS in one call.", Required: false},
-			{Name: "method", Description: "HTTP method for verify_xss: GET (default) navigates to url; POST (default when data is set) submits url as a form POST with body=data. Use POST for reflected XSS that only triggers on form submission.", Required: false},
-			{Name: "direction", Description: "Scroll direction: up or down (for scroll)", Required: false},
-			{Name: "tab_id", Description: "Tab ID (for switch_tab)", Required: false},
-			{Name: "proxy", Description: "Proxy: 'caido', 'none', or proxy URL", Required: false},
-			{Name: "name", Description: "Cookie name (for set_cookie)", Required: false},
-			{Name: "domain", Description: "Cookie domain (for set_cookie)", Required: false},
-			{Name: "timeout", Description: "Timeout in seconds for wait actions (default: 10)", Required: false},
-			{Name: "fields", Description: "Form fields as key=value pairs separated by | (for fill_form). Example: email=test@mail.com|password=Pass123|name=John", Required: false},
-			{Name: "session_name", Description: "Session name for save_session/load_session (default: 'default'). Use distinct names for multi-account IDOR testing, e.g. 'admin', 'user_a'.", Required: false},
+			{Name: "command", Description: "Browser action (see list above). Always provide it; only unambiguous omitted actions can be recovered.", Required: false, Type: "string", Enum: []string{"launch", "goto", "snapshot", "click", "type", "submit", "scroll", "screenshot", "get_html", "execute_js", "get_cookies", "set_cookie", "save_session", "load_session", "list_sessions", "wait", "select", "fill_form", "get_url", "iframe", "main_frame", "extract_links", "discover_client_routes", "new_tab", "switch_tab", "close", "verify_xss", "verify_path_template_xss"}},
+			{Name: "url", Description: "URL to navigate to (launch/goto/verify_xss), or the discovered route prefix for verify_path_template_xss", Required: false, Type: "string"},
+			{Name: "selector", Description: "CSS selector or semantic @eX ID from snapshot (for click/type/submit/wait/iframe/get_html/select)", Required: false, Type: "string"},
+			{Name: "text", Description: "Text to type (for type), option value (for select), or cookie value (for set_cookie)", Required: false, Type: "string"},
+			{Name: "code", Description: "JavaScript code to execute (for execute_js)", Required: false, Type: "string"},
+			{Name: "nonce", Description: "Unique marker your XSS payload emits (for verify_xss) via a dialog (alert/confirm/prompt), console.log(), or a DOM marker (document.title / window.name). Execution is confirmed only if this nonce is observed executing.", Required: false, Type: "string"},
+			{Name: "parameter", Description: "The injected parameter under test (for verify_xss), used to label the ledger hypothesis.", Required: false, Type: "string"},
+			{Name: "data", Description: "Request body for POST-based verify_xss: a urlencoded form body like search=<payload>&x=1 (values are decoded once, then the browser re-encodes them at submit). Providing data makes verify_xss submit a real form POST to url and confirm POST-reflected XSS in one call.", Required: false, Type: "string"},
+			{Name: "method", Description: "HTTP method for verify_xss: GET (default) navigates to url; POST (default when data is set) submits url as a form POST with body=data. Use POST for reflected XSS that only triggers on form submission.", Required: false, Type: "string", Enum: []string{"GET", "POST"}},
+			{Name: "direction", Description: "Scroll direction: up or down (for scroll)", Required: false, Type: "string", Enum: []string{"up", "down"}},
+			{Name: "tab_id", Description: "Tab ID (for switch_tab)", Required: false, Type: "string"},
+			{Name: "proxy", Description: "Proxy: 'caido', 'none', or proxy URL", Required: false, Type: "string"},
+			{Name: "name", Description: "Cookie name (for set_cookie)", Required: false, Type: "string"},
+			{Name: "domain", Description: "Cookie domain (for set_cookie)", Required: false, Type: "string"},
+			{Name: "timeout", Description: "Timeout in seconds for wait actions (default: 10)", Required: false, Type: "integer", Default: "10"},
+			{Name: "fields", Description: "Form fields as key=value pairs separated by | (for fill_form). Example: email=test@mail.com|password=Pass123|name=John", Required: false, Type: "string"},
+			{Name: "session_name", Description: "Session name for save_session/load_session (default: 'default'). Use distinct names for multi-account IDOR testing, e.g. 'admin', 'user_a'.", Required: false, Type: "string"},
 		},
 		Execute: func(args map[string]string) (tools.Result, error) {
 			return browserActionForRegistry(r, args)
@@ -447,6 +447,16 @@ func ensureBrowser(ctxID, proxy string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	requiredProxy := config.Get().ProxyRequired || egressproxy.Required()
+	// Egress pin (task proxy selector) when interception is off and the caller
+	// did not name a proxy itself. With interception on the run-scoped loopback
+	// listener is used and forwards through this same pinned egress.
+	if !requiredProxy && strings.TrimSpace(proxy) == "" {
+		if p, direct, ok := egressproxy.UpstreamFor(ctxID); !direct && ok && p != nil {
+			if u, err := p.URL(); err == nil {
+				proxy = u.String()
+			}
+		}
+	}
 	if egress.StatusFor(ctxID).Mode == "enforce" {
 		return fmt.Errorf("browser cannot be launched under egress enforce mode: Chromium launcher does not support the dedicated egress UID")
 	}
@@ -467,21 +477,27 @@ func ensureBrowser(ctxID, proxy string) error {
 
 	if requiredProxy {
 		// The agent's browser_action proxy argument must not override the
-		// operator's required outbound route. The loopback bridge handles
-		// authenticated upstream proxies without placing credentials in
-		// Chromium's process arguments.
-		localURL, err := trafficproxy.LocalURL()
-		if err != nil {
-			return fmt.Errorf("required browser proxy unavailable: %w", err)
+		// operator's required outbound route. The run-scoped listener handles
+		// authenticated upstreams without placing credentials in Chromium's
+		// process arguments and attributes the browser's traffic to this run.
+		if scanURL, scanErr := trafficproxy.ListenForScan(ctxID); scanErr == nil {
+			proxy = scanURL
+		} else if localURL, err := trafficproxy.LocalURL(); err == nil {
+			proxy = localURL
+		} else {
+			return fmt.Errorf("required browser proxy unavailable: %v", scanErr)
 		}
-		proxy = localURL
 	} else if proxy == "" && trafficproxy.Enabled() {
-		// R2b default posture: route Chromium through the shared loopback
-		// traffic proxy so browser traffic flows through the configured
-		// upstream chain and becomes observable. An explicit agent choice
-		// ("caido", a concrete URL, "none") still wins; a proxy routing
-		// failure must not hard-fail a non-required scan.
-		if localURL, err := trafficproxy.LocalURL(); err == nil {
+		// R2b default posture: route Chromium through the traffic proxy so
+		// browser traffic flows through the configured upstream chain and
+		// becomes observable. The per-run listener is preferred: Chromium has
+		// no proxy-auth channel, so a port that implies the run is what makes
+		// its traffic attributable (and archived). An explicit agent choice
+		// ("caido", a concrete URL, "none") still wins; a proxy routing failure
+		// must not hard-fail a non-required scan.
+		if scanURL, err := trafficproxy.ListenForScan(ctxID); err == nil {
+			proxy = scanURL
+		} else if localURL, err := trafficproxy.LocalURL(); err == nil {
 			proxy = localURL
 		} else {
 			log.Printf("[browser] traffic proxy unavailable, browser will dial directly: %v", err)

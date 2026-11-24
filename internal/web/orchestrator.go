@@ -1032,8 +1032,11 @@ func (s *Server) runSingleTarget(ctx context.Context, scanCfg *config.Config, re
 
 	sess := &scanSession{
 		objective:          req.Objective,
+		goal:               req.ObjectiveGoal,
 		objectiveProjectID: req.ObjectiveProjectID,
 		objectiveTaskID:    req.ObjectiveTaskID,
+		auditMode:          req.AuditMode,
+		proxyPin:           req.Proxy,
 		id:                 filepath.Base(scanDir),
 		target:             target,
 		scanDir:            scanDir,
@@ -1047,7 +1050,6 @@ func (s *Server) runSingleTarget(ctx context.Context, scanCfg *config.Config, re
 		severityFilter:     req.SeverityFilter,
 		discordWebhook:     req.DiscordWebhook,
 		discoveryMode:      false,
-		genReport:          true,
 		resetState:         !resumed,
 		instanceID:         req.InstanceID,
 		redispatchFromDir:  req.RedispatchFromDir,
@@ -1113,8 +1115,12 @@ func (s *Server) runDASTTarget(ctx context.Context, scanCfg *config.Config, req 
 		target:             target,
 		scanDir:            scanDir,
 		cfg:                scanCfg,
+		auditMode:          req.AuditMode,
+		proxyPin:           req.Proxy,
 		server:             s,
 		instruction:        dastInstruction,
+		objective:          req.Objective,
+		goal:               req.ObjectiveGoal,
 		codeScanMode:       req.codeScanMode,
 		allowLoopbackPorts: req.allowLoopbackPorts,
 		name:               req.Name,
@@ -1122,7 +1128,6 @@ func (s *Server) runDASTTarget(ctx context.Context, scanCfg *config.Config, req 
 		severityFilter:     req.SeverityFilter,
 		discordWebhook:     req.DiscordWebhook,
 		discoveryMode:      false,
-		genReport:          true,
 		resetState:         !resumed,
 		instanceID:         req.InstanceID,
 		parentCtx:          ctx,
@@ -1264,8 +1269,11 @@ func (s *Server) runWildcardTarget(ctx context.Context, scanCfg *config.Config, 
 		// keeping them available for collectSubdomains' Layer 3 (notes fallback).
 		discoverySess := &scanSession{
 			objective:          req.Objective,
+			goal:               req.ObjectiveGoal,
 			objectiveProjectID: req.ObjectiveProjectID,
 			objectiveTaskID:    req.ObjectiveTaskID,
+			auditMode:          req.AuditMode,
+			proxyPin:           req.Proxy,
 			id:                 filepath.Base(scanDir),
 			target:             target,
 			scanDir:            scanDir,
@@ -1279,7 +1287,6 @@ func (s *Server) runWildcardTarget(ctx context.Context, scanCfg *config.Config, 
 			severityFilter:     req.SeverityFilter,
 			discordWebhook:     req.DiscordWebhook,
 			discoveryMode:      true,
-			genReport:          false,
 			resetState:         !resumed,
 			instanceID:         req.InstanceID,
 			parentCtx:          ctx,
@@ -1621,13 +1628,13 @@ func (s *Server) runWildcardTarget(ctx context.Context, scanCfg *config.Config, 
 				CurrentPhase:   firstSelectedPhase(req.Phases),
 			})
 
-			// Track vulns BEFORE this subdomain scan using the stable parent context
-			vulnCountBefore := len(reporting.GetVulnerabilitiesForContext(parentReportingCtxID))
-
 			subSess := &scanSession{
 				objective:            req.Objective,
+				goal:                 req.ObjectiveGoal,
 				objectiveProjectID:   req.ObjectiveProjectID,
 				objectiveTaskID:      req.ObjectiveTaskID,
+				auditMode:            req.AuditMode,
+				proxyPin:             req.Proxy,
 				id:                   filepath.Base(subScanDir),
 				target:               subdomain,
 				parentTarget:         target,
@@ -1642,7 +1649,6 @@ func (s *Server) runWildcardTarget(ctx context.Context, scanCfg *config.Config, 
 				severityFilter:       req.SeverityFilter,
 				discordWebhook:       req.DiscordWebhook,
 				discoveryMode:        false,
-				genReport:            false,
 				resetState:           false, // accumulate vulns across subdomains
 				instanceID:           req.InstanceID,
 				parentCtx:            ctx,
@@ -1686,54 +1692,11 @@ func (s *Server) runWildcardTarget(ctx context.Context, scanCfg *config.Config, 
 				parentRecord.SubScans[j] = subScanSummaryFromRecord(subSess.record)
 			}
 
-			// Generate PDF for this subdomain if NEW vulnerabilities found
-			// Read from the stable parent context — guaranteed to have all accumulated vulns
-			allVulns := reporting.GetVulnerabilitiesForContext(parentReportingCtxID)
-			if vulnCountBefore <= len(allVulns) {
-				newVulns := allVulns[vulnCountBefore:]
-				if len(newVulns) > 0 {
-					subScanRecord := ScanRecord{
-						ID:                       filepath.Base(subScanDir),
-						InstanceID:               req.InstanceID,
-						Name:                     req.Name,
-						Target:                   subdomain,
-						ParentTarget:             target,
-						ScanMode:                 "wildcard",
-						Instruction:              req.Instruction,
-						SeverityFilter:           append([]string(nil), req.SeverityFilter...),
-						DiscordWebhook:           req.DiscordWebhook,
-						DiscordWebhookConfigured: req.DiscordWebhook != "" || s.discordWebhook != "",
-						TelegramConfigured:       s.telegramConfigured(),
-						ReconMode:                req.ReconMode,
-						ScanIntensity:            req.ScanIntensity,
-						StartedAt:                time.Now().Format(time.RFC3339),
-						Status:                   "finished",
-						FinishedAt:               time.Now().Format(time.RFC3339),
-						Events:                   []WSEvent{},
-						Vulns:                    []VulnSummary{},
-						CompanyName:              req.CompanyName,
-						LogoPath:                 req.LogoPath,
-						Phases:                   append([]int(nil), req.Phases...),
-						CurrentPhase:             22,
-					}
-					for _, v := range newVulns {
-						summary := vulnToSummary(v)
-						summary.SourceScanID = subScanRecord.ID
-						subScanRecord.Vulns = append(subScanRecord.Vulns, summary)
-					}
-					reportPath, err := s.generateReportAt(&subScanRecord, subScanDir)
-					if err == nil {
-						desc := fmt.Sprintf("**Target:** %s\n**Vulnerabilities:** %d found", subdomain, len(newVulns))
-						s.sendDiscordWithFile(0x3b82f6, "🔴 Vulnerability Found - Report Ready", desc, reportPath)
-						if s.telegramConfigured() {
-							s.sendTelegramWithFile(0x3b82f6, "🔴 Vulnerability Found - Report Ready", desc, reportPath)
-						}
-						// IM robot webhooks can't carry the PDF; the text notice
-						// still goes out so the channel learns about the finding.
-						s.sendDomesticIM("", 0x3b82f6, "🔴 Vulnerability Found - Report Ready", desc)
-					}
-				}
-			}
+			// Reports are operator-triggered only (REPORT_DELIVERY_SPEC §0/§2):
+			// the wildcard loop no longer renders a per-subdomain PDF or sends a
+			// report attachment. The target record still carries its findings;
+			// manual generation aggregates them into one total report plus one
+			// sub report per target/subdomain.
 
 			s.broadcastToInstance(req.InstanceID, WSEvent{
 				Type:           "target_completed",

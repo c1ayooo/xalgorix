@@ -28,6 +28,9 @@ func (s *Server) scanRecordForSession(sess *scanSession) *ScanRecord {
 
 	rec = existing
 	s.reconcileSavedFindingUpgrades(rec, sess.scanDir)
+	if stamped := backfillFindingFoundAt(rec, sess.scanDir); stamped > 0 {
+		log.Printf("[scan] backfilled found_at on %d persisted finding(s) for %s from the event journal", stamped, sess.id)
+	}
 	s.refreshResumedScanRecord(rec, sess, startedAt)
 	// A delegated request can finish after the last progress event. Restore its
 	// persisted usage before seeding the next run's budget and record counters.
@@ -36,6 +39,65 @@ func (s *Server) scanRecordForSession(sess *scanSession) *ScanRecord {
 	}
 	sess.recordTokenOffset = rec.TotalTokens
 	return rec
+}
+
+// backfillFindingFoundAt stamps FoundAt on findings persisted before the field
+// existed. The durable event journal already holds the authoritative report
+// time: each report_vulnerability tool_result carries its finding summaries
+// plus the broadcast timestamp. Matching by finding id avoids guessing, and
+// only missing rows are touched, so a fully stamped record costs one scan of
+// the id set and no journal read.
+//
+// This runs once per resumed session (not on the /api/findings read path), so
+// a long-running assessment's earlier findings stop reading as "as old as the
+// run" while the page keeps its cheap PG-only walk.
+func backfillFindingFoundAt(rec *ScanRecord, dir string) int {
+	if rec == nil || len(rec.Vulns) == 0 || strings.TrimSpace(dir) == "" {
+		return 0
+	}
+	missing := make(map[string]struct{}, len(rec.Vulns))
+	for _, v := range rec.Vulns {
+		if strings.TrimSpace(v.FoundAt) == "" && strings.TrimSpace(v.ID) != "" {
+			missing[v.ID] = struct{}{}
+		}
+	}
+	if len(missing) == 0 {
+		return 0
+	}
+	reportedAt := make(map[string]string, len(missing))
+	_, _, err := walkEventJournal(dir, func(_ int, ev WSEvent) {
+		if ev.Type != "tool_result" || len(ev.Vulns) == 0 {
+			return
+		}
+		for _, v := range ev.Vulns {
+			if _, want := missing[v.ID]; !want {
+				continue
+			}
+			if _, done := reportedAt[v.ID]; done {
+				continue
+			}
+			if t := strings.TrimSpace(v.FoundAt); t != "" {
+				reportedAt[v.ID] = t
+			} else if t := strings.TrimSpace(ev.Timestamp); t != "" {
+				reportedAt[v.ID] = t
+			}
+		}
+	})
+	if err != nil && len(reportedAt) == 0 {
+		log.Printf("[scan] found_at backfill for %s skipped: %v", rec.ID, err)
+		return 0
+	}
+	stamped := 0
+	for i := range rec.Vulns {
+		if strings.TrimSpace(rec.Vulns[i].FoundAt) != "" {
+			continue
+		}
+		if t, ok := reportedAt[rec.Vulns[i].ID]; ok {
+			rec.Vulns[i].FoundAt = t
+			stamped++
+		}
+	}
+	return stamped
 }
 
 func (s *Server) freshScanRecordForSession(sess *scanSession, startedAt string) *ScanRecord {

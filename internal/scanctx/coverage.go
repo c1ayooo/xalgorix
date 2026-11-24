@@ -1,6 +1,7 @@
 package scanctx
 
 import (
+	"sort"
 	"strings"
 	"sync"
 )
@@ -112,4 +113,32 @@ func (s *CoverageStore) HasEndpoint(endpoint string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return len(s.pairs[endpoint]) > 0
+}
+
+// Snapshot returns read-only copies of the probed and verifier-attributed
+// matrices (endpoint -> sorted classes). Callers must not mutate the result.
+// Used by the deterministic coverage-gap pass; it never writes.
+func (s *CoverageStore) Snapshot() (probed, verified map[string][]string) {
+	if s == nil {
+		return map[string][]string{}, map[string][]string{}
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return copyMatrix(s.pairs), copyMatrix(s.verified)
+}
+
+func copyMatrix(src map[string]map[string]struct{}) map[string][]string {
+	out := make(map[string][]string, len(src))
+	for endpoint, classes := range src {
+		if len(classes) == 0 {
+			continue
+		}
+		list := make([]string, 0, len(classes))
+		for class := range classes {
+			list = append(list, class)
+		}
+		sort.Strings(list)
+		out[endpoint] = list
+	}
+	return out
 }

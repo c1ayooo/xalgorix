@@ -293,7 +293,7 @@ func (s *Store) DeleteProject(ctx context.Context, id string) error {
 // also carries project_id), so every column is table-qualified: a bare
 // project_id made every joined task query fail with SQLSTATE 42702
 // (ambiguous column reference).
-const taskColumns = `tasks.id, tasks.project_id, tasks.name, tasks.goal, tasks.instruction, tasks.context_paths, tasks.context, tasks.phase_policy, tasks.schedule, tasks.created_at, tasks.updated_at, tasks.archived_at`
+const taskColumns = `tasks.id, tasks.project_id, tasks.name, tasks.goal, tasks.instruction, tasks.context_paths, tasks.context, tasks.phase_policy, tasks.schedule, tasks.audit_mode, tasks.created_at, tasks.updated_at, tasks.archived_at`
 
 // taskObjectiveJoin attaches the 1:1 objective extension row. LEFT JOIN keeps
 // every task visible, including the ones without a structured objective.
@@ -312,7 +312,7 @@ func scanTaskRow(row pgx.Row) (*Task, error) {
 		objectiveJSON    []byte
 	)
 	if err := row.Scan(&t.ID, &t.ProjectID, &t.Name, &t.Goal, &t.Instruction, &contextPathsJSON, &contextJSON,
-		&policyJSON, &scheduleJSON, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &objectiveJSON); err != nil {
+		&policyJSON, &scheduleJSON, &t.AuditMode, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &objectiveJSON); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
 		}
@@ -346,6 +346,7 @@ func hydrateTaskJSON(t *Task, contextPathsJSON, contextJSON, policyJSON, schedul
 		_ = json.Unmarshal(contextJSON, &t.Context)
 	}
 	hydrateTaskLLMChain(t)
+	hydrateTaskProxy(t)
 	t.CreatedAt = t.CreatedAt.UTC()
 	if t.UpdatedAt != nil {
 		ts := t.UpdatedAt.UTC()
@@ -388,6 +389,11 @@ func (s *Store) createTaskInternal(ctx context.Context, projectID uuid.UUID, in 
 	if in.Name == "" {
 		return nil, fmt.Errorf("%w: task name is required", ErrValidation)
 	}
+	auditMode := NormalizeTaskAuditMode(in.AuditMode)
+	if auditMode == "" {
+		return nil, fmt.Errorf("%w: audit_mode must be inherit, off or enforce", ErrValidation)
+	}
+	in.AuditMode = auditMode
 	objective, err := NormalizeObjective(in.Objective)
 	if err != nil {
 		return nil, err
@@ -411,7 +417,10 @@ func (s *Store) createTaskInternal(ctx context.Context, projectID uuid.UUID, in 
 	if _, has := contextMap["slug"]; !has {
 		contextMap["slug"] = uniqueSlug(slugify(in.Name, id), siblingSlugs)
 	}
-	// Model chain: stored in the task context (llm_chain / llm_active).
+	// Model chain (4zreco task_llm_profiles port): stored in the task context.
+	if proxyPin := NormalizeTaskProxy(in.Proxy); proxyPin != "" {
+		contextMap["proxy"] = proxyPin
+	}
 	if chain, active := NormalizeTaskLLMChain(in.LLMChain, in.ActiveLLM); len(chain) > 0 {
 		contextMap["llm_chain"] = chain
 		contextMap["llm_active"] = active
@@ -434,14 +443,14 @@ func (s *Store) createTaskInternal(ctx context.Context, projectID uuid.UUID, in 
 	}
 	now := time.Now().UTC()
 	stmt := `
-		INSERT INTO tasks (id, project_id, name, goal, instruction, context_paths, context, phase_policy, schedule, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`
+		INSERT INTO tasks (id, project_id, name, goal, instruction, context_paths, context, phase_policy, schedule, audit_mode, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`
 	if idempotent {
 		stmt += ` ON CONFLICT DO NOTHING`
 	}
 	tag, err := s.exec(ctx, stmt,
 		id, projectID, in.Name, in.Goal, in.Instruction, contextPathsJSON,
-		contextJSON, policyJSON, scheduleJSON, now)
+		contextJSON, policyJSON, scheduleJSON, in.AuditMode, now)
 	if err != nil {
 		return nil, fmt.Errorf("platform/postgres: create task: %w", err)
 	}
@@ -508,7 +517,7 @@ func (s *Store) ListTasks(ctx context.Context, projectID string) ([]Task, error)
 			objectiveJSON    []byte
 		)
 		if err := rows.Scan(&t.ID, &t.ProjectID, &t.Name, &t.Goal, &t.Instruction, &contextPathsJSON, &contextJSON,
-			&policyJSON, &scheduleJSON, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &objectiveJSON); err != nil {
+			&policyJSON, &scheduleJSON, &t.AuditMode, &t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &objectiveJSON); err != nil {
 			return nil, fmt.Errorf("platform/postgres: scan task: %w", err)
 		}
 		hydrateTaskJSON(&t, contextPathsJSON, contextJSON, policyJSON, scheduleJSON)
@@ -557,6 +566,13 @@ func (s *Store) UpdateTask(ctx context.Context, id string, upd TaskUpdate) (*Tas
 	if upd.ContextPaths != nil {
 		current.ContextPaths = upd.ContextPaths
 	}
+	if upd.AuditMode != nil {
+		mode := NormalizeTaskAuditMode(*upd.AuditMode)
+		if mode == "" {
+			return nil, fmt.Errorf("%w: audit_mode must be inherit, off or enforce", ErrValidation)
+		}
+		current.AuditMode = mode
+	}
 	if upd.ClearObjective {
 		current.Objective = nil
 	}
@@ -580,6 +596,17 @@ func (s *Store) UpdateTask(ctx context.Context, id string, upd TaskUpdate) (*Tas
 	if upd.LLMChain != nil || upd.ActiveLLM != nil {
 		chain := current.LLMChain
 		active := current.ActiveLLM
+		if upd.Proxy != nil {
+			if current.Context == nil {
+				current.Context = map[string]any{}
+			}
+			if proxyPin := NormalizeTaskProxy(*upd.Proxy); proxyPin != "" {
+				current.Context["proxy"] = proxyPin
+			} else {
+				delete(current.Context, "proxy")
+			}
+			current.Proxy = NormalizeTaskProxy(*upd.Proxy)
+		}
 		if upd.LLMChain != nil {
 			chain = *upd.LLMChain
 		}
@@ -631,19 +658,44 @@ func (s *Store) UpdateTask(ctx context.Context, id string, upd TaskUpdate) (*Tas
 	}
 	now := time.Now().UTC()
 	current.UpdatedAt = &now
+	auditMode := NormalizeTaskAuditMode(current.AuditMode)
+	if auditMode == "" {
+		auditMode = TaskAuditInherit
+	}
 	if _, err := s.exec(ctx, `
 		UPDATE tasks SET name = $2, goal = $3, instruction = $4, context_paths = $5,
 		                 context = $6, phase_policy = $7, schedule = $8,
-		                 updated_at = $9, archived_at = $10
+		                 audit_mode = $9, updated_at = $10, archived_at = $11
 		WHERE id = $1`,
 		parsed, current.Name, current.Goal, current.Instruction, contextPathsJSON,
-		contextJSON, policyJSON, scheduleJSON, now, current.ArchivedAt); err != nil {
+		contextJSON, policyJSON, scheduleJSON, auditMode, now, current.ArchivedAt); err != nil {
 		return nil, fmt.Errorf("platform/postgres: update task: %w", err)
 	}
 	if err := s.writeTaskObjective(ctx, parsed, current.ProjectID, current.Objective); err != nil {
 		return nil, err
 	}
 	return s.GetTask(ctx, id)
+}
+
+// SetTaskRunRevision implements Repository.SetTaskRunRevision. The marker
+// lives in tasks.context and is written in place: dispatching is not an edit,
+// so updated_at stays untouched.
+func (s *Store) SetTaskRunRevision(ctx context.Context, id, revision string) error {
+	parsed, err := parseUUID(id)
+	if err != nil {
+		return err
+	}
+	tag, err := s.exec(ctx, `
+		UPDATE tasks
+		SET context = jsonb_set(context, '{run_revision}', to_jsonb($2::text), true)
+		WHERE id = $1`, parsed, strings.TrimSpace(revision))
+	if err != nil {
+		return fmt.Errorf("platform/postgres: set task run revision: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // DeleteTask implements Repository.DeleteTask (runs cascade).

@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"strings"
 
@@ -32,6 +33,17 @@ func (a *Agent) runLoop(systemPrompt string, tokenCount func() int) {
 	a.scanFinished.Store(false)
 	if a.scanCtx == nil || a.scanCtx.ID == "" {
 		a.emit(Event{Type: "finished", Content: a.op("Scan stopped: scan context is unavailable.", "扫描已停止：扫描上下文不可用。"), Aborted: true, AbortReason: "eino_init_failed", TotalTokens: tokenCount()})
+		return
+	}
+	// Final graph projection: the last turn's findings/evidence must land even
+	// if the loop ends without another BeforeTurn (R7/M1).
+	if a.delegatedAgentID == "" {
+		defer a.syncExplorationGraph()
+	}
+	// R7: the main agent is a per-message chat, not a continuous scan loop.
+	// It never executes tools; workers own all execution.
+	if a.plannerWorkerMode {
+		a.runMainChatLoop(tokenCount)
 		return
 	}
 
@@ -60,10 +72,22 @@ func (a *Agent) runLoop(systemPrompt string, tokenCount func() int) {
 		ModelRecovery:   observer,
 		Compactor:       observer.CompactMessages,
 		NativeTools:     a.nativeToolCalling,
+		Streaming:       einoStreamingEnabled(),
+		DynamicTools:    einoToolSearchEnabled(),
 		Approvals:       a.approvalBroker,
 		InstanceID:      a.scanCtx.ID,
 		ScanContextID:   a.scanCtx.ID,
 		ToolTimeout:     a.hardTimeoutFor,
+		// Reasoning models (DeepSeek reasoning_content, Anthropic thinking
+		// deltas) surface their raw thinking as a "thinking" event on both the
+		// streaming and non-streaming channels. a.emit redacts secrets; the
+		// transcript intentionally keeps thinking out of the assistant rows.
+		OnReasoning: func(reasoning string) {
+			if strings.TrimSpace(reasoning) == "" {
+				return
+			}
+			a.emit(Event{Type: "thinking", Content: reasoning, TotalTokens: tokenCount()})
+		},
 		OnToolTimeout: func(name string) {
 			if isExecChannelTool(name) {
 				streak := int(a.execTimeoutStreak.Add(1))
@@ -95,7 +119,11 @@ func (a *Agent) runLoop(systemPrompt string, tokenCount func() int) {
 	// moment the scan is complete; the graph otherwise runs ahead of the event
 	// consumer and issues one extra discarded model call.
 	a.runCancel.Store(&cancelRun)
-	iter := rt.Run(runCtx, a.einoMessages(), checkpointID)
+	// B8 (default off): a delegated lane whose durable approval checkpoint
+	// survived a restart resumes at the interrupt instead of replaying the lane
+	// from scratch. Any doubt — missing/unsupported checkpoint, non-lane id,
+	// flag off — falls back to the fresh run below, unchanged.
+	iter := a.einoRunOrResumeLane(rt, store, checkpointID, runCtx, tokenCount)
 	for {
 		ev, ok := iter.Next()
 		if !ok {
@@ -128,6 +156,10 @@ func (a *Agent) runLoop(systemPrompt string, tokenCount func() int) {
 			a.emit(Event{Type: "finished", Content: a.op("Scan stopped: runtime error: ", "扫描已停止：运行时错误：") + ev.Err.Error(), Aborted: true, AbortReason: "eino_runtime_error", TotalTokens: tokenCount()})
 			return
 		}
+		// Approval interrupts are checked before MessageOutput and are
+		// independent of the streaming mode: a streamed turn still interrupts
+		// through Action.Interrupted and still resumes via
+		// engine.Runtime.Resume → ResumeWithParams.
 		if ev.Action != nil && ev.Action.Interrupted != nil {
 			next, resumeErr := a.resumeEinoInterrupt(rt, checkpointID, ev)
 			if resumeErr != nil {
@@ -138,11 +170,8 @@ func (a *Agent) runLoop(systemPrompt string, tokenCount func() int) {
 			iter = next
 			continue
 		}
-		if ev.Output != nil && ev.Output.MessageOutput != nil && ev.Output.MessageOutput.Message != nil {
-			msg := ev.Output.MessageOutput.Message
-			if msg.Content != "" {
-				a.emit(Event{Type: "message", Content: msg.Content, TotalTokens: tokenCount()})
-			}
+		if ev.Output != nil && ev.Output.MessageOutput != nil {
+			a.consumeEinoOutput(ev.Output.MessageOutput, tokenCount)
 		}
 	}
 	if a.scanFinished.Load() {
@@ -224,4 +253,144 @@ func (a *Agent) einoMessages() []*schema.Message {
 		out = append(out, schema.UserMessage(fmt.Sprintf("Begin the security assessment for %s", strings.Join(a.targets, ", "))))
 	}
 	return out
+}
+
+// einoStreamingEnabled reports whether the incremental assistant-text
+// projection is on. Streaming is always on: the env-var experiment was retired
+// (no settings-page switch), and the recovery + projection paths are the
+// production behavior.
+func einoStreamingEnabled() bool {
+	return true
+}
+
+// einoToolSearchEnabled reports whether the B7 dynamic tool surface is on. It is
+// always on; the engine remains the authority on whether it is effective — inert
+// in XML fallback mode and when a lane has nothing curated as searchable, and
+// the curated pool is conservative (only tools with no prompt/gate dependency),
+// so ordinary lanes keep their full tool list.
+func einoToolSearchEnabled() bool {
+	return true
+}
+
+// consumeEinoOutput projects one ADK MessageOutput into session events.
+//
+// Non-streaming output keeps its existing shape: a complete non-empty message
+// becomes exactly one "message" event. A streaming output carries the whole
+// model generation as a chunk stream, so the stream is always drained here —
+// Eino's producer blocks on an unread stream. Every delta and the closing
+// assistant_done of one turn share a MessageID:
+//
+//   - live clients append the deltas to one bubble (the chat store keys its
+//     streaming buffer on message_id) and finalize it from assistant_done;
+//   - the durable transcript folds assistant_done into one assistant row (see
+//     web/chat_transcript.go), so the turn survives a REST refetch.
+//
+// No duplicate "message" is emitted for a streamed turn: that would give the
+// live store a second assistant row for the same text.
+//
+// Tool-role streams are drained and discarded: their result events come from
+// the tool observer, and projecting tool output as assistant text would corrupt
+// or duplicate the transcript.
+func (a *Agent) consumeEinoOutput(mv *adk.MessageVariant, tokenCount func() int) {
+	if mv == nil {
+		return
+	}
+	if mv.IsStreaming && mv.MessageStream != nil {
+		a.consumeEinoStream(mv, tokenCount)
+		return
+	}
+	if mv.Message != nil && mv.Message.Content != "" {
+		a.emit(Event{Type: "message", Content: mv.Message.Content, TotalTokens: tokenCount()})
+	}
+}
+
+// nextStreamMessageID names one streamed assistant turn. The agent id keeps it
+// unique across runs; the counter keeps turns distinct within a run.
+func (a *Agent) nextStreamMessageID() string {
+	return fmt.Sprintf("%s-msg-%d", a.ID, a.streamMsgSeq.Add(1))
+}
+
+func (a *Agent) consumeEinoStream(mv *adk.MessageVariant, tokenCount func() int) {
+	stream := mv.MessageStream
+	defer stream.Close()
+	// Assistant output is what the session transcript projects. An empty role
+	// is treated as assistant for forward compatibility with Eino paths that
+	// do not tag model output (the ADK's own model output event uses
+	// schema.Assistant).
+	assistant := mv.Role == "" || mv.Role == schema.Assistant
+	messageID := a.nextStreamMessageID()
+	var full strings.Builder
+	// pending holds the tail of the assistant text that is withheld from the
+	// delta projection because it may be the beginning of a registered secret
+	// split across chunks. a.emit redacts complete secrets, but a secret split
+	// over two deltas would otherwise leak in fragments, so the boundary is
+	// never allowed to fall inside one.
+	var pending string
+	for {
+		chunk, err := stream.Recv()
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				log.Printf("[eino] assistant stream error for %s: %v", a.einoLogID(), err)
+			}
+			break
+		}
+		if chunk == nil || chunk.Content == "" || !assistant {
+			continue
+		}
+		full.WriteString(chunk.Content)
+		emit, keep := a.splitEinoDelta(pending + chunk.Content)
+		pending = keep
+		if emit != "" {
+			a.emit(Event{Type: "assistant_delta", MessageID: messageID, Delta: emit, Content: emit, TotalTokens: tokenCount()})
+		}
+	}
+	if !assistant {
+		return
+	}
+	if pending != "" {
+		a.emit(Event{Type: "assistant_delta", MessageID: messageID, Delta: pending, Content: pending, TotalTokens: tokenCount()})
+	}
+	if text := full.String(); text != "" {
+		a.emit(Event{Type: "assistant_done", MessageID: messageID, Content: text, TotalTokens: tokenCount()})
+	}
+}
+
+// splitEinoDelta returns the prefix of accumulated assistant text that is safe
+// to emit as a delta and the suffix that must be held back. When no secrets are
+// registered the whole accumulation is safe. Otherwise the held-back suffix is
+// the longest proper suffix that is a prefix of a registered secret, so no
+// delta boundary can split a secret across two events.
+func (a *Agent) splitEinoDelta(accumulated string) (emit, keep string) {
+	if len(a.secretValues) == 0 || accumulated == "" {
+		return accumulated, ""
+	}
+	safe := len(accumulated)
+	for _, secret := range a.secretValues {
+		if secret == "" {
+			continue
+		}
+		max := len(secret) - 1
+		if max > len(accumulated) {
+			max = len(accumulated)
+		}
+		for n := max; n >= 1; n-- {
+			if strings.HasSuffix(accumulated, secret[:n]) {
+				if cut := len(accumulated) - n; cut < safe {
+					safe = cut
+				}
+				break
+			}
+		}
+	}
+	return accumulated[:safe], accumulated[safe:]
+}
+
+func (a *Agent) einoLogID() string {
+	if a != nil && a.scanCtx != nil && a.scanCtx.ID != "" {
+		return a.scanCtx.ID
+	}
+	if a != nil {
+		return a.ID
+	}
+	return ""
 }

@@ -1,0 +1,30 @@
+---
+name: playbook-src-short-table-part5
+description: "打穿短表（索引）（第 5/7 部分）"
+tags: [playbook, src-hunting, short, table]
+intent: offensive
+---
+| 公开列表只出上架/公开；详情、hidden、tab、短 slug、预览/导出用同一个业务 id，不校验这层闸。或列表有可见性查询参默认把隐藏滤掉。或列表要登录/空包、详情只要数字 id + 业务键。或对外详情把联系人/手机置空。或 `period=edit 或 publish`。或筛选项 null/缺字段报错、空数组当不过滤。或文档 CMS 写死公开 area/端/channel。或文档站公开 itemList 只出对外产品，item 用纯数字仍出对内/未对外知识库正文。或搜索口素材类型默认公开。或入驻/审核 query 只带业务 id 出空壳。或全量列表口不带可见性参行里就带着 unpublished 正文。或浏览页请登录、同站 search/文件列表/visit-log 仍出正文。或内容 SPA 按 host 正则选站点域 | 不登录。按 `idor-test.md`「列表过滤详情不闸」里的别停表打：可见性参、全量列表、browse 请登录跟 search、详情修了跟 visit-log、目录请登录跟文件列表+PreviewUrl、SPA 站点 TLD、证照图注册人行、telephone 打码看备注、公开 itemList 只有对外几本仍用数字 item 打详情/page、收集表详情 relative 挂答卷 sheet 跟答卷表。**预览口 `isDelete=1` / 已删除仍出整页 H5 别停** | 未上架/未公开业务正文；或他主体证件照/手机；或证照图注册人行印着身份证号 | 详情本来就是公开橱窗；加了可见性参仍只出公开稿；只有标题没有正文；列表 401 就当没洞；edit 和 publish 出同一份已上架正文；空数组和缺参出同一份上架稿；`materialType` 仍只出公开橱窗；只带业务 id 出空壳就当没洞、没再加审核状态；浏览页写请登录就当没洞；打错站点域当没口不是假点；预览只出已上架运营页 |
+| 业务 H5 把登录 RPC 写在需登录前缀；同网关另有未登录前缀（n/unlogin/guest） | 不登录。JS 里的登录前缀口请登录别停，把 path 改成未登录前缀，再换对象 id。见 `idor-test.md`「登录前缀双胞胎」 | 不登录出他人身份证/证件照/手机 | 未登录前缀仍请登录；只有公开配置；只有自己刚交的补件 |
+| 业务页 JS 调数字 RPC 网关（`/data/{数字}/forward` 一类），页面只写死一个 cmd | 不登录 POST 邻号，先空 `{"req":{}}` 看列表，再带 id 打邻写口。见 `idor-test.md`「数字 RPC 邻 cmd」 | 内部发布/操作人正文，或字段被改 | 邻号仍是同一套公开接口；只出公开软件目录 |
+| 同产品业务前端的账号 CRUD 口回登录闸；另有独立身份子域，同一套账号 API 不要 Cookie | 不登录。前端 NoLogin 别停，改打身份子域 list（空包也出整表），再 generate / reset-pwd 只带 Id / delete。见 `idor-test.md`「身份域账号 CRUD」 | 名单里是手机/企业邮箱；能建号、不验旧密改密、按 Ids 删 | 只打了业务前端就当没洞；list 出数但 Mail/Phone 全空且写口也闸 |
+| 开放平台 / 分销合作入驻申请查询口；未登录；参是执照号、手机号或名字关键字。页面查询空时 JSON 格式参常还在出数 | 不登录打申请查询。执照号从 1 自增，或换手机号 / 申请单号 / 名字关键字。页面格子空别停，加 `f=json`（或同类 format 参）再打。名录页是登录壳时，同目录 `search`/`list` 再打一枪，不必关键字也可能整表出联系人。见 `idor-test.md` | 出他人联系人手机 / 邮箱 / 身份证 / 执照图 | 只回公开合作名录没有联系人；页面和 JSON 都只有公开格子；只回自己刚交的单；执照号无效 |
+| 报名/入驻/发票抬头自动完成；页上下拉只出公司名；接口走工商 Match 或抬头 suggest（前端可能标 auth） | 不登录 POST。名称+国家码；suggest 字段可能是 `prefix`（填 `title` 报关键词空别停）。同产品还有专票/工商补全口，字段就是 `title`。前端标 auth 仍打。见 `idor-test.md`「公司名/抬头自动完成」 | 回包出现负责人或开票手机/住址/银行账号，且对得上人 | 下拉和接口都只有公司名；必须登录；公开企业名录没有电话；前端标 auth 就当没洞 |
+| 未登录字典补全口；分类参前端只示范区号/城市一类，后端能切到用户/员工表 | 不登录 POST，分类填 `user`（或 employee），filter 用号段或姓 | name 里是他人姓名+11 位手机 | 只出公开城市/公司字典；user 分类空或只有 MIS 没有手机 |
+| 注册 / 改资料 / 建用户的 JSON 比页面控件多；Swagger 或管理员建用户多出字段 | 多塞 `role`/`isAdmin`/`verified`/`tenantId`/`balance`。见 `idor-test.md`「Mass Assignment / 隐藏可写字段」 | 自己号变成高权，或余额/认证状态真变（能改回） | 字段吃了权限没变；只能改展示名；公开运营开关 |
+| Node JSON/query 能污染 `__proto__` 或 `constructor.prototype`；后面有 `res.render` / EJS / Pug | 先确认污染通了，再打 `outputFunctionName` / Pug `block`。见 `prototype-pollution-test.md`「PP 打到模板 RCE」 | 模板渲染后命令跑起来（标记/`uid=`） | 只能改前端展示、没有模板/spawn gadget；污染一请求就没了、下一次 render 不跟 |
+| 站上已有 `/static` `/assets` `/img` `/files` 这类静态前缀；或 Caddy 模板吃用户输入 | `/static../` 读 web 外文件；Caddy 模板试 `{{readFile "path"}}`。见 `path-traversal-lfi-test.md`「Nginx alias 缺斜杠」 | 读到 `nginx.conf` / 应用配置 / 密钥文件 | 只 404；只能列静态目录里本来就有的文件；Caddy 模板不执行用户输入 |
+| Node 把仓库根交给 koa-static / express.static（能直接 GET 到 `package.json` 或 `routes/`） | 不登录打 `/config/online.yml` `/config/default.yml` `/config/production.yml`；有 `package.json` 就顺着 node-config 环境名扫。见 `path-traversal-lfi-test.md`「仓库根当静态」 | yml/json 里是**完整库账密或云密钥实值** | 静态根只出 public；yml 没有账密；`package.json` 200 但 config 404 |
+| 对象存储/静态桶上的旧 .NET 发布物；aspx 源码还能 GET，同目录 `web.config` 被 WAF 拦 | 不登录。`web.config` 456 别停，打同目录 `App.config`、`*.exe.config`、`bin/*.dll.config`。见 `path-traversal-lfi-test.md`「静态桶上的 .NET 发布物」 | 完整账密或 DeveloperToken，不是 `ENTER_YOUR_PASSWORD` 占位 | aspx 200 但 config 404；只有源码没有钥；占位符口令 |
+| 公网 VS Code 系编辑器；`/login` 直接进（无登录墙） | 不登录打资源接口，path 吃绝对路径时先读进程 status 看 Uid，再读进程环境。页面里 `AuthType.None` 是常见皮，没有这个字仍打。抄到环境里的 SSH 私钥别停：解开 PEM，假钥对照连环境里的 Git 主机。见 `path-traversal-lfi-test.md`「公网 VS Code 系读进程环境」 | 环境里是**他人**邮箱和完整 SSH 私钥，且真钥能问出 Git 用户名 | 只读到 README/安装脚本；path 要登录；真假钥同一句 Permission denied |
+| 公网编程台有租户登录口 + Codex 系 RPC（`command/exec` / `fs` / `env`） | 当前站打裸默认口拿会话，再打 RPC。无 Cookie 也试 `meta/methods`。跟 env / 集群 SA / 模型 Key。**只打当前站**。见 `cloud-ide-codex-rce-chain.md`「Codex 系编程台 RPC」 | root（`uid=0`）且 hostname 是持久计算面，并能问出集群钥或模型 Key | 通配符证书临时沙箱随时销毁；只登录没有 RPC；命令没跑起来 |
+| 未登录业务口 JSON 报「缺少 xxx」；query/body 带了仍报缺少。或 Spring 400 点名 `Required String parameter`，缺的其实是 Cookie 名 | 把缺的字段放到 **HTTP 头**再打换票。头没吃别停，改打 Cookie。未登录写口同样试。见 `authbypass-test.md`「缺参字段改头换票」 | 出别人的登录票/姓名；或写上他人门店/对象 | query 有该字段仍报缺少（头和 Cookie 都没吃）不算过；只出自己的票 |
+| JSON 网关刷新票口；空包就发票，票里是 admin | 不登录 POST refresh `{}`，Bearer 打管理 me 和申请名单。见 `authbypass-test.md`「刷新票空包发管理员票」 | me 是超级管理员 *，或名单出现他人手机 | 只出游客票；refresh 要旧 refresh token；me 仍是自己 |
+| 小程序/H5 GET 登录口吃 `openId`（`loginByOpenId` 一类） | 不登录。缺参报缺、假值失败别停，空串再打。见 `authbypass-test.md`「空 openId 进已有号」 | 进已有商家号且出手机 | 空串只出游客空号 |
+| 软件/制品下载详情把 query 里 `uin`（或同类身份字段）有无当登录闸，不验 skey/Cookie | 不登录 GET 详情，身份字段填非空假值（对照空值 DownloadURL 应是空串/跳登录）。拿回的带签 URL Range GET 真文件。见 `file-upload-test.md` | 专有云安装包/内部部署文档真文件（ELF/docx 正文） | 空 uin 也出 URL（那是完全无鉴权，另一条）；带签地址 403；只有公开说明书 |
+| 企业软件中心人打开是登录页；另有领对象存储带签口不要 Cookie；或同站 `/download/`+软件文件名不要 Cookie；包里是桌面客户端连接配置（Host/账号/密文） | 不登录打领签口（登录墙 302 体里内联的也算）。**领签没有也别停**，首页/302 体里的软件文件名同站 `/download/` 直 GET。解 zip 里的连接配置。解密钥见 `info-leak-test.md`「匿名领签包里的连接配置」 | 内网库 Host+账号+明文密 | 包里只有公开客户端没有连接配置；密文解不开；只打了领签口就当没静态目录 |
+| `action.php?c=X&a=Y` 自研 PHP 后台：管理页匿名直开（无登录跳转），列表走 `XxxProxy&a=get*List` | 不登录开 `?c=User`/`?c=Score` 一类管理页 → 页内联 JS 抽 Proxy 列表口直打（GET，pageSize 放大翻页）；写口带假 id 打对照，回业务校验错（不是登录错）即写口也裸。见 `authbypass-test.md`「PHP 后台 Proxy 层无鉴权」 | 整表师生/成绩 PII（姓名+手机+院校），写口能增删改 | 列表/写口回登录跳转或「请登录」；页面能开但 Proxy 口要会话 |
+| Java 后台登录口不校验凭证：空体/假账号回 `stateCode` 602 + 完整用户对象（含密码哈希）并 Set-Cookie | 拿回包 Cookie 打 `vlogin` 类会话验证口（602=真会话），再按前端 JS 抽 `*/list` 口读账号/通讯录/短信/审计；list 用 GET，回 405 说明已过鉴权换对方法再打。见 `authbypass-test.md`「空凭证直发超管会话」 | 超管真会话+账号哈希+员工手机邮箱+短信日志，审计日志出现自己这次登录 | 会话口回未登录；list 回登录码；只有用户对象但 vlogin 不认 |
+| 公示名录/目录类公开接口（pageSize 可放大整表导出）回包为实体整行，含文件路径类字段（bmbfj/attachment/fileUrl）与联系电话列 | 不登录分页拉满 → 全字段统计揪出文件路径字段 → 拼 imagePre/图床基址 URL 编码直接 GET 下载本体；电话/法人列一并导出。见 `idor-test.md`「公示目录接口吐整行含附件」 | 拿到盖章申请表/报名表等材料文件本体（或批量电话+姓名导出） | 附件404/要签名；字段全是占位（0000@qq.com）；本就无文件字段仅公示列 |
+
+> （续前：playbook-src-short-table 第 5/7 部分）

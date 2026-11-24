@@ -118,6 +118,27 @@ EXPOSE 9137
 ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["--web"]
 
+# ── Stage 3b: platform-slim-prebuilt — same image from a host-built binary ───
+# Used by STACK_MODE=split with PLATFORM_PACKAGING=native: the webui and Go
+# binary were built on the host, so Docker only packages them. This avoids
+# running npm/go inside the image build.
+FROM debian:bookworm-slim AS platform-slim-prebuilt
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates tzdata openssl \
+    && rm -rf /var/lib/apt/lists/*
+COPY build/xalgorix /usr/local/bin/xalgorix
+ENV XALGORIX_BIND=0.0.0.0 \
+    XALGORIX_DATA_DIR=/data \
+    XALGORIX_ALLOW_AUTO_INSTALL=0 \
+    XALGORIX_NO_AUTO_UPDATE=1
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh && mkdir -p /data
+VOLUME ["/data"]
+EXPOSE 9137
+ENTRYPOINT ["docker-entrypoint.sh"]
+CMD ["--web"]
+
 # ── Stage 4: runnerd — host-side runtime service for the split deployment ────
 # Stateless execution endpoint: owns /var/run/docker.sock and exposes only
 # ensure/exec/stop/remove/inspect/list/capacity over a unix socket. It has no

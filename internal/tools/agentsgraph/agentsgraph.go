@@ -34,10 +34,13 @@ type AgentRunner func(ctx context.Context, agentID, name string, targets []strin
 type AuditSink func(op domainjournal.Operation, summary string)
 
 type subAgentState struct {
-	ID          string
-	Name        string
-	Task        string
-	Targets     []string
+	ID      string
+	Name    string
+	Task    string
+	Targets []string
+	// UnitID is the authoritative intent this dispatched worker owns (pool
+	// path only). steer_work / kill_work address workers by this id.
+	UnitID      string
 	Status      string // queued, running, completed, failed
 	StartedAt   time.Time
 	CompletedAt time.Time
@@ -47,6 +50,10 @@ type subAgentState struct {
 	Partial     []string
 	done        chan struct{}
 	doneOnce    sync.Once
+	// ctx is the per-worker cancellation context (pool dispatches). nil means
+	// the graph's root context.
+	ctx    context.Context
+	cancel context.CancelCauseFunc
 }
 
 // Graph owns all delegation state for exactly one root scan. Nothing in this
@@ -67,10 +74,14 @@ type Graph struct {
 	activeAgents int
 	queue        []*subAgentState
 	agents       map[string]*subAgentState
-	wg           sync.WaitGroup
-	persistPath  string
-	persistErr   error
-	audit        AuditSink
+	steerSinks   map[string]func(string) error
+	// surfaces maps a dispatched worker to its role surface (pool only). The
+	// root runner applies it when constructing the child agent.
+	surfaces    map[string]string
+	wg          sync.WaitGroup
+	persistPath string
+	persistErr  error
+	audit       AuditSink
 	// stateSink receives best-effort lifecycle notifications for panel
 	// invalidation (see SetStateSink). Never the authority: Snapshot() is.
 	stateSink func(StateEvent)
@@ -110,6 +121,67 @@ func EffectiveMaxConcurrentAgents() int {
 	return DefaultMaxConcurrentAgents
 }
 
+// SetMaxConcurrent resizes the number of simultaneously running workers. It is
+// the live half of the R7 pool's hot resize: growing starts queued workers
+// immediately; shrinking lowers admission and lets running workers finish.
+func (g *Graph) SetMaxConcurrent(n int) {
+	if g == nil {
+		return
+	}
+	if n < 1 {
+		n = 1
+	}
+	if n > 10 {
+		n = 10
+	}
+	g.mu.Lock()
+	if g.stopped || g.ctx.Err() != nil {
+		g.mu.Unlock()
+		return
+	}
+	g.maxConcurrent = n
+	if g.maxAgents < n {
+		// Dispatch does not consume the lifetime budget, but the queue drain
+		// path still clamps to maxAgents; keep them consistent.
+		g.maxAgents = n
+	}
+	type start struct {
+		state  *subAgentState
+		id     string
+		lane   string
+		unitID string
+		task   string
+		target string
+	}
+	var starts []start
+	for g.activeAgents < g.maxConcurrent && len(g.queue) > 0 {
+		next := g.queue[0]
+		g.queue = g.queue[1:]
+		next.Status = "running"
+		next.StartedAt = time.Now()
+		if err := g.persistLocked(); err != nil {
+			next.Status = "queued"
+			g.queue = append([]*subAgentState{next}, g.queue...)
+			break
+		}
+		g.activeAgents++
+		g.wg.Add(1)
+		starts = append(starts, start{
+			state:  next,
+			id:     next.ID,
+			lane:   next.Name,
+			unitID: next.UnitID,
+			task:   next.Task,
+			target: strings.Join(next.Targets, ","),
+		})
+	}
+	g.mu.Unlock()
+	for _, s := range starts {
+		go g.runAgent(s.state)
+		g.notify("agent_started", s.id, s.lane, s.unitID, "running", s.task, s.target)
+	}
+}
+
 // New creates a scan-scoped graph with the production concurrency limit.
 func New(parent context.Context, runner AgentRunner) *Graph {
 	return NewWithLimit(parent, DefaultMaxConcurrentAgents, runner)
@@ -144,6 +216,8 @@ func NewWithConfig(parent context.Context, maxAgents, maxConcurrent int, runner 
 		maxAgents:     maxAgents,
 		maxConcurrent: maxConcurrent,
 		agents:        make(map[string]*subAgentState),
+		steerSinks:    make(map[string]func(string) error),
+		surfaces:      make(map[string]string),
 	}
 }
 
@@ -247,12 +321,12 @@ func (g *Graph) syncDelegationNote() string {
 
 // notifyAgentStatus emits the admission notification for a freshly admitted
 // delegation: "agent_started" when it took a slot, "agent_queued" otherwise.
-func (g *Graph) notifyAgentStatus(agentID, lane, task, target string, started bool) {
+func (g *Graph) notifyAgentStatus(agentID, lane, unitID, task, target string, started bool) {
 	if started {
-		g.notify("agent_started", agentID, lane, "running", task, target)
+		g.notify("agent_started", agentID, lane, unitID, "running", task, target)
 		return
 	}
-	g.notify("agent_queued", agentID, lane, "queued", task, target)
+	g.notify("agent_queued", agentID, lane, unitID, "queued", task, target)
 }
 
 func (g *Graph) nextIDLocked(prefix string) string {
@@ -270,7 +344,11 @@ func (g *Graph) runAgent(state *subAgentState) {
 		g.onAgentDone()
 	}()
 
-	summary, runErr := g.runner(g.ctx, state.ID, state.Name, state.Targets, state.Task)
+	runCtx := state.ctx
+	if runCtx == nil {
+		runCtx = g.ctx
+	}
+	summary, runErr := g.runner(runCtx, state.ID, state.Name, state.Targets, state.Task)
 	g.complete(state.ID, summary, runErr)
 }
 
@@ -298,11 +376,11 @@ func (g *Graph) onAgentDone() {
 			return
 		}
 		g.wg.Add(1)
-		agentID, lane := next.ID, next.Name
+		agentID, lane, unitID := next.ID, next.Name, next.UnitID
 		task, target := next.Task, strings.Join(next.Targets, ",")
 		g.mu.Unlock()
 		go g.runAgent(next)
-		g.notify("agent_started", agentID, lane, "running", task, target)
+		g.notify("agent_started", agentID, lane, unitID, "running", task, target)
 		return
 	}
 	g.activeAgents--
@@ -360,7 +438,7 @@ func (g *Graph) createAgent(args map[string]string) (tools.Result, error) {
 	started := state.Status == "running"
 	g.mu.Unlock()
 
-	g.notifyAgentStatus(agentID, name, task, strings.Join(targets, ","), started)
+	g.notifyAgentStatus(agentID, name, "", task, strings.Join(targets, ","), started)
 	g.auditDelegation(domainjournal.OpAgentDelegat, fmt.Sprintf("create_agent id=%s role=%q task=%q", agentID, name, truncTask(task, 200)))
 
 	select {
@@ -439,7 +517,7 @@ func (g *Graph) spawnAgent(args map[string]string) (tools.Result, error) {
 	started := state.Status == "running"
 	g.mu.Unlock()
 
-	g.notifyAgentStatus(agentID, name, task, strings.Join(targets, ","), started)
+	g.notifyAgentStatus(agentID, name, "", task, strings.Join(targets, ","), started)
 	g.auditDelegation(domainjournal.OpAgentDelegat, fmt.Sprintf("spawn_agent id=%s role=%q task=%q", agentID, name, truncTask(task, 200)))
 
 	target := ""
@@ -454,6 +532,170 @@ func (g *Graph) spawnAgent(args map[string]string) (tools.Result, error) {
 			"spawned":    true,
 		},
 	}, nil
+}
+
+// Dispatch enqueues one worker run without the spawn_agent tool. The worker
+// pool has already claimed an authoritative intent; this hands the task to the
+// graph's concurrency/queue/checkpoint/event machinery. It deliberately does
+// NOT consume the lifetime delegation budget: the pool is continuous, while
+// maxAgents bounds model-initiated waves.
+func (g *Graph) Dispatch(name, task string, targets []string, unitID string) (string, error) {
+	return g.DispatchWithSurface(name, task, targets, unitID, "")
+}
+
+// DispatchWithSurface is Dispatch plus the child's role surface (R7 pool
+// orchestration: control-plane API lane vs execution lane).
+func (g *Graph) DispatchWithSurface(name, task string, targets []string, unitID, surface string) (string, error) {
+	if g == nil || g.runner == nil {
+		return "", fmt.Errorf("agent runner not initialized")
+	}
+	g.mu.Lock()
+	if g.stopped || g.ctx.Err() != nil {
+		g.mu.Unlock()
+		return "", fmt.Errorf("graph stopped")
+	}
+	agentID := g.nextIDLocked("sub")
+	agentCtx, cancel := context.WithCancelCause(g.ctx)
+	state := &subAgentState{
+		ID:        agentID,
+		Name:      name,
+		Task:      task,
+		Targets:   append([]string(nil), targets...),
+		UnitID:    unitID,
+		StartedAt: time.Now(),
+		done:      make(chan struct{}),
+		ctx:       agentCtx,
+		cancel:    cancel,
+	}
+	state.Status = "queued"
+	g.agents[agentID] = state
+	if surface != "" {
+		g.surfaces[agentID] = surface
+	}
+	if err := g.persistLocked(); err != nil {
+		delete(g.agents, agentID)
+		delete(g.surfaces, agentID)
+		cancel(nil)
+		g.mu.Unlock()
+		return "", fmt.Errorf("delegation checkpoint could not be saved: %w", err)
+	}
+	if g.activeAgents < g.maxConcurrent {
+		g.activeAgents++
+		state.Status = "running"
+		g.wg.Add(1)
+		go g.runAgent(state)
+	} else {
+		g.queue = append(g.queue, state)
+	}
+	started := state.Status == "running"
+	target := ""
+	if len(targets) > 0 {
+		target = targets[0]
+	}
+	g.mu.Unlock()
+
+	g.notifyAgentStatus(agentID, name, unitID, truncTask(task, 200), target, started)
+	g.auditDelegation(domainjournal.OpAgentDelegat, fmt.Sprintf("pool_dispatch id=%s lane=%q unit=%q task=%q", agentID, name, unitID, truncTask(task, 200)))
+	return agentID, nil
+}
+
+// RegisterSteer binds a running worker's message sink. The agent runner calls
+// this after constructing the child agent.
+func (g *Graph) RegisterSteer(agentID string, fn func(string) error) {
+	if g == nil || strings.TrimSpace(agentID) == "" || fn == nil {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.steerSinks[agentID] = fn
+}
+
+// SteerUnit injects a course correction into the active worker for one
+// authoritative intent. Returns an error when the unit has no active worker or
+// the worker has not registered its sink yet.
+func (g *Graph) SteerUnit(unitID, msg string) error {
+	unitID = strings.TrimSpace(unitID)
+	msg = strings.TrimSpace(msg)
+	if g == nil || unitID == "" || msg == "" {
+		return fmt.Errorf("unit_id and message are required")
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for _, state := range g.agents {
+		if state.UnitID != unitID || (state.Status != "running" && state.Status != "queued") {
+			continue
+		}
+		sink := g.steerSinks[state.ID]
+		if sink == nil {
+			return fmt.Errorf("worker for %s is queued and has not started yet", unitID)
+		}
+		return sink(msg)
+	}
+	return fmt.Errorf("no active worker for unit %s", unitID)
+}
+
+// KillUnit cancels the active worker for one authoritative intent. The
+// scheduler settles the intent as blocked when the run returns.
+func (g *Graph) KillUnit(unitID, reason string) error {
+	unitID = strings.TrimSpace(unitID)
+	if g == nil || unitID == "" {
+		return fmt.Errorf("unit_id is required")
+	}
+	if strings.TrimSpace(reason) == "" {
+		reason = "killed by planner"
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for _, state := range g.agents {
+		if state.UnitID != unitID || (state.Status != "running" && state.Status != "queued") {
+			continue
+		}
+		if state.cancel != nil {
+			state.cancel(fmt.Errorf("killed: %s", reason))
+			return nil
+		}
+	}
+	return fmt.Errorf("no active worker for unit %s", unitID)
+}
+
+// SurfaceFor returns the role surface registered for a dispatched worker.
+func (g *Graph) SurfaceFor(agentID string) string {
+	if g == nil {
+		return ""
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.surfaces[agentID]
+}
+
+// DispatchResult waits for one dispatched worker to settle and returns its
+// status/result. A context timeout returns status "timeout" without killing
+// the worker (the caller decides whether to cancel it via the scan context).
+func (g *Graph) DispatchResult(ctx context.Context, agentID string) (summary, status, errText string) {
+	g.mu.Lock()
+	state := g.agents[agentID]
+	g.mu.Unlock()
+	if state == nil {
+		return "", "missing", "worker not found"
+	}
+	select {
+	case <-state.done:
+	case <-ctx.Done():
+		return "", "timeout", ctx.Err().Error()
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	// The pool consumes every result, so a dispatched worker is observed by
+	// construction. Without this the root's uncollected-work finish gate would
+	// block forever after the first completed intent.
+	if !state.Observed {
+		state.Observed = true
+		_ = g.persistLocked()
+	}
+	if state.Status == "" {
+		return state.Result, "missing", state.Error
+	}
+	return state.Result, state.Status, state.Error
 }
 
 func (g *Graph) complete(agentID, summary string, runErr error) {
@@ -477,6 +719,11 @@ func (g *Graph) complete(agentID, summary string, runErr error) {
 		state.Result = summary
 	}
 	state.doneOnce.Do(func() { close(state.done) })
+	if state.cancel != nil {
+		state.cancel(nil)
+	}
+	delete(g.steerSinks, agentID)
+	delete(g.surfaces, agentID)
 	_ = g.persistLocked()
 	// Delegation completion audit: the sink serializes on the journal's own
 	// mutex and never calls back into the graph, so calling it under g.mu is
@@ -489,14 +736,14 @@ func (g *Graph) complete(agentID, summary string, runErr error) {
 			g.audit(domainjournal.OpAgentDelegat, fmt.Sprintf("delegate_result id=%s role=%q status=completed in=%s", state.ID, state.Name, elapsed))
 		}
 	}
-	lane, status := state.Name, state.Status
+	lane, status, unitID := state.Name, state.Status, state.UnitID
 	task, target := state.Task, strings.Join(state.Targets, ",")
 	g.mu.Unlock()
 	kind := "agent_completed"
 	if status == "failed" {
 		kind = "agent_failed"
 	}
-	g.notify(kind, agentID, lane, status, task, target)
+	g.notify(kind, agentID, lane, unitID, status, task, target)
 }
 
 type agentSnapshot struct {
@@ -751,13 +998,13 @@ func (g *Graph) Stop() {
 			state.Error = "parent scan stopped"
 			state.CompletedAt = now
 			state.doneOnce.Do(func() { close(state.done) })
-			stopped = append(stopped, AgentState{AgentID: state.ID, Lane: state.Name, Task: state.Task, Target: strings.Join(state.Targets, ",")})
+			stopped = append(stopped, AgentState{AgentID: state.ID, Lane: state.Name, UnitID: state.UnitID, Task: state.Task, Target: strings.Join(state.Targets, ",")})
 		}
 	}
 	_ = g.persistLocked()
 	g.mu.Unlock()
 	for _, agent := range stopped {
-		g.notify("agent_failed", agent.AgentID, agent.Lane, "failed", agent.Task, agent.Target)
+		g.notify("agent_failed", agent.AgentID, agent.Lane, agent.UnitID, "failed", agent.Task, agent.Target)
 	}
 }
 

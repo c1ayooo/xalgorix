@@ -36,17 +36,33 @@ func (s *Server) handleTaskWorkers(w http.ResponseWriter, r *http.Request, store
 		return
 	}
 	// Same read-time projection the run list uses: status/timestamps are not
-	// stored on the mount row.
-	idx := s.scanSummaryIndexFor(s.findAllScanSummaries())
+	// stored on the mount row. The walk happens ONCE here and is reused for
+	// every run's directory resolution below — the old code paid one full
+	// scan-summary walk per run (plus one PG worker query per run), which made
+	// the session rail's first load scale with the task's run count.
+	entries := s.findAllScanSummaries()
+	idx := s.scanSummaryIndexFor(entries)
 	idx.projectRuns(runs, s.pendingDispatchExists)
+
+	instanceIDs := make([]string, 0, len(runs))
+	seenInstance := make(map[string]bool, len(runs))
+	for _, run := range runs {
+		if run.InstanceID == "" || seenInstance[run.InstanceID] {
+			continue
+		}
+		seenInstance[run.InstanceID] = true
+		instanceIDs = append(instanceIDs, run.InstanceID)
+	}
+	histories, historyLoaded := s.workerHistories(instanceIDs)
+	summaries := func() []scanEntry { return entries }
 
 	items := make([]taskWorkerRunView, 0, len(runs))
 	for _, run := range runs {
 		if run.InstanceID == "" {
 			continue
 		}
-		workers := s.instanceAgentsView(run.InstanceID)
-		if len(workers.Agents) == 0 {
+		workers := s.instanceAgentsViewWith(run.InstanceID, summaries, histories[run.InstanceID], historyLoaded)
+		if len(workers.Agents) == 0 && len(workers.Units) == 0 {
 			continue
 		}
 		items = append(items, taskWorkerRunView{Run: run, Workers: workers})

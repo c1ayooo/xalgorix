@@ -111,8 +111,17 @@ func TestSingleAgent_AllLanesDisabledDerivesSingleAgentMode(t *testing.T) {
 		t.Fatal("with lanes available and auto-delegation on, DelegationEnabled must be true")
 	}
 	a3 := newDelegationTestAgent(t, &config.Config{DisableAutoDelegate: true}, state)
-	if a3.delegationEnabled() {
-		t.Fatal("XALGORIX_DISABLE_AUTO_DELEGATE=true must derive DelegationEnabled=false")
+	if !a3.delegationEnabled() {
+		t.Fatal("XALGORIX_DISABLE_AUTO_DELEGATE only suppresses the automatic wave; manual delegation remains available")
+	}
+	if msg := a3.maybeAutoDelegate([]string{"https://example.com"}); msg != "" {
+		t.Fatalf("the automatic wave must stay off, got %q", msg)
+	}
+	if a3.state.DelegationAttempted || a3.state.WaveLaunched || a3.state.ReconLaneLaunched {
+		t.Fatal("disabled auto-delegation must not fake wave state")
+	}
+	if !a3.state.SingleAgentNoted {
+		t.Fatal("the one-time automatic-wave notice should have been recorded")
 	}
 }
 

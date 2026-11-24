@@ -100,6 +100,33 @@ func (a *TrafficArchive) enabled() bool {
 	return a != nil && a.dir != ""
 }
 
+// Count reports how many exchanges this archive holds. The sequence counter is
+// seeded past the highest existing record on reopen, so it is also the append
+// count. Zero means the capture plane produced nothing for this run — the
+// report gate uses it to distinguish "the model named no evidence" from
+// "evidence capture is unavailable in this environment".
+func (a *TrafficArchive) Count() int64 {
+	if !a.enabled() {
+		return 0
+	}
+	// Count on disk rather than trusting the in-memory counter: another
+	// archive instance (test seed, resume reopen) may have appended since this
+	// object was constructed, and the report gate must see those records.
+	entries, err := os.ReadDir(a.dir)
+	if err != nil {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		return a.next
+	}
+	var n int64
+	for _, entry := range entries {
+		if trafficIDPattern.MatchString(entry.Name()) {
+			n++
+		}
+	}
+	return n
+}
+
 // Append stores one exchange and returns its sequence number. Failure is
 // reported but never fatal to the caller: the observation journal line (which
 // carries the summary) is written independently, and a lost raw packet must
@@ -142,10 +169,20 @@ func TrafficExchangeFile(seq int64) string {
 	return trafficArchiveDir + "/" + fmt.Sprintf("tr_%06d.json", seq)
 }
 
-// ReadTrafficExchanges loads the archived exchanges for a scan directory,
-// ordered by sequence. Works without a live ScanContext (post-scan reads);
-// a missing archive yields an empty slice, not an error.
-func ReadTrafficExchanges(scanDir string) ([]TrafficExchange, error) {
+// TrafficRef pins one archived exchange inside a run's traffic evidence.
+// Session is the session directory basename that owns the record — a run can
+// span sibling session directories (re-dispatch/checkpoint restores), and
+// sequence numbers restart in each one, so (Session, Seq) is the stable
+// identity. An empty Session means "the scan's own directory".
+type TrafficRef struct {
+	Session string `json:"session,omitempty"`
+	Seq     int64  `json:"seq"`
+}
+
+// trafficFiles lists the archive records of one scan directory ordered by
+// sequence. total is the number of records; a missing archive is empty, not an
+// error.
+func trafficFiles(scanDir string) (files []int64, err error) {
 	dir := filepath.Join(scanDir, trafficArchiveDir)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -154,30 +191,105 @@ func ReadTrafficExchanges(scanDir string) ([]TrafficExchange, error) {
 		}
 		return nil, err
 	}
-	type named struct {
-		seq  int64
-		path string
-	}
-	files := make([]named, 0, len(entries))
 	for _, e := range entries {
 		if m := trafficIDPattern.FindStringSubmatch(e.Name()); m != nil {
-			if n, err := strconv.ParseInt(m[1], 10, 64); err == nil {
-				files = append(files, named{seq: n, path: filepath.Join(dir, e.Name())})
+			if n, perr := strconv.ParseInt(m[1], 10, 64); perr == nil {
+				files = append(files, n)
 			}
 		}
 	}
-	sort.Slice(files, func(i, j int) bool { return files[i].seq < files[j].seq })
+	sort.Slice(files, func(i, j int) bool { return files[i] < files[j] })
+	return files, nil
+}
+
+// ReadTrafficExchangesNewest loads only the newest `limit` archived exchanges
+// of a scan directory (ascending sequence) plus the total record count. It is
+// the live-panel read path: listing and parsing every record on every poll
+// would make the endpoint proportional to the whole run, while the UI only
+// renders the newest window. limit <= 0 reads everything.
+func ReadTrafficExchangesNewest(scanDir string, limit int) ([]TrafficExchange, int, error) {
+	files, err := trafficFiles(scanDir)
+	if err != nil || len(files) == 0 {
+		return nil, 0, err
+	}
+	total := len(files)
+	if limit > 0 && len(files) > limit {
+		files = files[len(files)-limit:]
+	}
 	exchanges := make([]TrafficExchange, 0, len(files))
-	for _, f := range files {
-		data, err := os.ReadFile(f.path)
-		if err != nil {
+	for _, seq := range files {
+		ex, rerr := ReadTrafficExchangeAt(scanDir, seq)
+		if rerr != nil || ex == nil {
+			continue // a torn record must not blank the whole window
+		}
+		exchanges = append(exchanges, *ex)
+	}
+	return exchanges, total, nil
+}
+
+// ReadTrafficExchangeAt loads one archived exchange by sequence. A missing
+// record returns (nil, nil) so callers can answer "not found" without
+// treating it as an infrastructure error.
+func ReadTrafficExchangeAt(scanDir string, seq int64) (*TrafficExchange, error) {
+	if seq <= 0 {
+		return nil, nil
+	}
+	path := filepath.Join(scanDir, trafficArchiveDir, fmt.Sprintf("tr_%06d.json", seq))
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var ex TrafficExchange
+	if err := json.Unmarshal(data, &ex); err != nil {
+		return nil, err
+	}
+	return &ex, nil
+}
+
+// MatchTrafficRefs filters one scan directory's archive for a finding and
+// returns the newest matches as durable refs (Session = the directory
+// basename). host, when non-empty, pins the match to that asset so a
+// same-path request against another asset never becomes evidence.
+func MatchTrafficRefs(scanDir, endpoint, method, host string, limit int) ([]TrafficRef, int) {
+	all, err := ReadTrafficExchanges(scanDir)
+	if err != nil || len(all) == 0 {
+		return nil, 0
+	}
+	matched, total := FilterTrafficExchangesWith(all, TrafficQuery{
+		Endpoint: endpoint,
+		Method:   method,
+		Host:     host,
+		Limit:    limit,
+	})
+	if len(matched) == 0 {
+		return nil, total
+	}
+	session := filepath.Base(strings.TrimSpace(scanDir))
+	refs := make([]TrafficRef, 0, len(matched))
+	for _, ex := range matched {
+		refs = append(refs, TrafficRef{Session: session, Seq: ex.Seq})
+	}
+	return refs, total
+}
+
+// ReadTrafficExchanges loads the archived exchanges for a scan directory,
+// ordered by sequence. Works without a live ScanContext (post-scan reads);
+// a missing archive yields an empty slice, not an error.
+func ReadTrafficExchanges(scanDir string) ([]TrafficExchange, error) {
+	files, err := trafficFiles(scanDir)
+	if err != nil || len(files) == 0 {
+		return nil, err
+	}
+	exchanges := make([]TrafficExchange, 0, len(files))
+	for _, seq := range files {
+		ex, rerr := ReadTrafficExchangeAt(scanDir, seq)
+		if rerr != nil || ex == nil {
 			continue // a torn record must not blank the whole archive
 		}
-		var ex TrafficExchange
-		if err := json.Unmarshal(data, &ex); err != nil {
-			continue
-		}
-		exchanges = append(exchanges, ex)
+		exchanges = append(exchanges, *ex)
 	}
 	return exchanges, nil
 }

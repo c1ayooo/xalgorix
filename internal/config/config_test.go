@@ -282,3 +282,30 @@ func TestLoad_ReadsToolboxProxyURL(t *testing.T) {
 		t.Fatalf("expected ToolboxProxyURL from XALGORIX_TOOLBOX_PROXY_URL, got %q", cfg.ToolboxProxyURL)
 	}
 }
+
+func TestLiveWorkerConcurrencyReadsEnvFileEachCall(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	// A previous test may have loaded the real env file into the process
+	// environment (loadEnvFile exports values). Keep the fallback hermetic.
+	t.Setenv("XALGORIX_WORKER_CONCURRENCY", "")
+	path := filepath.Join(home, ".xalgorix.env")
+	if err := os.WriteFile(path, []byte("XALGORIX_WORKER_CONCURRENCY=5\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := LiveWorkerConcurrency(3); got != 5 {
+		t.Fatalf("got %d, want 5", got)
+	}
+	if err := os.WriteFile(path, []byte("XALGORIX_WORKER_CONCURRENCY=99\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := LiveWorkerConcurrency(3); got != 10 {
+		t.Fatalf("clamp got %d, want 10", got)
+	}
+	if got := LiveWorkerConcurrency(4); got != 4 {
+		os.Remove(path)
+		if got2 := LiveWorkerConcurrency(4); got2 != 4 {
+			t.Fatalf("fallback got %d, want 4", got2)
+		}
+	}
+}

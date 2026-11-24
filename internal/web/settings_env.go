@@ -16,12 +16,17 @@ import (
 
 	"github.com/c1ayooo/xalgorix/v4/internal/auth"
 	"github.com/c1ayooo/xalgorix/v4/internal/config"
+	"github.com/c1ayooo/xalgorix/v4/internal/proxy"
+	"github.com/c1ayooo/xalgorix/v4/internal/trafficproxy"
 )
 
 type envSettingDefinition struct {
-	Key             string   `json:"key"`
-	Label           string   `json:"label"`
-	Category        string   `json:"category"`
+	Key      string `json:"key"`
+	Label    string `json:"label"`
+	Category string `json:"category"`
+	// CategoryKey is a stable slug the dashboard translates
+	// (settings.env.category.<slug>). Category stays the English fallback.
+	CategoryKey     string   `json:"categoryKey"`
 	Description     string   `json:"description"`
 	DefaultValue    string   `json:"defaultValue,omitempty"`
 	Placeholder     string   `json:"placeholder,omitempty"`
@@ -29,6 +34,11 @@ type envSettingDefinition struct {
 	Options         []string `json:"options,omitempty"`
 	Sensitive       bool     `json:"sensitive"`
 	RequiresRestart bool     `json:"requiresRestart"`
+	// Advanced settings render behind a collapsed disclosure in the
+	// Environment tab. Hidden settings stay in the API response (dedicated
+	// tabs read their values) but never render there.
+	Advanced bool `json:"advanced,omitempty"`
+	Hidden   bool `json:"hidden,omitempty"`
 }
 
 type envSettingValue struct {
@@ -124,7 +134,7 @@ func allEnvSettingDefinitions() []envSettingDefinition {
 	if os.Getuid() == 0 {
 		autoInstallDefault = "true"
 	}
-	return []envSettingDefinition{
+	defs := []envSettingDefinition{
 		{Key: "XALGORIX_LLM", Label: "LLM model", Category: "LLM", Description: "Provider-native model ID used by scans and post-scan chat. For best results, choose a current frontier model with strong reasoning and tool calling.", Placeholder: "gpt-5.6", InputType: "text"},
 		{Key: "XALGORIX_LLM_PROVIDER", Label: "LLM provider", Category: "LLM", Description: "Explicit provider ID used to route the selected model without adding a provider prefix to its model name.", Placeholder: "ollama", InputType: "text"},
 		{Key: "XALGORIX_API_KEY", Label: "LLM API key", Category: "LLM", Description: "Provider API key for the configured model.", Placeholder: "sk-...", InputType: "secret", Sensitive: true},
@@ -157,6 +167,7 @@ func allEnvSettingDefinitions() []envSettingDefinition {
 		{Key: "XALGORIX_CONVERGE_FINISH_IDLE", Label: "Principled finish: no-finding tail (iterations)", Category: "Runtime", Description: "When the principled finish (XALGORIX_CONVERGE_FINISH) is on, a saturated scan finalizes after this many consecutive iterations without a new validated finding. Each new finding, and each new hypothesis the agent records (up to 5 times per scan), restarts the count. Higher values test longer before closing. Applies to new scans.", DefaultValue: "500", InputType: "number"},
 		{Key: "XALGORIX_CONVERGE_FINISH_LEAD_WINDOW", Label: "Principled finish: lead verification window (iterations)", Category: "Runtime", Description: "When the no-finding tail elapses while the agent still holds recent high-confidence unverified leads, it gets one final window of this many iterations to verify or reject them before the scan finalizes. -1 disables the window. Applies to new scans.", DefaultValue: "100", InputType: "number"},
 		{Key: "XALGORIX_MAX_CONCURRENT_AGENTS", Label: "Max concurrent subagents", Category: "Runtime", Description: "Maximum delegated specialist subagents executing simultaneously per scan. Set to 1 to run specialists serially one at a time. Default 3.", DefaultValue: "3", InputType: "number", RequiresRestart: true},
+		{Key: "XALGORIX_WORKER_CONCURRENCY", Label: "Worker pool concurrency", Category: "Runtime", Description: "Number of parallel workers in the built-in planner/worker topology (1–10, default 3). Hot: new scans read it at start; live pools resize in place (shrink waits for the in-flight intent).", DefaultValue: "3", InputType: "number"},
 		{Key: "XALGORIX_ITERATION_DELAY", Label: "Iteration delay (seconds)", Category: "Runtime", Description: "Pause in seconds between agent reasoning iterations. Paces LLM request velocity to stay within rolling-window provider rate limits. 0 disables delay (default). Takes effect immediately.", DefaultValue: "0", InputType: "number"},
 		{Key: "XALGORIX_MAX_TOOL_CALLS", Label: "Max tool calls (budget)", Category: "Runtime", Description: "Per-scan tool-call cap; the scan stops cleanly when reached (findings preserved). 0 = unlimited.", DefaultValue: "0", InputType: "number", RequiresRestart: true},
 		{Key: "XALGORIX_MAX_DURATION", Label: "Max duration seconds (budget)", Category: "Runtime", Description: "Per-scan wall-clock cap in seconds; the scan stops cleanly when reached. 0 = unlimited.", DefaultValue: "0", InputType: "number", RequiresRestart: true},
@@ -164,6 +175,7 @@ func allEnvSettingDefinitions() []envSettingDefinition {
 		{Key: "XALGORIX_APPROVAL_MODE", Label: "HITL approval mode", Category: "HITL", Description: "enforce routes command executions and high-risk HTTP through the operator approval queue (timeout = rejection); off (default) runs without approvals. Per-call exemptions are managed as approval rules on the Approvals page — they narrow what enforce asks about. Takes effect on restart.", DefaultValue: "off", InputType: "select", Options: []string{"off", "enforce"}, RequiresRestart: true},
 		{Key: "XALGORIX_APPROVAL_TIMEOUT", Label: "Approval timeout (seconds)", Category: "HITL", Description: "How long a pending approval waits before timeout = rejection. Default 600s; must stay under the smallest gated tool's hard ceiling (browser_action 10m) or the tool timeout fires first and abandons the verdict. Takes effect on restart.", DefaultValue: "600", InputType: "number", RequiresRestart: true},
 		{Key: "XALGORIX_APPROVAL_MAX_PENDING", Label: "Approval max pending per run", Category: "HITL", Description: "Concurrent pending approvals allowed per run (default 1); overflow queues FIFO for a free slot. Higher values let autonomous scans keep working while several requests wait, at the cost of a longer operator queue. Takes effect on restart.", DefaultValue: "1", InputType: "number", RequiresRestart: true},
+		{Key: "XALGORIX_APPROVAL_STORE_TIMEOUT", Label: "Approval store call timeout (seconds)", Category: "HITL", Description: "Budget for ONE database call the gate makes (ownership lookup + approval INSERT), default 30s. It never bounds the operator wait: a gated worker stays suspended for the Approval timeout above. Raise it when many workers submit at once and PostgreSQL is contended. Takes effect on restart.", DefaultValue: "30", InputType: "number", RequiresRestart: true},
 		{Key: "XALGORIX_APPROVAL_ALLOWLIST", Label: "Approval allowlist (programs)", Category: "HITL", Description: "Comma-separated read-only program names appended to the built-in passive-recon allowlist (subfinder/httpx/nmap -sV/curl GET are pre-allowed). Deny shapes (command substitution, redirection, PATH= shadowing) stay refused even for listed programs. Prefer approval rules (per-target, expiring) over blanket entries. Takes effect on restart.", Placeholder: "traceroute,openssl", InputType: "text", RequiresRestart: true},
 		{Key: "XALGORIX_TARGET_AUTH", Label: "Target auth (authenticated scanning)", Category: "Runtime", Description: "Authenticated-session credentials for the target so the agent tests post-auth surface (IDOR/BOLA, privilege escalation, business logic). One 'Header-Name: value' per line or separated by ';'. e.g. 'Cookie: session=abc; Authorization: Bearer xyz'. Auto-applied to http_request.", Placeholder: "Cookie: session=...; Authorization: Bearer ...", InputType: "text", Sensitive: true, RequiresRestart: true},
 		{Key: "XALGORIX_SCAN_HEADERS", Label: "Scan headers (attribution)", Category: "Runtime", Description: "Identifying header(s) added to ALL target-facing scan traffic (agent HTTP client + httpx/nuclei via -H) so an authorized Xalgorix run is attributable in the target's logs and can be allow-listed by its WAF/SOC. Bug-bounty programs often require one, e.g. 'X-Bug-Bounty: <handle>'. One 'Header-Name: value' per entry, separated by ';'. Never attached to LLM APIs, notifications, or the dashboard.", Placeholder: "X-Bug-Bounty: ulises2k; X-Scan-ID: engagement-42", InputType: "text", RequiresRestart: true},
@@ -195,21 +207,27 @@ func allEnvSettingDefinitions() []envSettingDefinition {
 
 		{Key: "XALGORIX_WECOM_WEBHOOK", Label: "WeCom webhook", Category: "Notifications", Description: "WeCom (企业微信) group robot webhook (key in the URL). The URL embeds the robot credential and is never returned by APIs.", Placeholder: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...", InputType: "secret", Sensitive: true},
 		{Key: "XALGORIX_WECOM_MIN_SEVERITY", Label: "WeCom minimum severity", Category: "Notifications", Description: "Minimum severity sent to WeCom.", InputType: "select", Options: []string{"", "info", "low", "medium", "high", "critical"}},
-		{Key: "XALGORIX_NOTIFY_SCAN_COMPLETE", Label: "Notify on scan completion", Category: "Notifications", Description: "Send the \"Scan Finished\" summary (report ready / clean scan) to the configured channels after every scan. Off by default so only per-vulnerability alerts are sent.", DefaultValue: "false", InputType: "boolean"},
+		{Key: "XALGORIX_NOTIFY_SCAN_COMPLETE", Label: "Notify on scan completion", Category: "Notifications", Description: "Send the \"Scan Finished\" summary (vulnerabilities found / clean scan) to the configured channels after a queue finishes. Reports are generated manually and are not attached. Off by default so only per-vulnerability alerts are sent.", DefaultValue: "false", InputType: "boolean"},
 
 		{Key: "XALGORIX_RATE_LIMIT_REQUESTS", Label: "Rate-limit requests", Category: "Rate limits", Description: "Requests allowed per dashboard rate-limit window.", DefaultValue: "60", InputType: "number"},
 		{Key: "XALGORIX_RATE_LIMIT_WINDOW", Label: "Rate-limit window", Category: "Rate limits", Description: "Rate-limit window in seconds.", DefaultValue: "60", InputType: "number"},
 		{Key: "XALGORIX_RATE_RPS", Label: "Outbound RPS", Category: "Rate limits", Description: "Sustained per-domain outbound request rate.", DefaultValue: "10", InputType: "number"},
 		{Key: "XALGORIX_RATE_BURST", Label: "Outbound burst", Category: "Rate limits", Description: "Per-domain outbound burst size.", DefaultValue: "20", InputType: "number"},
 
-		{Key: "XALGORIX_TRAFFICPROXY", Label: "Traffic proxy (MITM)", Category: "Proxy", Description: "Route all scan HTTP through a local loopback MITM proxy (default on): observes requests into each run's audit journal and forwards through the proxy pool or directly. Off restores direct routing. Takes effect after restart.", DefaultValue: "true", InputType: "boolean", RequiresRestart: true},
-		{Key: "XALGORIX_CA_DIR", Label: "Traffic proxy CA directory", Category: "Proxy", Description: "Directory holding the traffic-proxy interception CA (ca.pem / ca.key.pem). Takes effect after restart.", Placeholder: "~/.xalgorix/ca", InputType: "path", RequiresRestart: true},
-		{Key: "XALGORIX_USE_PROXY", Label: "Use proxy", Category: "Proxy", Description: "Enable proxy routing for outbound traffic. Takes effect after restart.", DefaultValue: "false", InputType: "boolean", RequiresRestart: true},
-		{Key: "XALGORIX_PROXY_REQUIRED", Label: "Require proxy for scan HTTP", Category: "Proxy", Description: "Reject missing proxy configuration; route built-in scan HTTP/browser via the proxy and fail requests if it is down. Shell tools still require network isolation. Takes effect after restart.", DefaultValue: "false", InputType: "boolean", RequiresRestart: true},
-		{Key: "XALGORIX_PROXY_URL", Label: "Proxy URL", Category: "Proxy", Description: "Single proxy URL. Overrides proxy file when set. Takes effect after restart.", Placeholder: "socks5://user:pass@127.0.0.1:1080", InputType: "secret", Sensitive: true, RequiresRestart: true},
-		{Key: "XALGORIX_PROXY_FILE", Label: "Proxy file", Category: "Proxy", Description: "Path to a file with one proxy per line. Takes effect after restart.", Placeholder: "/path/to/proxies.txt", InputType: "path", RequiresRestart: true},
-		{Key: "XALGORIX_PROXY_ROTATION", Label: "Proxy rotation", Category: "Proxy", Description: "Proxy rotation strategy. Takes effect after restart.", DefaultValue: "roundrobin", InputType: "select", Options: []string{"roundrobin", "random"}, RequiresRestart: true},
-		{Key: "XALGORIX_TLS_SKIP_VERIFY", Label: "Skip TLS verification", Category: "Proxy", Description: "Allow insecure TLS verification for proxied/testing traffic.", DefaultValue: "false", InputType: "boolean"},
+		{Key: "XALGORIX_TRAFFICPROXY", Label: "Traffic recording (MITM)", Category: "Traffic recording", Description: "Intercept and record scan HTTP into each run's audit journal (traffic evidence, live HTTP view, approval wire gate). Off disables recording; how traffic still reaches the egress proxy is governed by XALGORIX_EGRESS_ROUTER in the Egress proxy group. Applies immediately; running containers reconnect on their next command.", DefaultValue: "true", InputType: "boolean"},
+		{Key: "XALGORIX_CA_DIR", Label: "Traffic recording CA directory", Category: "Traffic recording", Description: "Directory holding the interception CA (ca.pem / ca.key.pem) used while recording is on. Takes effect after restart.", Placeholder: "~/.xalgorix/ca", InputType: "path", RequiresRestart: true},
+		{Key: "XALGORIX_USE_PROXY", Label: "Use proxy", Category: "Proxy", Description: "Enable proxy routing for outbound traffic. Applies immediately to new requests.", DefaultValue: "false", InputType: "boolean"},
+		{Key: "XALGORIX_PROXY_REQUIRED", Label: "Require proxy for scan HTTP", Category: "Proxy", Description: "Reject missing proxy configuration; route built-in scan HTTP/browser via the proxy and fail requests if it is down. Shell tools still require network isolation. Applies immediately; an invalid combination is rejected and the previous policy kept.", DefaultValue: "false", InputType: "boolean"},
+		{Key: "XALGORIX_PROXY_URL", Label: "Proxy URL", Category: "Proxy", Description: "Single proxy URL. Overrides proxy file when set. Applies immediately to new requests.", Placeholder: "socks5://user:pass@127.0.0.1:1080", InputType: "secret", Sensitive: true},
+		{Key: "XALGORIX_PROXY_FILE", Label: "Proxy file", Category: "Proxy", Description: "Path to a file with one proxy per line. Applies immediately to new requests.", Placeholder: "/path/to/proxies.txt", InputType: "path"},
+		{Key: "XALGORIX_PROXY_ROTATION", Label: "Proxy rotation", Category: "Proxy", Description: "Proxy rotation strategy. Applies immediately to new requests.", DefaultValue: "roundrobin", InputType: "select", Options: []string{"roundrobin", "random"}},
+		{Key: "XALGORIX_TLS_SKIP_VERIFY", Label: "Skip TLS verification", Category: "Traffic recording", Description: "Allow insecure TLS verification for proxied/testing traffic.", DefaultValue: "false", InputType: "boolean"},
+		{Key: "XALGORIX_TOOLBOX_PROXY_URL", Label: "Toolbox egress proxy URL", Category: "Proxy", Description: "Egress proxy for tool traffic inside project containers (XALGORIX_RUNTIME_BACKEND=docker). Must be reachable from the project network, e.g. http://xalgorix-proxy:8081. Empty fails closed when proxy routing is required. Applies to new scans.", Placeholder: "http://xalgorix-proxy:8081", InputType: "url"},
+		{Key: "XALGORIX_TOOLBOX_BROWSER_PROXY", Label: "Toolbox browser proxy URL", Category: "Proxy", Description: "Proxy URL handed to Chromium inside the project container. Chromium ignores HTTP_PROXY, so this must be an address the project network resolves. Applies to new scans.", Placeholder: "http://xalgorix-proxy:8081", InputType: "url"},
+		{Key: "XALGORIX_TRAFFICPROXY_BIND", Label: "Traffic recording listener bind", Category: "Traffic recording", Description: "Listener address for the recorder. Use 0.0.0.0:<port> when project containers must reach it through the container network gateway. Applies immediately; running containers reconnect on their next command.", DefaultValue: "127.0.0.1:0", Placeholder: "0.0.0.0:8081", InputType: "text"},
+		{Key: "XALGORIX_TRAFFICPROXY_ADVERTISE", Label: "Traffic recording advertised address", Category: "Traffic recording", Description: "Optional host:port handed to consumers instead of the bind address (for NAT/reverse-proxy deployments). Applies to new requests.", Placeholder: "127.0.0.1:8081", InputType: "text"},
+		{Key: "XALGORIX_EGRESS_ROUTER", Label: "Egress router when recording is off", Category: "Proxy", Description: "auto (default): with recording off, the platform still routes scan traffic through the selected egress proxy via an internal forward-only listener, so a task's proxy change applies immediately without recreating containers. off: legacy behavior — recording off means direct egress, and container proxy changes wait for the next Run.", DefaultValue: "auto", InputType: "select", Options: []string{"auto", "off"}},
+		{Key: "XALGORIX_EGRESS_MODE", Label: "Egress mode", Category: "Proxy", Description: "proxy (default) routes cooperative clients through the traffic proxy. enforce adds an OS-level nftables boundary that confines child-process egress to the proxy port; it requires root and the nft binary and fails closed otherwise.", DefaultValue: "proxy", InputType: "select", Options: []string{"proxy", "enforce"}},
 
 		{Key: "XALGORIX_WORKSPACE", Label: "Workspace", Category: "Runtime", Description: "Workspace root for scan execution.", InputType: "path", RequiresRestart: true},
 		{Key: "XALGORIX_DISABLE_BROWSER", Label: "Disable browser", Category: "Runtime", Description: "Disable browser automation tools.", DefaultValue: "false", InputType: "boolean"},
@@ -245,6 +263,146 @@ func allEnvSettingDefinitions() []envSettingDefinition {
 		{Key: "XALGORIX_HEAVY_TOOL_MEM_LIMIT_MB", Label: "Heavy tool memory limit MB", Category: "Resources", Description: "Optional hard address-space limit for heavy terminal tools. Empty or 0 leaves hard limiting disabled; dynamic admission still uses live RAM headroom.", Placeholder: "disabled", InputType: "number", RequiresRestart: true},
 		{Key: "XALGORIX_PYTHON_MEM_LIMIT_MB", Label: "Python script memory limit MB", Category: "Resources", Description: "Address-space ceiling applied to agent-generated Python scripts (terminal python3 and python_action). Empty means auto-scale from RAM (2–4 GB); 0 disables the hard limit. An over-limit script fails with MemoryError instead of triggering the host OOM killer.", Placeholder: "auto", InputType: "number", RequiresRestart: true},
 		{Key: "XALGORIX_GO_MEM_LIMIT_MB", Label: "Go memory limit MB", Category: "Resources", Description: "Soft memory limit for the Xalgorix parent process. Empty means auto-scale from RAM.", Placeholder: "auto", InputType: "number", RequiresRestart: true},
+	}
+	stampEnvironmentMetadata(defs)
+	return defs
+}
+
+// environmentCategorySlugs gives every display category a stable identifier so
+// the dashboard translates it without matching English strings.
+var environmentCategorySlugs = map[string]string{
+	"LLM":               "llm",
+	"Runtime":           "runtime",
+	"HITL":              "hitl",
+	"OOB":               "oob",
+	"Notifications":     "notifications",
+	"Rate limits":       "rate_limits",
+	"Proxy":             "proxy",
+	"Traffic recording": "traffic_recording",
+	"Security":          "security",
+	"Integrations":      "integrations",
+	"Resources":         "resources",
+}
+
+// environmentDedicatedTabCategories are fully owned by another settings tab.
+// Their entries still ride the API response because those tabs read their
+// values from it, but the Environment tab must not render a second editor.
+// The LLM category is only partly duplicated by the LLM tab, so it stays
+// represented by its advanced-only keys below.
+var environmentDedicatedTabCategories = map[string]bool{
+	"Notifications": true,
+}
+
+// environmentHiddenKeys are internal tuning knobs, duplicates of a dedicated
+// control, or fields that only make sense in the env file. Keeping them in the
+// response preserves the settings export/import and dedicated-tab value reads.
+var environmentHiddenKeys = map[string]bool{
+	// Duplicated by dedicated controls.
+	"XALGORIX_RATE_LIMIT_REQUESTS": true, // Rate limit card (Engagement tab)
+	"XALGORIX_RATE_LIMIT_WINDOW":   true,
+	// Covered by the LLM tab's provider/model/key editor.
+	"XALGORIX_LLM":                       true,
+	"XALGORIX_LLM_PROVIDER":              true,
+	"XALGORIX_API_KEY":                   true,
+	"XALGORIX_API_KEYS":                  true,
+	"XALGORIX_API_BASE":                  true,
+	"XALGORIX_LLM_PROFILE":               true,
+	"XALGORIX_REASONING_EFFORT":          true,
+	"XALGORIX_OLLAMA_COMPATIBLE":         true,
+	"XALGORIX_LLM_MAX_RETRIES":           true,
+	"XALGORIX_MEMORY_COMPRESSOR_TIMEOUT": true,
+	"GEMINI_API_KEY":                     true,
+	// Internal context/archive scheduling.
+	"XALGORIX_CONTEXT_COMPACT_RATIO":      true,
+	"XALGORIX_CONTEXT_COMPACT_TOKENS":     true,
+	"XALGORIX_TOOL_ARCHIVE_ACTIVE_WINDOW": true,
+	"XALGORIX_TOOL_ARCHIVE_MIN_BYTES":     true,
+	"XALGORIX_LLM_MAX_INFLIGHT":           true,
+	"XALGORIX_DISABLE_AUTO_DELEGATE":      true,
+	"XALGORIX_DISABLED_SPECIALISTS":       true,
+	"XALGORIX_CHECKLIST":                  true,
+	// Internal convergence / iteration tuning.
+	"XALGORIX_EPOCH_COVERAGE":              true,
+	"XALGORIX_MIN_ITERATIONS":              true,
+	"XALGORIX_NO_TOOL_ABORT_AT":            true,
+	"XALGORIX_MAX_WILDCARD_SUBDOMAINS":     true,
+	"XALGORIX_MAX_FINISH_REJECTIONS":       true,
+	"XALGORIX_CONVERGE_FINISH_IDLE":        true,
+	"XALGORIX_CONVERGE_FINISH_LEAD_WINDOW": true,
+	"XALGORIX_ITERATION_DELAY":             true,
+	// Resource watermarks and memory budgets are derived from the host.
+	"XALGORIX_CPU_CAUTION_PCT":         true,
+	"XALGORIX_CPU_CRITICAL_PCT":        true,
+	"XALGORIX_RAM_CAUTION_MB":          true,
+	"XALGORIX_RAM_CRITICAL_MB":         true,
+	"XALGORIX_DISK_CAUTION_MB":         true,
+	"XALGORIX_DISK_CRITICAL_MB":        true,
+	"XALGORIX_HEAVY_TOOL_CPU_LOAD":     true,
+	"XALGORIX_SCAN_MEMORY_BUDGET_MB":   true,
+	"XALGORIX_SCAN_OVERHEAD_MB":        true,
+	"XALGORIX_HEAVY_TOOL_MEM_LIMIT_MB": true,
+	"XALGORIX_PYTHON_MEM_LIMIT_MB":     true,
+	"XALGORIX_GO_MEM_LIMIT_MB":         true,
+	// Deployment / credential internals.
+	"XALGORIX_AUTO_INSTALL_SUDO":      true,
+	"XALGORIX_PASSWORD_HASH":          true,
+	"XALGORIX_WORKSPACE":              true,
+	"XALGORIX_SOURCE_REPO":            true,
+	"XALGORIX_APPROVAL_MAX_PENDING":   true,
+	"XALGORIX_APPROVAL_STORE_TIMEOUT": true,
+}
+
+// environmentAdvancedKeys render behind the collapsed Advanced disclosure.
+var environmentAdvancedKeys = map[string]bool{
+	// LLM knobs the LLM tab does not expose (model/provider/keys live there).
+	"XALGORIX_LANGUAGE":            true,
+	"XALGORIX_PDF_CJK_FONT":        true,
+	"XALGORIX_MAX_RATE_LIMIT_WAIT": true,
+	"XALGORIX_MAX_OUTPUT_TOKENS":   true,
+	"XALGORIX_LLM_CONTEXT_WINDOW":  true,
+	"XALGORIX_LLM_TIMEOUT_SECONDS": true,
+	"XALGORIX_BOUNDED_CONTEXT":     true,
+	"XALGORIX_ROLE_SCOPED_TOOLS":   true,
+	// Proxy.
+	"XALGORIX_PROXY_FILE":            true,
+	"XALGORIX_PROXY_ROTATION":        true,
+	"XALGORIX_CA_DIR":                true,
+	"XALGORIX_TLS_SKIP_VERIFY":       true,
+	"XALGORIX_TOOLBOX_PROXY_URL":     true,
+	"XALGORIX_TOOLBOX_BROWSER_PROXY": true,
+	"XALGORIX_TRAFFICPROXY_BIND":     true,
+	"XALGORIX_EGRESS_MODE":           true,
+	// Runtime.
+	"XALGORIX_MAX_CONCURRENT_AGENTS":   true,
+	"XALGORIX_MAX_TOKENS":              true,
+	"XALGORIX_MAX_TOOL_CALLS":          true,
+	"XALGORIX_SCAN_HEADERS_FILE":       true,
+	"XALGORIX_DISABLE_BROWSER":         true,
+	"XALGORIX_BROWSER_PATH":            true,
+	"XALGORIX_ALLOW_AUTO_INSTALL":      true,
+	"XALGORIX_ALLOW_ABSOLUTE_FILEEDIT": true,
+	// HITL.
+	"XALGORIX_APPROVAL_TIMEOUT":   true,
+	"XALGORIX_APPROVAL_ALLOWLIST": true,
+	// OOB.
+	"XALGORIX_OOB_PORT":         true,
+	"XALGORIX_OOB_INTERACTIONS": true,
+	// Integrations.
+	"XALGORIX_TELEMETRY":     true,
+	"XALGORIX_OTEL_ENDPOINT": true,
+	// Security.
+	"XALGORIX_USERNAME": true,
+	"XALGORIX_PASSWORD": true,
+}
+
+func stampEnvironmentMetadata(defs []envSettingDefinition) {
+	for i := range defs {
+		def := &defs[i]
+		def.CategoryKey = environmentCategorySlugs[def.Category]
+		def.Hidden = def.Hidden ||
+			environmentDedicatedTabCategories[def.Category] ||
+			environmentHiddenKeys[def.Key]
+		def.Advanced = !def.Hidden && environmentAdvancedKeys[def.Key]
 	}
 }
 
@@ -794,12 +952,21 @@ func (s *Server) applyEnvironmentUpdates(values map[string]string) (bool, error)
 			_ = os.Setenv(key, value)
 		}
 	}
-	s.applyEnvironmentToRuntimeConfig(effective)
+	if err := s.applyEnvironmentToRuntimeConfig(effective); err != nil {
+		return restartRequired, err
+	}
 	return restartRequired, nil
 }
 
-func (s *Server) applyEnvironmentToRuntimeConfig(values map[string]string) {
+func (s *Server) applyEnvironmentToRuntimeConfig(values map[string]string) error {
 	rateChanged := false
+	proxyChanged := false
+	trafficProxyChanged := false
+	// Snapshot the manager policy so a rejected re-init can roll back to the
+	// pre-edit state instead of leaving the process running with a half-applied
+	// configuration.
+	oldProxy := [5]string{s.cfg.ProxyURL, s.cfg.ProxyFile, s.cfg.ProxyRotation, boolString(s.cfg.UseProxy), boolString(s.cfg.ProxyRequired)}
+	oldTraffic := [5]string{boolString(s.cfg.TrafficProxy), s.cfg.CADir, s.cfg.TrafficProxyBind, s.cfg.TrafficProxyAdvertise, boolString(s.cfg.TLSSkipVerify)}
 	for key, value := range values {
 		switch key {
 		case "XALGORIX_LLM":
@@ -848,6 +1015,10 @@ func (s *Server) applyEnvironmentToRuntimeConfig(values map[string]string) {
 			s.cfg.MemCompTimeout = parseIntSetting(value, 30)
 		case "XALGORIX_MAX_ITERATIONS":
 			s.cfg.MaxIterations = parseIntSetting(value, 0)
+		case "XALGORIX_WORKER_CONCURRENCY":
+			n := clampInt(parseIntSetting(value, 3), 1, 10)
+			s.cfg.WorkerConcurrency = n
+			s.resizeWorkerPools(n)
 		case "XALGORIX_MIN_ITERATIONS":
 			s.cfg.MinIterations = parseIntSetting(value, 50)
 		case "XALGORIX_ITERATION_DELAY":
@@ -888,6 +1059,7 @@ func (s *Server) applyEnvironmentToRuntimeConfig(values map[string]string) {
 			s.cfg.RateLimitBurst = parseIntSetting(value, 20)
 		case "XALGORIX_TLS_SKIP_VERIFY":
 			s.cfg.TLSSkipVerify = parseBoolSetting(value, false)
+			trafficProxyChanged = true
 		case "XALGORIX_ALLOW_LOCAL_TARGETS":
 			s.cfg.AllowLocalTargets = parseBoolSetting(value, false)
 		case "CAIDO_PORT":
@@ -969,14 +1141,38 @@ func (s *Server) applyEnvironmentToRuntimeConfig(values map[string]string) {
 			s.cfg.AllowAutoInstallSudo = parseBoolSetting(value, false)
 		case "XALGORIX_USE_PROXY":
 			s.cfg.UseProxy = parseBoolSetting(value, false)
+			proxyChanged = true
 		case "XALGORIX_PROXY_REQUIRED":
 			s.cfg.ProxyRequired = parseBoolSetting(value, false)
+			proxyChanged = true
 		case "XALGORIX_PROXY_FILE":
 			s.cfg.ProxyFile = value
+			proxyChanged = true
 		case "XALGORIX_PROXY_ROTATION":
 			s.cfg.ProxyRotation = valueOrDefault(value, "roundrobin")
+			proxyChanged = true
 		case "XALGORIX_PROXY_URL":
 			s.cfg.ProxyURL = value
+			proxyChanged = true
+		case "XALGORIX_TOOLBOX_PROXY_URL":
+			s.cfg.ToolboxProxyURL = value
+		case "XALGORIX_TOOLBOX_BROWSER_PROXY":
+			s.cfg.ToolboxBrowserProxy = value
+		case "XALGORIX_EGRESS_ROUTER":
+			s.cfg.EgressRouter = strings.ToLower(valueOrDefault(value, "auto"))
+			trafficProxyChanged = true
+		case "XALGORIX_TRAFFICPROXY":
+			s.cfg.TrafficProxy = parseBoolSetting(value, true)
+			trafficProxyChanged = true
+		case "XALGORIX_CA_DIR":
+			s.cfg.CADir = value
+			trafficProxyChanged = true
+		case "XALGORIX_TRAFFICPROXY_ADVERTISE":
+			s.cfg.TrafficProxyAdvertise = value
+			trafficProxyChanged = true
+		case "XALGORIX_TRAFFICPROXY_BIND":
+			s.cfg.TrafficProxyBind = valueOrDefault(value, "127.0.0.1:0")
+			trafficProxyChanged = true
 		case "XALGORIX_BROWSER_PATH":
 			s.cfg.BrowserPath = value
 		}
@@ -992,6 +1188,52 @@ func (s *Server) applyEnvironmentToRuntimeConfig(values map[string]string) {
 		s.rateLimiter = NewRateLimiter(requests, time.Duration(window)*time.Second)
 		log.Printf("Rate limiting updated: %d requests/%ds per IP", requests, window)
 	}
+	if proxyChanged {
+		if err := proxy.InitWithPolicy(s.cfg.UseProxy, s.cfg.ProxyRequired, s.cfg.ProxyURL, s.cfg.ProxyFile, s.cfg.ProxyRotation, 30*time.Second); err != nil {
+			// Roll the policy back so the live process keeps the working pool;
+			// the caller surfaces the error and the operator fixes the value.
+			s.cfg.ProxyURL, s.cfg.ProxyFile, s.cfg.ProxyRotation = oldProxy[0], oldProxy[1], oldProxy[2]
+			s.cfg.UseProxy = oldProxy[3] == "true"
+			s.cfg.ProxyRequired = oldProxy[4] == "true"
+			_ = proxy.InitWithPolicy(s.cfg.UseProxy, s.cfg.ProxyRequired, s.cfg.ProxyURL, s.cfg.ProxyFile, s.cfg.ProxyRotation, 30*time.Second)
+			return fmt.Errorf("proxy settings rejected: %w", err)
+		}
+		log.Printf("[proxy] policy applied without restart: use=%v required=%v rotation=%s", s.cfg.UseProxy, s.cfg.ProxyRequired, s.cfg.ProxyRotation)
+	}
+	if trafficProxyChanged {
+		if err := s.configureTrafficProxyMode(); err != nil {
+			s.cfg.TrafficProxy = oldTraffic[0] == "true"
+			s.cfg.CADir = oldTraffic[1]
+			s.cfg.TrafficProxyBind = oldTraffic[2]
+			s.cfg.TrafficProxyAdvertise = oldTraffic[3]
+			s.cfg.TLSSkipVerify = oldTraffic[4] == "true"
+			_ = s.configureTrafficProxyMode()
+			return fmt.Errorf("traffic proxy settings rejected: %w", err)
+		}
+		log.Printf("[trafficproxy] configuration applied without restart: enabled=%v bind=%s advertise=%s (running containers reconnect on their next command)", s.cfg.TrafficProxy, s.cfg.TrafficProxyBind, s.cfg.TrafficProxyAdvertise)
+	}
+	return nil
+}
+
+// configureTrafficProxyMode applies the recorded-vs-forward-only decision from
+// the current config. Recording wins; with recording off and an egress
+// configured, the forward-only router keeps task proxy changes hot.
+func (s *Server) configureTrafficProxyMode() error {
+	cfg := s.cfg
+	if cfg.TrafficProxy {
+		return trafficproxy.ConfigureWithListen(cfg.TrafficProxy, cfg.CADir, cfg.TLSSkipVerify, cfg.TrafficProxyBind, cfg.TrafficProxyAdvertise)
+	}
+	if !strings.EqualFold(strings.TrimSpace(cfg.EgressRouter), "off") && (cfg.UseProxy || cfg.ProxyRequired) {
+		return trafficproxy.ConfigureForwardOnly(cfg.TrafficProxyBind, cfg.TrafficProxyAdvertise)
+	}
+	return trafficproxy.ConfigureWithListen(false, cfg.CADir, cfg.TLSSkipVerify, cfg.TrafficProxyBind, cfg.TrafficProxyAdvertise)
+}
+
+func boolString(v bool) string {
+	if v {
+		return "true"
+	}
+	return "false"
 }
 
 func (s *Server) envSettingValue(key string) string {
@@ -1042,6 +1284,10 @@ func (s *Server) envSettingValue(key string) string {
 		return strconv.Itoa(cfg.MemCompTimeout)
 	case "XALGORIX_MAX_ITERATIONS":
 		return strconv.Itoa(cfg.MaxIterations)
+	case "XALGORIX_WORKER_CONCURRENCY":
+		// Reflect the value a NEW scan will actually use (the env file is read
+		// at scan start), so an operator file edit is visible without restart.
+		return strconv.Itoa(config.LiveWorkerConcurrency(cfg.WorkerConcurrency))
 	case "XALGORIX_MIN_ITERATIONS":
 		return strconv.Itoa(cfg.MinIterations)
 	case "XALGORIX_ITERATION_DELAY":
@@ -1140,6 +1386,12 @@ func (s *Server) envSettingValue(key string) string {
 		return valueOrDefault(cfg.ProxyRotation, "roundrobin")
 	case "XALGORIX_PROXY_URL":
 		return cfg.ProxyURL
+	case "XALGORIX_TOOLBOX_PROXY_URL":
+		return cfg.ToolboxProxyURL
+	case "XALGORIX_TOOLBOX_BROWSER_PROXY":
+		return cfg.ToolboxBrowserProxy
+	case "XALGORIX_TRAFFICPROXY_BIND":
+		return valueOrDefault(cfg.TrafficProxyBind, "127.0.0.1:0")
 	case "XALGORIX_BROWSER_PATH":
 		return cfg.BrowserPath
 	default:
@@ -1300,6 +1552,8 @@ func normalizeEnvSettingValue(def envSettingDefinition, value string) (string, e
 		}
 		return strconv.Itoa(clampInt(v, 0, 1000)), nil
 	case "XALGORIX_MAX_CONCURRENT_AGENTS":
+		return strconv.Itoa(clampInt(parseIntSetting(value, 3), 1, 10)), nil
+	case "XALGORIX_WORKER_CONCURRENCY":
 		return strconv.Itoa(clampInt(parseIntSetting(value, 3), 1, 10)), nil
 	case "XALGORIX_ITERATION_DELAY":
 		d := parseFloatSetting(value, 0)

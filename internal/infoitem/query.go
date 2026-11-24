@@ -221,6 +221,9 @@ type ContextResult struct {
 	GapReason  string `json:"gap_reason,omitempty"`
 }
 
+// ErrNotFound is returned by Reader.GetByID for an unknown (scan, id) pair.
+var ErrNotFound = errors.New("infoitem: not found")
+
 // Reader is implemented by the PostgreSQL cold-path adapter and by bounded
 // in-memory test adapters. A nil or disabled Reader means cross-scan
 // activation is unavailable, not that scanning has failed.
@@ -228,6 +231,9 @@ type Reader interface {
 	Region(ctx context.Context, q RegionQuery) (RegionResult, error)
 	Associate(ctx context.Context, q AssociationQuery) (AssociationResult, error)
 	ContextSlice(ctx context.Context, q ContextQuery) (ContextResult, error)
+	// GetByID returns one exact item. Callers MUST have already authorized
+	// the scan id against the caller's project/task scope.
+	GetByID(ctx context.Context, scanID, id string) (Item, error)
 }
 
 func NormalizeLimit(limit int) int {

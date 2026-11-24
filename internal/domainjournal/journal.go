@@ -117,14 +117,14 @@ func (a Actor) Validate() error {
 type Operation string
 
 const (
-	OpSeedHypothesis    Operation = "seed_hypothesis"
-	OpRecordHypothesis  Operation = "record_hypothesis"
-	OpClaimHypothesis   Operation = "claim_hypothesis"
-	OpAssignHypothesis  Operation = "assign_hypothesis"
-	OpSetStatus         Operation = "set_status"
-	OpAddEvidence       Operation = "add_evidence"
-	OpRecordAttempt     Operation = "record_attempt"
-	OpSetVOI            Operation = "set_voi"
+	OpSeedHypothesis   Operation = "seed_hypothesis"
+	OpRecordHypothesis Operation = "record_hypothesis"
+	OpClaimHypothesis  Operation = "claim_hypothesis"
+	OpAssignHypothesis Operation = "assign_hypothesis"
+	OpSetStatus        Operation = "set_status"
+	OpAddEvidence      Operation = "add_evidence"
+	OpRecordAttempt    Operation = "record_attempt"
+	OpSetVOI           Operation = "set_voi"
 	// OpReclaimHypothesis records a lease expiry returning a claimed
 	// hypothesis to the schedulable pool (deterministic claim protocol).
 	OpReclaimHypothesis Operation = "reclaim_hypothesis"
@@ -165,6 +165,19 @@ const (
 	// the model, decides that the observation is worth keeping, so budget
 	// exhaustion cannot drop it.
 	OpToolObservation Operation = "tool_observation"
+	// OpRecordDeviation records an executor's stated departure from its
+	// assigned intent (R8.4). Audit-only: it never changes plan state.
+	OpRecordDeviation Operation = "record_deviation"
+	// OpRecordGuidance projects operator guidance delivered to a run into the
+	// information space as an observed, human-sourced InfoItem. It is the
+	// InfoItem counterpart of the R7 hint node; the journal append never
+	// mutates ledger or plan state.
+	OpRecordGuidance Operation = "record_guidance"
+	// OpContextDigest records one context-compaction snapshot as an inferred
+	// InfoItem with supports (IG6b). The digest node is the aggregate/authority
+	// reference; this record is its atomic provenance. Audit-only like the other
+	// observation ops: it never mutates ledger, plan or scheduling state.
+	OpContextDigest Operation = "context_digest"
 )
 
 func (o Operation) Valid() bool {
@@ -172,7 +185,8 @@ func (o Operation) Valid() bool {
 	case OpSeedHypothesis, OpRecordHypothesis, OpClaimHypothesis, OpAssignHypothesis,
 		OpSetStatus, OpAddEvidence, OpRecordAttempt, OpSetVOI, OpReclaimHypothesis, OpMergeLedger, OpResetLedger,
 		OpInfoItemEnriched, OpInfoItemProjected, OpObserveTraffic, OpRecordObjective,
-		OpSkillLoad, OpAgentDelegat, OpMcpCall, OpFindingRecorded, OpToolObservation:
+		OpSkillLoad, OpAgentDelegat, OpMcpCall, OpFindingRecorded, OpToolObservation,
+		OpRecordDeviation, OpRecordGuidance, OpContextDigest:
 		return true
 	default:
 		return false
@@ -199,6 +213,7 @@ type Record struct {
 	At           time.Time           `json:"at"`
 	Actor        Actor               `json:"actor"`
 	Operation    Operation           `json:"operation"`
+	IntentID     string              `json:"intent_id,omitempty"`
 	HypothesisID string              `json:"hypothesis_id,omitempty"`
 	EvidenceID   string              `json:"evidence_id,omitempty"`
 	Summary      string              `json:"summary,omitempty"`
@@ -532,12 +547,22 @@ type Projection struct {
 	LastSeq         uint64           `json:"last_seq"`
 	Timeline        []Record         `json:"timeline"`
 	Claims          []Claim          `json:"claims,omitempty"`
+	Deviations      []Deviation      `json:"deviations,omitempty"`
 	HypothesisFinal map[string]State `json:"hypothesis_final,omitempty"`
 }
 
 type Gap struct {
 	From uint64 `json:"from"`
 	To   uint64 `json:"to"`
+}
+
+// Deviation is one executor-reported departure from its assigned intent.
+type Deviation struct {
+	IntentID string    `json:"intent_id,omitempty"`
+	Summary  string    `json:"summary"`
+	Actor    Actor     `json:"actor"`
+	At       time.Time `json:"at"`
+	Seq      uint64    `json:"seq"`
 }
 
 type Claim struct {
@@ -603,6 +628,15 @@ func Project(scanID string, records []Record) Projection {
 		}
 		if rec.HypothesisID != "" && rec.After != nil {
 			p.HypothesisFinal[rec.HypothesisID] = *rec.After
+		}
+		if rec.Operation == OpRecordDeviation {
+			p.Deviations = append(p.Deviations, Deviation{
+				IntentID: rec.IntentID,
+				Summary:  rec.Summary,
+				Actor:    rec.Actor,
+				At:       rec.At,
+				Seq:      rec.Seq,
+			})
 		}
 	}
 

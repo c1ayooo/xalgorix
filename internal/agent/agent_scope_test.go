@@ -831,6 +831,15 @@ func argsEqual(a, b map[string]string) bool {
 // EXPECTED OUTCOME on UNFIXED code: this test FAILS. The failure
 // confirms the bug exists. After task 3's fix the same test passes.
 func TestBugCondition_PublicOOSHostPassThrough(t *testing.T) {
+	// The property generates random public host labels. The operator-machine
+	// classifier must not pay a real DNS lookup for them (it can block for the
+	// resolver timeout in sandboxed CI); pin it to a public address so this
+	// test measures the guard logic, not the network.
+	prevLookup := scopeguard.SetLookupHost(func(string) ([]string, error) {
+		return []string{"198.51.100.7"}, nil
+	})
+	t.Cleanup(func() { scopeguard.SetLookupHost(prevLookup) })
+
 	// ── Scoped deterministic counterexamples ────────────────────
 	// These four cases are pinned per design.md → "Exploratory Bug
 	// Condition Checking → Test Cases". They serve as reproducible

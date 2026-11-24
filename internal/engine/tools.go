@@ -64,15 +64,51 @@ func (t *RegistryTool) Info(context.Context) (*schema.ToolInfo, error) {
 	if len(tool.Parameters) > 0 {
 		params := make(map[string]*schema.ParameterInfo, len(tool.Parameters))
 		for _, param := range tool.Parameters {
-			params[param.Name] = &schema.ParameterInfo{
-				Type:     schema.String,
+			paramType := parameterSchemaType(param.Type)
+			info := &schema.ParameterInfo{
+				Type:     paramType,
 				Desc:     param.Description,
 				Required: param.Required,
 			}
+			// ParameterInfo.Enum is documented as string-only (eino
+			// schema/tool.go). Only attach it when the type really is string.
+			if paramType == schema.String && len(param.Enum) > 0 {
+				info.Enum = append([]string(nil), param.Enum...)
+			}
+			// param.Default has no counterpart in schema.ParameterInfo (no
+			// Default field in eino v0.9.23), so it stays documentation-only:
+			// the registry/tool code owns the effective default.
+			params[param.Name] = info
 		}
 		info.ParamsOneOf = schema.NewParamsOneOfByParams(params)
 	}
 	return info, nil
+}
+
+// parameterSchemaType maps a tools.Parameter.Type string onto the Eino/JSON
+// schema data types. An empty type is "string" so pre-existing tool literals
+// keep their exact schema. "array"/"object" are degraded to "string" because
+// tools.Parameter carries no element/sub-field description, and Eino's
+// ParameterInfo needs ElemInfo/SubParams to emit a valid, meaningful shape for
+// them; the registry passes every argument as a string anyway. Unknown values
+// degrade to "string" rather than producing an invalid schema.
+func parameterSchemaType(t string) schema.DataType {
+	switch strings.ToLower(strings.TrimSpace(t)) {
+	case "":
+		return schema.String
+	case "string":
+		return schema.String
+	case "integer":
+		return schema.Integer
+	case "number":
+		return schema.Number
+	case "boolean":
+		return schema.Boolean
+	case "null":
+		return schema.Null
+	default:
+		return schema.String
+	}
 }
 
 // InvokableRun decodes Eino's JSON argument string into the registry's

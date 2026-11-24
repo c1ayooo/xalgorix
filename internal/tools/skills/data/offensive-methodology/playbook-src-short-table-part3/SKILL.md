@@ -1,0 +1,29 @@
+---
+name: playbook-src-short-table-part3
+description: "打穿短表（索引）（第 3/7 部分）"
+tags: [playbook, src-hunting, short, table]
+intent: offensive
+---
+| 助手/Agent 前端有历史列表口；登录态只在可选头里 | 不登录调列表再打详情。见 `idor-test.md`「助手历史未授权读他人任务」 | 列表/详情出现**他人**任务原文（下载、订阅、对话卡片），不是公开广场 | 只出广场/`share_id`；换 guid 列表变空或只剩自己的 |
+| 文件翻译/文档转换网关；list 和 load 不要登录 | 不登录 POST list，抄他人 `file_id` 再 load。对照空 session 应只出自己的或空 | load 出**他人**未公开译稿/文档正文 | 只出自己刚交的；list 是公开示例库；load 只要标题没有正文 |
+| 匿名 CSRF/临时 token 口；业务详情只验这个头不验登录；query id 和回包业务 id 可以不是同一个号 | 不登录拿 token 头打详情换数字 id，id 对不上别停。见 `idor-test.md`「匿名 CSRF 头读详情」 | 未上架/测试训练脚本或内部会话正文 | 只有公开广场；token 过了仍空 |
+| 管理后台 SPA 请求拦截器把自定义头（`User-Id` / `employeeId` 一类）当登录身份；未登录名单口只出数字号没有手机 | 不登录。名单抄数字号，把头换成这个号打当前人信息口。名单没手机别停。见 `idor-test.md`「自定义身份头当会话」 | 出他人姓名+11 位手机 | 头过了仍空；名单已经出手机（那是另一条） |
+| CRM / 企业 IM 客户详情口前端只写外部联系人 id；只带这个 id 回空壳 | 不登录 POST 同一详情口，body 加 `phone`（及展示开关）。换号必须换人。见 `idor-test.md`「客户详情口还吃 phone」 | 出他人姓名/公司/内部 UDF，且查的就是这个完整号 | phone 一律空或只出同一条测试号 |
+| 云助手 whoami/身份口回未登录，对话口 `/chat`/`createTask` 仍接；工具列表有 bash/python。**没有 whoami 对照也打** | 不登录 POST 对话口，让模型用 bash 或 Python 跑 `id`。SSE 没有 `toolName` 别停。命令跑起来后跟 flag / 云钥 / 他主体正文。见 `agent-tool-exec-test.md` | stdout 是 SRC 验证台 flag、云密钥、或他主体业务正文。沙箱 `uid=` 不算 | 模型只口头说执行了、数字对不上本机、沙箱文件名是提示里写过的；沙箱拒命令；必须登录；只 curl 到公网不算通内网 |
+| 云厂商产品 Demo / 体验页 / 控制台代理 / 供应商后台；领 STS、联合身份、建任务只要业务 id 或空 body，不要 Cookie。领 STS 口缺参只报字段校验不是登录闸，不一定有演示号。或分享域前端 HMAC 过网关后，领 STS 口不要分享页 token | 不登录。有演示号抄客户编号；没有也打领钥口，缺参报校验别当登录闸。空 body 报缺 `AppId`/`Uin` 也别当没口，带能解析的数字 Uin 就发联邦 STS；bucket+file_name 仍打。领钥口可能在独立 demo CDN `/openapi/`。HMAC 过网关后对照其它口「token 不合法」，领 STS 口仍打。换 bucket 用 PUT/NoSuchBucket 探活桶。过签≠出数。见 `authbypass-test.md`「演示号领云钥」 | 临时钥匙能问出 AccountId/角色名；同一身份下列表出现刚建的任务；或检索出口径出账单/实例/他主体业务字段；或活桶 PUT 200 | 钥匙调业务 API 全 Unauthorized；领钥口请登录/401；create 200 但列表没有。没有演示号/客户编号不是假点 |
+| BaaS 匿名 session；列表口不验管理员 | 不登录 `POST .../sessions/anonymous` 再 listRows。常见 BaaS 皮，没有这名仍打。对照无 Cookie 应 `total=0`。见 `idor-test.md`「匿名会话读报名表」 | 匿名会话 `total` 涨，rows 里是**他人**手机/邮箱/报名正文 | 无会话也是全表（另一条：完全无鉴权）；匿名会话仍空或只自己刚填的；删别人 401 只说明写没开；公开运营名单 |
+| 云开发匿名登录；有低代码数据源函数 | 不登录匿名签到拿 JWT，打用户集合 / 低代码记录口。HTTP 网关禁用匿名别停。用户表行权限失败别停，改文档库 query `collection=users`。见 `idor-test.md`「云开发匿名用户表」 | records 里是**他人**手机/邮箱/uin，不是自己刚匿名建的空号 | 行权限拒匿名且文档库 users 也空；数据源不存在；只出演示 todo/sales；旧 HS256 票丢函数口报 KID 无效当没洞 |
+| 前端写死 `appId`+`appKey`（或同类 Id/Key 头）；或无代码落地页写死 `role=anon` JWT | 不登录带写死钥打业务表。rest 403 别停，改打存储 REST：官方前缀 + `x-upsert:true`。见 `idor-test.md`「写死 appKey 打业务表」+ `file-upload-test.md` STS 第 9 步 | 业务表 `count` 海量或出现**他人**稿/邮箱/电话；PUT 改别人 `objectId` 成功；或官方前缀对象能盖 | `_User` 和业务表都 403；只能读自己刚建的；只能 LIST 公开运营配置；rest 403 就当存储也不能写 |
+| 客服/支持台 umi 有知识列表+详情；或大厅 HTML 吃数字篇号；或公告 JSON 用 callname 代理知识库；或未登录 CMS 能列出非官网内部知识库；或 chatbot 未登录检索口正文在 behavior | 不登录打列表再打详情。json 没有就打 HTML；公告口换 callname；CMS 换非官网 siteId；loginMode is null 带头；chatbot dir 401 改检索口看 `behavior.value`。细节见 `idor-test.md`「未授权内部话术正文」 | 列表 `pager.items` 上千或 count 海量，且 Info/HTML/详情/`behavior.value` 出**内部**话术/协查/短信/运营知识库正文，不是公开 FAQ | 只有公开帮助稿/错误码/对外协议/官网 Banner；Info 只要标题；工单口也放行（那是另一条）；只打了默认官网站点；dir 节点 401 就停；检索口只出标题 content；不带头当没口；content 缺 siteId 当没正文 |
+| 问卷/测验填表模型口；前端写死业务 id 或白名单；回包 schema 带标准答案或内部审核题干/样图 | 不登录打 getModel/schema，别停在表单标题。样图 preview 跟着打。见 `idor-test.md`「填表模型带标准答案」 | 内部测验正文+标准答案，或证件/执照样图真下到 | 只有公开报名表标题；schema 没有 answer；只有自己刚填的答卷 |
+| 前端 JS 写死签名盐；写接口或检索/名单 query 只要 `timestamp`/`sign`/`nonce`，或头 `Authorization: OAuth apiSign=`，不要 Cookie。资讯 CMS 常见 `md5(盐+unix秒)`，盐是 source 拼两遍再加 biz | 不登录抄盐自己算。常见 MD5(timestamp+path+盐+nonce)；或 SHA1(盐+按 key 排序后的参数值拼接) 放进 `OAuth apiSign=`。对照：其它业务要登录，检索/名单/写接口仍 200。见 `idor-test.md` | 平台状态真变（能改回）；或名单/详情出现他主体/证件号 | 只过网关签名、业务仍 401；盐只能过本接口、写/读另外要会话 |
+| 开放支付/进件网关 body 有 `appId`+`sign`；假签时活应用回 `MERCHANT_NOT_EXIST` 或 `SUCCESS`，死应用回 `SIGN_ERROR`/`APP_NOT_FOUND`；或演示收银台预下单口假签/node 代签也能进生产网关 | 不登录。假签枚举 `appId` 看回码差分，活的打商户查询换 `merchantId`；演示预下单本站查单 404 别停，打生产查单口。见 `idor-test.md`「开放支付假签枚举 appId」 | 出他人商户身份证/银行卡/手机；或生产查单新单且有他商户交易号 | 假签一律 `SIGN_ERROR`；`SUCCESS` 但证件卡号全空；文档示例 appId 已死；只回渠道号且生产查单不存在；只能给演示店挂 |
+| 支付/开放网关要商户签；假签时 **GET / DELETE / OPTIONS / HEAD 都可能 302**，Location 或 msg 把服务端刚算的签明文带出来 | 不登录。假签打签约/下单口，**GET 也要看 Location**，再换 METHOD；从 Location/`calculateSign is:` 抄签填回 `sign_data` 打查询。见 `authbypass-test.md`「验签失败 302 回显算出的签」 | 过签查出**他商户**未公开订单/账户正文 | 所有 METHOD 都只报验签失败、没有算出的签；抄回去仍 `ILLEGAL_SIGN` |
+| 短信/运营短链解析站；猜中的短码 302 到落地页，query 明文带 phone/name/金额 | 不登录。打 `/open` `/app` `/s/` `/www` 加短字典（aaaaa、1、1234）；首页欢迎页、302 官网或 Hello 壳别停。对照见 `idor-test.md`「短链 302 query 带手机」 | 跳转地址里是**别人**的手机/姓名 | 失效页；公开营销无 PII；短码要真短信才解析；首页 302 官网/Hello/Welcome 不是没洞 |
+| 支付 UISDK/开通页；未登录配置或 RPC 口用可枚举 appId 回 signKey | 不登录换 appId。死应用 APP_NOT_FOUND，活的抄完整 signKey，再用真钥现签打支付进件/打款/预下单/创建虚拟门店/改结算卡。改卡口看支行号差分出 changeId，原值报未变更；SUCCESS 但 changeId=null 不算写上。对照假钥 SIGN_ERROR。见 `authbypass-test.md`「开通页 RPC 下发 signKey」 | 完整 AppSecret 且真钥过生产验签，或查出他商户身份证/卡/挂单，或建出虚拟门店 poiId，或改掉他商户结算卡/开户行（changeId 有值） | 回的是占位钥过不了验签；死活都 APP_NOT_FOUND 且无钥 |
+| 文档 / Demo / 官方包 / 接入 HTML / npm 历史包写死完整 AppSecret（不是占位符）。wiki 打码、同一套 zip/Demo/HTML 仍明文别停 | 不登录抄出来打换票口或按文档现签生产口。wiki 打码别停，跟 zip/Demo/HTML/npm。算法见 `authbypass-test.md`「调试文档写死 AppSecret」 | 钥是活的：能换成该应用的用户票或 client 票，或查出该应用供给/他商户未公开订单/手机，或生产闸真签过、假签失败 | 文档是占位符；真假密钥同一句错；钥过期调不通；联调钥只能打测试环境、生产拒；wiki 打码就当 zip/Demo/HTML 示例也打码；只逆地理通、地点云/图层没表 |
+| 入驻/资质 SPA 打包 JS 的 mock/演示 formData 写死密文 `fileKey`；站点根 301 到新域 | 不登录。根 301 别当旧 host 下载口废。抄 JS 里的 fileKey 打旧 host 下载口。见 `file-upload-test.md`「入驻 JS 写死 fileKey」 | 私有桶执照/证件原图真下到 | 把 301 新域名当整站废；mock fileKey 当下占位且乱填也出同一张图 |
+| 入驻 H5 有招商电话页；同套其它 settle 口 302 未登录。JS 里按品类查 BD 的 RPC，industry/类目空时 body 空 | 不登录打网关 `/api`。类目字段空着，不要填死数字。见 `idor-test.md`「入驻 H5 空参出招商通讯录」 | 内部 BD 姓名+11 位手机+企业邮箱整表 | 类目填死数字出空数组就当没口；把页面公开热线当这枪 |
+| 入驻 H5/小程序打包 JS 把 OCR/企业信息口 token 写死；JSON 口只要 pin（或同类账号）+ 非空 token | 不登录。空 token 对照应空 data；写死那串能过，任意非空串也能过，再换可遍历 pin。见 `idor-test.md`「入驻 H5 写死 token 换 pin」 | 出 pin 对应真实手机 | 空 token 也出数（完全无鉴权，另一条）；token 过了仍只出自己刚入驻的 |
+
+> （续前：playbook-src-short-table 第 3/7 部分）

@@ -16,6 +16,9 @@ func (stubReader) Associate(context.Context, AssociationQuery) (AssociationResul
 func (stubReader) ContextSlice(context.Context, ContextQuery) (ContextResult, error) {
 	return ContextResult{}, nil
 }
+func (stubReader) GetByID(context.Context, string, string) (Item, error) {
+	return Item{}, ErrNotFound
+}
 
 func TestReaderRegistryLifecycle(t *testing.T) {
 	cancel := RegisterReader(stubReader{})

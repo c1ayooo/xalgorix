@@ -31,9 +31,10 @@ package web
 // Orphaned rows from a previous process (crash between create and verdict)
 // are closed once at startup by ReconcilePending.
 //
-// Store calls carry a short deadline (approvalStoreCallTimeout): a wedged
-// PostgreSQL must fail the gate open (charter §6.1 — scanning never depends
-// on the platform), not park the tool call.
+// Store calls carry a bounded deadline (defaultApprovalStoreTimeout /
+// XALGORIX_APPROVAL_STORE_TIMEOUT): a wedged PostgreSQL must fail the gate
+// open (charter §6.1 — scanning never depends on the platform), not park the
+// tool call. The budget covers ONE call, never the approval wait.
 //
 // Known interaction with the runtime's own tool ceilings
 // (RegistryTool hardTimeoutFor(tool)+30s): the configured approval
@@ -41,6 +42,15 @@ package web
 // and the approval verdict arrives too late to matter. newApprovalService
 // warns at startup; the row is still closed by its own deadline timer, so
 // nothing leaks — the tool result is simply abandoned.
+//
+// Concurrency: the gate stays synchronous by design. River must not take over
+// HITL approval (AGENTS.md §8 / REDESIGN D5): the tool call must block on the
+// human verdict, never be re-queued as a background job whose result can
+// arrive after the call gave up. High worker concurrency is absorbed inside
+// the gate instead — a per-run FIFO slot queue (MaxPending, default 1)
+// serializes row creation, and each store deadline is opened only AFTER the
+// slot is granted (createPendingRow/submit), so waiting on a human decision
+// never consumes the database-call budget.
 
 import (
 	"context"
@@ -66,10 +76,14 @@ const (
 	maxApprovalCommandBytes = 4096
 )
 
-// approvalStoreCallTimeout bounds every platform-store call the gate makes:
-// a wedged PostgreSQL must surface as the gate's fail-open path within
-// seconds, never park a tool call. Var so tests can shorten it.
-var approvalStoreCallTimeout = 3 * time.Second
+// defaultApprovalStoreTimeout is the fallback budget for ONE platform-store
+// call the gate makes (ownership lookup + INSERT). A wedged PostgreSQL must
+// surface within this bound, never park a tool call. It is NOT the approval
+// wait: the deadline opens only AFTER the per-run slot is granted
+// (createPendingRow / submit), and the worker stays suspended for the policy
+// timeout. Operators raise it with XALGORIX_APPROVAL_STORE_TIMEOUT (default
+// 30s) when many workers submit against PostgreSQL at once.
+const defaultApprovalStoreTimeout = 30 * time.Second
 
 // redactionMarker matches the agent's telemetry redaction output
 // (agent.redactSecrets) so approval payloads carry the same marker the rest
@@ -108,6 +122,9 @@ var secretHeaderNames = map[string]struct{}{
 type ApprovalService struct {
 	srv    *Server
 	policy approval.Policy
+	// storeTimeout bounds ONE platform-store call (ownership lookup + row
+	// write). It never covers the approval wait; 0 falls back to the default.
+	storeTimeout time.Duration
 
 	mu sync.Mutex
 	// pendingCount tracks in-flight submits holding a slot, keyed by
@@ -128,6 +145,7 @@ func newApprovalService(srv *Server) *ApprovalService {
 	}
 	timeout := 600 * time.Second
 	maxPending := 1
+	storeTimeout := defaultApprovalStoreTimeout
 	var allowlist []string
 	if srv.cfg != nil {
 		if srv.cfg.ApprovalTimeoutSeconds > 0 {
@@ -135,6 +153,9 @@ func newApprovalService(srv *Server) *ApprovalService {
 		}
 		if srv.cfg.ApprovalMaxPending > 0 {
 			maxPending = srv.cfg.ApprovalMaxPending
+		}
+		if srv.cfg.ApprovalStoreTimeoutSeconds > 0 {
+			storeTimeout = time.Duration(srv.cfg.ApprovalStoreTimeoutSeconds) * time.Second
 		}
 		allowlist = splitAllowlist(srv.cfg.ApprovalAllowlist)
 	}
@@ -152,17 +173,25 @@ func newApprovalService(srv *Server) *ApprovalService {
 			Allowlist:  allowlist,
 			MaxPending: maxPending,
 		},
+		storeTimeout: storeTimeout,
 		pendingCount: make(map[string]int),
 		slotWaiters:  make(map[string][]chan struct{}),
 		verdicts:     make(map[string]chan platform.Approval),
 	}
 }
 
-// storeCtx returns a short-deadline context for one platform-store call: a
-// wedged PostgreSQL fails the gate's fail-open paths in seconds instead of
-// parking a tool call (charter §6.1).
-func storeCtx() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), approvalStoreCallTimeout)
+// storeCtx returns a bounded context for one platform-store call: a wedged
+// PostgreSQL fails the gate's fail-open paths in seconds instead of parking a
+// tool call (charter §6.1). The budget is configurable
+// (XALGORIX_APPROVAL_STORE_TIMEOUT, default 30s) so PG contention under many
+// concurrent workers does not turn into spurious tool failures. It does NOT
+// bound the approval wait — the worker stays suspended for policy.Timeout.
+func (s *ApprovalService) storeCtx() (context.Context, context.CancelFunc) {
+	timeout := defaultApprovalStoreTimeout
+	if s != nil && s.storeTimeout > 0 {
+		timeout = s.storeTimeout
+	}
+	return context.WithTimeout(context.Background(), timeout)
 }
 
 func splitAllowlist(raw string) []string {
@@ -221,11 +250,17 @@ func (s *ApprovalService) createPendingRow(instanceID string, sctx *scanctx.Scan
 		return row, nil
 	}
 
-	ctx, cancel := storeCtx()
-	defer cancel()
+	// Reserve the per-run pending slot BEFORE opening the store deadline: the
+	// slot queue can legitimately wait for the operator to decide another tool
+	// (minutes), and a deadline opened first would already be expired when the
+	// slot is granted — the exact concurrency failure where a second worker's
+	// row creation died with "context deadline exceeded". The store budget
+	// covers only the ownership lookup + INSERT.
 	if err := s.waitForSlot(instanceID, sctx); err != nil {
 		return nil, err
 	}
+	ctx, cancel := s.storeCtx()
+	defer cancel()
 	projectID, taskID, runID := s.resolveOwnership(ctx, store, instanceID)
 	row, err := store.CreateApproval(ctx, platform.ApprovalInput{
 		ProjectID:  projectID,
@@ -335,7 +370,7 @@ func (s *ApprovalService) submit(instanceID string, sctx *scanctx.ScanContext, v
 		return submitOutcome{Approved: false, Status: platform.ApprovalCancelled}
 	}
 
-	ctx, cancel := storeCtx()
+	ctx, cancel := s.storeCtx()
 	defer cancel()
 	projectID, taskID, runID := s.resolveOwnership(ctx, store, instanceID)
 	row, err := store.CreateApproval(ctx, platform.ApprovalInput{
@@ -431,7 +466,7 @@ func (s *ApprovalService) adoptConflict(row *platform.Approval, err error) (*pla
 	if store == nil {
 		return nil, err
 	}
-	ctx, cancel := storeCtx()
+	ctx, cancel := s.storeCtx()
 	defer cancel()
 	return store.GetApproval(ctx, row.ID)
 }
@@ -446,7 +481,7 @@ func (s *ApprovalService) finalize(row *platform.Approval, dec platform.Approval
 	if store == nil {
 		return nil, errors.New("approval store unavailable")
 	}
-	ctx, cancel := storeCtx()
+	ctx, cancel := s.storeCtx()
 	defer cancel()
 	final, err := store.DecideApproval(ctx, row.ID, dec)
 	if err != nil {
@@ -529,7 +564,7 @@ func (s *ApprovalService) ReconcilePending() {
 	s.reconciled = true
 	s.mu.Unlock()
 
-	ctx, cancel := storeCtx()
+	ctx, cancel := s.storeCtx()
 	defer cancel()
 	rows, err := store.ListApprovals(ctx, platform.ApprovalFilter{Status: "pending"})
 	if err != nil {

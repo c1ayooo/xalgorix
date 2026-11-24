@@ -38,9 +38,15 @@ type Config struct {
 	DisableAutoDelegate bool     // XALGORIX_DISABLE_AUTO_DELEGATE — skip the deterministic specialist wave entirely
 	EnableCTFDelegate   bool     // XALGORIX_ENABLE_CTF_DELEGATE — unlock specialist delegation for CTF/benchmark missions (default off: single-agent doctrine unchanged)
 	DisabledSpecialists []string // XALGORIX_DISABLED_SPECIALISTS — comma-separated lane names to skip
-	Checklist           string   // XALGORIX_CHECKLIST - full or professional
-	LLMProfile          string   // XALGORIX_LLM_PROFILE — active credential pointer "<provider>:<profileId>" (v4.4.22+)
-	ReasoningEffort     string   // XALGORIX_REASONING_EFFORT — "none", "low", "medium", "high", or "xhigh"
+	// Orchestrator selects the execution topology (R7): "legacy" (single root
+	// agent, historical behavior) or "planner_worker" (main observes, a graph
+	// planner seeds intents, N workers execute them).
+	Orchestrator string // XALGORIX_ORCHESTRATOR
+	// WorkerConcurrency is the planner_worker pool size, clamped to 1..10.
+	WorkerConcurrency int    // XALGORIX_WORKER_CONCURRENCY, default 3
+	Checklist         string // XALGORIX_CHECKLIST - full or professional
+	LLMProfile        string // XALGORIX_LLM_PROFILE — active credential pointer "<provider>:<profileId>" (v4.4.22+)
+	ReasoningEffort   string // XALGORIX_REASONING_EFFORT — "none", "low", "medium", "high", or "xhigh"
 
 	// Language is the output language for human-readable AI content — agent
 	// reasoning, notes, vulnerability findings, and post-scan chat. It does
@@ -238,6 +244,10 @@ type Config struct {
 	// ToolboxImage must be digest-pinned in production (":tag@sha256:...").
 	ToolboxImage   string // XALGORIX_TOOLBOX_IMAGE
 	ToolboxProfile string // XALGORIX_TOOLBOX_PROFILE: core|full|web
+	// ToolboxNetworkMode selects the container network: "internal" (default,
+	// project bridge with proxy-only egress) or "host" (share the host network
+	// namespace so the container can reach VPN/target subnets directly).
+	ToolboxNetworkMode string // XALGORIX_TOOLBOX_NETWORK_MODE: internal|host
 	// ToolboxBrowserProxy is the proxy URL handed to Chromium inside the project
 	// container. Chromium ignores HTTP_PROXY, so a containerised browser needs a
 	// name the project network can resolve (e.g. http://xalgorix-proxy:8081).
@@ -299,9 +309,15 @@ type Config struct {
 	// ApprovalMaxPending caps concurrently pending approvals per run
 	// (anti-storm, REDESIGN §5.3). Overflowing requests queue for a free
 	// slot instead of failing. XALGORIX_APPROVAL_MAX_PENDING, default 1.
-	ApprovalMaxPending int  // XALGORIX_APPROVAL_MAX_PENDING, default 1
-	DisableBrowser     bool // XALGORIX_DISABLE_BROWSER
-	MaxIterations      int  // XALGORIX_MAX_ITERATIONS — 0 = unlimited
+	ApprovalMaxPending int // XALGORIX_APPROVAL_MAX_PENDING, default 1
+	// ApprovalStoreTimeoutSeconds bounds ONE platform-store call the gate
+	// makes (ownership lookup + INSERT). It is NOT the approval wait: a worker
+	// stays suspended for ApprovalTimeoutSeconds. A longer budget absorbs
+	// PostgreSQL contention when many workers submit at once.
+	// XALGORIX_APPROVAL_STORE_TIMEOUT, default 30.
+	ApprovalStoreTimeoutSeconds int
+	DisableBrowser              bool // XALGORIX_DISABLE_BROWSER
+	MaxIterations               int  // XALGORIX_MAX_ITERATIONS — 0 = unlimited
 	// DwellMaxCalls caps tool calls per private-IPv4 endpoint (benchmark
 	// rotation discipline, dwell_guard.go). 0 = off.
 	DwellMaxCalls int // XALGORIX_DWELL_MAX_CALLS
@@ -527,6 +543,14 @@ type Config struct {
 	// Required when Bind is unspecified (0.0.0.0/::), because 0.0.0.0 is not a
 	// dialable address. It must be reachable from the project network.
 	TrafficProxyAdvertise string // XALGORIX_TRAFFICPROXY_ADVERTISE
+	// EgressRouter selects how scan traffic reaches the configured egress
+	// proxy when traffic recording (MITM) is OFF:
+	//   auto (default) — platform-internal forward-only router; containers keep
+	//                    their env and a task's proxy change applies to the
+	//                    next connection without recreating anything;
+	//   off            — legacy behaviour: recording off means direct egress,
+	//                    and a container task-proxy change needs the next Run.
+	EgressRouter string // XALGORIX_EGRESS_ROUTER
 
 	// Goal analysis (REDESIGN §3.1, R-goal): the round-0 intent analysis that
 	// turns a task's unstructured goal into a decidable objective before the
@@ -628,6 +652,8 @@ func load() *Config {
 		DisableAutoDelegate:      envOrBool("XALGORIX_DISABLE_AUTO_DELEGATE", false),
 		EnableCTFDelegate:        envOrBool("XALGORIX_ENABLE_CTF_DELEGATE", false),
 		DisabledSpecialists:      envOrStringSlice("XALGORIX_DISABLED_SPECIALISTS"),
+		Orchestrator:             envOr("XALGORIX_ORCHESTRATOR", "planner_worker"),
+		WorkerConcurrency:        envOrInt("XALGORIX_WORKER_CONCURRENCY", 3),
 		Checklist:                envOrChecklist(envOr("XALGORIX_CHECKLIST", "full")),
 		LLMProfile:               envOr("XALGORIX_LLM_PROFILE", ""),
 		ReasoningEffort:          envOr("XALGORIX_REASONING_EFFORT", "high"),
@@ -669,6 +695,7 @@ func load() *Config {
 		HostDataDir:              envOr("XALGORIX_HOST_DATA_DIR", ""),
 		ToolboxImage:             envOr("XALGORIX_TOOLBOX_IMAGE", ""),
 		ToolboxProfile:           envOr("XALGORIX_TOOLBOX_PROFILE", "core"),
+		ToolboxNetworkMode:       normalizeToolboxNetworkMode(envOr("XALGORIX_TOOLBOX_NETWORK_MODE", "internal")),
 		ToolboxBrowserProxy:      envOr("XALGORIX_TOOLBOX_BROWSER_PROXY", ""),
 		ToolboxProxyURL:          envOr("XALGORIX_TOOLBOX_PROXY_URL", ""),
 		MaxProjects:              envOrInt("XALGORIX_MAX_PROJECTS", 0),
@@ -688,36 +715,37 @@ func load() *Config {
 
 		// HITL approval pipeline (REDESIGN §5 / D5). Mode default "off":
 		// enforce requires an explicit operator choice (see struct comment).
-		ApprovalMode:            normalizeApprovalMode(envOr("XALGORIX_APPROVAL_MODE", "off")),
-		ApprovalTimeoutSeconds:  envOrInt("XALGORIX_APPROVAL_TIMEOUT", 600),
-		ApprovalAllowlist:       envOr("XALGORIX_APPROVAL_ALLOWLIST", ""),
-		ApprovalMaxPending:      envOrInt("XALGORIX_APPROVAL_MAX_PENDING", 1),
-		VOIWeight:               envOrFloat("XALGORIX_VOI_WEIGHT", 0),
-		legacyCWD:               cwd,
-		DisableBrowser:          envOrBool("XALGORIX_DISABLE_BROWSER", false),
-		MaxIterations:           envOrInt("XALGORIX_MAX_ITERATIONS", 0),
-		DwellMaxCalls:           envOrInt("XALGORIX_DWELL_MAX_CALLS", 0),
-		MinIterations:           envOrInt("XALGORIX_MIN_ITERATIONS", 50),
-		IterationDelaySec:       envOrFloat("XALGORIX_ITERATION_DELAY", 0),
-		MaxWildcardSubdomains:   envOrInt("XALGORIX_MAX_WILDCARD_SUBDOMAINS", -1),
-		NoToolAbortAt:           envOrInt("XALGORIX_NO_TOOL_ABORT_AT", 30),
-		MaxFinishRejections:     envOrInt("XALGORIX_MAX_FINISH_REJECTIONS", 15),
-		TargetAuth:              envOr("XALGORIX_TARGET_AUTH", ""),
-		TargetAuthSecondary:     envOr("XALGORIX_TARGET_AUTH_B", ""),
-		OOBPublicURL:            envOr("XALGORIX_OOB_PUBLIC_URL", ""),
-		OOBPort:                 envOrInt("XALGORIX_OOB_PORT", 0),
-		InteractshServer:        envOr("XALGORIX_INTERACTSH_SERVER", ""),
-		InteractshToken:         envOr("XALGORIX_INTERACTSH_TOKEN", ""),
-		OOBDisable:              envOrBool("XALGORIX_OOB_DISABLE", false),
-		OOBInteractions:         envOr("XALGORIX_OOB_INTERACTIONS", ""),
-		SourceRepo:              envOr("XALGORIX_SOURCE_REPO", ""),
-		ScanContext:             envOr("XALGORIX_SCAN_CONTEXT", ""),
-		ScanHeaders:             loadScanHeaders(),
-		MaxToolCalls:            envOrInt("XALGORIX_MAX_TOOL_CALLS", 0),
-		MaxDurationSec:          envOrInt("XALGORIX_MAX_DURATION", 0),
-		MaxTokens:               envOrInt("XALGORIX_MAX_TOKENS", 0),
-		MaxNonProgressSec:       envOrInt("XALGORIX_MAX_NON_PROGRESS", 3600),
-		PlanCompleteFindingIdle: envOrInt("XALGORIX_PLAN_COMPLETE_IDLE", 0),
+		ApprovalMode:                normalizeApprovalMode(envOr("XALGORIX_APPROVAL_MODE", "off")),
+		ApprovalTimeoutSeconds:      envOrInt("XALGORIX_APPROVAL_TIMEOUT", 600),
+		ApprovalAllowlist:           envOr("XALGORIX_APPROVAL_ALLOWLIST", ""),
+		ApprovalMaxPending:          envOrInt("XALGORIX_APPROVAL_MAX_PENDING", 1),
+		ApprovalStoreTimeoutSeconds: envOrInt("XALGORIX_APPROVAL_STORE_TIMEOUT", 30),
+		VOIWeight:                   envOrFloat("XALGORIX_VOI_WEIGHT", 0),
+		legacyCWD:                   cwd,
+		DisableBrowser:              envOrBool("XALGORIX_DISABLE_BROWSER", false),
+		MaxIterations:               envOrInt("XALGORIX_MAX_ITERATIONS", 0),
+		DwellMaxCalls:               envOrInt("XALGORIX_DWELL_MAX_CALLS", 0),
+		MinIterations:               envOrInt("XALGORIX_MIN_ITERATIONS", 50),
+		IterationDelaySec:           envOrFloat("XALGORIX_ITERATION_DELAY", 0),
+		MaxWildcardSubdomains:       envOrInt("XALGORIX_MAX_WILDCARD_SUBDOMAINS", -1),
+		NoToolAbortAt:               envOrInt("XALGORIX_NO_TOOL_ABORT_AT", 30),
+		MaxFinishRejections:         envOrInt("XALGORIX_MAX_FINISH_REJECTIONS", 15),
+		TargetAuth:                  envOr("XALGORIX_TARGET_AUTH", ""),
+		TargetAuthSecondary:         envOr("XALGORIX_TARGET_AUTH_B", ""),
+		OOBPublicURL:                envOr("XALGORIX_OOB_PUBLIC_URL", ""),
+		OOBPort:                     envOrInt("XALGORIX_OOB_PORT", 0),
+		InteractshServer:            envOr("XALGORIX_INTERACTSH_SERVER", ""),
+		InteractshToken:             envOr("XALGORIX_INTERACTSH_TOKEN", ""),
+		OOBDisable:                  envOrBool("XALGORIX_OOB_DISABLE", false),
+		OOBInteractions:             envOr("XALGORIX_OOB_INTERACTIONS", ""),
+		SourceRepo:                  envOr("XALGORIX_SOURCE_REPO", ""),
+		ScanContext:                 envOr("XALGORIX_SCAN_CONTEXT", ""),
+		ScanHeaders:                 loadScanHeaders(),
+		MaxToolCalls:                envOrInt("XALGORIX_MAX_TOOL_CALLS", 0),
+		MaxDurationSec:              envOrInt("XALGORIX_MAX_DURATION", 0),
+		MaxTokens:                   envOrInt("XALGORIX_MAX_TOKENS", 0),
+		MaxNonProgressSec:           envOrInt("XALGORIX_MAX_NON_PROGRESS", 3600),
+		PlanCompleteFindingIdle:     envOrInt("XALGORIX_PLAN_COMPLETE_IDLE", 0),
 
 		// Scan retention: 0 disables automatic pruning (keep forever).
 		ScanRetentionDays: envOrInt("XALGORIX_SCAN_RETENTION_DAYS", 0),
@@ -798,6 +826,7 @@ func load() *Config {
 		CADir:                 envOr("XALGORIX_CA_DIR", filepath.Join(xalgorixHome, "ca")),
 		TrafficProxyBind:      envOr("XALGORIX_TRAFFICPROXY_BIND", "127.0.0.1:0"),
 		TrafficProxyAdvertise: envOr("XALGORIX_TRAFFICPROXY_ADVERTISE", ""),
+		EgressRouter:          envOr("XALGORIX_EGRESS_ROUTER", "auto"),
 
 		// Goal analysis (R-goal): automatic round-0 analysis at task run
 		// start, default ON (see field comment).
@@ -812,6 +841,18 @@ func load() *Config {
 		// (sensitive home and system paths plus the scanner's own
 		// credential files); user list extends them.
 		ReadDenyList: resolveReadDenyList(home, dataDir, os.Getenv("XALGORIX_READ_DENY_LIST")),
+	}
+
+	// R7 orchestrator bounds: the worker pool is 1..10, and an unknown mode
+	// falls back to legacy (the operator must opt in explicitly).
+	if cfg.WorkerConcurrency < 1 {
+		cfg.WorkerConcurrency = 1
+	}
+	if cfg.WorkerConcurrency > 10 {
+		cfg.WorkerConcurrency = 10
+	}
+	if cfg.Orchestrator == "" {
+		cfg.Orchestrator = "legacy"
 	}
 
 	// Debug: show loaded config so users can verify correct env was picked up.
@@ -1062,6 +1103,20 @@ func normalizeRuntimeBackend(v string) string {
 	default:
 		log.Printf("[config] WARN unknown XALGORIX_RUNTIME_BACKEND=%q; falling back to native", v)
 		return "native"
+	}
+}
+
+// normalizeToolboxNetworkMode clamps XALGORIX_TOOLBOX_NETWORK_MODE onto
+// internal|host. Unknown values fall back to internal (proxy-only egress).
+func normalizeToolboxNetworkMode(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "host", "hostnetwork", "host-network":
+		return "host"
+	case "", "internal", "bridge":
+		return "internal"
+	default:
+		log.Printf("[config] WARN unknown XALGORIX_TOOLBOX_NETWORK_MODE=%q; using internal", v)
+		return "internal"
 	}
 }
 

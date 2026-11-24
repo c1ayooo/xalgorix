@@ -34,8 +34,10 @@ import (
 	"github.com/c1ayooo/xalgorix/v4/internal/auth"
 	"github.com/c1ayooo/xalgorix/v4/internal/config"
 	"github.com/c1ayooo/xalgorix/v4/internal/goalanalysis"
+	"github.com/c1ayooo/xalgorix/v4/internal/imhub"
 	"github.com/c1ayooo/xalgorix/v4/internal/infoitem"
 	"github.com/c1ayooo/xalgorix/v4/internal/llm"
+	"github.com/c1ayooo/xalgorix/v4/internal/orchestrator"
 	"github.com/c1ayooo/xalgorix/v4/internal/platform"
 	"github.com/c1ayooo/xalgorix/v4/internal/platformutil"
 	"github.com/c1ayooo/xalgorix/v4/internal/providers"
@@ -448,6 +450,10 @@ type ScanRequest struct {
 	// the objective (used for the human-sourced InfoItem). Internal only.
 	ObjectiveProjectID string `json:"-"`
 	ObjectiveTaskID    string `json:"-"`
+	// AuditMode is the task's effective HITL posture snapshotted at dispatch
+	// ("off" | "enforce", empty = process default). Internal only — a wire
+	// request can never raise or lower the gate for its own run.
+	AuditMode string `json:"-"`
 	// ObjectiveGoal / ObjectiveInstruction are the task's RAW goal and
 	// execution notes — the round-0 analyzer's input when Objective is nil
 	// (R-goal, goal_analysis.go roundZeroGoalAnalysis). Internal only; set by
@@ -464,6 +470,14 @@ type ScanRequest struct {
 	// per Requirement 11.4.
 	// Validates: Requirements 11.1, 11.2, 11.5.
 	ProviderProfile string `json:"provider_profile,omitempty"`
+	// ProviderProfileChain is the task's ordered model chain, active entry
+	// first. Internal only (set by the task run entries): a length > 1 installs
+	// a ChainResolver so quota/auth failures advance to the next profile.
+	ProviderProfileChain []string `json:"-"`
+	// Proxy is the task-level outbound proxy pin ("" inherit, "direct", "N").
+	// Internal only: set by the task run entries and snapshotted onto the
+	// session's ScanContext as a per-run upstream policy.
+	Proxy string `json:"-"`
 	// DispatchID is an optional caller-owned idempotency key for control-plane
 	// dispatch. It is validated and reserved before the goroutine starts; the
 	// internal InstanceID remains wire-inaccessible for resume safety.
@@ -521,9 +535,15 @@ type WSEvent struct {
 	// (live SSE frames only). It anchors SSE Last-Event-ID resumption; REST
 	// history entries and persisted journal records leave it unset — live
 	// ordering only, not a storage field.
-	Seq            uint64            `json:"seq,omitempty"`
-	Type           string            `json:"type"`
-	Content        string            `json:"content,omitempty"`
+	Seq     uint64 `json:"seq,omitempty"`
+	Type    string `json:"type"`
+	Content string `json:"content,omitempty"`
+	// MessageID/Delta carry one streamed assistant turn: every assistant_delta
+	// plus the closing assistant_done share MessageID, and Delta is the
+	// incremental text. Live clients key their streaming bubble on MessageID;
+	// the durable transcript folds assistant_done into the final row.
+	MessageID      string            `json:"message_id,omitempty"`
+	Delta          string            `json:"delta,omitempty"`
 	ToolName       string            `json:"tool_name,omitempty"`
 	ToolArgs       map[string]string `json:"tool_args,omitempty"`
 	Output         string            `json:"output,omitempty"`
@@ -589,6 +609,15 @@ type VulnSummary struct {
 	VerificationMethod string                     `json:"verification_method,omitempty"`
 	Verified           bool                       `json:"verified"`
 	Tags               []string                   `json:"tags,omitempty"`
+	// FoundAt is when report_vulnerability accepted the finding (the
+	// reporting store's Timestamp). scan_started_at says when the RUN began,
+	// which for a long assessment is hours older than the finding itself — so
+	// project-level views sort and label by FoundAt, falling back to
+	// scan_started_at for rows persisted before this field existed.
+	FoundAt string `json:"found_at,omitempty"`
+	// TrafficRefs pins the raw MITM archive packets (session + sequence) that
+	// backed this finding when it was reported.
+	TrafficRefs []scanctx.TrafficRef `json:"traffic_refs,omitempty"`
 }
 
 // SubScanSummary is a child target scanned as part of a wildcard parent scan.
@@ -752,6 +781,18 @@ type QueueState struct {
 	Iterations            int      `json:"iterations,omitempty"`
 	TotalTokens           int      `json:"total_tokens,omitempty"`
 	ToolCalls             int      `json:"tool_calls,omitempty"`
+
+	// Task/run coordinates. These are internal (never wire-settable) but MUST
+	// survive an interrupted-scan auto-resume: losing them re-creates the
+	// ScanContext without a project, which silently disables project-scoped
+	// features (asset ingestion, cross-scan cold-path whitelist, task
+	// objective projection) and drops the task's HITL posture.
+	Objective            *platform.Objective `json:"objective,omitempty"`
+	ObjectiveProjectID   string              `json:"objective_project_id,omitempty"`
+	ObjectiveTaskID      string              `json:"objective_task_id,omitempty"`
+	ObjectiveGoal        string              `json:"objective_goal,omitempty"`
+	ObjectiveInstruction string              `json:"objective_instruction,omitempty"`
+	AuditMode            string              `json:"audit_mode,omitempty"`
 }
 
 // ScanInstance represents a running or completed scan instance.
@@ -810,14 +851,19 @@ type ScanInstance struct {
 	// walk. SubScans intentionally omits `omitempty`: an empty array is the
 	// capability marker SaaS uses to distinguish upgraded scanners from older
 	// versions that cannot safely finalize wildcard scans from this endpoint.
-	SubScans                []SubScanSummary `json:"sub_scans"`
-	SubScanTotal            int              `json:"sub_scan_total"`
-	SubScanCompleted        int              `json:"sub_scan_completed"`
-	SubScanRunning          int              `json:"sub_scan_running"`
-	SubScanRemaining        int              `json:"sub_scan_remaining"`
-	Discovery               *SubScanSummary  `json:"discovery,omitempty"`
-	SubScanSkipped          int              `json:"sub_scan_skipped,omitempty"`
-	WorkStarted             bool             `json:"work_started"` // true once any agent session is admitted
+	SubScans         []SubScanSummary `json:"sub_scans"`
+	SubScanTotal     int              `json:"sub_scan_total"`
+	SubScanCompleted int              `json:"sub_scan_completed"`
+	SubScanRunning   int              `json:"sub_scan_running"`
+	SubScanRemaining int              `json:"sub_scan_remaining"`
+	Discovery        *SubScanSummary  `json:"discovery,omitempty"`
+	SubScanSkipped   int              `json:"sub_scan_skipped,omitempty"`
+	WorkStarted      bool             `json:"work_started"` // true once any agent session is admitted
+	// Container is a read-only per-request projection of this instance's
+	// toolbox project container. It is populated by GET /api/instances only
+	// (never persisted and never authoritative on its own): actual state comes
+	// from the container runtime, desired state from PG toolbox_projects.
+	Container               *InstanceContainerStatus `json:"container,omitempty"`
 	agent                   *agent.Agent
 	cancel                  context.CancelFunc
 	scanDir                 string
@@ -902,11 +948,14 @@ var dashboardRoutes = []string{
 	"/api/upload-source",
 	"/uploads/logos/",
 	"/api/report/",
+	"/api/reports",
+	"/api/reports/",
 	"/api/settings/rate-limit",
 	"/api/settings/llm",
 	"/api/settings/llm/keys",
 	"/api/settings/llm/test-route",
 	"/api/pool",
+	"/api/proxies",
 	"/api/pool/reset",
 	"/api/settings/environment",
 	"/api/queue/status",
@@ -964,8 +1013,11 @@ var dashboardRoutes = []string{
 	"/api/tools",
 	"/api/tools/invocations",
 
-	// User skills (operator-authored methodology, API_CONTRACT §integration-skills).
+	// User skills (operator-authored methodology, API_CONTRACT §integration-skills)
+	// + the read-only built-in corpus projection (list/detail).
 	"/api/skills",
+	"/api/skills/builtin",
+	"/api/skills/builtin/",
 	"/api/skills/",
 
 	// Agent delegation profiles (builtin rows merged read-only,
@@ -1008,6 +1060,8 @@ func registerPlatformAPIRoutes(mux *http.ServeMux, s *Server) {
 	mux.HandleFunc("/api/runtime", s.handleRuntime)
 
 	mux.HandleFunc("/api/skills", s.handleSkills)
+	mux.HandleFunc("/api/skills/builtin", s.handleBuiltinSkills)
+	mux.HandleFunc("/api/skills/builtin/", s.handleBuiltinSkillDetail)
 	mux.HandleFunc("/api/skills/", s.handleSkillDetail)
 
 	mux.HandleFunc("/api/agent-profiles", s.handleAgentProfiles)
@@ -1031,7 +1085,9 @@ type Server struct {
 	streamMu        sync.Mutex
 	streamRing      []sseRingEntry
 	currentAgents   map[string]*agent.Agent // scanID → agent (replaces singleton currentAgent)
-	cancelScan      context.CancelFunc      // cancels the current scan session context
+	workerPoolsMu   sync.Mutex
+	workerPools     map[string]*orchestrator.Pool // instanceID → live planner/worker pool (hot resize)
+	cancelScan      context.CancelFunc            // cancels the current scan session context
 	running         atomic.Bool
 	stopReq         atomic.Bool
 	restartWhenIdle atomic.Bool  // SIGUSR1 sets this; a watcher restarts once scans drain
@@ -1077,13 +1133,23 @@ type Server struct {
 	// call over a point-in-time scan snapshot. Same resolver decision order
 	// as postScanChatFn; the caller's context carries the answer deadline.
 	scanQuestionFn func(ctx context.Context, systemPrompt, userMessage string) (string, error)
+	// reportNarrativeFn is the optional report-writing agent call
+	// (report_agent.go). Same resolver decision order as the other web-layer
+	// LLM closures; model overrides the configured model when non-empty.
+	// nil ⇒ agent mode falls back to the deterministic template.
+	reportNarrativeFn func(ctx context.Context, systemPrompt, userMessage, model string) (string, error)
 	// questionsMu/questionsInFlight gate one in-flight side-question per run
 	// (4zreco chatBusy semantics — 409 on double-submit, no queueing).
 	questionsMu       sync.Mutex
 	questionsInFlight map[string]struct{}
-	schedulesMu       sync.RWMutex
-	schedules         map[string]*ScanSchedule
-	shutdownChan      chan struct{}
+	// guidanceDeliveredMu/guidanceDelivered make R7 main-chat guidance delivery
+	// exactly-once inside this process: the session-start drain and a guidance
+	// POST that raced the agent attach can both observe the same queued row.
+	guidanceDeliveredMu sync.Mutex
+	guidanceDelivered   map[string]struct{}
+	schedulesMu         sync.RWMutex
+	schedules           map[string]*ScanSchedule
+	shutdownChan        chan struct{}
 	// scanListCache memoizes the built GET /api/scans list for a few seconds
 	// so paging/filtering/polling don't each re-walk the whole data dir.
 	scanListCacheMu sync.Mutex
@@ -1115,6 +1181,19 @@ type Server struct {
 	// (charter §6.6). Wired via SetPlatformStore.
 	platformStoreMu sync.RWMutex
 	platformStore   platform.Repository
+	// imHub is the inbound IM gateway (Feishu/DingTalk/WeCom/Telegram). nil =
+	// no channel configured; the WeCom callback then answers 503.
+	imMu  sync.RWMutex
+	imHub *imhub.Hub
+	// liveRuns holds the in-process planner/pool/agent handles of running
+	// sessions so a task edit can be applied hot (task_config_live.go).
+	liveRunsMu sync.RWMutex
+	liveRuns   map[string]*liveRunHandles
+	// reportJobs tracks in-process manual report generations
+	// (REPORT_DELIVERY_SPEC §9). Durable status lives in the platform
+	// ReportStore; this map only carries the cancel func and live progress.
+	reportJobsMu sync.Mutex
+	reportJobs   map[string]*reportJob
 	// approvalSvc drives the HITL approval gate (R2a, REDESIGN §5) — policy,
 	// slot accounting, WS broadcasting. nil (mode off / not constructed)
 	// leaves registries ungated. Constructed in NewServer; replaceable via
@@ -1213,6 +1292,7 @@ func NewServer(cfg *config.Config, port int) *Server {
 		port:                   port,
 		clients:                make(map[*sseClient]bool),
 		currentAgents:          make(map[string]*agent.Agent),
+		workerPools:            make(map[string]*orchestrator.Pool),
 		dataDir:                dataDir,
 		discordWebhook:         cfg.DiscordWebhook,
 		discordMinSeverity:     strings.ToLower(strings.TrimSpace(cfg.DiscordMinSeverity)),
@@ -1341,6 +1421,33 @@ func NewServer(cfg *config.Config, port int) *Server {
 		resolver := llm.NewCompositeResolver(opts...)
 		client := llm.NewClient(cfg, llm.WithResolver(resolver))
 		client.SetContext(ctx)
+		return client.Chat([]llm.Message{
+			{Role: "system", Content: systemPrompt},
+			{Role: "user", Content: userMessage},
+		})
+	}
+
+	// Wire reportNarrativeFn (REPORT_DELIVERY_SPEC §8): the optional
+	// report-writing agent. It is only invoked from a manual generation job in
+	// agent mode; nil or an error falls back to the deterministic template.
+	srv.reportNarrativeFn = func(ctx context.Context, systemPrompt, userMessage, model string) (string, error) {
+		cfg := srv.configSnapshot()
+		if cfg == nil {
+			return "", fmt.Errorf("report agent: no configuration available")
+		}
+		callCfg := *cfg
+		if strings.TrimSpace(model) != "" {
+			callCfg.LLM = strings.TrimSpace(model)
+		}
+		opts := []llm.ResolverOption{}
+		if srv.catalog != nil && srv.profiles != nil {
+			opts = append(opts, llm.WithCatalog(srv.catalog, srv.profiles))
+		}
+		opts = append(opts, llm.WithLegacy(&callCfg))
+		resolver := llm.NewCompositeResolver(opts...)
+		client := llm.NewClient(&callCfg, llm.WithResolver(resolver))
+		client.SetContext(ctx)
+		client.SetTemperature(agent.TempReporter)
 		return client.Chat([]llm.Message{
 			{Role: "system", Content: systemPrompt},
 			{Role: "user", Content: userMessage},
@@ -1489,6 +1596,8 @@ func (s *Server) Start() error {
 
 	// Start the background scheduler
 	go s.startScheduler()
+	// Hot worker-concurrency watcher: env-file edits resize live pools.
+	s.startWorkerConcurrencyWatcher()
 
 	// Start the scan-retention sweeper. It self-disables (returns
 	// immediately) when XALGORIX_SCAN_RETENTION_DAYS is 0, so this is a
@@ -1550,6 +1659,10 @@ func (s *Server) Start() error {
 		fileServer.ServeHTTP(w, r)
 	})
 	mux.HandleFunc("/api/stream", s.handleEventStream)
+	// Inbound IM callback (enterprise WeChat). Self-verifying endpoint: exempt
+	// from session auth and CSRF (see auth_session.go); the hub validates the
+	// signature and decrypts with the configured token/AES key.
+	mux.HandleFunc(imhub.WecomCallbackPath, s.handleIMWecomCallback)
 	mux.HandleFunc("/api/scan", s.handleScan)
 	mux.HandleFunc("/api/stop", s.handleStop)
 	mux.HandleFunc("/api/restart", s.handleRestart)
@@ -1571,6 +1684,12 @@ func (s *Server) Start() error {
 		}
 		if strings.Contains(r.URL.Path, "/vulns/") && r.Method == http.MethodDelete {
 			s.handleDeleteVuln(w, r)
+			return
+		}
+		// GET /api/scans/{id}/findings/{vulnId}/export?format=md|html|json —
+		// single-vulnerability SRC export with sanitized HTTP raw evidence.
+		if strings.Contains(r.URL.Path, "/findings/") && strings.HasSuffix(r.URL.Path, "/export") && r.Method == http.MethodGet {
+			s.handleFindingExport(w, r)
 			return
 		}
 		// GET /api/scans/{id}/token-usage — token-attribution diagnostics
@@ -1612,6 +1731,33 @@ func (s *Server) Start() error {
 			s.handleScanPlan(w, r)
 			return
 		}
+		// GET/POST /api/scans/{id}/decisions — the operator decision inbox
+		// (read-only stalled/blocked/open/deviations projection + the four
+		// bounded decision actions). Never an event-stream subscription;
+		// handlers_decision_inbox.go.
+		if strings.HasSuffix(r.URL.Path, "/decisions") {
+			s.handleScanDecisions(w, r)
+			return
+		}
+		// GET /api/scans/{id}/graph/validate — full read-only conformance
+		// report (invariants, severities, truncation). Must be checked before
+		// the /graph suffix handler.
+		if strings.HasSuffix(r.URL.Path, "/graph/validate") && r.Method == http.MethodGet {
+			s.handleScanGraphValidate(w, r)
+			return
+		}
+		// GET /api/scans/{id}/graph — read-only dual-graph projection
+		// (exploration nodes/edges + counters; the graph is the authority).
+		if strings.HasSuffix(r.URL.Path, "/graph") && r.Method == http.MethodGet {
+			s.handleScanGraph(w, r)
+			return
+		}
+		// GET /api/scans/{id}/assets — assets linked to this run, read from
+		// the project-scoped asset graph authority.
+		if strings.HasSuffix(r.URL.Path, "/assets") && r.Method == http.MethodGet {
+			s.handleScanAssets(w, r)
+			return
+		}
 		// GET /api/scans/{id}/exploration — read-only exploration projection
 		// (shared node/edge model for the 探索链路 graph + 播报板 stream;
 		// scan_exploration.go). Checked before the generic detail handler.
@@ -1624,6 +1770,12 @@ func (s *Server) Start() error {
 		// window), the packets the findings UI renders (scan_traffic.go).
 		if strings.HasSuffix(r.URL.Path, "/traffic") && r.Method == http.MethodGet {
 			s.handleScanTraffic(w, r)
+			return
+		}
+		// GET /api/scans/{id}/findings/{fid}/evidence[/{sid}/body] — immutable
+		// sha256-verified snapshots pinned by the report gate (scan_evidence.go).
+		if strings.Contains(r.URL.Path, "/findings/") && strings.Contains(r.URL.Path, "/evidence") && r.Method == http.MethodGet {
+			s.handleScanEvidence(w, r)
 			return
 		}
 		// GET /api/scans/{id}/security — read-only security-chain view: guard
@@ -1660,6 +1812,8 @@ func (s *Server) Start() error {
 	_ = os.MkdirAll(logosDir, 0700)
 	mux.Handle("/uploads/logos/", http.StripPrefix("/uploads/logos/", http.FileServer(http.Dir(logosDir))))
 	mux.HandleFunc("/api/report/", s.handleDownloadReport)
+	mux.HandleFunc("/api/reports", s.handleReportRoutes)
+	mux.HandleFunc("/api/reports/", s.handleReportRoutes)
 	mux.HandleFunc("/api/settings/rate-limit", s.handleRateLimit)
 	mux.HandleFunc("/api/settings/llm", s.handleLLMSettings)
 	mux.HandleFunc("/api/settings/llm/keys", s.handleProviderKeys)
@@ -1672,6 +1826,7 @@ func (s *Server) Start() error {
 	// Scoped LLM key-pool API: machine tokens may manage exactly this knob
 	// (masked reads only); the full settings surface stays operator-only.
 	mux.HandleFunc("/api/pool", s.handleKeyPool)
+	mux.HandleFunc("/api/proxies", s.handleProxyList)
 	mux.HandleFunc("/api/pool/reset", s.handleKeyPoolReset)
 	mux.HandleFunc("/api/queue/status", s.handleQueueStatus)
 	mux.HandleFunc("/api/queue/resume", s.handleQueueResume)
@@ -2792,6 +2947,23 @@ func severityRankValue(severity string) int {
 	}
 }
 
+// findingRecency is when the finding itself was reported, falling back to the
+// owning run's start for rows persisted before FoundAt existed (and for
+// projections that predate it). Parsed rather than string-compared: RFC3339
+// values with different UTC offsets do not sort lexicographically.
+func findingRecency(foundAt, scanStartedAt string) time.Time {
+	for _, raw := range []string{foundAt, scanStartedAt} {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		if t, err := time.Parse(time.RFC3339, raw); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
+}
+
 // handleFindingsList returns every finding flattened across all scans, deduped
 // by findingContentKey (title, target, endpoint, method, cve) and sorted by
 // severity desc then scan_started_at desc. This replaces the previous WebUI behavior of fetching
@@ -2840,7 +3012,12 @@ func (s *Server) handleFindingsList(w http.ResponseWriter, r *http.Request) {
 		if ri != rj {
 			return ri > rj
 		}
-		return findings[i].ScanStartedAt > findings[j].ScanStartedAt
+		// Same severity → newest REPORTED first. scan_started_at is the run's
+		// start (hours old on a long assessment), so it must not decide
+		// recency: a finding reported a minute ago would sink below every
+		// finding reported at run start.
+		return findingRecency(findings[i].FoundAt, findings[i].ScanStartedAt).
+			After(findingRecency(findings[j].FoundAt, findings[j].ScanStartedAt))
 	})
 
 	w.Header().Set("Content-Type", "application/json")
@@ -2907,9 +3084,13 @@ func (s *Server) handleInstances(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	s.instancesMu.RLock()
 	instances := make([]*ScanInstance, 0, len(s.instances))
+	// projectIDs maps each list copy to its toolbox project (session/scan ID).
+	// It is captured under the same lock as the copy so the projection never
+	// reads a half-swapped session after admission/finalize.
+	projectIDs := make(map[*ScanInstance]string, len(s.instances))
 	for _, inst := range s.instances {
 		inst.mu.RLock()
-		instances = append(instances, &ScanInstance{
+		listed := &ScanInstance{
 			AssessmentProgress:  inst.AssessmentProgress,
 			ID:                  inst.ID,
 			Name:                inst.Name,
@@ -2947,7 +3128,9 @@ func (s *Server) handleInstances(w http.ResponseWriter, r *http.Request) {
 			SubScanCompleted:    inst.SubScanCompleted,
 			SubScanRunning:      inst.SubScanRunning,
 			SubScanRemaining:    inst.SubScanRemaining,
-		})
+		}
+		projectIDs[listed] = instanceProjectIDLocked(inst)
+		instances = append(instances, listed)
 		inst.mu.RUnlock()
 	}
 	s.instancesMu.RUnlock()
@@ -3058,6 +3241,11 @@ func (s *Server) handleInstances(w http.ResponseWriter, r *http.Request) {
 	if instances == nil {
 		instances = []*ScanInstance{}
 	}
+	// Attach the read-only container projection for the current page only:
+	// one runtime enumeration plus one batched desired-state read, never a
+	// per-card inspect. Failures degrade to "no line" instead of failing the
+	// instance list.
+	attachInstanceContainers(r.Context(), instances, projectIDs, now)
 
 	// Include resource stats so the UI can explain why scans are pending
 	stats := resources.GetStats()
@@ -3160,6 +3348,19 @@ func (s *Server) handleInstanceAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.handleInstanceAgents(w, r, instanceID)
+		return
+	}
+
+	// GET /api/instances/{id}/container — read-only toolbox container detail
+	// (actual runtime state + PG desired state + image tool inventory). It
+	// never creates, starts, stops, or reconciles a container.
+	if len(parts) >= 2 && parts[1] == "container" {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		s.handleInstanceContainer(w, r, instanceID)
 		return
 	}
 
@@ -3641,11 +3842,18 @@ func (s *Server) handleInstanceAction(w http.ResponseWriter, r *http.Request) {
 // scanSession isolates all per-scan state. Crashes in one session
 // cannot corrupt server-level state or leak into subsequent scans.
 type scanSession struct {
-	id                  string
-	target              string
-	parentTarget        string // parent domain for subdomain scans (wildcard mode)
-	scanDir             string
-	cfg                 *config.Config
+	id           string
+	target       string
+	parentTarget string // parent domain for subdomain scans (wildcard mode)
+	scanDir      string
+	cfg          *config.Config
+	// auditMode is the task's effective HITL posture for this session
+	// ("off" | "enforce", empty = process default); snapshotted from the
+	// dispatching task (ScanRequest.AuditMode) and stamped onto the ScanContext.
+	auditMode string
+	// proxyPin is the task's outbound proxy pin for this session ("" inherit,
+	// "direct", pool index). Resolved into a per-run upstream at start.
+	proxyPin            string
 	agent               *agent.Agent
 	events              chan agent.Event
 	record              *ScanRecord
@@ -3659,7 +3867,6 @@ type scanSession struct {
 	severityFilter      []string
 	discordWebhook      string
 	discoveryMode       bool
-	genReport           bool
 	resetState          bool
 	redispatchFromDir   string               // 1:1 re-dispatch: previous scan dir for continuity copy + replay (REDESIGN D11)
 	instanceID          string               // parent instance ID for multi-instance tracking
@@ -3684,6 +3891,9 @@ type scanSession struct {
 	objective          *platform.Objective
 	objectiveProjectID string
 	objectiveTaskID    string
+	// goal is the operator's raw task goal (tasks.goal). It is the primary
+	// human authority for the planner; objective is derived analysis.
+	goal               string
 	allowLoopbackPorts []int // per-scan loopback allowlist for provision scans (scope-guard exemption)
 
 	// llmClient, when non-nil, is a pre-built llm.Client carrying
@@ -3746,6 +3956,7 @@ func (sess *scanSession) cleanup() {
 			// M-5: drop operator A/B session headers with the Run so
 			// plaintext credentials do not accumulate in process memory.
 			httpclient.ClearSessionAuth(sess.sctx.ID)
+			proxy.ClearScanUpstream(sess.sctx.ID)
 			scanctx.Deactivate(sess.sctx.ID)
 			// Flush the token summary + release the records file before the
 			// wider context teardown.

@@ -77,6 +77,28 @@ func (p RequestRatePolicy) Delay() time.Duration {
 type ScanContext struct {
 	ID      string
 	ScanDir string
+	// InstanceID is the D11 run identity stamped by the session wiring. The
+	// authoritative dual graph is keyed by it so a re-dispatch/sibling
+	// session shares the same plan. It is set once before the scan runs and
+	// only read afterwards.
+	InstanceID string
+	// ProjectID / TaskID are the situational coordinates of this run
+	// (charter §3.1). The asset graph is project-scoped; task links carry the
+	// run provenance. Empty is allowed for CLI/offline runs.
+	ProjectID string
+	TaskID    string
+	// AuditMode is the effective HITL/audit posture snapshotted from the
+	// task's audit_mode at session start: "off" (observe-only) or "enforce"
+	// (approval rows block the call). Empty = follow the process default
+	// (XALGORIX_APPROVAL_MODE). The agent's tool gate and the traffic-proxy
+	// wire gate read this single field, so a task switch cannot leave the two
+	// layers disagreeing.
+	AuditMode string
+	// RequireEvidenceRefs enables the report gate's wire-evidence requirement:
+	// a non-info finding must name a resolvable traffic_refs/evidence_outputs
+	// entry (engine-authoritative proof excepted). Production sessions set it;
+	// unit-test contexts leave it false so synthetic reports stay constructible.
+	RequireEvidenceRefs bool
 
 	Vulns    *VulnStore
 	Notes    *NoteStore
@@ -90,6 +112,17 @@ type ScanContext struct {
 	// Coverage is the live scan-shared endpoint × class matrix. It lets the
 	// coordinator reconcile work executed by parallel delegated specialists.
 	Coverage *CoverageStore
+	// Progress is the in-memory, scan-shared progress ledger projection
+	// (PLANNER_OBSERVATION_AND_CORRECTION §3). It records which worker produced
+	// information-layer increments and when, so kill validation is a fact
+	// check rather than an LLM judgment. It is never persisted and never a
+	// state authority.
+	Progress *ProgressStore
+	// SubmitGuard is the scan-shared platform submission discipline ledger
+	// (BENCHMARK_ROUND5_ANALYSIS §7 P0-2): observed output tail, challenge
+	// catalog and submission budget. It is scratch state for a code-level
+	// guard, never a state authority, and it is never persisted.
+	SubmitGuard *SubmitGuard
 
 	// Tokens tracks per-request token attribution and post-scan efficiency metrics.
 	Tokens *TokenTracker
@@ -112,6 +145,68 @@ type ScanContext struct {
 	requestRatePolicy RequestRatePolicy
 	targetsMu         sync.RWMutex
 	targets           []string
+
+	// assetSeen dedupes observed-asset ingestion within one session. It is
+	// per-scan scratch state, not an authority: the asset graph itself owns
+	// identity. Bounded so a pathological target cannot grow it without limit.
+	assetSeenMu sync.Mutex
+	assetSeen   map[string]struct{}
+
+	// submitGuardMu lazily materializes SubmitGuard on contexts that were not
+	// built by New (test/legacy literals).
+	submitGuardMu sync.Mutex
+}
+
+// EnsureSubmitGuard returns the scan's submission discipline ledger, creating
+// it on demand. Nil for a nil context.
+func (sc *ScanContext) EnsureSubmitGuard() *SubmitGuard {
+	if sc == nil {
+		return nil
+	}
+	sc.submitGuardMu.Lock()
+	defer sc.submitGuardMu.Unlock()
+	if sc.SubmitGuard == nil {
+		sc.SubmitGuard = NewSubmitGuard()
+	}
+	return sc.SubmitGuard
+}
+
+// maxAssetSeen bounds the per-session observed-asset dedupe set. Once full,
+// new identities are skipped for the rest of the session rather than growing
+// unbounded.
+const maxAssetSeen = 4096
+
+// MarkAssetSeen reports whether (kind, key) is new for this session. False for
+// a repeat, a nil context, or a full dedupe set.
+func (sc *ScanContext) MarkAssetSeen(kind, key string) bool {
+	if sc == nil {
+		return false
+	}
+	k := strings.ToLower(strings.TrimSpace(kind)) + "\x00" + strings.ToLower(strings.TrimSpace(key))
+	if k == "\x00" {
+		return false
+	}
+	sc.assetSeenMu.Lock()
+	defer sc.assetSeenMu.Unlock()
+	if sc.assetSeen == nil {
+		sc.assetSeen = make(map[string]struct{})
+	}
+	if _, ok := sc.assetSeen[k]; ok {
+		return false
+	}
+	if len(sc.assetSeen) >= maxAssetSeen {
+		return false
+	}
+	sc.assetSeen[k] = struct{}{}
+	return true
+}
+
+// SetInstanceID stamps the D11 run identity. The authoritative dual graph is
+// keyed by it; a re-dispatch/sibling session therefore shares the same plan.
+func (sc *ScanContext) SetInstanceID(id string) {
+	if sc != nil {
+		sc.InstanceID = strings.TrimSpace(id)
+	}
 }
 
 // New creates a fresh ScanContext for an isolated scan session.
@@ -148,6 +243,8 @@ func New(id, scanDir string) *ScanContext {
 		Browser:     NewBrowserState(),
 		Ledger:      ledger,
 		Coverage:    coverage,
+		Progress:    NewProgressStore(),
+		SubmitGuard: NewSubmitGuard(),
 		Tokens:      tokens,
 		ToolOutputs: NewToolArchive(scanDir),
 		Traffic:     NewTrafficArchive(scanDir),

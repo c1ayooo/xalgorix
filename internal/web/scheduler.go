@@ -698,6 +698,7 @@ func (s *Server) launchDueSchedule(sch ScanSchedule) {
 				req.Objective = task.Objective
 				req.ObjectiveProjectID = task.ProjectID
 				req.ObjectiveTaskID = task.ID
+				req.AuditMode = effectiveTaskAuditMode(task, s.cfg)
 				req.ObjectiveGoal = task.Goal
 				req.ObjectiveInstruction = task.Instruction
 				// Task context files (the project/task upload landing zone)
@@ -1055,7 +1056,9 @@ func (s *Server) dispatchScheduledScan(req ScanRequest, scanCfg *config.Config, 
 			// something readable before the first human message arrives; a
 			// best-effort GetTask keeps the dispatch path unchanged on error.
 			title := ""
-			if task, getErr := store.GetTask(mountCtx, taskID); getErr == nil && task != nil {
+			var task *platform.Task
+			if fetched, getErr := store.GetTask(mountCtx, taskID); getErr == nil && fetched != nil {
+				task = fetched
 				title = conversationTitle(task.Name, time.Now())
 			}
 			_, err := store.CreateRun(mountCtx, taskID, platform.RunMount{
@@ -1068,6 +1071,10 @@ func (s *Server) dispatchScheduledScan(req ScanRequest, scanCfg *config.Config, 
 			if err != nil {
 				log.Printf("[platform] scheduled scan %s accepted but run mount on task %s failed: %v", instanceID, taskID, err)
 			}
+			// The scheduled dispatch consumed the task's current runnable
+			// content exactly like a manual run; stamp the revision so a
+			// trailing manual run still requires an edit. Best-effort.
+			s.recordTaskRunRevision(store, task)
 		}
 	}
 	go s.runMultiScan(req, scanCfg, instanceID)

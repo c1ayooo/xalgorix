@@ -8,9 +8,13 @@ import "github.com/c1ayooo/xalgorix/v4/internal/tools/agentsgraph"
 type DelegatedAgent struct {
 	AgentID string `json:"agent_id"`
 	Lane    string `json:"lane"`
-	Status  string `json:"status"` // queued | running | completed | failed
-	Task    string `json:"task,omitempty"`
-	Target  string `json:"target,omitempty"`
+	// UnitID is the intent this worker owns (pool path only). Panels key
+	// worker lanes by unit so one work unit stays one visible worker across
+	// retries; empty = legacy model-initiated spawn keyed by AgentID.
+	UnitID string `json:"unit_id,omitempty"`
+	Status string `json:"status"` // queued | running | completed | failed
+	Task   string `json:"task,omitempty"`
+	Target string `json:"target,omitempty"`
 	// Started/CompletedAt are RFC3339 UTC; CompletedAt stays empty while the
 	// agent is running or queued.
 	Started        string `json:"started_at,omitempty"`
@@ -56,6 +60,7 @@ func (a *Agent) DelegationSnapshot() DelegationView {
 		view.Agents = append(view.Agents, DelegatedAgent{
 			AgentID:        agent.AgentID,
 			Lane:           agent.Lane,
+			UnitID:         agent.UnitID,
 			Status:         agent.Status,
 			Task:           agent.Task,
 			Target:         agent.Target,
@@ -95,6 +100,7 @@ func DelegationProjectionFromCheckpoint(scanDir string) (DelegationView, bool) {
 		view.Agents = append(view.Agents, DelegatedAgent{
 			AgentID:        agent.AgentID,
 			Lane:           agent.Lane,
+			UnitID:         agent.UnitID,
 			Status:         agent.Status,
 			Task:           agent.Task,
 			Target:         agent.Target,

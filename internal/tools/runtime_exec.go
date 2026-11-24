@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/c1ayooo/xalgorix/v4/internal/config"
+	"github.com/c1ayooo/xalgorix/v4/internal/proxy"
 	"github.com/c1ayooo/xalgorix/v4/internal/resources"
 	toolrt "github.com/c1ayooo/xalgorix/v4/internal/runtime"
 	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
@@ -34,6 +36,11 @@ func ContainerActive() bool { return toolrt.ActiveContainer() != nil }
 
 type ensuredProject struct {
 	at time.Time
+	// proxyURL is the container-reachable per-run proxy URL reported by the
+	// runtime (project-network gateway + run-scoped listener port). The
+	// containerised browser needs it for --proxy-server; empty when the
+	// runtime did not report one.
+	proxyURL string
 }
 
 var (
@@ -102,9 +109,18 @@ func EnsureScanProject(ctx context.Context, sc *scanctx.ScanContext) (toolrt.Dri
 		}
 	}
 	ensuredMu.Lock()
-	ensured[sc.ID] = ensuredProject{at: time.Now()}
+	ensured[sc.ID] = ensuredProject{at: time.Now(), proxyURL: handle.ProxyURL}
 	ensuredMu.Unlock()
 	return drv, nil
+}
+
+// ScanProjectProxyURL reports the container-reachable per-run proxy URL the
+// runtime resolved for a scan ("" when none). The containerised browser uses it
+// as --proxy-server so its traffic is attributed by the run-scoped listener.
+func ScanProjectProxyURL(scanID string) string {
+	ensuredMu.Lock()
+	defer ensuredMu.Unlock()
+	return ensured[scanID].proxyURL
 }
 
 // invalidateProject drops the ensure cache so the next call re-creates.
@@ -136,6 +152,12 @@ func ProjectCDPURL(ctx context.Context, sc *scanctx.ScanContext) (string, error)
 	}
 	proxyURL := strings.TrimSpace(config.Get().ToolboxBrowserProxy)
 	if proxyURL == "" {
+		// Prefer the container-reachable URL of this run's dedicated proxy
+		// listener: it attributes browser traffic without putting a token in
+		// Chromium's process arguments or the persisted project spec.
+		proxyURL = ScanProjectProxyURL(sc.ID)
+	}
+	if proxyURL == "" {
 		if config.Get().ProxyRequired || trafficproxy.Enabled() {
 			// Fail closed: a containerised browser that cannot be told about the
 			// proxy would dial the target directly, bypassing observation and
@@ -154,30 +176,64 @@ func ProjectCDPURL(ctx context.Context, sc *scanctx.ScanContext) (string, error)
 type egressPlan struct {
 	NetProfile string
 	ProxyURL   string
-	CACertPath string
+	// ProxyGatewayPort is set when the proxy is addressed through the project
+	// network's gateway (the platform proxy listens on 0.0.0.0).
+	ProxyGatewayPort int
+	CACertPath       string
 }
 
 // resolveEgress decides how a project container reaches the network.
 //
-// The platform's traffic proxy listens on loopback, which a project container
-// cannot reach, so it is never used as the container's proxy. When a proxy is
-// required (XALGORIX_PROXY_REQUIRED or the traffic proxy enabled) a
-// container-reachable XALGORIX_TOOLBOX_PROXY_URL must be configured; missing it
-// is a hard error rather than a silent direct-egress fallback. An explicitly
-// configured URL always selects the proxy-only network, even when nothing else
-// demands a proxy.
-func resolveEgress(proxyRequired, trafficProxyEnabled bool, toolboxProxyURL, caPath string) (egressPlan, error) {
+// The traffic proxy binds a dedicated per-run listener on the configured bind
+// host (ephemeral port), so container traffic arrives on a port that already
+// implies the run: no bearer token needs to ride the container environment or
+// the persisted project spec, and browser/terminal/Python traffic is still
+// attributed and archived. A loopback bind is unreachable from an --internal
+// project network, so the bind host must be unspecified (0.0.0.0/::). An
+// explicitly configured XALGORIX_TOOLBOX_PROXY_URL still wins and selects the
+// proxy-only network even when nothing else demands a proxy.
+func resolveEgress(scanCtxID string, proxyRequired, trafficProxyEnabled bool, toolboxProxyURL, trafficProxyBind, caPath string) (egressPlan, error) {
 	proxyURL := strings.TrimSpace(toolboxProxyURL)
-	if proxyRequired || trafficProxyEnabled {
-		if proxyURL == "" {
-			return egressPlan{}, fmt.Errorf("tools: XALGORIX_TOOLBOX_PROXY_URL must be set to a container-reachable proxy URL when tool traffic is proxied (the loopback traffic proxy cannot be reached from a project container); refusing to fall back to direct egress")
+	if proxyURL == "" && (proxyRequired || trafficProxyEnabled) {
+		// The platform proxy serves the project network through its gateway:
+		// bind the run's listener on 0.0.0.0 and address it at the project
+		// network's gateway.
+		if !bindReachesProjectGateway(trafficProxyBind) {
+			return egressPlan{}, fmt.Errorf("tools: the traffic proxy is required but not container-reachable: set XALGORIX_TRAFFICPROXY_BIND=0.0.0.0:<port>, or set XALGORIX_TOOLBOX_PROXY_URL to a project-network-reachable proxy; refusing to fall back to direct egress")
 		}
-		return egressPlan{NetProfile: toolrt.NetProfileProxyOnly, ProxyURL: proxyURL, CACertPath: caPath}, nil
+		if _, err := trafficproxy.ListenForScan(scanCtxID); err != nil {
+			return egressPlan{}, fmt.Errorf("tools: bind the run-scoped traffic proxy listener: %w", err)
+		}
+		port, ok := trafficproxy.ScanListenerPort(scanCtxID)
+		if !ok || port <= 0 {
+			return egressPlan{}, fmt.Errorf("tools: the run-scoped traffic proxy listener has no port")
+		}
+		return egressPlan{
+			NetProfile:       toolrt.NetProfileProxyOnly,
+			ProxyGatewayPort: port,
+			CACertPath:       caPath,
+		}, nil
 	}
 	if proxyURL != "" {
 		return egressPlan{NetProfile: toolrt.NetProfileProxyOnly, ProxyURL: proxyURL, CACertPath: caPath}, nil
 	}
 	return egressPlan{NetProfile: toolrt.NetProfileDirect}, nil
+}
+
+// bindReachesProjectGateway reports whether the configured traffic-proxy bind
+// host is reachable from an --internal project network (only an unspecified
+// host is; a loopback or specific-interface bind is not).
+func bindReachesProjectGateway(bind string) bool {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(bind))
+	if err != nil {
+		return false
+	}
+	switch host {
+	case "", "0.0.0.0", "::", "[::]":
+		return true
+	default:
+		return false
+	}
 }
 
 // prepareSharedAssets materialises the shared mount root and makes the
@@ -222,7 +278,26 @@ func prepareSharedAssets(dataDir, caPath string) (sharedRoot, mountedCA string, 
 func buildProjectSpec(sc *scanctx.ScanContext, cfg *config.Config) (toolrt.ProjectSpec, error) {
 	budget := resources.CurrentProjectBudget()
 
-	egress, err := resolveEgress(cfg.ProxyRequired, trafficproxy.Enabled(), cfg.ToolboxProxyURL, trafficproxy.CAPath())
+	// Egress selection for the container is the task's pinned proxy (or the
+	// global pool) when the MITM recorder is off. With interception on, the
+	// container talks to the run-scoped loopback listener, which forwards
+	// through the same pinned egress.
+	containerProxyURL := strings.TrimSpace(cfg.ToolboxProxyURL)
+	hostNetwork := strings.EqualFold(strings.TrimSpace(cfg.ToolboxNetworkMode), "host")
+	if !trafficproxy.Enabled() {
+		if pin, has := proxy.ScanUpstreamFor(sc.ID); has && pin.Direct && cfg.ProxyRequired {
+			return toolrt.ProjectSpec{}, fmt.Errorf("tools: this task pins direct egress but the process requires a proxy")
+		}
+		if containerProxyURL == "" && hostNetwork {
+			if p, direct, ok := proxy.UpstreamFor(sc.ID); ok && !direct && p != nil {
+				if u, err := p.URL(); err == nil {
+					containerProxyURL = u.String()
+				}
+			}
+		}
+	}
+
+	egress, err := resolveEgress(sc.ID, cfg.ProxyRequired, trafficproxy.Enabled(), containerProxyURL, cfg.TrafficProxyBind, trafficproxy.CAPath())
 	if err != nil {
 		return toolrt.ProjectSpec{}, err
 	}
@@ -237,20 +312,27 @@ func buildProjectSpec(sc *scanctx.ScanContext, cfg *config.Config) (toolrt.Proje
 	if prepErr != nil {
 		return toolrt.ProjectSpec{}, prepErr
 	}
+	workerSocket := HTTPWorkerSocketPath(sc.ScanDir)
+	if mkErr := os.MkdirAll(filepath.Dir(workerSocket), 0o750); mkErr != nil {
+		return toolrt.ProjectSpec{}, fmt.Errorf("tools: prepare http worker socket dir: %w", mkErr)
+	}
 
 	// A scan whose source tree is available needs no extra mounts; the same-path
 	// scan directory mount already covers the clone and the artefacts.
 	return toolrt.BuildProject(toolrt.ProjectOptions{
-		InstanceID:   cfg.RuntimeInstanceID(),
-		ScanID:       sc.ID,
-		ScanDir:      sc.ScanDir,
-		SharedDir:    sharedRoot,
-		Image:        cfg.ToolboxImage,
-		Profile:      cfg.ToolboxProfile,
-		NetProfile:   netProfile,
-		ProxyURL:     proxyURL,
-		CACertPath:   mountedCA,
-		BrowserProxy: cfg.ToolboxBrowserProxy,
+		InstanceID:       cfg.RuntimeInstanceID(),
+		ScanID:           sc.ID,
+		ScanDir:          sc.ScanDir,
+		SharedDir:        sharedRoot,
+		Image:            cfg.ToolboxImage,
+		Profile:          cfg.ToolboxProfile,
+		NetProfile:       netProfile,
+		NetworkMode:      cfg.ToolboxNetworkMode,
+		ProxyURL:         proxyURL,
+		ProxyGatewayPort: egress.ProxyGatewayPort,
+		CACertPath:       mountedCA,
+		HTTPWorkerSocket: workerSocket,
+		BrowserProxy:     cfg.ToolboxBrowserProxy,
 		Limits: toolrt.ResourceLimits{
 			MemoryMB:  budget.MemoryMB,
 			CPUQuota:  budget.CPUQuota,

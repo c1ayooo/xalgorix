@@ -162,6 +162,42 @@ func BuiltinSpecialistRoles() []string {
 	return out
 }
 
+// BuiltinSpecialistProfiles returns the code-defined specialists as
+// read-only views for the operator console, carrying the canonical focus,
+// evidence contract, stopping rule and the EFFECTIVE tool-scope hide list.
+// Resolving the effective list here (instead of letting the web layer guess)
+// keeps the console honest: it must match what applyRoleToolScope withholds.
+func BuiltinSpecialistProfiles() []SpecialistProfile {
+	out := make([]SpecialistProfile, 0, len(defaultSpecialistProfiles))
+	for _, p := range defaultSpecialistProfiles {
+		hidden := p.ToolScopeHidden
+		if len(hidden) == 0 {
+			hidden = effectiveRoleToolScope(p.Role)
+		}
+		out = append(out, SpecialistProfile{
+			Role:             p.Role,
+			Focus:            p.Focus,
+			VulnClasses:      append([]string{}, p.VulnClasses...),
+			EvidenceContract: p.EvidenceContract,
+			StoppingRule:     p.StoppingRule,
+			ToolScopeHidden:  append([]string{}, hidden...),
+			Builtin:          true,
+		})
+	}
+	return out
+}
+
+// effectiveRoleToolScope resolves a role's hidden-tool list the way
+// applyRoleToolScope does: canonical agent-type map first, then the Other
+// fallback (covered by the verifier role and unknown custom names).
+func effectiveRoleToolScope(role string) []string {
+	hidden := roleToolScope[determineAgentType(role, true)]
+	if len(hidden) == 0 {
+		hidden = roleToolScope[scanctx.AgentTypeOther]
+	}
+	return hidden
+}
+
 // buildDelegationNudge builds the coordinator's one-time multi-agent
 // decomposition prompt. It assigns work from the shared ledger to the
 // deterministic specialist profiles, each with an evidence contract, and points

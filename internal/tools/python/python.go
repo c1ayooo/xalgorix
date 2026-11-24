@@ -161,7 +161,7 @@ func executePythonForContextCtx(parent context.Context, contextID string, args m
 	// at cmd.Dir, which is now guaranteed to be sc.ScanDir or
 	// cfg.WorkspaceRoot — both Allow_List descendants. That satisfies R8.8.
 	cmdEnv := pythonWorkspaceEnv(cmd.Dir)
-	if config.Get().ProxyRequired || egressproxy.Required() || trafficproxy.Enabled() {
+	if trafficproxy.Enabled() {
 		// EnvironmentForScan embeds the run token as proxy-URL userinfo so the
 		// python child attributes its own traffic via Proxy-Authorization:
 		// Basic (the subprocess channel). No token registered → identical to
@@ -170,6 +170,12 @@ func executePythonForContextCtx(parent context.Context, contextID string, args m
 		if err != nil {
 			return tools.Result{}, fmt.Errorf("required proxy unavailable: %w", err)
 		}
+	} else {
+		egressEnv, eerr := egressproxy.EgressEnv(contextID, config.Get().ProxyRequired)
+		if eerr != nil {
+			return tools.Result{}, fmt.Errorf("required proxy unavailable: %w", eerr)
+		}
+		cmdEnv = append(cmdEnv, egressEnv...)
 	}
 	cmdEnv, err = trafficProxyTLSBundleEnv(cmdEnv, cmd.Dir)
 	if err != nil {

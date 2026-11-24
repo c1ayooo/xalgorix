@@ -212,6 +212,13 @@ func StableEvidenceID(scanID, evidenceID string) string {
 	return "evidence:" + strings.TrimSpace(scanID) + ":" + strings.TrimSpace(evidenceID)
 }
 
+// StableGuidanceID maps one delivered operator-guidance row to a deterministic
+// global identifier. Delivery is at-least-once across process restarts, so the
+// projection must converge on one row.
+func StableGuidanceID(scanID, guidanceID string) string {
+	return "guidance:" + strings.TrimSpace(scanID) + ":" + strings.TrimSpace(guidanceID)
+}
+
 // NewEvidenceItem projects one ledger Evidence instance into an InfoItem.
 func NewEvidenceItem(scanID, evidenceID string, nature Nature, content Content, source Source, subject Subject, observedAt time.Time, seq uint64) Item {
 	if observedAt.IsZero() {
@@ -237,7 +244,9 @@ func NewEvidenceItem(scanID, evidenceID string, nature Nature, content Content, 
 }
 
 // Normalize fills safe defaults without promoting an inferred item to an
-// observation.
+// observation. Coordinate status is recomputed from the dimensions the
+// producers actually supplied; an explicit pending/partial status is preserved
+// so a deliberate enrichment marker is not overwritten.
 func (i *Item) Normalize() {
 	if i == nil {
 		return
@@ -245,13 +254,60 @@ func (i *Item) Normalize() {
 	if i.Nature == "" {
 		i.Nature = NatureInferred
 	}
-	if i.CoordinateStatus == "" {
-		i.CoordinateStatus = CoordinatesComplete
-	}
 	if i.CreatedAt.IsZero() {
 		i.CreatedAt = time.Now().UTC()
 	}
 	if i.Coordinates.ObservedAt.IsZero() {
 		i.Coordinates.ObservedAt = i.CreatedAt
+	}
+	i.DeriveCoordinates()
+	if i.CoordinateStatus == "" || i.CoordinateStatus == CoordinatesComplete {
+		i.CoordinateStatus = i.ClassifyCoordinateStatus()
+	}
+}
+
+// DeriveCoordinates fills the one coordinate a rule can safely derive: the
+// purpose, from an engine-owned source. It never invents content, source or
+// subject — those must come from the producer. An unrecognized source leaves
+// the purpose empty, which ClassifyCoordinateStatus reports as partial rather
+// than pretending the coordinates are complete.
+func (i *Item) DeriveCoordinates() {
+	if i == nil || strings.TrimSpace(i.Coordinates.Purpose) != "" {
+		return
+	}
+	kind := strings.ToLower(strings.TrimSpace(i.Coordinates.Source.Kind))
+	name := strings.ToLower(strings.TrimSpace(i.Coordinates.Source.Name))
+	switch kind {
+	case "trafficproxy":
+		i.Coordinates.Purpose = "traffic_observation"
+	case "report_gate":
+		i.Coordinates.Purpose = "finding"
+	case "human":
+		i.Coordinates.Purpose = "human_input"
+	case "engine":
+		switch name {
+		case "terminal_execute":
+			i.Coordinates.Purpose = "tool_observation"
+		case "prompt-guard":
+			i.Coordinates.Purpose = "injection_suspected"
+		}
+	}
+}
+
+// ClassifyCoordinateStatus derives the completion state from the seven
+// dimensions. It describes annotation completeness only, never truth.
+func (i Item) ClassifyCoordinateStatus() CoordinateStatus {
+	c := i.Coordinates
+	hasContent := strings.TrimSpace(c.Content.Text) != ""
+	hasSource := strings.TrimSpace(c.Source.Kind) != ""
+	hasSubject := strings.TrimSpace(c.Subject.Identifier) != ""
+	hasPurpose := strings.TrimSpace(c.Purpose) != ""
+	switch {
+	case !hasContent && !hasSource && !hasSubject && !hasPurpose:
+		return CoordinatesPending
+	case hasContent && hasSource && hasSubject && hasPurpose && !c.ObservedAt.IsZero():
+		return CoordinatesComplete
+	default:
+		return CoordinatesPartial
 	}
 }

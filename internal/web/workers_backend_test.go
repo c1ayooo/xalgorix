@@ -5,24 +5,29 @@ package web
 // Two seams are pinned here:
 //   - processEvent projects each delegated-agent lifecycle boundary into the
 //     backend (the row the session page reads after the run is gone);
-//   - instanceAgentsView prefers those rows over the graph checkpoint and
-//     merges rows the live graph never saw (sibling sessions of one run).
+//   - instanceAgentsView merges the graph checkpoint (current-session spawn
+//     order) with the durable rows (every session of the run, lifecycle
+//     authority) and never emits a duplicate worker.
 
 import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/c1ayooo/xalgorix/v4/internal/agent"
 	"github.com/c1ayooo/xalgorix/v4/internal/runstate"
 )
 
 type fakeWorkerBackend struct {
-	mu   sync.Mutex
-	rows map[string]runstate.WorkerRecord // key: instance/agent
+	mu            sync.Mutex
+	rows          map[string]runstate.WorkerRecord // key: instance/agent
+	batchCalls    int
+	instanceCalls int
 }
 
 func newFakeWorkerBackend() *fakeWorkerBackend {
@@ -55,6 +60,7 @@ func (f *fakeWorkerBackend) UpsertWorker(_ context.Context, rec runstate.WorkerR
 func (f *fakeWorkerBackend) ListWorkersByInstance(_ context.Context, instanceID string) ([]runstate.WorkerRecord, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.instanceCalls++
 	var out []runstate.WorkerRecord
 	for _, rec := range f.rows {
 		if rec.InstanceID == instanceID {
@@ -62,6 +68,29 @@ func (f *fakeWorkerBackend) ListWorkersByInstance(_ context.Context, instanceID 
 		}
 	}
 	return out, nil
+}
+
+// ListWorkersByInstances is the batch seam handleTaskWorkers uses; the counters
+// let the task-scoped test pin "one query for the whole task".
+func (f *fakeWorkerBackend) ListWorkersByInstances(_ context.Context, instanceIDs []string) (map[string][]runstate.WorkerRecord, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.batchCalls++
+	out := make(map[string][]runstate.WorkerRecord, len(instanceIDs))
+	for _, id := range instanceIDs {
+		for _, rec := range f.rows {
+			if rec.InstanceID == id {
+				out[id] = append(out[id], rec)
+			}
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeWorkerBackend) calls() (batch, instance int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.batchCalls, f.instanceCalls
 }
 
 func (f *fakeWorkerBackend) get(instanceID, agentID string) (runstate.WorkerRecord, bool) {
@@ -228,5 +257,72 @@ func TestInstanceAgentsProjection_MergesHistoryWithCheckpoint(t *testing.T) {
 	}
 	if view.Agents[1].AgentID != "sub_0" || view.Agents[1].Lane != "recon" {
 		t.Fatalf("sibling history row missing: %#v", view.Agents[1])
+	}
+}
+
+// TestInstanceAgentsProjection_RowsAreLifecycleAuthority pins the other half of
+// the merge contract: the checkpoint supplies order and workers PG never saw,
+// but the durable row is the lifecycle authority. A checkpoint written mid-run
+// (status running) must not win over a row that recorded completion, and a
+// checkpoint-only worker whose process died must render failed — never an
+// eternal spinner.
+func TestInstanceAgentsProjection_RowsAreLifecycleAuthority(t *testing.T) {
+	s := newTestServer(t, nil)
+	fake := useFakeWorkerBackend(t)
+	id := "agents-row-authority"
+	dir := ledgerTestScan(t, s, id)
+	checkpoint := `{"version":1,"counter":2,"delegated":2,"agents":[
+		{"id":"sub_1","name":"injection","task":"test sqli","status":"running","started_at":"2026-01-02T00:00:00Z"},
+		{"id":"sub_2","name":"authz","task":"check idor","status":"running","started_at":"2026-01-02T00:01:00Z"}
+	]}`
+	if err := os.WriteFile(filepath.Join(dir, "execution-graph.json"), []byte(checkpoint), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := fake.UpsertWorker(context.Background(), runstate.WorkerRecord{
+		InstanceID: id, ScanID: "sibling", AgentID: "sub_1", Lane: "injection",
+		Task: "test sqli", Status: "completed",
+		StartedAt:  time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC),
+		FinishedAt: time.Date(2026, 1, 2, 0, 10, 0, 0, time.UTC),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	view := s.instanceAgentsView(id)
+	if len(view.Agents) != 2 {
+		t.Fatalf("agents = %d, want 2 (checkpoint order, no duplicate row): %#v", len(view.Agents), view.Agents)
+	}
+	completed := view.Agents[0]
+	if completed.AgentID != "sub_1" || completed.Status != "completed" || completed.CompletedAt == "" {
+		t.Fatalf("row must override the stale checkpoint status: %#v", completed)
+	}
+	orphan := view.Agents[1]
+	if orphan.AgentID != "sub_2" || orphan.Status != "failed" || orphan.Error == "" {
+		t.Fatalf("checkpoint-only stale worker must render failed: %#v", orphan)
+	}
+	if view.Concurrency.Running != 0 || view.Concurrency.Queued != 0 {
+		t.Fatalf("terminal run must not claim live work: %#v", view.Concurrency)
+	}
+}
+
+func TestPersistWorkerLifecycleSanitizesInvalidUTF8(t *testing.T) {
+	s := newTestServer(t, nil)
+	fake := useFakeWorkerBackend(t)
+	sess := &scanSession{id: "scan-utf8", instanceID: "run-utf8"}
+
+	// A truncated multi-byte rune in model-authored task text used to make
+	// PostgreSQL reject the row (SQLSTATE 22021) and lose worker history.
+	s.persistWorkerLifecycle(agent.Event{
+		Type: "agent_started",
+		Meta: map[string]any{
+			"agent_id": "sub_utf8", "lane": "work", "status": "running",
+			"task": "broken \xe7\x2e\x2e payload", "target": "10.0.0.9",
+		},
+	}, sess)
+	rec := waitForWorkerRow(t, fake, "run-utf8", "sub_utf8", "running")
+	if !utf8.ValidString(rec.Task) {
+		t.Fatalf("task stored invalid UTF-8: %q", rec.Task)
+	}
+	if !strings.Contains(rec.Task, "broken") || !strings.Contains(rec.Task, "payload") {
+		t.Fatalf("task content lost: %q", rec.Task)
 	}
 }

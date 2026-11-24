@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/c1ayooo/xalgorix/v4/internal/chains"
 	"github.com/c1ayooo/xalgorix/v4/internal/config"
 	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
 	"github.com/c1ayooo/xalgorix/v4/internal/tools/codesearch"
@@ -60,6 +61,15 @@ func (a *Agent) buildSystemPrompt(targets []string, instruction string, ratePoli
 	rateInt := promptPolicy.CommandRPS()
 	rateDelay := formatRatePolicyDelay(promptPolicy)
 	ratePolicySection := buildRequestRatePolicySection(ratePolicy)
+
+	// Control-plane API lanes run with a tight tool surface (HTTP + notes +
+	// ledger + skills). The offensive prompt below mandates terminal_execute /
+	// browser_action / report_vulnerability, so reuse would make the model call
+	// tools the registry does not contain. Give the lane a prompt that matches
+	// what it can actually do.
+	if a.toolSurface == SurfaceOrchestrator {
+		return a.buildOrchestratorSystemPrompt(targets, instruction, rateInt, rateDelay)
+	}
 
 	// XALGORIX_CHECKLIST: full (22-phase, default) or professional (compact)
 	checklistMode := ""
@@ -447,6 +457,11 @@ You have access to **expert-level vulnerability skills** via the read_skill and 
 		rateInt, rateDelay,
 		toolSchema, strings.Join(targets, "\n"), checklist, a.buildClosingInstruction(instruction))
 
+	// L2 counter-question discipline (internal/chains): a standing self-check
+	// that applies to every scan and both checklist depths. Appended after the
+	// mode-specific checklist so the professional checklist is covered too.
+	prompt = prompt + "\n\n" + chains.Discipline()
+
 	if a.nativeToolCalling {
 		// The embedded reference is 122 lines of XML examples; appending it on
 		// the native channel would contradict the instructions above and cost
@@ -499,11 +514,22 @@ This target is a reproducible local fixture, but treat it exactly like a remote 
 	// Single-agent mode: the system prompt must not instruct the root to
 	// spawn a wave that the configuration disabled. The root owns the full
 	// methodology; every coverage gate applies unchanged.
-	if !a.delegationEnabled() {
+	// State the executable surface explicitly for restricted non-legacy roles.
+	// Without it the model calls delegation/plan tools from the general prompt
+	// that the registry no longer contains — a rejected call per attempt.
+	if a.toolSurface != SurfaceLegacyRoot {
+		prompt = a.restrictedToolSurfaceSection() + "\n\n" + prompt
+	}
+
+	if a.singleAgentPromptMode() {
+		section := "## Single-Agent Mode (specialists disabled)\nSpecialist delegation is disabled for this assessment: the configuration intends ONE agent to perform the complete methodology. Do NOT call spawn_agent or create_agent - no specialist wave will run, and none is required. You personally own every phase: complete reconnaissance (crawl, content discovery, JavaScript analysis, API mapping, auth surface mapping, parameter discovery), the full assessment plan, hypothesis testing on every applicable endpoint x class, verification, and reporting. Every coverage gate applies unchanged: comprehensive recon, the structural plan, and the hypothesis ledger are all enforced with zero specialists."
+		if a.cfg != nil && a.cfg.DisableAutoDelegate && a.delegationEnabled() {
+			section = "## Single-Agent Mode (specialists disabled)\nThe automatic specialist wave is disabled for this assessment: do NOT launch a coordinator wave. The root agent owns the complete methodology — reconnaissance, plan, hypothesis testing, verification, and reporting — and every coverage gate applies unchanged. If a bounded specialist is genuinely needed, spawn_agent remains available for manual, per-unit delegation; no automatic wave will run."
+		}
 		prompt = replacePromptSection(prompt,
 			"## Multi-Agent Coordinator (REQUIRED for full assessments)",
 			coordinatorSectionEndMarker(prompt),
-			"## Single-Agent Mode (specialists disabled)\nSpecialist delegation is disabled for this assessment: the configuration intends ONE agent to perform the complete methodology. Do NOT call spawn_agent or create_agent - no specialist wave will run, and none is required. You personally own every phase: complete reconnaissance (crawl, content discovery, JavaScript analysis, API mapping, auth surface mapping, parameter discovery), the full assessment plan, hypothesis testing on every applicable endpoint x class, verification, and reporting. Every coverage gate applies unchanged: comprehensive recon, the structural plan, and the hypothesis ledger are all enforced with zero specialists.")
+			section)
 	}
 
 	return prompt
@@ -634,6 +660,9 @@ func buildDelegatedTaskInstruction(task, agentID string, ctfMission, delegateUnl
 - Do not stop after the first flag. Repeatedly claim_next_hypothesis for every vulnerability class assigned in the task until that assigned lane has no queued hypothesis left.
 - Close every hypothesis you claim: save control and exploit evidence, and submit every distinct captured flag through report_vulnerability immediately (link it with kind=finding_ref), then continue to the next claim. A captured flag is a result, never a lane-completion signal.
 - Before finish, read_ledger again and confirm no hypothesis you own remains testing or proven without a linked finding. Finish only after the full assigned lane is exhausted.`, owner)
+		if chain := chains.SkeletonForIntent(task); chain != "" {
+			contract += "\n" + chain
+		}
 		if task == "" {
 			return contract
 		}
@@ -649,6 +678,9 @@ func buildDelegatedTaskInstruction(task, agentID string, ctfMission, delegateUnl
 - If the operator supplied no account/session, do not guess or spray passwords, create accounts, or crack leaked hashes. Set role-dependent work aside as blocked by missing prerequisites. Public JavaScript and source maps are route/sink discovery material, not a vulnerability unless they expose an actual secret value.
 - Close every hypothesis you claim: save control and exploit evidence, report every distinct proven vulnerability, link its finding_ref, then continue to the next claim. A finding is a result, never a lane-completion signal.
 - Before finish, read_ledger again and confirm no hypothesis owned by %s remains testing or proven without a linked finding. Finish only after the full assigned lane is exhausted.`, owner, owner)
+	if chain := chains.SkeletonForIntent(task); chain != "" {
+		contract += "\n" + chain
+	}
 	if task == "" {
 		return contract
 	}
@@ -1149,14 +1181,19 @@ IMPORTANT BROWSER TIPS:
 - If the page has iframes (e.g., CAPTCHA), use iframe/main_frame to switch context
 - Use extract_links to find all links on a page (useful for navigation)
 
-### Caido Proxy
-All HTTP requests via the send_request tool are automatically routed through the Caido proxy (port 8080) for traffic analysis.
-Use list_requests to see all captured HTTP traffic.
+### Traffic proxy (MITM) archive
+Every target-facing request from this run — http_request/send_request, curl/wget,
+Python, and the browser — is routed through the local MITM traffic proxy by
+default and archived as the exact raw wire packets (request line, headers,
+body). Use list_requests to list the archive and list_requests seq=<n> to
+quote the exact request/response in exploitation_proof; the same packets are
+attached to the finding as evidence.
 
-⚠️ **IMPORTANT: PREFER terminal_execute (curl) OVER send_request for ALL reconnaissance and analysis.**
+⚠️ **IMPORTANT: PREFER terminal_execute (curl) OVER send_request for bulk
+reconnaissance and analysis.**
 - send_request truncates responses at 10KB — JS bundles, API responses, and HTML pages are often 50-500KB.
 - Use curl via terminal_execute for: downloading pages, JS bundles, API probing, and any response you need to grep/analyze.
-- Use send_request ONLY when you specifically need requests logged in the Caido proxy (e.g., authenticated session testing).
+- Use send_request when you want a compact structured response; both paths are archived, so either one is quotable evidence.
 - NEVER use send_request to download JavaScript files — they WILL be truncated and you'll miss endpoints.
 
 ### Test Authenticated Endpoints

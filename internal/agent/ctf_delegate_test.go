@@ -33,9 +33,14 @@ func TestCTFDelegateSwitchOnUnlocksDelegation(t *testing.T) {
 	if !newCTFAgent(t, &config.Config{EnableCTFDelegate: true}).delegationEnabled() {
 		t.Fatal("switch on must unlock specialist delegation for a CTF mission")
 	}
-	// The operator-wide off-switch still wins over the CTF unlock.
-	if newCTFAgent(t, &config.Config{EnableCTFDelegate: true, DisableAutoDelegate: true}).delegationEnabled() {
-		t.Fatal("DisableAutoDelegate must keep overriding the CTF unlock")
+	// The operator-wide off-switch suppresses the automatic wave, not manual
+	// delegation: an operator may still spawn per-unit specialists.
+	a := newCTFAgent(t, &config.Config{EnableCTFDelegate: true, DisableAutoDelegate: true})
+	if !a.delegationEnabled() {
+		t.Fatal("manual delegation must remain available; DisableAutoDelegate only suppresses the automatic wave")
+	}
+	if msg := a.maybeAutoDelegate([]string{"http://t.local"}); msg != "" {
+		t.Fatalf("DisableAutoDelegate must suppress the automatic wave, got %q", msg)
 	}
 }
 

@@ -16,6 +16,7 @@ package web
 // open plan tasks / unreported proven hypotheses).
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"os"
@@ -25,6 +26,7 @@ import (
 	"time"
 
 	"github.com/c1ayooo/xalgorix/v4/internal/agent"
+	"github.com/c1ayooo/xalgorix/v4/internal/graph"
 	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
 )
 
@@ -65,6 +67,69 @@ func (s *Server) handleScanUnits(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 	now := time.Now().UTC()
+
+	// R7/M1: the graph is the authority for intent/belief units. A zero-row
+	// graph falls through to the legacy live/record/ledger projection while
+	// the graph is still being seeded.
+	if repo := graph.Backend(); repo != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		units, err := repo.Units(ctx, s.graphRunID(scanID))
+		cancel()
+		if err != nil {
+			writeJSONStatus(w, http.StatusServiceUnavailable, map[string]any{
+				"error": "graph units read failed", "detail": err.Error(), "scan_id": scanID,
+			})
+			return
+		}
+		if len(units) > 0 {
+			view.Source = "graph"
+			for _, u := range units {
+				kind, state := "task", u.State
+				if u.Kind == "belief" {
+					kind = "hypothesis"
+				} else {
+					state = planStatusFromGraphState(u.State)
+				}
+				unit := scanUnit{
+					Kind:       kind,
+					ID:         u.UnitID,
+					Subject:    u.Subject,
+					State:      state,
+					Owner:      u.Owner,
+					LeaseUntil: u.LeaseUntil,
+					VulnClass:  u.VulnClass,
+					Phase:      u.Phase,
+					Expired:    u.Expired,
+				}
+				if unit.Expired {
+					if kind == "task" {
+						view.Counters["tasks_expired"]++
+					} else {
+						view.Counters["hypotheses_expired"]++
+					}
+				}
+				switch kind {
+				case "task":
+					switch state {
+					case "pending":
+						view.Counters["tasks_open"]++
+					case "active":
+						view.Counters["tasks_claimed"]++
+					}
+				case "hypothesis":
+					switch u.State {
+					case string(scanctx.HypothesisQueued):
+						view.Counters["hypotheses_queued"]++
+					case string(scanctx.HypothesisTesting):
+						view.Counters["hypotheses_testing"]++
+					}
+				}
+				view.Units = append(view.Units, unit)
+			}
+			writeJSONStatus(w, http.StatusOK, view)
+			return
+		}
+	}
 
 	// Intent units: live plan first, then the persisted projection.
 	if planView, ok := s.livePlanView(scanID); ok && planView.Present {
@@ -156,6 +221,23 @@ func appendPlanUnits(view *scanUnitsView, pv agent.PlanView, now time.Time) {
 	}
 }
 
+// planStatusFromGraphState maps the authoritative intent state onto the
+// legacy PlanTask vocabulary used by the units API.
+func planStatusFromGraphState(state string) string {
+	switch state {
+	case "open":
+		return "pending"
+	case "running", "paused":
+		return "active"
+	case "done":
+		return "completed"
+	case "blocked", "exhausted", "stopped", "deleted":
+		return "skipped"
+	default:
+		return state
+	}
+}
+
 func hypothesisSubject(h *scanctx.Hypothesis) string {
 	if h == nil {
 		return ""
@@ -165,4 +247,3 @@ func hypothesisSubject(h *scanctx.Hypothesis) string {
 	}
 	return strings.ToLower(strings.TrimSpace(h.VulnClass))
 }
-

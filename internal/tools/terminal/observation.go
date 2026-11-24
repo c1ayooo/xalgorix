@@ -28,6 +28,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/c1ayooo/xalgorix/v4/internal/assetobs"
 	"github.com/c1ayooo/xalgorix/v4/internal/infoitem"
 	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
 )
@@ -95,6 +96,9 @@ func observeSensitiveOutput(contextID, command, output string) {
 			log.Printf("[terminal] observation capture failed (%s): %v", label, err)
 			return
 		}
+		// Observed asset ingestion from tool output: only explicit URLs prove a
+		// network asset; local file paths never become endpoints.
+		assetobs.IngestURLsInText(sc, item.ID, excerpt, "tool_observation")
 		written++
 	}
 	for _, p := range sensitivePathPatterns {

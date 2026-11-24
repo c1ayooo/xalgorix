@@ -94,9 +94,10 @@ func (b *blockingStore) CreateApproval(ctx context.Context, in platform.Approval
 // never park the tool call until the operator timeout.
 func TestGateFailsOpenWhenStoreBlocks(t *testing.T) {
 	s, store := newEnforceGateServer(t, 600, 1)
-	original := approvalStoreCallTimeout
-	approvalStoreCallTimeout = 150 * time.Millisecond
-	t.Cleanup(func() { approvalStoreCallTimeout = original })
+	svc := s.approvalService()
+	original := svc.storeTimeout
+	svc.storeTimeout = 150 * time.Millisecond
+	t.Cleanup(func() { svc.storeTimeout = original })
 
 	release := make(chan struct{})
 	s.SetPlatformStore(&blockingStore{Repository: store, release: release})
@@ -111,7 +112,7 @@ func TestGateFailsOpenWhenStoreBlocks(t *testing.T) {
 		t.Fatalf("wedged store must fail OPEN, got %+v", outcome)
 	}
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
-		t.Errorf("fail-open took %s, want ~%s", elapsed, approvalStoreCallTimeout)
+		t.Errorf("fail-open took %s, want ~%s", elapsed, svc.storeTimeout)
 	}
 	// The reserved slot was released on the failed create — a second submit
 	// proceeds immediately instead of queueing behind a phantom slot.

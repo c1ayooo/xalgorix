@@ -237,6 +237,9 @@ type LedgerStore struct {
 	journal     *domainjournal.Journal
 	voiWeight   float64
 	leaseTTL    time.Duration // hypothesis claim lease (0 = defaultHypothesisLease)
+
+	injectionMu   sync.Mutex
+	injectionSeen map[string]struct{} // dedupe key for injection observations
 }
 
 // defaultHypothesisLease bounds how long a claimed (testing) hypothesis may

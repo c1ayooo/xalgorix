@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/c1ayooo/xalgorix/v4/internal/infoitem"
+	"github.com/c1ayooo/xalgorix/v4/internal/infospace"
 	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
 )
 
@@ -29,6 +30,13 @@ func (f *fakeInfoReader) Associate(_ context.Context, q infoitem.AssociationQuer
 func (f *fakeInfoReader) ContextSlice(_ context.Context, q infoitem.ContextQuery) (infoitem.ContextResult, error) {
 	f.contextQuery = q
 	return infoitem.ContextResult{Items: []infoitem.Item{f.item}}, nil
+}
+
+func (f *fakeInfoReader) GetByID(_ context.Context, scanID, id string) (infoitem.Item, error) {
+	if f.item.ID != id || (scanID != "" && f.item.ScanID != "" && f.item.ScanID != scanID) {
+		return infoitem.Item{}, infoitem.ErrNotFound
+	}
+	return f.item, nil
 }
 
 func TestSearchInfoToolUsesCurrentScanAndIsReadOnly(t *testing.T) {
@@ -89,5 +97,51 @@ func TestSearchInfoToolReportsDisabledColdPath(t *testing.T) {
 	}
 	if res.Error != "" || !strings.Contains(res.Output, "disabled") {
 		t.Fatalf("expected disabled explanation, got %+v", res)
+	}
+}
+
+func TestInfoSpaceResultRendersLayersAndSummary(t *testing.T) {
+	items := []infospace.Item{
+		{
+			InfoID: "i1", Layer: infospace.LayerAggregate, Kind: "intent", State: "running",
+			Subject: "10.0.1.5:8080", Purpose: "ssrf", Nature: "inferred",
+			Payload: []byte(`{"title":"probe container"}`),
+		},
+		{
+			InfoID: "a1", Layer: infospace.LayerAtom, Kind: "info_item",
+			Subject: "/api", Purpose: "ssrf", Nature: "observed",
+			Payload: []byte(`{"content":{"text":"anonymous request returned 401"}}`),
+		},
+	}
+	res := infoSpaceResult("association", items, true, true, "cold path gap",
+		[][]string{{"i1"}, {"a1"}}, [][]string{{}, {"supports"}})
+	if res.Metadata["source"] != "graph" || res.Metadata["count"] != 2 {
+		t.Fatalf("metadata = %+v", res.Metadata)
+	}
+	for _, want := range []string{
+		"source=graph", "mode=association", "results=2", "truncated=true", "incomplete=true",
+		"gap: cold path gap",
+		"path: i1",
+		"- i1 [aggregate/inferred] kind=intent state=running subject=10.0.1.5:8080 purpose=ssrf",
+		"probe container",
+		"path: a1 (supports)",
+		"- a1 [atom/observed] kind=info_item state=- subject=/api purpose=ssrf",
+		"anonymous request returned 401",
+	} {
+		if !strings.Contains(res.Output, want) {
+			t.Fatalf("output missing %q:\n%s", want, res.Output)
+		}
+	}
+}
+
+func TestInfoSpaceSummaryPrefersContentThenTitle(t *testing.T) {
+	if got := infoSpaceSummary(infospace.Item{Payload: []byte(`{"content":{"text":"body"},"title":"title"}`)}); got != "body" {
+		t.Fatalf("summary = %q, want body", got)
+	}
+	if got := infoSpaceSummary(infospace.Item{Payload: []byte(`{"title":"title","notes":"notes"}`)}); got != "title" {
+		t.Fatalf("summary = %q, want title", got)
+	}
+	if got := infoSpaceSummary(infospace.Item{Payload: []byte(`not-json`)}); got != "" {
+		t.Fatalf("bad payload summary = %q, want empty", got)
 	}
 }

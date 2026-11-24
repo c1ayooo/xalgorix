@@ -149,7 +149,7 @@ func (s *Server) postScanChat(inst *ScanInstance, message string) (string, error
 		}
 		inst.chatMessages = []llm.Message{{
 			Role:    "system",
-			Content: buildPostScanChatPrompt(inst, lang),
+			Content: buildPostScanChatPrompt(chatSnapshotFromInstanceLocked(inst), lang),
 		}}
 	}
 	messages := append([]llm.Message(nil), inst.chatMessages...)
@@ -173,19 +173,75 @@ func (s *Server) postScanChat(inst *ScanInstance, message string) (string, error
 	return response, nil
 }
 
-func buildPostScanChatPrompt(inst *ScanInstance, language string) string {
+// chatScanSnapshot is the bounded, immutable view both chat channels reason
+// over (post-scan chat and the in-run side-question responder). It is its own
+// type on purpose: a by-value copy of a live *ScanInstance copies its mutex
+// (go vet) and drags fields the prompt never reads, and a finished/evicted run
+// has no *ScanInstance at all — its snapshot is reconstructed from the durable
+// scan records instead.
+type chatScanSnapshot struct {
+	ID          string
+	Targets     string
+	Status      string
+	ScanMode    string
+	StartedAt   string
+	FinishedAt  string
+	Instruction string
+	Iterations  int
+	ToolCalls   int
+	VulnCount   int
+	TotalTokens int
+	Vulns       []VulnSummary
+	Events      []WSEvent
+}
+
+// chatSnapshotFromInstance copies the chat-visible fields of a live instance
+// while holding its lock. The caller's pointer is never retained.
+func chatSnapshotFromInstance(inst *ScanInstance) *chatScanSnapshot {
+	if inst == nil {
+		return nil
+	}
+	inst.mu.RLock()
+	defer inst.mu.RUnlock()
+	return chatSnapshotFromInstanceLocked(inst)
+}
+
+// chatSnapshotFromInstanceLocked is chatSnapshotFromInstance for a caller that
+// already holds inst.mu (RWMutex is not reentrant). It never locks.
+func chatSnapshotFromInstanceLocked(inst *ScanInstance) *chatScanSnapshot {
+	if inst == nil {
+		return nil
+	}
+	return &chatScanSnapshot{
+		ID:          inst.ID,
+		Targets:     inst.Targets,
+		Status:      inst.Status,
+		ScanMode:    inst.ScanMode,
+		StartedAt:   inst.StartedAt,
+		FinishedAt:  inst.FinishedAt,
+		Instruction: inst.Instruction,
+		Iterations:  inst.Iterations,
+		ToolCalls:   inst.ToolCalls,
+		VulnCount:   inst.VulnCount,
+		TotalTokens: inst.TotalTokens,
+		Vulns:       append([]VulnSummary(nil), inst.Vulns...),
+		Events:      append([]WSEvent(nil), inst.events...),
+	}
+}
+
+func buildPostScanChatPrompt(snap *chatScanSnapshot, language string) string {
 	var b strings.Builder
 	if directive := config.OutputLanguageDirective(language); directive != "" {
 		b.WriteString(directive)
 		b.WriteString("\n\n")
 	}
-	if inst.Status == "paused" {
+	if snap != nil && snap.Status == "paused" {
 		b.WriteString("You are Xalgorix in paused-scan chat mode. The scan is paused, so answer follow-up questions using only the scan context captured so far. Do not claim that you are still scanning or that you can run tools in this chat. If the user asks for new testing, explain what the current results show and suggest resuming the scan.\n\n")
 	} else {
 		b.WriteString("You are Xalgorix in post-scan chat mode. The scan has already finished, so answer follow-up questions using only the completed scan context below. Do not claim that you are still scanning or that you can run tools in this chat. If the user asks for new testing, first summarize what the completed scan already found for that topic, then explain that additional live testing requires resuming, restarting, or starting a new scan.\n\n")
 	}
 
-	writeScanChatSnapshot(&b, inst)
+	writeScanChatSnapshot(&b, snap)
 	return b.String()
 }
 
@@ -193,31 +249,36 @@ func buildPostScanChatPrompt(inst *ScanInstance, language string) string {
 // chat channels (post-scan chat and running side-questions): instance facts,
 // bounded vulnerability list and the recent event tail. Callers own the
 // framing preamble; this body is identical so both channels answer from the
-// same context discipline.
-func writeScanChatSnapshot(b *strings.Builder, inst *ScanInstance) {
+// same context discipline. A missing snapshot is stated honestly instead of
+// dereferencing nil.
+func writeScanChatSnapshot(b *strings.Builder, snap *chatScanSnapshot) {
+	if snap == nil {
+		b.WriteString("## Scan\nSnapshot unavailable: no readable scan record is mounted for this run on this machine.\n")
+		return
+	}
 	b.WriteString("## Scan\n")
-	fmt.Fprintf(b, "Instance ID: %s\n", inst.ID)
-	fmt.Fprintf(b, "Targets: %s\n", inst.Targets)
-	fmt.Fprintf(b, "Status: %s\n", inst.Status)
-	if inst.ScanMode != "" {
-		fmt.Fprintf(b, "Mode: %s\n", inst.ScanMode)
+	fmt.Fprintf(b, "Instance ID: %s\n", snap.ID)
+	fmt.Fprintf(b, "Targets: %s\n", snap.Targets)
+	fmt.Fprintf(b, "Status: %s\n", snap.Status)
+	if snap.ScanMode != "" {
+		fmt.Fprintf(b, "Mode: %s\n", snap.ScanMode)
 	}
-	if inst.StartedAt != "" {
-		fmt.Fprintf(b, "Started: %s\n", inst.StartedAt)
+	if snap.StartedAt != "" {
+		fmt.Fprintf(b, "Started: %s\n", snap.StartedAt)
 	}
-	if inst.FinishedAt != "" {
-		fmt.Fprintf(b, "Finished: %s\n", inst.FinishedAt)
+	if snap.FinishedAt != "" {
+		fmt.Fprintf(b, "Finished: %s\n", snap.FinishedAt)
 	}
-	fmt.Fprintf(b, "Iterations: %d\nTool calls: %d\nVulnerabilities: %d\nTotal tokens: %d\n", inst.Iterations, inst.ToolCalls, inst.VulnCount, inst.TotalTokens)
-	if strings.TrimSpace(inst.Instruction) != "" {
-		fmt.Fprintf(b, "User instructions: %s\n", truncStr(inst.Instruction, 1200))
+	fmt.Fprintf(b, "Iterations: %d\nTool calls: %d\nVulnerabilities: %d\nTotal tokens: %d\n", snap.Iterations, snap.ToolCalls, snap.VulnCount, snap.TotalTokens)
+	if strings.TrimSpace(snap.Instruction) != "" {
+		fmt.Fprintf(b, "User instructions: %s\n", truncStr(snap.Instruction, 1200))
 	}
 
-	if len(inst.Vulns) > 0 {
+	if len(snap.Vulns) > 0 {
 		b.WriteString("\n## Vulnerabilities\n")
-		for i, v := range inst.Vulns {
+		for i, v := range snap.Vulns {
 			if i >= 40 {
-				fmt.Fprintf(b, "- ... %d additional vulnerabilities omitted from prompt context\n", len(inst.Vulns)-i)
+				fmt.Fprintf(b, "- ... %d additional vulnerabilities omitted from prompt context\n", len(snap.Vulns)-i)
 				break
 			}
 			fmt.Fprintf(b, "- [%s] %s", strings.ToUpper(v.Severity), v.Title)
@@ -234,13 +295,13 @@ func writeScanChatSnapshot(b *strings.Builder, inst *ScanInstance) {
 		}
 	}
 
-	if len(inst.events) > 0 {
+	if len(snap.Events) > 0 {
 		b.WriteString("\n## Recent Scan Events\n")
 		start := 0
-		if len(inst.events) > 80 {
-			start = len(inst.events) - 80
+		if len(snap.Events) > 80 {
+			start = len(snap.Events) - 80
 		}
-		for _, evt := range inst.events[start:] {
+		for _, evt := range snap.Events[start:] {
 			line := summarizeChatEvent(evt)
 			if line != "" {
 				b.WriteString("- ")

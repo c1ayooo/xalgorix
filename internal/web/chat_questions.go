@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -67,6 +68,22 @@ func (s *Server) handleTaskQuestions(w http.ResponseWriter, r *http.Request, sto
 		return
 	}
 
+	createdBy := ""
+	if claims, ok := sessionClaimsFrom(r); ok {
+		createdBy = claims.Username
+	}
+	// Snapshot before claiming the slot: a run with no readable context (no
+	// live instance and no durable scan records) must fail honestly instead of
+	// queueing a question that can never be answered. This also closes the old
+	// nil dereference that made side questions on finished runs 500.
+	snap := s.snapshotChatInstance(instanceID)
+	if snap == nil {
+		writeJSONStatus(w, http.StatusConflict, map[string]string{
+			"error": "no readable scan context is available for this run; the side assistant cannot answer",
+		})
+		return
+	}
+
 	// One in-flight question per run: the composer disables itself while
 	// pending, so 409 only guards double tabs / raced retries (4zreco
 	// chatBusy semantics — no queueing, the operator retries).
@@ -74,12 +91,6 @@ func (s *Server) handleTaskQuestions(w http.ResponseWriter, r *http.Request, sto
 		writeJSONStatus(w, http.StatusConflict, map[string]string{"error": "a question for this run is already being answered"})
 		return
 	}
-
-	createdBy := ""
-	if claims, ok := sessionClaimsFrom(r); ok {
-		createdBy = claims.Username
-	}
-	snap := s.snapshotChatInstance(instanceID)
 	question := WSEvent{
 		Type:       "chat_question",
 		Content:    req.Message,
@@ -127,25 +138,86 @@ func (s *Server) endQuestion(instanceID string) {
 	delete(s.questionsInFlight, instanceID)
 }
 
-// snapshotChatInstance copies the instance's chat-visible fields under the
-// instance lock: the answer must reason over the state at question time, not
-// a live structure that keeps moving under the LLM call.
-func (s *Server) snapshotChatInstance(instanceID string) *ScanInstance {
+// snapshotChatInstance resolves the chat-visible state at question time: the
+// live instance when this process still holds it, else the durable scan-record
+// projection. The answer must reason over a point-in-time copy, not a live
+// structure that keeps moving under the LLM call — and a run spanning several
+// D11 session records (or a post-restart run) has no live instance at all.
+func (s *Server) snapshotChatInstance(instanceID string) *chatScanSnapshot {
 	s.instancesMu.RLock()
 	inst := s.instances[instanceID]
 	s.instancesMu.RUnlock()
-	if inst == nil {
+	if inst != nil {
+		if snap := chatSnapshotFromInstance(inst); snap != nil {
+			return snap
+		}
+	}
+	return s.persistedChatSnapshot(instanceID)
+}
+
+// persistedChatSnapshot rebuilds the same snapshot from the durable scan
+// summaries: the newest sibling session drives status/timing/instruction, the
+// findings corpus merges across every session of the run (one record per
+// instance is a projection blind spot, not the truth), and the newest tail
+// supplies recent events.
+func (s *Server) persistedChatSnapshot(instanceID string) *chatScanSnapshot {
+	instanceID = strings.TrimSpace(instanceID)
+	if instanceID == "" {
 		return nil
 	}
-	inst.mu.RLock()
-	defer inst.mu.RUnlock()
-	cp := *inst //nolint:govet // intentional snapshot under RLock; the copy's mutex is never taken
-	cp.Vulns = append([]VulnSummary(nil), inst.Vulns...)
-	cp.events = append([]WSEvent(nil), inst.events...)
-	cp.chatCfg = nil
-	cp.chatMessages = nil
-	cp.agent = nil
-	return &cp
+	idx := s.scanSummaryIndexFor(s.findAllScanSummaries())
+	recs := idx.lookupAll(instanceID, "")
+	if len(recs) == 0 {
+		return nil
+	}
+	sort.SliceStable(recs, func(i, j int) bool { return recs[i].StartedAt > recs[j].StartedAt })
+	newest := recs[0]
+
+	snap := &chatScanSnapshot{
+		ID:          instanceID,
+		Status:      newest.Status,
+		ScanMode:    newest.ScanMode,
+		FinishedAt:  newest.FinishedAt,
+		Instruction: newest.Instruction,
+		Iterations:  newest.Iterations,
+		ToolCalls:   newest.ToolCalls,
+		TotalTokens: newest.TotalTokens,
+		Vulns:       make([]VulnSummary, 0, len(newest.Vulns)),
+		Events:      append([]WSEvent(nil), newest.Events...),
+	}
+	// Timestamps span the whole run: earliest start, latest finish.
+	for _, rec := range recs {
+		if rec.StartedAt != "" && (snap.StartedAt == "" || rec.StartedAt < snap.StartedAt) {
+			snap.StartedAt = rec.StartedAt
+		}
+		if rec.FinishedAt > snap.FinishedAt {
+			snap.FinishedAt = rec.FinishedAt
+		}
+	}
+	snap.Targets = mergeChatTargets(recs)
+	for _, rec := range recs {
+		for _, vuln := range rec.Vulns {
+			appendVulnSummaryUnique(&snap.Vulns, vuln)
+		}
+	}
+	snap.VulnCount = len(snap.Vulns)
+	return snap
+}
+
+// mergeChatTargets lists the run's distinct targets (a multi-target dispatch
+// or a re-dispatch can cover more than the newest record's target).
+func mergeChatTargets(recs []*ScanRecord) string {
+	seen := make(map[string]bool, len(recs))
+	out := make([]string, 0, len(recs))
+	for _, rec := range recs {
+		target := strings.TrimSpace(rec.Target)
+		if target == "" || seen[target] {
+			continue
+		}
+		seen[target] = true
+		out = append(out, target)
+	}
+	return strings.Join(out, ", ")
 }
 
 // answerRunQuestion runs the tool-less responder and lands the answer in the
@@ -162,6 +234,15 @@ func (s *Server) answerRunQuestion(instanceID, createdBy, requestID, system, que
 		InstanceID: instanceID,
 		AgentID:    "operator_chat",
 		ResultMeta: map[string]any{"request_id": requestID, "answered_by": createdBy},
+	}
+	if s.scanQuestionFn == nil {
+		// Never panic in this goroutine: a nil fact would kill the process, and
+		// the operator still deserves an honest failed row.
+		reply.Error = "side assistant is not configured"
+		reply.ResultMeta["status"] = "failed"
+		s.appendConversationEvent(instanceID, reply)
+		s.broadcastToInstance(instanceID, reply)
+		return
 	}
 	answer, err := s.scanQuestionFn(ctx, system, question)
 	if err != nil {
@@ -183,7 +264,7 @@ func (s *Server) answerRunQuestion(instanceID, createdBy, requestID, system, que
 // buildQuestionAnswerPrompt assembles the responder's system prompt: a live
 // framing preamble over the same scan snapshot body post-scan chat uses, so
 // both channels see identical context discipline (bounded vulns/events tail).
-func buildQuestionAnswerPrompt(inst *ScanInstance, language string) string {
+func buildQuestionAnswerPrompt(snap *chatScanSnapshot, language string) string {
 	var b strings.Builder
 	if directive := config.OutputLanguageDirective(language); directive != "" {
 		b.WriteString(directive)
@@ -198,6 +279,6 @@ Rules:
 - Be direct and concise; answer in the operator's language.
 
 `)
-	writeScanChatSnapshot(&b, inst)
+	writeScanChatSnapshot(&b, snap)
 	return b.String()
 }

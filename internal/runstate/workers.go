@@ -21,6 +21,9 @@ type WorkerRecord struct {
 	InstanceID string
 	ScanID     string
 	AgentID    string
+	// UnitID is the intent the worker owned (pool dispatch only). Empty for
+	// legacy model-initiated spawns and for pre-0029 rows.
+	UnitID     string
 	Lane       string
 	Task       string
 	Target     string
@@ -44,11 +47,12 @@ func (s *Store) UpsertWorker(ctx context.Context, rec WorkerRecord) error {
 	}
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO run_workers
-			(instance_id, scan_id, agent_id, lane, task, target, status, error,
-			 started_at, finished_at, updated_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,now())
+			(instance_id, scan_id, agent_id, unit_id, lane, task, target, status,
+			 error, started_at, finished_at, updated_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,now())
 		ON CONFLICT (instance_id, agent_id) DO UPDATE SET
 			scan_id     = EXCLUDED.scan_id,
+			unit_id     = CASE WHEN EXCLUDED.unit_id <> '' THEN EXCLUDED.unit_id ELSE run_workers.unit_id END,
 			lane        = CASE WHEN EXCLUDED.lane <> '' THEN EXCLUDED.lane ELSE run_workers.lane END,
 			task        = CASE WHEN EXCLUDED.task <> '' THEN EXCLUDED.task ELSE run_workers.task END,
 			target      = CASE WHEN EXCLUDED.target <> '' THEN EXCLUDED.target ELSE run_workers.target END,
@@ -57,8 +61,8 @@ func (s *Store) UpsertWorker(ctx context.Context, rec WorkerRecord) error {
 			started_at  = COALESCE(run_workers.started_at, EXCLUDED.started_at),
 			finished_at = EXCLUDED.finished_at,
 			updated_at  = now()`,
-		rec.InstanceID, rec.ScanID, rec.AgentID, rec.Lane, rec.Task, rec.Target,
-		rec.Status, rec.Error, nilOrTime(rec.StartedAt), nilOrTime(rec.FinishedAt))
+		rec.InstanceID, rec.ScanID, rec.AgentID, rec.UnitID, rec.Lane, rec.Task,
+		rec.Target, rec.Status, rec.Error, nilOrTime(rec.StartedAt), nilOrTime(rec.FinishedAt))
 	return err
 }
 
@@ -69,8 +73,8 @@ func (s *Store) ListWorkersByInstance(ctx context.Context, instanceID string) ([
 		return nil, errors.New("runstate: store is closed")
 	}
 	rows, err := s.pool.Query(ctx, `
-		SELECT instance_id, scan_id, agent_id, lane, task, target, status, error,
-		       started_at, finished_at, updated_at
+		SELECT instance_id, scan_id, agent_id, unit_id, lane, task, target,
+		       status, error, started_at, finished_at, updated_at
 		FROM run_workers
 		WHERE instance_id = $1
 		ORDER BY updated_at DESC, agent_id`, instanceID)
@@ -82,8 +86,8 @@ func (s *Store) ListWorkersByInstance(ctx context.Context, instanceID string) ([
 	for rows.Next() {
 		var rec WorkerRecord
 		var started, finished *time.Time
-		if err := rows.Scan(&rec.InstanceID, &rec.ScanID, &rec.AgentID, &rec.Lane,
-			&rec.Task, &rec.Target, &rec.Status, &rec.Error,
+		if err := rows.Scan(&rec.InstanceID, &rec.ScanID, &rec.AgentID, &rec.UnitID,
+			&rec.Lane, &rec.Task, &rec.Target, &rec.Status, &rec.Error,
 			&started, &finished, &rec.UpdatedAt); err != nil {
 			return nil, err
 		}
@@ -94,6 +98,47 @@ func (s *Store) ListWorkersByInstance(ctx context.Context, instanceID string) ([
 			rec.FinishedAt = *finished
 		}
 		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
+// ListWorkersByInstances returns the worker rows of several runs in one query,
+// grouped by instance_id (newest activity first inside each group). The
+// task-scoped session rail lists a whole task's runs, so the per-run read it
+// used to do was N round trips for one request the operator waits on.
+func (s *Store) ListWorkersByInstances(ctx context.Context, instanceIDs []string) (map[string][]WorkerRecord, error) {
+	if s == nil || s.pool == nil {
+		return nil, errors.New("runstate: store is closed")
+	}
+	out := make(map[string][]WorkerRecord, len(instanceIDs))
+	if len(instanceIDs) == 0 {
+		return out, nil
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT instance_id, scan_id, agent_id, unit_id, lane, task, target,
+		       status, error, started_at, finished_at, updated_at
+		FROM run_workers
+		WHERE instance_id = ANY($1)
+		ORDER BY instance_id, updated_at DESC, agent_id`, instanceIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var rec WorkerRecord
+		var started, finished *time.Time
+		if err := rows.Scan(&rec.InstanceID, &rec.ScanID, &rec.AgentID, &rec.UnitID,
+			&rec.Lane, &rec.Task, &rec.Target, &rec.Status, &rec.Error,
+			&started, &finished, &rec.UpdatedAt); err != nil {
+			return nil, err
+		}
+		if started != nil {
+			rec.StartedAt = *started
+		}
+		if finished != nil {
+			rec.FinishedAt = *finished
+		}
+		out[rec.InstanceID] = append(out[rec.InstanceID], rec)
 	}
 	return out, rows.Err()
 }

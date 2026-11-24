@@ -97,6 +97,28 @@ func TestValidateMountsRejectsPathRewrite(t *testing.T) {
 	}
 }
 
+// TestValidateMountsRefusesDockerSocket pins the red line that tool
+// containers never see the host docker daemon — BuildMounts constructs the
+// mount set, and ValidateMounts is the choke point that must keep refusing a
+// docker socket bind even if a future caller hand-crafts one.
+func TestValidateMountsRefusesDockerSocket(t *testing.T) {
+	cases := []Mount{
+		{Host: "/var/run/docker.sock", Container: "/var/run/docker.sock", Mode: MountReadWrite},
+		{Host: "/var/run/docker.sock", Container: "/var/run/docker.sock", Mode: MountReadOnly},
+		{Host: "/run/containerd/docker.sock", Container: "/var/run/docker.sock", Mode: MountReadWrite},
+		{Host: "/tmp/side/docker.sock", Container: "/tmp/side/docker.sock", Mode: MountReadWrite},
+	}
+	for _, m := range cases {
+		if err := ValidateMounts([]Mount{m}); err == nil {
+			t.Fatalf("docker socket mount must be rejected: %+v", m)
+		}
+	}
+	// Unrelated sockets and scan dirs are unaffected.
+	if err := ValidateMounts([]Mount{{Host: "/tmp/x/other.sock", Container: "/tmp/x/other.sock", Mode: MountReadWrite}}); err != nil {
+		t.Fatalf("non-docker socket mount must be allowed: %v", err)
+	}
+}
+
 func TestNativeDriverExecCapturesExitAndOutput(t *testing.T) {
 	d := NewNative()
 	res, err := d.Exec(context.Background(), ExecSpec{

@@ -104,10 +104,11 @@ func RegisterRun(token, instanceID, scanCtxID string, guard scopeguard.Config) {
 }
 
 // UnregisterRun removes a finished session's token. token may be empty to
-// unregister only by scan context id.
+// unregister only by scan context id. The run's dedicated listener is closed
+// here too: a resumed session binds a fresh one, and leaving the old port open
+// would keep attributing late traffic to a dead run.
 func UnregisterRun(token, scanCtxID string) {
 	attributionMu.Lock()
-	defer attributionMu.Unlock()
 	if token != "" {
 		delete(byToken, token)
 	}
@@ -115,6 +116,10 @@ func UnregisterRun(token, scanCtxID string) {
 		if existing, ok := byScanCtx[scanCtxID]; ok && (token == "" || existing.scanCtxID == scanCtxID) {
 			delete(byScanCtx, scanCtxID)
 		}
+	}
+	attributionMu.Unlock()
+	if scanCtxID != "" {
+		CloseScanListener(scanCtxID)
 	}
 }
 
@@ -124,6 +129,16 @@ func RunTokenFor(scanCtxID string) string {
 	attributionMu.RLock()
 	defer attributionMu.RUnlock()
 	return byScanCtx[scanCtxID].token // zero value "" via map default
+}
+
+// attributionForScan returns the instance id registered for a scan context.
+// Used by the per-run listener to stamp its fixed attribution without holding
+// attributionMu across a listener bind.
+func attributionForScan(scanCtxID string) (string, bool) {
+	attributionMu.RLock()
+	defer attributionMu.RUnlock()
+	entry, ok := byScanCtx[scanCtxID]
+	return entry.instanceID, ok
 }
 
 // SetDialGuardBase installs the process-level operator-machine configuration

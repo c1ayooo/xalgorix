@@ -239,7 +239,7 @@ func reportDisposition(state *ScanState) PhaseDisposition {
 	switch state.CompletionStatus {
 	case CompletionStatusCompleted, CompletionStatusCompletedWithBlocked:
 		d.Status = PhaseCompleted
-		d.Reason = "finish accepted; report generated from the settled assessment"
+		d.Reason = "finish accepted; assessment settled — report delivery is manual (outside the scan lifecycle)"
 	case CompletionStatusIncomplete:
 		d.Status = PhaseBlocked
 		d.Reason = "assessment terminated incomplete — remaining work preserved for resume"

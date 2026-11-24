@@ -32,7 +32,7 @@ const (
 
 // serveConnectIntercepted upgrades the CONNECT tunnel to an observed TLS
 // session signed by the traffic-proxy CA.
-func (h *proxyHandler) serveConnectIntercepted(w http.ResponseWriter, r *http.Request) {
+func (h *proxyHandler) serveConnectIntercepted(w http.ResponseWriter, r *http.Request, baseAttr Attribution) {
 	m := h.m
 	host, _, err := net.SplitHostPort(r.Host)
 	if err != nil {
@@ -87,11 +87,22 @@ func (h *proxyHandler) serveConnectIntercepted(w http.ResponseWriter, r *http.Re
 		Status:      http.StatusOK,
 		Intercepted: true,
 	}
-	var tunnelAttr Attribution
-	if attr, _ := extractAttribution(r); attr.ScanCtxID != "" || attr.InstanceID != "" {
-		tunnelAttr = attr
-		obs.ScanCtxID = attr.ScanCtxID
-		obs.InstanceID = attr.InstanceID
+	tunnelAttr := baseAttr
+	if headerAttr, ok := extractAttribution(r); ok {
+		switch {
+		case baseAttr.ScanCtxID == "" && baseAttr.InstanceID == "":
+			tunnelAttr = headerAttr
+		case headerAttr.Channel == ChannelBearer &&
+			(headerAttr.ScanCtxID == "" || headerAttr.ScanCtxID == baseAttr.ScanCtxID):
+			// A Bearer CONNECT from the same run (container HTTP worker) means
+			// the tunnel's requests already met the tool-layer gate; keep that
+			// channel so the proxy does not re-adjudicate them.
+			tunnelAttr = headerAttr
+		}
+	}
+	if tunnelAttr.ScanCtxID != "" || tunnelAttr.InstanceID != "" {
+		obs.ScanCtxID = tunnelAttr.ScanCtxID
+		obs.InstanceID = tunnelAttr.InstanceID
 	}
 	m.observe(obs)
 
@@ -102,7 +113,7 @@ func (h *proxyHandler) serveConnectIntercepted(w http.ResponseWriter, r *http.Re
 	}
 	// The tunnel is fully built (inner server included) before registration
 	// publishes it, so Close never reads a half-initialized tunnel.
-	t := &tunnel{conn: clientConn, inner: inner, done: make(chan struct{})}
+	t := &tunnel{conn: clientConn, inner: inner, done: make(chan struct{}), scanID: tunnelAttr.ScanCtxID}
 	m.registerTunnel(t)
 	// The tunnel lives as long as the CONNECTION: the one-shot listener makes
 	// Serve return right after the single Accept while the connection

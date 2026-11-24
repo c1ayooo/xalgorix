@@ -63,9 +63,14 @@ func removeHopByHopHeaders(h http.Header) {
 	}
 }
 
-// proxyHandler serves the loopback listener.
+// proxyHandler serves the loopback listener. baseAttr, when non-empty, is the
+// per-scan listener's fixed attribution: everything arriving on that port
+// belongs to that run even when the client cannot send a token (Chromium has
+// no proxy-auth channel), so browser and container traffic is observed and
+// archived instead of degrading to system-level.
 type proxyHandler struct {
-	m *Manager
+	m        *Manager
+	baseAttr Attribution
 }
 
 func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -74,14 +79,14 @@ func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method == http.MethodConnect {
-		h.serveConnect(w, r)
+		h.serveConnect(w, r, h.baseAttr)
 		return
 	}
 	if r.URL == nil || !r.URL.IsAbs() {
 		http.Error(w, "absolute URL required", http.StatusBadRequest)
 		return
 	}
-	h.forward(w, r, r.URL.Scheme, Attribution{})
+	h.forward(w, r, r.URL.Scheme, h.baseAttr)
 }
 
 // forward relays one plain (or intercepted) HTTP request and records it.
@@ -107,8 +112,18 @@ func (h *proxyHandler) forward(w http.ResponseWriter, r *http.Request, scheme st
 	}
 
 	attr := baseAttr
-	if attr.ScanCtxID == "" && attr.InstanceID == "" {
-		attr, _ = extractAttribution(r)
+	if headerAttr, ok := extractAttribution(r); ok {
+		if baseAttr.ScanCtxID == "" && baseAttr.InstanceID == "" {
+			attr = headerAttr
+		} else if headerAttr.Channel == ChannelBearer &&
+			(headerAttr.ScanCtxID == "" || headerAttr.ScanCtxID == baseAttr.ScanCtxID) {
+			// The run-scoped listener port owns the run. An explicit Bearer for
+			// the same run (the container HTTP worker) upgrades the channel to
+			// Bearer: that request already met the tool-layer gate, so it must
+			// not be re-adjudicated at the proxy. Basic never overrides the
+			// port.
+			attr = headerAttr
+		}
 	}
 	// Raw capture is attribution-gated (rawcapture.go): system-level traffic
 	// has no scan archive to persist into.
@@ -118,6 +133,9 @@ func (h *proxyHandler) forward(w http.ResponseWriter, r *http.Request, scheme st
 		InstanceID: attr.InstanceID,
 		ScanCtxID:  attr.ScanCtxID,
 		Method:     r.Method,
+	}
+	if obs.ScanCtxID != "" {
+		NoteEgressUsage(obs.ScanCtxID, obs.InstanceID, proxy.UpstreamLabelFor(obs.ScanCtxID), 0, 1)
 	}
 
 	target := r.URL
@@ -248,8 +266,18 @@ func (h *proxyHandler) forwardUpgrade(w http.ResponseWriter, r *http.Request, sc
 	m := h.m
 
 	attr := baseAttr
-	if attr.ScanCtxID == "" && attr.InstanceID == "" {
-		attr, _ = extractAttribution(r)
+	if headerAttr, ok := extractAttribution(r); ok {
+		if baseAttr.ScanCtxID == "" && baseAttr.InstanceID == "" {
+			attr = headerAttr
+		} else if headerAttr.Channel == ChannelBearer &&
+			(headerAttr.ScanCtxID == "" || headerAttr.ScanCtxID == baseAttr.ScanCtxID) {
+			// The run-scoped listener port owns the run. An explicit Bearer for
+			// the same run (the container HTTP worker) upgrades the channel to
+			// Bearer: that request already met the tool-layer gate, so it must
+			// not be re-adjudicated at the proxy. Basic never overrides the
+			// port.
+			attr = headerAttr
+		}
 	}
 	obs := &TrafficObservation{
 		At:                 time.Now().UTC(),
@@ -257,6 +285,9 @@ func (h *proxyHandler) forwardUpgrade(w http.ResponseWriter, r *http.Request, sc
 		ScanCtxID:          attr.ScanCtxID,
 		Method:             r.Method,
 		UpgradePassthrough: true,
+	}
+	if obs.ScanCtxID != "" {
+		NoteEgressUsage(obs.ScanCtxID, obs.InstanceID, proxy.UpstreamLabelFor(obs.ScanCtxID), 1, 0)
 	}
 	target := r.URL
 	target.Scheme = scheme
@@ -359,7 +390,7 @@ func (h *proxyHandler) forwardUpgrade(w http.ResponseWriter, r *http.Request, sc
 	// inner case is already tracked by its CONNECT tunnel.
 	var t *tunnel
 	if r.URL.IsAbs() && r.RequestURI != "" {
-		t = &tunnel{conn: clientConn, done: make(chan struct{})}
+		t = &tunnel{conn: clientConn, done: make(chan struct{}), scanID: obs.ScanCtxID}
 		m.registerTunnel(t)
 	}
 
@@ -459,12 +490,31 @@ func (m *Manager) roundTrip(obs *TrafficObservation, req *http.Request) (*http.R
 	return resp, err
 }
 
+// selectUpstream resolves one exchange's outbound proxy. A per-task pin
+// (proxy.ScanUpstreamFor) wins over the global rotation pool; direct pins are
+// honored unless the process itself is proxy-required (those are rejected at
+// run start, so this is a belt-and-braces check).
+func (m *Manager) selectUpstream(scanCtxID string) (*proxy.Proxy, bool, error) {
+	p, direct, ok := proxy.UpstreamFor(scanCtxID)
+	if direct && ok && proxy.Required() {
+		// A per-task direct pin is rejected at dispatch; belt and braces.
+		return nil, false, errRequiredNoUpstream
+	}
+	if !ok && proxy.Required() {
+		return nil, false, errRequiredNoUpstream
+	}
+	if direct {
+		return nil, true, nil
+	}
+	return p, false, nil
+}
+
 func (m *Manager) forwardTransport(obs *TrafficObservation, req *http.Request) (*http.Response, error) {
-	p := proxy.GetProxy()
-	if p == nil {
-		if proxy.Required() {
-			return nil, errRequiredNoUpstream
-		}
+	p, direct, err := m.selectUpstream(obs.ScanCtxID)
+	if err != nil {
+		return nil, err
+	}
+	if direct || p == nil {
 		obs.Upstream = "direct"
 		tr := m.directTransport(obs.ScanCtxID)
 		return tr.RoundTrip(req)
@@ -478,8 +528,8 @@ func (m *Manager) forwardTransport(obs *TrafficObservation, req *http.Request) (
 }
 
 func (m *Manager) insecureForwardTransport(obs *TrafficObservation) *http.Transport {
-	p := proxy.GetProxy()
-	if p == nil {
+	p, direct, err := m.selectUpstream(obs.ScanCtxID)
+	if err != nil || direct || p == nil {
 		return m.insecureDirectTransport(obs.ScanCtxID)
 	}
 	return m.insecureUpstreamTransport(p)
@@ -665,16 +715,16 @@ func clonedDefaultTransport() *http.Transport {
 // CONNECT
 // ---------------------------------------------------------------------------
 
-func (h *proxyHandler) serveConnect(w http.ResponseWriter, r *http.Request) {
+func (h *proxyHandler) serveConnect(w http.ResponseWriter, r *http.Request, baseAttr Attribution) {
 	if _, _, err := net.SplitHostPort(r.Host); err != nil {
 		http.Error(w, "CONNECT host:port required", http.StatusBadRequest)
 		return
 	}
 	if h.m.mitm && h.m.ca != nil {
-		h.serveConnectIntercepted(w, r)
+		h.serveConnectIntercepted(w, r, baseAttr)
 		return
 	}
-	h.serveConnectBlind(w, r)
+	h.serveConnectBlind(w, r, baseAttr)
 }
 
 // tunnelDial establishes the tunnel's outbound connection: through the
@@ -684,12 +734,12 @@ func (h *proxyHandler) serveConnect(w http.ResponseWriter, r *http.Request) {
 // operator-machine dial guard. Proxy-required mode never dials the target
 // directly.
 func (m *Manager) tunnelDial(scanCtxID, target string) (net.Conn, error) {
-	p := proxy.GetProxy()
+	p, _, err := m.selectUpstream(scanCtxID)
+	if err != nil {
+		return nil, err
+	}
 	if p != nil {
 		return m.dialThroughUpstream(p, target)
-	}
-	if proxy.Required() {
-		return nil, errRequiredNoUpstream
 	}
 	dialer := &net.Dialer{Timeout: upstreamDialTimeout}
 	if m.dialGuard != nil {
@@ -705,15 +755,31 @@ func (m *Manager) tunnelDial(scanCtxID, target string) (net.Conn, error) {
 // client connection, acknowledge, and pipe bytes both ways without ever
 // looking inside the TLS stream. Used when the traffic proxy is off
 // (proxy-required legacy bridge) or when the CA refused to load.
-func (h *proxyHandler) serveConnectBlind(w http.ResponseWriter, r *http.Request) {
+func (h *proxyHandler) serveConnectBlind(w http.ResponseWriter, r *http.Request, baseAttr Attribution) {
 	m := h.m
-	attr, _ := extractAttribution(r)
+	attr := baseAttr
+	if headerAttr, ok := extractAttribution(r); ok {
+		if baseAttr.ScanCtxID == "" && baseAttr.InstanceID == "" {
+			attr = headerAttr
+		} else if headerAttr.Channel == ChannelBearer &&
+			(headerAttr.ScanCtxID == "" || headerAttr.ScanCtxID == baseAttr.ScanCtxID) {
+			// The run-scoped listener port owns the run. An explicit Bearer for
+			// the same run (the container HTTP worker) upgrades the channel to
+			// Bearer: that request already met the tool-layer gate, so it must
+			// not be re-adjudicated at the proxy. Basic never overrides the
+			// port.
+			attr = headerAttr
+		}
+	}
 	obs := &TrafficObservation{
 		At:         time.Now().UTC(),
 		InstanceID: attr.InstanceID,
 		ScanCtxID:  attr.ScanCtxID,
 		Method:     http.MethodConnect,
 		URL:        redactURL(r.Host),
+	}
+	if obs.ScanCtxID != "" {
+		NoteEgressUsage(obs.ScanCtxID, obs.InstanceID, proxy.UpstreamLabelFor(obs.ScanCtxID), 1, 0)
 	}
 
 	upstreamConn, err := m.tunnelDial(attr.ScanCtxID, r.Host)
@@ -745,7 +811,7 @@ func (h *proxyHandler) serveConnectBlind(w http.ResponseWriter, r *http.Request)
 	obs.Status = http.StatusOK
 	m.observe(obs)
 
-	t := &tunnel{conn: clientConn, done: make(chan struct{})}
+	t := &tunnel{conn: clientConn, done: make(chan struct{}), scanID: obs.ScanCtxID}
 	m.registerTunnel(t)
 	defer m.unregisterTunnel(t)
 

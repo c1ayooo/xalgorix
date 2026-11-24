@@ -313,6 +313,10 @@ func (w *guidanceWatcher) processLocked(seq uint64) string {
 			continue
 		}
 		delete(w.pending, id)
+		// A consumed live guidance row is NOT mirrored into the hint graph:
+		// live directives are interpreted by the main chat (proposal →
+		// confirmation), and an active hint here would let the planner create
+		// the same work without that confirmation.
 		if w.broadcast != nil {
 			w.broadcast(WSEvent{
 				Type:     "guidance_consumed",

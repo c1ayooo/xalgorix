@@ -200,6 +200,8 @@ func vulnFromSummary(vs VulnSummary) reporting.Vulnerability {
 		VerificationMethod: vs.VerificationMethod,
 		Verified:           vs.Verified,
 		Tags:               vs.Tags,
+		Timestamp:          vs.FoundAt,
+		TrafficRefs:        vs.TrafficRefs,
 	}
 }
 

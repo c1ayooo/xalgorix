@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/c1ayooo/xalgorix/v4/internal/platform"
+	"github.com/c1ayooo/xalgorix/v4/internal/runstate"
 )
 
 func taskWorkerCheckpoint(agents string) string {
@@ -86,6 +87,54 @@ func TestTaskWorkersProjection_ListsHistoricalWorkers(t *testing.T) {
 	}
 	if statuses["sub_1_1"] != "completed" || statuses["sub_2_2"] != "failed" {
 		t.Fatalf("terminal statuses lost: %#v", statuses)
+	}
+}
+
+// TestTaskWorkersProjection_BatchesWorkerHistory pins the first-load cost: a
+// task with several runs must read worker history in ONE batch query and reuse
+// the ONE scan-summary walk the run projection already paid for. The old code
+// did a full walk + a PG query per run, so first paint scaled with run count.
+func TestTaskWorkersProjection_BatchesWorkerHistory(t *testing.T) {
+	s, store := newApprovalsTestServer(t, nil)
+	fake := useFakeWorkerBackend(t)
+	ctx := context.Background()
+	project, err := store.CreateProject(ctx, "Batch Project", platform.Scope{Targets: []string{"example.com"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := store.CreateTask(ctx, project.ID, platform.TaskInput{Name: "Batch Task", Goal: "g"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	instances := []string{"batch-inst-1", "batch-inst-2", "batch-inst-3"}
+	for _, id := range instances {
+		if _, err := store.CreateRun(ctx, task.ID, platform.RunMount{InstanceID: id, Mode: "single"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := fake.UpsertWorker(ctx, runstate.WorkerRecord{
+			InstanceID: id, ScanID: "scan-" + id, AgentID: "sub_" + id,
+			Lane: "recon", Task: "map surface", Status: "completed",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rr := projectionGet(t, s.handleTaskDetail, "/api/tasks/"+task.ID+"/workers")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var out struct {
+		Items []taskWorkerRunView `json:"items"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(out.Items) != len(instances) {
+		t.Fatalf("items = %d, want %d", len(out.Items), len(instances))
+	}
+	batch, perInstance := fake.calls()
+	if batch != 1 || perInstance != 0 {
+		t.Fatalf("worker history reads = batch %d / per-instance %d, want 1 / 0", batch, perInstance)
 	}
 }
 

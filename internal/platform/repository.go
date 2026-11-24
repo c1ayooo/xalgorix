@@ -42,6 +42,11 @@ type Repository interface {
 	ListTasks(ctx context.Context, projectID string) ([]Task, error)
 	GetTask(ctx context.Context, id string) (*Task, error)
 	UpdateTask(ctx context.Context, id string, upd TaskUpdate) (*Task, error)
+	// SetTaskRunRevision records the runnable-content revision an accepted
+	// dispatch consumed (tasks.context.run_revision). It is a dispatch marker,
+	// not an edit: updated_at is deliberately left untouched. Unknown task ids
+	// return ErrNotFound.
+	SetTaskRunRevision(ctx context.Context, id, revision string) error
 	DeleteTask(ctx context.Context, id string) error
 
 	// ── runs (mount records only) ───────────────────────────────────────────
@@ -273,4 +278,43 @@ func uniqueSlug(base string, existing map[string]struct{}) string {
 			return candidate
 		}
 	}
+}
+
+// ReportStore is the optional report-delivery seam. Both the PostgreSQL store
+// and the file store implement it; the web layer treats it as optional so a
+// repository used only for platform metadata keeps working unchanged.
+type ReportStore interface {
+	// CreateReport allocates the next revision for the task and inserts the
+	// row in ReportQueued. At most one queued/generating report may exist per
+	// task (migration 0028 partial unique index); a second attempt is
+	// ErrConflict.
+	CreateReport(ctx context.Context, mount ReportMount) (*Report, error)
+	// UpdateReportStatus moves one report through queued → generating →
+	// ready|failed|cancelled. The store stamps started_at/finished_at.
+	UpdateReportStatus(ctx context.Context, reportID, status, errMsg string) error
+	GetReport(ctx context.Context, reportID string) (*Report, error)
+	// ListReportsByTask returns revisions newest first.
+	ListReportsByTask(ctx context.Context, taskID string) ([]Report, error)
+	// PutReportArtifacts upserts the artifact index for one report.
+	PutReportArtifacts(ctx context.Context, reportID string, artifacts []ReportArtifact) error
+	ListReportArtifacts(ctx context.Context, reportID string) ([]ReportArtifact, error)
+	// DeleteReport removes the metadata row (artifacts cascade). The caller
+	// removes the report directory.
+	DeleteReport(ctx context.Context, reportID string) error
+}
+
+// ReportLister is an optional convenience seam for the global Reports page.
+// It is separate from ReportStore so a minimal implementation can support
+// per-task generation without a cross-task list.
+type ReportLister interface {
+	// ListReports returns the newest report rows across all tasks, bounded by
+	// limit (0 → 100, capped at 500).
+	ListReports(ctx context.Context, limit int) ([]Report, error)
+}
+
+// ReportReconciler recovers report rows left active by a process restart.
+// A queued/generating row has no live job after restart, so it is marked
+// failed and can be regenerated manually.
+type ReportReconciler interface {
+	ReconcileActiveReports(ctx context.Context, reason string) (int, error)
 }

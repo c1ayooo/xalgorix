@@ -23,9 +23,11 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY cmd/toolshim ./cmd/toolshim
+COPY cmd/httpworker ./cmd/httpworker
 COPY tools/toolbox/selftest ./tools/toolbox/selftest
 ENV CGO_ENABLED=0 GOOS=linux
 RUN go build -trimpath -ldflags "-s -w" -o /out/toolshim ./cmd/toolshim \
+ && go build -trimpath -ldflags "-s -w" -o /out/httpworker ./cmd/httpworker \
  && go build -trimpath -ldflags "-s -w" -o /out/toolbox-selftest ./tools/toolbox/selftest
 
 # ── Stage 2: base runtime ────────────────────────────────────────────────────
@@ -56,16 +58,6 @@ RUN chmod +x /opt/xalgorix/install.sh && /opt/xalgorix/install.sh base
 # fail silently. This also matches the toolpack's /usr/local/go/bin/go path.
 COPY --from=gobuild /usr/local/go /usr/local/go
 
-# Publish the repo-built helpers on a PATH directory that precedes distro bins.
-COPY --from=gobuild /out/toolshim /opt/xalgorix/bin/toolshim
-COPY --from=gobuild /out/toolbox-selftest /opt/xalgorix/bin/toolbox-selftest
-COPY tools/toolbox/toolpack.yaml /opt/xalgorix/toolpack.yaml
-
-# File capabilities are stripped AFTER each profile's package installs: apt
-# re-adds setcap capabilities when nmap/masscan/arping are installed again in
-# the net/exploit layers, and a binary requesting an effective cap outside the
-# container's bounding set fails execve with EPERM.
-
 ENV PATH="/opt/xalgorix/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/go/bin:/root/.local/bin:/root/.cargo/bin" \
     HOME=/root \
     LANG=C.UTF-8 \
@@ -78,22 +70,51 @@ WORKDIR /
 # runnable standalone for debugging.
 CMD ["sleep", "infinity"]
 
-# ── Stage 3: core profile ────────────────────────────────────────────────────
-FROM base AS core
+# Stage 2 ends here on purpose: everything below this line is a *profile*
+# install (expensive, minutes, several GB), and the repo-built helpers are
+# layered only on top of the finished profiles. Docker invalidates every layer
+# downstream of a change, so putting `COPY --from=gobuild` above the profile
+# installs made a one-line helper edit re-run the whole 6 GB apt/go toolset.
+# Keep those copies below the last profile install (see "final images").
+
+# ── Stage 3: profile tool installs (cached; independent of helper sources) ────
+#
+# File capabilities are stripped AFTER each profile's package installs: apt
+# re-adds setcap capabilities when nmap/masscan/arping are installed again in
+# the net/exploit layers, and a binary requesting an effective cap outside the
+# container's bounding set fails execve with EPERM.
+FROM base AS core-tools
 RUN /opt/xalgorix/install.sh core \
  && getcap -r / 2>/dev/null | awk '{print $1}' | while read -r f; do setcap -r "$f" 2>/dev/null || true; done || true
 
 # ── Stage 4: full profile (raw sockets, exploitation, credentials) ───────────
-FROM core AS full
+FROM core-tools AS full-tools
 RUN /opt/xalgorix/install.sh net && /opt/xalgorix/install.sh exploit && /opt/xalgorix/install.sh sast \
  && getcap -r / 2>/dev/null | awk '{print $1}' | while read -r f; do setcap -r "$f" 2>/dev/null || true; done || true
 
 # ── Stage 5: web profile (headless Chromium) ─────────────────────────────────
-FROM core AS web
+FROM core-tools AS web-tools
 RUN /opt/xalgorix/install.sh browser \
  && getcap -r / 2>/dev/null | awk '{print $1}' | while read -r f; do setcap -r "$f" 2>/dev/null || true; done || true
 
-# ── Stage 6: self-test gate ──────────────────────────────────────────────────
+# ── Final images: cheap repo-built helpers, on top of the finished profile ────
+# These are the only layers that change when cmd/toolshim, cmd/httpworker,
+# tools/toolbox/selftest or toolpack.yaml change. Each profile needs its own
+# copy layer because a layer cannot be inserted between an existing parent and
+# child. Publish helper binaries on a PATH directory that precedes distro bins.
+FROM core-tools AS core
+COPY --from=gobuild /out/ /opt/xalgorix/bin/
+COPY tools/toolbox/toolpack.yaml /opt/xalgorix/toolpack.yaml
+
+FROM full-tools AS full
+COPY --from=gobuild /out/ /opt/xalgorix/bin/
+COPY tools/toolbox/toolpack.yaml /opt/xalgorix/toolpack.yaml
+
+FROM web-tools AS web
+COPY --from=gobuild /out/ /opt/xalgorix/bin/
+COPY tools/toolbox/toolpack.yaml /opt/xalgorix/toolpack.yaml
+
+# ── Self-test gate ──────────────────────────────────────────────────────────
 # CI builds this target and treats a non-zero exit as a failed image. The
 # platform's PrefetchImage/Selftest jobs run the same binary in a live container.
 FROM core AS verify

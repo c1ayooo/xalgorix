@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math"
+	"net"
 	"net/http"
 	neturl "net/url"
 	"os"
@@ -274,19 +276,29 @@ func (d *DockerDriver) EnsureProject(ctx context.Context, spec ProjectSpec) (Pro
 	existing, err := d.client.inspectContainer(ctx, name)
 	if err == nil {
 		if imageMatches(existing.Config.Image, spec.Image) {
-			if !existing.State.Running {
-				if startErr := d.client.startContainer(ctx, existing.ID); startErr != nil {
-					return ProjectHandle{}, NewExecError(CodeContainerStart, PhaseEnsure, "start existing container: %v", startErr)
+			// A run-scoped proxy listener gets a new port after a platform
+			// restart/resume. Reusing a container whose HTTP_PROXY still names
+			// the dead port would silently break egress (and, for host-network
+			// projects, stop the traffic archive entirely), so recreate it.
+			if want := specProxyPort(spec); want > 0 && containerProxyPort(existing.Config.Env) != want {
+				if rmErr := d.removeContainerAndNetwork(ctx, spec.ProjectID, existing.ID); rmErr != nil && !IsCode(rmErr, CodeNotFound) {
+					return ProjectHandle{}, rmErr
 				}
+			} else {
+				if !existing.State.Running {
+					if startErr := d.client.startContainer(ctx, existing.ID); startErr != nil {
+						return ProjectHandle{}, NewExecError(CodeContainerStart, PhaseEnsure, "start existing container: %v", startErr)
+					}
+				}
+				// The container already exists and consumes host resources whether
+				// or not we count it, so adopt it without failing at the cap.
+				d.adoptSlot(spec.ProjectID)
+				d.remember(spec.ProjectID, existing.ID, StateReady)
+				d.ensureHTTPWorker(ctx, existing.ID, spec.HTTPWorkerSocket)
+				return ProjectHandle{ProjectID: spec.ProjectID, ContainerID: existing.ID, State: StateReady, Image: spec.Image, CreatedAt: time.Now().UTC(), ProxyURL: d.projectGatewayProxyURL(ctx, spec)}, nil
 			}
-			// The container already exists and consumes host resources whether
-			// or not we count it, so adopt it without failing at the cap.
-			d.adoptSlot(spec.ProjectID)
-			d.remember(spec.ProjectID, existing.ID, StateReady)
-			return ProjectHandle{ProjectID: spec.ProjectID, ContainerID: existing.ID, State: StateReady, Image: spec.Image, CreatedAt: time.Now().UTC()}, nil
-		}
-		// Image digest changed: replace rather than mutate in place.
-		if rmErr := d.removeContainerAndNetwork(ctx, spec.ProjectID, existing.ID); rmErr != nil && !IsCode(rmErr, CodeNotFound) {
+		} else if rmErr := d.removeContainerAndNetwork(ctx, spec.ProjectID, existing.ID); rmErr != nil && !IsCode(rmErr, CodeNotFound) {
+			// Image digest changed: replace rather than mutate in place.
 			return ProjectHandle{}, rmErr
 		}
 	} else if !IsCode(err, CodeNotFound) {
@@ -312,6 +324,22 @@ func (d *DockerDriver) EnsureProject(ctx context.Context, spec ProjectSpec) (Pro
 			d.releaseSlot(spec.ProjectID)
 			return ProjectHandle{}, NewExecError(CodeContainerStart, PhaseEnsure, "create network: %v", netErr)
 		}
+	}
+
+	// The platform proxy can be addressed through the project network's own
+	// gateway: an --internal network has no default route, but its gateway is
+	// on-link. Resolve it only after the network exists and inject the proxy
+	// environment before the container is created.
+	if spec.Network.ProxyGatewayPort > 0 && spec.Network.Name != "" {
+		gateway, gwErr := d.client.networkGateway(ctx, spec.Network.Name)
+		if gwErr != nil {
+			d.releaseSlot(spec.ProjectID)
+			return ProjectHandle{}, NewExecError(CodeContainerStart, PhaseEnsure,
+				"resolve project network gateway for proxy: %v", gwErr)
+		}
+		proxyURL := "http://" + net.JoinHostPort(gateway, strconv.Itoa(spec.Network.ProxyGatewayPort))
+		spec.Network.ProxyURL = proxyURL
+		spec.Env = appendGatewayProxyEnv(spec.Env, proxyURL)
 	}
 
 	labels := map[string]string{
@@ -349,9 +377,13 @@ func (d *DockerDriver) EnsureProject(ctx context.Context, spec ProjectSpec) (Pro
 		}
 	}
 
+	networkMode := orDefault(spec.Network.Name, "none")
+	if spec.Network.Host {
+		networkMode = "host"
+	}
 	hostCfg := dockerHostConfig{
 		Binds:          binds,
-		NetworkMode:    orDefault(spec.Network.Name, "none"),
+		NetworkMode:    networkMode,
 		ReadonlyRootfs: true,
 		Privileged:     false,
 		CapDrop:        []string{"ALL"},
@@ -395,13 +427,72 @@ func (d *DockerDriver) EnsureProject(ctx context.Context, spec ProjectSpec) (Pro
 		return ProjectHandle{}, NewExecError(CodeContainerStart, PhaseEnsure, "start container: %v", startErr)
 	}
 	d.remember(spec.ProjectID, containerID, StateReady)
+	d.ensureHTTPWorker(ctx, containerID, spec.HTTPWorkerSocket)
 	return ProjectHandle{
 		ProjectID:   spec.ProjectID,
 		ContainerID: containerID,
 		State:       StateReady,
 		Image:       spec.Image,
 		CreatedAt:   time.Now().UTC(),
+		ProxyURL:    spec.Network.ProxyURL,
 	}, nil
+}
+
+// specProxyPort is the port the container's proxy environment should name,
+// whether the spec addresses the proxy through a bridge gateway (driver
+// resolves the gateway URL) or through an explicit loopback URL (host network).
+func specProxyPort(spec ProjectSpec) int {
+	if spec.Network.ProxyGatewayPort > 0 {
+		return spec.Network.ProxyGatewayPort
+	}
+	raw := strings.TrimSpace(spec.Network.ProxyURL)
+	if raw == "" {
+		return 0
+	}
+	u, err := neturl.Parse(raw)
+	if err != nil {
+		return 0
+	}
+	port, err := strconv.Atoi(u.Port())
+	if err != nil {
+		return 0
+	}
+	return port
+}
+
+// containerProxyPort extracts the proxy port from a container's environment
+// (HTTP_PROXY / HTTPS_PROXY). Used to detect a stale run-scoped proxy port on a
+// container that outlived a platform restart.
+func containerProxyPort(env []string) int {
+	for _, kv := range env {
+		for _, key := range []string{"HTTP_PROXY=", "http_proxy=", "HTTPS_PROXY=", "https_proxy="} {
+			if !strings.HasPrefix(kv, key) {
+				continue
+			}
+			u, err := neturl.Parse(strings.TrimPrefix(kv, key))
+			if err != nil {
+				continue
+			}
+			if port, perr := strconv.Atoi(u.Port()); perr == nil {
+				return port
+			}
+		}
+	}
+	return 0
+}
+
+// projectGatewayProxyURL rebuilds the container-reachable proxy URL for an
+// already-running project (gateway address + run-scoped listener port). Empty
+// when the project does not use the platform proxy.
+func (d *DockerDriver) projectGatewayProxyURL(ctx context.Context, spec ProjectSpec) string {
+	if spec.Network.ProxyGatewayPort <= 0 || spec.Network.Name == "" {
+		return ""
+	}
+	gateway, err := d.client.networkGateway(ctx, spec.Network.Name)
+	if err != nil {
+		return ""
+	}
+	return "http://" + net.JoinHostPort(gateway, strconv.Itoa(spec.Network.ProxyGatewayPort))
 }
 
 func imageMatches(current, want string) bool {
@@ -421,6 +512,33 @@ func imageMatches(current, want string) bool {
 		return len(digest) >= 12 && strings.Contains(current, digest[:12])
 	}
 	return false
+}
+
+// appendGatewayProxyEnv replaces any host proxy environment with the
+// project-network gateway URL. Host proxy variables point at the platform's
+// loopback and are not reachable from the container.
+func appendGatewayProxyEnv(env []string, proxyURL string) []string {
+	out := make([]string, 0, len(env)+8)
+	for _, kv := range env {
+		key, _, ok := strings.Cut(kv, "=")
+		if !ok {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(key)) {
+		case "http_proxy", "https_proxy", "all_proxy", "no_proxy":
+			continue
+		}
+		out = append(out, kv)
+	}
+	return append(out,
+		"HTTP_PROXY="+proxyURL,
+		"HTTPS_PROXY="+proxyURL,
+		"ALL_PROXY="+proxyURL,
+		"http_proxy="+proxyURL,
+		"https_proxy="+proxyURL,
+		"all_proxy="+proxyURL,
+		"NO_PROXY=127.0.0.1,localhost,::1",
+	)
 }
 
 func capabilitiesFor(spec ProjectSpec) []string {
@@ -772,6 +890,69 @@ func withInContainerTimeout(argv []string, timeout time.Duration) []string {
 		secs = 1
 	}
 	return append([]string{"timeout", "-k", "5", strconv.Itoa(secs)}, argv...)
+}
+
+// ensureHTTPWorker starts the in-container HTTP worker when the project asked
+// for one. Failure is non-fatal for the project: other tools still work, and the
+// HTTP transport reports a clear error on first use.
+func (d *DockerDriver) ensureHTTPWorker(ctx context.Context, containerID, socket string) {
+	if strings.TrimSpace(socket) == "" {
+		return
+	}
+	if httpWorkerHealthy(ctx, socket) {
+		return
+	}
+	if info, err := os.Stat(socket); err == nil && info.Mode()&os.ModeSocket != 0 {
+		_ = os.Remove(socket)
+	}
+	if err := os.MkdirAll(filepath.Dir(socket), 0o750); err != nil {
+		log.Printf("[runtime] http worker dir %s: %v", filepath.Dir(socket), err)
+		return
+	}
+	execID, err := d.client.createExec(ctx, containerID, dockerExecConfig{
+		Cmd: []string{"/opt/xalgorix/bin/httpworker", "--socket", socket},
+		Env: []string{"HOME=/tmp", "TMPDIR=/tmp"},
+	})
+	if err != nil {
+		log.Printf("[runtime] start http worker: %v", err)
+		return
+	}
+	if err := d.client.startExecDetached(ctx, execID); err != nil {
+		log.Printf("[runtime] start http worker: %v", err)
+		return
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if httpWorkerHealthy(ctx, socket) {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	log.Printf("[runtime] http worker did not become ready on %s (image may lack /opt/xalgorix/bin/httpworker)", socket)
+}
+
+func httpWorkerHealthy(ctx context.Context, socket string) bool {
+	tr := &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "unix", socket)
+		},
+	}
+	client := &http.Client{Transport: tr, Timeout: 500 * time.Millisecond}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://httpworker/v1/health", nil)
+	if err != nil {
+		return false
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = resp.Body.Close() }()
+	return resp.StatusCode == http.StatusOK
 }
 
 // waitExec polls the exec state until it stops running.

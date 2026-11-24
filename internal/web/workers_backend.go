@@ -12,6 +12,7 @@ package web
 import (
 	"context"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -79,6 +80,7 @@ func (s *Server) persistWorkerLifecycle(evt agent.Event, sess *scanSession) {
 	if st, _ := meta["status"].(string); st != "" {
 		status = st
 	}
+	unitID, _ := meta["unit_id"].(string)
 	lane, _ := meta["lane"].(string)
 	task, _ := meta["task"].(string)
 	target, _ := meta["target"].(string)
@@ -88,11 +90,24 @@ func (s *Server) persistWorkerLifecycle(evt agent.Event, sess *scanSession) {
 		InstanceID: sess.instanceID,
 		ScanID:     sess.id,
 		AgentID:    agentID,
+		UnitID:     unitID,
 		Lane:       lane,
 		Task:       task,
 		Target:     target,
 		Status:     status,
 	}
+	// Event metadata is model-authored and can contain a truncated multi-byte
+	// rune. PostgreSQL rejects the whole row on invalid UTF-8 (SQLSTATE 22021),
+	// which made the live worker disappear from /agents history. Persist a
+	// valid UTF-8 projection instead of dropping the lifecycle row.
+	rec.InstanceID = strings.ToValidUTF8(rec.InstanceID, "\uFFFD")
+	rec.ScanID = strings.ToValidUTF8(rec.ScanID, "\uFFFD")
+	rec.AgentID = strings.ToValidUTF8(rec.AgentID, "\uFFFD")
+	rec.UnitID = strings.ToValidUTF8(rec.UnitID, "\uFFFD")
+	rec.Lane = strings.ToValidUTF8(rec.Lane, "\uFFFD")
+	rec.Task = strings.ToValidUTF8(rec.Task, "\uFFFD")
+	rec.Target = strings.ToValidUTF8(rec.Target, "\uFFFD")
+	rec.Status = strings.ToValidUTF8(rec.Status, "\uFFFD")
 	switch evt.Type {
 	case "agent_started":
 		rec.StartedAt = now

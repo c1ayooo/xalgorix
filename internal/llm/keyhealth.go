@@ -142,6 +142,63 @@ func ResetKeyPoolHealth(fingerprint string) {
 	delete(keyPoolHealth.m, fingerprint)
 }
 
+// KeyFailoverEvent is one observable automatic switch off a key. The Live page
+// renders these so "traffic moved" is visible without reading server logs. It
+// carries fingerprints only, never key material.
+type KeyFailoverEvent struct {
+	At            time.Time `json:"at"`
+	Reason        string    `json:"reason"` // rate_limit | quota_exhausted | overloaded | auth
+	From          string    `json:"from,omitempty"`
+	To            string    `json:"to,omitempty"`
+	CooldownUntil time.Time `json:"cooldown_until,omitempty"`
+}
+
+const keyFailoverRingSize = 20
+
+type keyFailoverRing struct {
+	mu     sync.Mutex
+	events []KeyFailoverEvent
+}
+
+var keyFailoverLog = &keyFailoverRing{events: make([]KeyFailoverEvent, 0, keyFailoverRingSize)}
+
+// RecordKeyFailover appends one switch to the process-wide ring. Called from the
+// client retry loop at the exact point a request moves to another key; health
+// state is read after the cooldown is armed, so CooldownUntil is the window the
+// failed key is skipped for.
+func RecordKeyFailover(reason, fromKey, toKey string) {
+	event := KeyFailoverEvent{
+		At:     time.Now(),
+		Reason: reason,
+		From:   KeyFingerprint(fromKey),
+		To:     KeyFingerprint(toKey),
+	}
+	if event.From != "" {
+		keyPoolHealth.mu.Lock()
+		if st := keyPoolHealth.m[event.From]; st != nil {
+			event.CooldownUntil = st.OpenUntil
+		}
+		keyPoolHealth.mu.Unlock()
+	}
+	keyFailoverLog.mu.Lock()
+	defer keyFailoverLog.mu.Unlock()
+	keyFailoverLog.events = append(keyFailoverLog.events, event)
+	if len(keyFailoverLog.events) > keyFailoverRingSize {
+		keyFailoverLog.events = keyFailoverLog.events[len(keyFailoverLog.events)-keyFailoverRingSize:]
+	}
+}
+
+// KeyFailoverEvents returns the recent switches, newest first.
+func KeyFailoverEvents() []KeyFailoverEvent {
+	keyFailoverLog.mu.Lock()
+	defer keyFailoverLog.mu.Unlock()
+	out := make([]KeyFailoverEvent, 0, len(keyFailoverLog.events))
+	for i := len(keyFailoverLog.events) - 1; i >= 0; i-- {
+		out = append(out, keyFailoverLog.events[i])
+	}
+	return out
+}
+
 // trimKeyError shortens provider bodies for the status API / logs.
 func trimKeyError(msg string) string {
 	s := strings.TrimSpace(strings.ReplaceAll(msg, "\n", " "))

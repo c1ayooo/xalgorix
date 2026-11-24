@@ -13,6 +13,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 
@@ -401,6 +402,65 @@ func FormatForContextID(contextID string) string {
 	return formatStore(s)
 }
 
+// NotesContextBudgetBytes bounds the notes block injected into an LLM context.
+// Notes are unbounded in count and the whole block is re-injected on every
+// compaction, so without a total budget a large endpoint inventory can push the
+// buffer straight back over the compaction ceiling and cause thrash. The
+// per-value 500-byte cap is not a substitute: it bounds one note, not the block.
+const NotesContextBudgetBytes = 6000
+
+// FormatForContextBudgetID renders at most maxBytes of notes in deterministic
+// key order, appending a trailer that names how many notes were omitted. It
+// returns "" when there are no notes. maxBytes<=0 uses
+// NotesContextBudgetBytes.
+//
+// This is the injection form used by context compaction: the agent can always
+// re-read a specific note with read_notes(key=...), so truncation loses no
+// information, only eager resend.
+func FormatForContextBudgetID(contextID string, maxBytes int) string {
+	s := getNoteStoreForContext(contextID)
+	return formatStoreBudget(s, maxBytes)
+}
+
+func formatStoreBudget(s *noteStore, maxBytes int) string {
+	if maxBytes <= 0 {
+		maxBytes = NotesContextBudgetBytes
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if len(s.store) == 0 {
+		return ""
+	}
+
+	keys := make([]string, 0, len(s.store))
+	for k := range s.store {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var b strings.Builder
+	b.WriteString("=== YOUR SAVED NOTES (from add_note) ===\n")
+	written := 0
+	for _, k := range keys {
+		v := s.store[k]
+		if len(v) > 500 {
+			v = v[:500] + "... (truncated)"
+		}
+		line := fmt.Sprintf("• %s: %s\n", k, v)
+		if b.Len()+len(line) > maxBytes {
+			break
+		}
+		b.WriteString(line)
+		written++
+	}
+	if omitted := len(keys) - written; omitted > 0 {
+		fmt.Fprintf(&b, "… %d more notes omitted (use read_notes(key=...) for a specific key)\n", omitted)
+	}
+	b.WriteString("=== END NOTES ===")
+	return b.String()
+}
+
 func formatStore(s *noteStore) string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -409,9 +469,16 @@ func formatStore(s *noteStore) string {
 		return ""
 	}
 
+	keys := make([]string, 0, len(s.store))
+	for k := range s.store {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
 	var b strings.Builder
 	b.WriteString("=== YOUR SAVED NOTES (from add_note) ===\n")
-	for k, v := range s.store {
+	for _, k := range keys {
+		v := s.store[k]
 		if len(v) > 500 {
 			v = v[:500] + "... (truncated)"
 		}

@@ -118,6 +118,17 @@ func (o *einoObserver) BeforeTurn(_ context.Context, turn int) engine.TurnDecisi
 			},
 		})
 	}
+	// R7/M1: the graph is the plan authority. If it became unavailable during
+	// this turn's hook, pause the run instead of continuing on a divergent
+	// in-memory plan. The scan session maps graph_unavailable to a resumable
+	// pause so the operator can resume once PG is back.
+	if a.state != nil && a.state.GraphUnavailable {
+		return engine.TurnDecision{StopReason: "graph_unavailable"}
+	}
+	// R7/M1: mirror ledger hypotheses/evidence, accepted findings and the
+	// deterministic objective into the authoritative exploration graph at the
+	// turn boundary. Root only; a projection failure never stops the loop.
+	a.syncExplorationGraph()
 	return engine.TurnDecision{Nudge: result.Nudge, EmitMessage: result.EmitMessage}
 }
 
@@ -152,6 +163,12 @@ func (o *einoObserver) BeforeTool(_ context.Context, name string, args map[strin
 	}
 	if blocked, reason := a.shouldBlockForTargetScope(name, merged); blocked {
 		return block("⛔ OUTSIDE SCAN BOUNDARY — ", reason)
+	}
+	// Round-5 P0-2/P0-3: platform submission discipline (provenance, catalog,
+	// probe rejection, dedupe, rate limit) and lane closure for start/close/
+	// submit. Only calls aimed at a configured control-plane host are in scope.
+	if blocked, reason := a.shouldBlockForPlatformDiscipline(name, merged); blocked {
+		return block("⛔ PLATFORM SUBMISSION GUARD BLOCKED — ", reason)
 	}
 	if blocked, reason := a.shouldBlockForDwellBudget(name, merged); blocked {
 		return block("⛔ DWELL BUDGET EXHAUSTED — ", reason)
@@ -256,6 +273,10 @@ func (o *einoObserver) AfterTool(_ context.Context, name string, args map[string
 	if callErr == nil && isExecChannelTool(name) {
 		a.execTimeoutStreak.Store(0)
 	}
+	// Round-5 P0-2: every tool output feeds the scan's observed tail so a later
+	// submit can prove its value came from this run; acceptances mark the
+	// challenge complete.
+	a.observePlatformResult(name, args, output)
 
 	previousTargetErrors := a.state.ConsecutiveTargetErrors
 	result := a.hooks.Fire(OnToolResult, a.state, merged)
@@ -508,8 +529,12 @@ func (o *einoObserver) OnModelResponse(_ context.Context, request []llm.Message,
 }
 
 // CompactMessages enforces the bounded working context over the ADK state.
-// Kept bytes remain reachable through notes; compacted history is converted
-// into one deterministic digest before the next provider request.
+// Kept bytes remain reachable through notes/archives; compacted history is
+// converted into one deterministic digest before the next provider request.
+//
+// Trigger order (IG6a): provider-reported prompt tokens are authoritative; the
+// byte heuristic only covers requests that have no usage yet. Setting
+// XALGORIX_CONTEXT_COMPACT_TOKENS=0 still disables automatic compaction.
 func (o *einoObserver) CompactMessages(input []*schema.Message) []*schema.Message {
 	a := o.agent
 	if a == nil || a.cfg == nil || len(input) < 2 {
@@ -528,7 +553,13 @@ func (o *einoObserver) CompactMessages(input []*schema.Message) []*schema.Messag
 			size += len(msg.Content) + perMessageOverheadBytes
 		}
 	}
-	if size <= threshold && len(input) <= maxMessagesBeforePrune {
+	tokenTrigger := a.promptTokensNearLimit()
+	if !tokenTrigger && a.lastPromptTokens.Load() <= 0 {
+		// First request (or a provider that never reports usage): fall back to
+		// the CJK-corrected estimator, never the raw 4-bytes/token count alone.
+		tokenTrigger = a.estimatedTokensNearLimit(input)
+	}
+	if size <= threshold && len(input) <= maxMessagesBeforePrune && !tokenTrigger {
 		return input
 	}
 	const keepRecent = 40
@@ -544,16 +575,23 @@ func (o *einoObserver) CompactMessages(input []*schema.Message) []*schema.Messag
 		if msg == nil {
 			continue
 		}
-		old = append(old, llm.Message{Role: string(msg.Role), Content: msg.Content})
+		old = append(old, schemaMessageToLLM(msg))
+	}
+	// IG6c: replace the text digest with the deterministic state projection.
+	// The transcript window only contributes a bounded "recent actions" list.
+	snap := a.buildContextSnapshot(a.digestRegion(), old, a.snapshotBudgetBytes())
+	digestText := snap.Text
+	if !snap.HasState {
+		// No authoritative state is wired (CLI/unit-test setup): keep the
+		// lossy transcript digest so the buffer is never replaced by nothing.
+		digestText = "## Compacted History\n" + compactMessages(old)
+		if notesContext := notes.FormatForContextBudgetID(a.scanCtx.ID, notes.NotesContextBudgetBytes); notesContext != "" {
+			digestText += "\n\n## Your Saved Notes\n" + notesContext
+		}
 	}
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("[CONTEXT PRUNED: %d older messages were compacted to save context space.]\n\n", len(old)))
-	sb.WriteString("## Compacted History\n")
-	sb.WriteString(compactMessages(old))
-	if notes := notes.FormatForContextID(a.scanCtx.ID); notes != "" {
-		sb.WriteString("\n\n## Your Saved Notes\n")
-		sb.WriteString(notes)
-	}
+	sb.WriteString(fmt.Sprintf("[CONTEXT PRUNED: %d older messages were compacted. The engine state snapshot below was rebuilt from authoritative stores.]\n\n", len(old)))
+	sb.WriteString(digestText)
 	sb.WriteString("\n\nYou are still in the MIDDLE of your scan. DO NOT call finish — continue testing from where you left off.")
 	out := make([]*schema.Message, 0, keepRecent+2)
 	out = append(out, input[0])
@@ -568,7 +606,54 @@ func (o *einoObserver) CompactMessages(input []*schema.Message) []*schema.Messag
 		}
 		out = append(out, &cp)
 	}
+	// Persist before incrementing compactionCount so the node's compaction_seq
+	// matches the ordinal this compaction represents (1 for the first).
+	a.persistContextDigest(snap, size)
+	afterSize := 0
+	for _, msg := range out {
+		if msg != nil {
+			afterSize += len(msg.Content) + perMessageOverheadBytes
+		}
+	}
+	promptTokensBefore := a.lastPromptTokens.Load()
+	// Re-baseline the trigger on the compacted buffer. The provider will
+	// overwrite this with exact usage on the next response; until then, a
+	// provider that omits usage must not re-see the stale pre-compaction value
+	// and compact again on every request.
+	a.lastPromptTokens.Store(int64(estimateSchemaMessagesTokens(out)))
 	a.compactionCount++
+	log.Printf("[agent] context compacted: messages %d→%d, bytes %d→%d, prompt_tokens=%d token_trigger=%v snapshot=%v refs=%d",
+		len(input), len(out), size, afterSize, promptTokensBefore, tokenTrigger, snap.HasState, len(snap.Refs))
+	return out
+}
+
+// estimateSchemaMessagesTokens is the no-usage fallback for the ADK state.
+func estimateSchemaMessagesTokens(msgs []*schema.Message) int {
+	tokens := 0
+	for _, msg := range msgs {
+		if msg == nil {
+			continue
+		}
+		tokens += estimateTextTokens(msg.Content) + perMessageOverheadBytes/bytesPerTokenEstimate
+	}
+	return tokens
+}
+
+// schemaMessageToLLM preserves native tool calls and the tool-call id when
+// converting the ADK state for the digest. Dropping them made the digest's
+// tool/finding sections silently empty on the default path.
+func schemaMessageToLLM(msg *schema.Message) llm.Message {
+	out := llm.Message{Role: string(msg.Role), Content: msg.Content, ToolCallID: msg.ToolCallID}
+	for _, call := range msg.ToolCalls {
+		out.ToolCalls = append(out.ToolCalls, llm.MessageToolCall{
+			ID:   call.ID,
+			Type: call.Type,
+			Function: llm.MessageToolFunction{
+				Name:      call.Function.Name,
+				Arguments: call.Function.Arguments,
+			},
+		})
+	}
 	return out
 }
 

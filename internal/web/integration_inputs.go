@@ -20,7 +20,7 @@ import (
 )
 
 // integrationInputTimeout bounds each platform-store read on the scan-launch
-// path (approvalStoreCallTimeout posture).
+// path (same per-call posture as the approval gate's store budget).
 var integrationInputTimeout = 3 * time.Second
 
 // scanUserSkills fetches the enabled operator-authored skills for a scan.

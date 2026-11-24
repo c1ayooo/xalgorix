@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -283,27 +284,55 @@ type Task struct {
 	PhasePolicy  *PhasePolicy  `json:"phase_policy,omitempty"`
 	Schedule     *TaskSchedule `json:"schedule,omitempty"`
 	ContextPaths []string      `json:"context_paths,omitempty"`
+	// AuditMode is the task-level HITL/audit switch:
+	//   inherit — follow the process default (XALGORIX_APPROVAL_MODE);
+	//   off     — observe-only for this task's runs (no approval rows);
+	//   enforce — every regulated call (command + high-risk HTTP through the
+	//             MITM proxy) creates an approval row and blocks until the
+	//             operator decides.
+	// The effective value is snapshotted onto the Run's ScanContext at session
+	// start, so changing it affects the next run, not an in-flight one.
+	AuditMode string `json:"audit_mode"`
 	// Objective is the structured goal: absent = "not structured". It never
 	// replaces Goal (free text) and never grants authority over findings.
-	Objective  *Objective     `json:"objective,omitempty"`
+	Objective *Objective `json:"objective,omitempty"`
 	// LLMChain is the task's ordered model chain — "<provider>:<profileId>"
-	// keys, highest priority first. The run starts on ActiveLLM; the chain is
-	// operator intent, so an explicit per-run provider_profile still wins.
+	// keys, highest priority first (4zreco task_llm_profiles port). The run
+	// starts on ActiveLLM; the chain is operator intent, so it never overrides
+	// an explicit per-run provider_profile. Persisted in the task context
+	// (llm_chain / llm_active) and hydrated by the repository.
 	LLMChain  []string `json:"llm_chain,omitempty"`
 	ActiveLLM string   `json:"active_llm,omitempty"`
+	// Proxy pins the run's outbound proxy: "" = follow the global pool,
+	// "direct" = explicit direct egress, "N" = 1-based entry of the global
+	// pool at run start. Persisted in the task context ("proxy"). A direct
+	// pin is rejected when the process runs proxy-required.
+	Proxy      string         `json:"proxy,omitempty"`
 	Context    map[string]any `json:"-"`
 	CreatedAt  time.Time      `json:"created_at"`
 	UpdatedAt  *time.Time     `json:"updated_at,omitempty"`
 	ArchivedAt *time.Time     `json:"archived_at,omitempty"`
-	// RunCount / LastRunAt / LastRunStatus / FindingCount are cold-path
-	// projections assembled by the web layer from runs + scan.json
-	// (API_CONTRACT §2); the repository never fills them. RunCount and
-	// FindingCount are always present (mock-backend parity); the last-run
+	// RunCount / LastRunAt / LastRunStatus / LastRunCompletion / FindingCount
+	// are cold-path projections assembled by the web layer from runs +
+	// scan.json (API_CONTRACT §2); the repository never fills them. RunCount
+	// and FindingCount are always present (mock-backend parity); the last-run
 	// fields stay omitempty until the task has run.
 	RunCount      int    `json:"run_count"`
 	LastRunAt     string `json:"last_run_at,omitempty"`
 	LastRunStatus string `json:"last_run_status,omitempty"`
-	FindingCount  int    `json:"finding_count"`
+	// LastRunCompletion is the last run's honest terminal assessment:
+	// "full" (the run walked its graph frontier to an accepted finish) or
+	// "partial" (bounded/physical stop — the intent was not achieved). There
+	// is no "failed" reading: a settled run is either complete or unmet.
+	LastRunCompletion string `json:"last_run_completion,omitempty"`
+	FindingCount      int    `json:"finding_count"`
+	// ContentChangedSinceRun answers "may the operator start this task
+	// again?". It compares the runnable-content revision (goal/instruction/
+	// objective/phase policy/context files/model chain) with the revision the
+	// latest dispatch consumed. false = that exact content already ran, so the
+	// UI must not offer a plain run; editing the content flips it back to true.
+	// Nil means "not projected" (write responses), never "unchanged".
+	ContentChangedSinceRun *bool `json:"content_changed_since_run,omitempty"`
 }
 
 // RunMount is the persisted portion of a Run: a pure mount record that ties
@@ -653,6 +682,29 @@ type ProjectUpdate struct {
 }
 
 // TaskInput is the POST body for task creation (API_CONTRACT §2).
+// Task audit modes: the task-level HITL switch.
+const (
+	TaskAuditInherit = "inherit"
+	TaskAuditOff     = "off"
+	TaskAuditEnforce = "enforce"
+)
+
+// NormalizeTaskAuditMode clamps a wire value onto the closed audit vocabulary.
+// Empty means inherit. An unrecognized non-empty value returns "" so callers
+// can reject it instead of silently changing the gate's posture.
+func NormalizeTaskAuditMode(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "inherit", "default", "global":
+		return TaskAuditInherit
+	case "off", "false", "0", "observe", "observe-only":
+		return TaskAuditOff
+	case "enforce", "on", "true", "1", "hitl":
+		return TaskAuditEnforce
+	default:
+		return ""
+	}
+}
+
 type TaskInput struct {
 	Name         string
 	Goal         string
@@ -660,12 +712,15 @@ type TaskInput struct {
 	PhasePolicy  *PhasePolicy
 	Schedule     *TaskSchedule
 	ContextPaths []string
+	AuditMode    string
 	// Objective is the structured goal; nil = not structured.
 	Objective *Objective
 	Context   map[string]any
 	// LLMChain / ActiveLLM seed the task's model chain (order = priority).
 	LLMChain  []string
 	ActiveLLM string
+	// Proxy pins the run's outbound proxy ("" inherit, "direct", "N").
+	Proxy string
 }
 
 // TaskUpdate is the PATCH body for a task (API_CONTRACT §2).
@@ -676,6 +731,8 @@ type TaskUpdate struct {
 	PhasePolicy  *PhasePolicy // non-nil replaces the policy; nil leaves it
 	Schedule     *TaskSchedule
 	ContextPaths []string
+	// AuditMode non-nil replaces the task's HITL switch (inherit/off/enforce).
+	AuditMode *string
 	// Objective non-nil replaces the structured goal; nil leaves it as is.
 	Objective *Objective
 	// ClearObjective removes the structured goal (an explicit "objective": null
@@ -683,7 +740,9 @@ type TaskUpdate struct {
 	ClearObjective bool
 	Context        map[string]any
 	Archived       *bool
-	// LLMChain non-nil replaces the ordered chain (empty clears it);
+	// Proxy non-nil replaces the task's outbound proxy pin ("" = inherit).
+	Proxy *string
+	// LLMChain non-nil replaces the ordered model chain (empty slice clears it);
 	// ActiveLLM non-nil replaces the chain head used by the next run.
 	LLMChain  *[]string
 	ActiveLLM *string
@@ -1151,6 +1210,68 @@ func validateAgentProfile(role, focus, evidenceContract, stoppingRule string) er
 	return nil
 }
 
+// ── reports (manual report delivery) ────────────────────────────────────────
+
+// Report lifecycle states. Only queued/generating are active; the partial
+// unique index in migration 0028 allows at most one active report per task.
+const (
+	ReportQueued     = "queued"
+	ReportGenerating = "generating"
+	ReportReady      = "ready"
+	ReportFailed     = "failed"
+	ReportCancelled  = "cancelled"
+)
+
+// Report is the durable metadata row of one manually generated report
+// revision. The rendered PDF/MD/HTML are byte artifacts on disk (D12); this
+// row is the status/version authority and the artifact index pointer.
+type Report struct {
+	ID            string     `json:"id"`
+	ProjectID     string     `json:"project_id,omitempty"`
+	TaskID        string     `json:"task_id"`
+	Revision      int        `json:"revision"`
+	RunIDs        []string   `json:"run_ids,omitempty"`
+	ScanIDs       []string   `json:"scan_ids,omitempty"`
+	Status        string     `json:"status"`
+	Template      string     `json:"template"`
+	Language      string     `json:"language"`
+	Mode          string     `json:"mode"`
+	Model         string     `json:"model,omitempty"`
+	PromptVersion string     `json:"prompt_version,omitempty"`
+	Formats       []string   `json:"formats,omitempty"`
+	Error         string     `json:"error,omitempty"`
+	CreatedAt     time.Time  `json:"created_at"`
+	StartedAt     *time.Time `json:"started_at,omitempty"`
+	FinishedAt    *time.Time `json:"finished_at,omitempty"`
+}
+
+// ReportArtifact is one rendered file belonging to a report. Kind is
+// "total" or "sub"; sub artifacts also carry the scan id and target.
+type ReportArtifact struct {
+	ReportID string `json:"report_id"`
+	Kind     string `json:"kind"`
+	ScanID   string `json:"scan_id,omitempty"`
+	Target   string `json:"target,omitempty"`
+	Format   string `json:"format"`
+	Path     string `json:"path"`
+	Bytes    int64  `json:"bytes"`
+	SHA256   string `json:"sha256,omitempty"`
+}
+
+// ReportMount is the creation input for CreateReport.
+type ReportMount struct {
+	ProjectID     string
+	TaskID        string
+	RunIDs        []string
+	ScanIDs       []string
+	Formats       []string
+	Template      string
+	Language      string
+	Mode          string
+	Model         string
+	PromptVersion string
+}
+
 // NormalizeTaskLLMChain trims, drops malformed and duplicate entries, and
 // falls back to the first entry when active names a profile outside the chain
 // (or names none). Order is priority: index 0 is the chain head. An empty chain
@@ -1204,5 +1325,34 @@ func hydrateTaskLLMChain(t *Task) {
 	}
 	if v, ok := t.Context["llm_active"].(string); ok {
 		t.ActiveLLM = v
+	}
+}
+
+// NormalizeTaskProxy canonicalizes the task proxy pin: "" (inherit), "direct",
+// or a positive 1-based pool index. Anything else collapses to inherit; the
+// handler validates the index against the live pool at save time.
+func NormalizeTaskProxy(raw string) string {
+	switch v := strings.ToLower(strings.TrimSpace(raw)); v {
+	case "", "inherit", "global", "default", "follow":
+		return ""
+	case "direct", "none", "off":
+		return "direct"
+	default:
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			return ""
+		}
+		return strconv.Itoa(n)
+	}
+}
+
+// hydrateTaskProxy exposes the context-stored proxy pin on the Task.
+func hydrateTaskProxy(t *Task) {
+	if t == nil || t.Context == nil {
+		return
+	}
+	t.Proxy = ""
+	if v, ok := t.Context["proxy"].(string); ok {
+		t.Proxy = NormalizeTaskProxy(v)
 	}
 }

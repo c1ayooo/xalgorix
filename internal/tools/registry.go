@@ -102,10 +102,31 @@ type Tool struct {
 }
 
 // Parameter describes a tool parameter.
+//
+// The optional type metadata below is advisory for schema generation (the
+// Eino adapter maps it to JSON-schema types so native tool calling can tell a
+// boolean from a number). Execution is unchanged: registry arguments are
+// always strings. Every existing literal that sets only Name/Description/
+// Required keeps compiling and behaves exactly as before, because the zero
+// value of Type means "string".
 type Parameter struct {
 	Name        string
 	Description string
 	Required    bool
+
+	// Type is the JSON-schema type of the parameter: "string", "integer",
+	// "number", "boolean", "array", "object" or "null". Empty means "string".
+	// Only types that Parameter can describe without element/sub-field
+	// metadata are meaningful; the Eino adapter degrades "array"/"object" to
+	// "string" because it cannot express their shape here.
+	Type string
+	// Enum optionally restricts a string parameter to a fixed set of values.
+	// nil/empty means unconstrained.
+	Enum []string
+	// Default optionally documents the value applied when the parameter is
+	// omitted. It is informational only; the tool's own parsing owns the
+	// actual default.
+	Default string
 }
 
 // Result is the output of a tool execution.
@@ -126,6 +147,10 @@ type Registry struct {
 	// schemaHidden withholds tool DOCUMENTATION from SchemaXML for role
 	// scoping. Hidden tools stay registered and executable.
 	schemaHidden map[string]bool
+	// toolFilter, when set, is the executable surface: Register skips a tool
+	// whose name the filter rejects, and Retain prunes already-registered
+	// tools. nil = no filtering (legacy/full surface).
+	toolFilter func(name string) bool
 	// leanSchema, when set, drops ⟦ex⟧…⟦/ex⟧ example/workflow spans from
 	// tool/parameter descriptions in SchemaXML to shrink the per-call prompt.
 	// Every tool, parameter, and core (non-example) description is preserved.
@@ -188,7 +213,39 @@ func (r *Registry) GetScanContextID() string {
 func (r *Registry) Register(t *Tool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.toolFilter != nil && !r.toolFilter(t.Name) {
+		return
+	}
 	r.tools[t.Name] = t
+}
+
+// SetToolFilter installs the executable-surface predicate. It affects every
+// subsequent Register; call Retain to prune tools registered before it.
+func (r *Registry) SetToolFilter(fn func(name string) bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.toolFilter = fn
+}
+
+// Retain prunes every registered tool the predicate rejects. It is the
+// companion to SetToolFilter for tools registered before the surface was
+// known (the agent builds its registry before options are applied).
+func (r *Registry) Retain(fn func(name string) bool) {
+	if fn == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for name := range r.tools {
+		if !fn(name) {
+			delete(r.tools, name)
+		}
+	}
+	for name := range r.schemaHidden {
+		if _, ok := r.tools[name]; !ok {
+			delete(r.schemaHidden, name)
+		}
+	}
 }
 
 // Get returns a tool by name.
@@ -520,6 +577,9 @@ func (r *Registry) VisibleToolSnapshots() []ToolSnapshot {
 		copy(params, t.Parameters)
 		for i := range params {
 			params[i].Description = r.renderDescription(params[i].Description)
+			if len(params[i].Enum) > 0 {
+				params[i].Enum = append([]string(nil), params[i].Enum...)
+			}
 		}
 		out = append(out, ToolSnapshot{
 			Name:        t.Name,

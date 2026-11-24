@@ -52,6 +52,10 @@ type keyPoolResponse struct {
 	// sticky (overflow failover) or off (fewer than two keys).
 	Strategy string           `json:"strategy"`
 	Entries  []keyPoolKeyView `json:"entries"`
+	// Events is the recent automatic failover log (newest first, fingerprints
+	// only). The Live page renders it so an operator can see traffic move
+	// between keys without reading server logs.
+	Events []llm.KeyFailoverEvent `json:"events"`
 	// RestartNeeded mirrors applyEnvironmentUpdates' verdict. The pool and
 	// the primary key apply to new scans immediately, so this is normally
 	// false; it is surfaced for completeness.
@@ -109,7 +113,13 @@ func (s *Server) currentKeyPool() keyPoolResponse {
 		}
 		entries = append(entries, view)
 	}
-	return keyPoolResponse{Keys: len(pool), Masked: masked, Strategy: strategy, Entries: entries}
+	return keyPoolResponse{
+		Keys:     len(pool),
+		Masked:   masked,
+		Strategy: strategy,
+		Entries:  entries,
+		Events:   llm.KeyFailoverEvents(),
+	}
 }
 
 // cleanKeyPoolInput trims, drops empties, dedupes preserving order, and

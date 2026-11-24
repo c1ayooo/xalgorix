@@ -4,8 +4,12 @@ import (
 	"fmt"
 	"log"
 	"regexp"
+	"sort"
 	"strings"
+	"unicode"
 	"unicode/utf8"
+
+	"github.com/cloudwego/eino/schema"
 
 	"github.com/c1ayooo/xalgorix/v4/internal/llm"
 	"github.com/c1ayooo/xalgorix/v4/internal/tools"
@@ -199,6 +203,84 @@ func (a *Agent) compactThresholdBytes() int {
 	return int(float64(window)*ratio) * bytesPerTokenEstimate
 }
 
+// estimateTextTokens is the fallback token estimate used only when the
+// provider has not yet reported usage (first request) or does not report it.
+// 4 bytes/token holds for English, JSON and code; CJK text is closer to one
+// token per rune, so counting CJK runes separately keeps a Chinese-heavy
+// transcript from compacting late and hitting the hard window.
+func estimateTextTokens(s string) int {
+	asciiBytes := 0
+	cjk := 0
+	for _, r := range s {
+		if isCJKRune(r) {
+			cjk++
+			continue
+		}
+		asciiBytes += utf8.RuneLen(r)
+	}
+	return cjk + (asciiBytes+bytesPerTokenEstimate-1)/bytesPerTokenEstimate
+}
+
+func isCJKRune(r rune) bool {
+	return unicode.Is(unicode.Han, r) ||
+		unicode.Is(unicode.Hiragana, r) || unicode.Is(unicode.Katakana, r) ||
+		unicode.Is(unicode.Hangul, r) ||
+		(r >= 0x3000 && r <= 0x303F) || // CJK punctuation
+		(r >= 0xFF00 && r <= 0xFFEF) // fullwidth forms
+}
+
+// promptTokensNearLimit reports whether the last provider-reported prompt
+// size reached the window-relative compaction trigger. Provider usage is the
+// authoritative measure; the byte heuristic only covers requests that have no
+// usage yet (first turn, or a provider that omits it).
+// promptTokensNearLimit reports whether the last provider-reported prompt
+// size reached the compaction trigger. The explicit XALGORIX_CONTEXT_COMPACT_TOKENS
+// override is an absolute token budget and takes precedence; otherwise the
+// window-relative ratio applies. Provider usage is authoritative — the
+// CJK-corrected estimator in estimatedTokensNearLimit only covers requests
+// that have no usage yet.
+func (a *Agent) promptTokensNearLimit() bool {
+	if a == nil || a.cfg == nil {
+		return false
+	}
+	last := a.lastPromptTokens.Load()
+	if last <= 0 {
+		return false
+	}
+	if a.cfg.ContextCompactTokens > 0 {
+		return last >= int64(a.cfg.ContextCompactTokens)
+	}
+	if a.cfg.LLMContextWindow <= 0 {
+		return false
+	}
+	ratio := a.cfg.ContextCompactRatio
+	if ratio < 0.5 || ratio > 0.9 {
+		ratio = defaultCompactRatio
+	}
+	return float64(last) >= float64(a.cfg.LLMContextWindow)*ratio
+}
+
+// estimatedTokensNearLimit is the no-usage fallback: it applies the same
+// absolute-or-window budget to estimateSchemaMessagesTokens, whose CJK-aware
+// estimator avoids compacting late on Chinese-heavy transcripts.
+func (a *Agent) estimatedTokensNearLimit(msgs []*schema.Message) bool {
+	if a == nil || a.cfg == nil || len(msgs) == 0 {
+		return false
+	}
+	est := estimateSchemaMessagesTokens(msgs)
+	if a.cfg.ContextCompactTokens > 0 {
+		return est >= a.cfg.ContextCompactTokens
+	}
+	if a.cfg.LLMContextWindow <= 0 {
+		return false
+	}
+	ratio := a.cfg.ContextCompactRatio
+	if ratio < 0.5 || ratio > 0.9 {
+		ratio = defaultCompactRatio
+	}
+	return est >= int(float64(a.cfg.LLMContextWindow)*ratio)
+}
+
 // shouldPruneBeforeLLM reports whether the agent's current message buffer
 // would serialize larger than the configured compaction ceiling and therefore
 // should be pruned before the next outbound LLM call. Cheap byte-count
@@ -271,7 +353,7 @@ func (a *Agent) pruneMessages() {
 	pruned = append(pruned, a.messages[0]) // system prompt
 
 	// Build continuation message with compacted history + notes
-	notesContext := notes.FormatForContextID(a.scanCtx.ID)
+	notesContext := notes.FormatForContextBudgetID(a.scanCtx.ID, notes.NotesContextBudgetBytes)
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("[CONTEXT PRUNED: %d older messages were compacted to save context space.]\n\n", cutoff-1))
 	sb.WriteString("## Compacted History\n")
@@ -343,7 +425,7 @@ func (a *Agent) forcePruneMessages() {
 	pruned = append(pruned, a.messages[0]) // system prompt
 
 	// Build continuation with compacted history + saved notes
-	notesContext := notes.FormatForContextID(a.scanCtx.ID)
+	notesContext := notes.FormatForContextBudgetID(a.scanCtx.ID, notes.NotesContextBudgetBytes)
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("[CONTEXT COMPACTED: %d older messages were summarized to fit context window.]\n\n", cutoff-1))
 	sb.WriteString("## Compacted History\n")
@@ -377,22 +459,43 @@ func (a *Agent) forcePruneMessages() {
 		len(a.messages), originalLen, cutoff-1, notesContext != "")
 }
 
-// compactMessages extracts a structured digest from a slice of messages.
-// Parses tool calls/results, findings, and endpoints to preserve the agent's
-// working memory without consuming excessive tokens.
+// compactMessages extracts a deterministic, lossy digest from a slice of
+// dropped messages. It exists so an aged-out window keeps a trace of what was
+// attempted without re-sending raw bytes.
+//
+// Authority (CORE §5): the digest is NOT a source of truth. Hypothesis
+// lifecycle is the ledger/graph, finding acceptance is the report gate, and
+// evidence is InfoItem/ledger. Sections therefore say "candidate mentions" and
+// "tool calls", never "confirmed findings" or "tested". Every claim can be
+// re-fetched with read_ledger / read_info_item / read_tool_output.
+//
+// Message shapes: the Eino runtime uses role="tool" for tool results and
+// carries native tool calls in ToolCalls; the legacy XML dialect puts them in
+// assistant text as <function=name>. Both are handled so the digest is not
+// silently empty on the default path.
+//
+// Determinism (INFO_AS §1.2 invariant 6): output ordering is fixed — tool
+// counts (count DESC, name ASC), URLs (lexical), findings/errors (transcript
+// order, first occurrence wins). No map iteration reaches the output.
 func compactMessages(msgs []llm.Message) string {
 	var sb strings.Builder
 	toolsRun := make(map[string]int)   // tool_name -> count
-	endpoints := make(map[string]bool) // unique endpoints/URLs seen
-	var findings []string              // key findings extracted
+	endpoints := make(map[string]bool) // unique endpoints/URLs mentioned
+	var findings []string              // unverified candidate mentions
 	var errors []string                // errors encountered
+	toolResults := 0
 
 	for _, msg := range msgs {
 		content := msg.Content
 
-		// Extract tool calls and counts
 		if msg.Role == "assistant" {
-			// Count tool call patterns: <function=tool_name>
+			// Native tool calling: calls live in the structured field, not text.
+			for _, call := range msg.ToolCalls {
+				if name := strings.TrimSpace(call.Function.Name); name != "" {
+					toolsRun[name]++
+				}
+			}
+			// Legacy XML dialect (still used on the Anthropic/Gemini fallback).
 			for _, line := range strings.Split(content, "\n") {
 				if strings.HasPrefix(strings.TrimSpace(line), "<function=") {
 					name := strings.TrimPrefix(strings.TrimSpace(line), "<function=")
@@ -404,26 +507,22 @@ func compactMessages(msgs []llm.Message) string {
 			}
 		}
 
-		// Extract tool results with findings
-		if msg.Role == "user" {
-			// Look for vulnerability/finding indicators in tool results
+		// Tool results are role="tool" on the native path; the legacy loop
+		// wrapped them in a user turn whose content starts with "Tool '".
+		isToolResult := msg.Role == "tool" || (msg.Role == "user" && isToolResultMessage(content))
+		if isToolResult {
+			toolResults++
 			lower := strings.ToLower(content)
-			if strings.Contains(lower, "vulnerability") || strings.Contains(lower, "injection") ||
-				strings.Contains(lower, "xss") || strings.Contains(lower, "sqli") ||
-				strings.Contains(lower, "rce") || strings.Contains(lower, "ssrf") ||
-				strings.Contains(lower, "idor") || strings.Contains(lower, "bypass") ||
-				strings.Contains(lower, "leak") || strings.Contains(lower, "exposed") {
-				// Extract first meaningful line as finding summary
-				for _, line := range strings.Split(content, "\n") {
-					line = strings.TrimSpace(line)
-					if len(line) > 20 && len(line) < 200 {
-						findings = append(findings, line)
-						break
-					}
+			if hasFindingSignal(lower) {
+				// A candidate mention, not an accepted finding. Prefer the
+				// first line that actually mentions the class: the formatted
+				// tool-result header ("Tool 'x' result:") is always first and
+				// must never become the digest's finding line.
+				if line := firstFindingLine(content); line != "" {
+					findings = append(findings, line)
 				}
 			}
 
-			// Extract error patterns
 			if strings.Contains(content, "error:") || strings.Contains(content, "Error:") {
 				for _, line := range strings.Split(content, "\n") {
 					if strings.Contains(line, "error") || strings.Contains(line, "Error") {
@@ -437,22 +536,37 @@ func compactMessages(msgs []llm.Message) string {
 			}
 		}
 
-		// Extract URLs/endpoints from any message
 		for _, word := range strings.Fields(content) {
 			if (strings.HasPrefix(word, "http://") || strings.HasPrefix(word, "https://")) && len(word) < 200 {
-				// Clean trailing punctuation
 				word = strings.TrimRight(word, ".,;:)\"'`")
 				endpoints[word] = true
 			}
 		}
 	}
 
-	// Format the digest
+	sb.WriteString("### Digest scope (deterministic, lossy)\n")
+	sb.WriteString("Generated by the runtime from dropped transcript bytes. NOT authoritative: " +
+		"hypothesis lifecycle is the ledger/graph, finding acceptance is the report gate, " +
+		"evidence is InfoItem/ledger. Re-fetch details with read_ledger / read_info_item / read_tool_output.\n")
+
 	if len(toolsRun) > 0 {
-		sb.WriteString("### Tools Executed\n")
-		for tool, count := range toolsRun {
-			sb.WriteString(fmt.Sprintf("- %s (×%d)\n", tool, count))
+		names := make([]string, 0, len(toolsRun))
+		for name := range toolsRun {
+			names = append(names, name)
 		}
+		sort.Slice(names, func(i, j int) bool {
+			if toolsRun[names[i]] != toolsRun[names[j]] {
+				return toolsRun[names[i]] > toolsRun[names[j]]
+			}
+			return names[i] < names[j]
+		})
+		sb.WriteString("\n### Tool Calls (counts — a call is not proof of success)\n")
+		for _, name := range names {
+			sb.WriteString(fmt.Sprintf("- %s (×%d)\n", name, toolsRun[name]))
+		}
+	}
+	if toolResults > 0 {
+		sb.WriteString(fmt.Sprintf("\nTool result messages in the dropped window: %d\n", toolResults))
 	}
 
 	if len(endpoints) > 0 {
@@ -460,20 +574,23 @@ func compactMessages(msgs []llm.Message) string {
 		// of URL mentions in the conversation, not an execution ledger — a mention
 		// does not prove a request was made, succeeded, or was conclusively
 		// assessed. Consumers must read it as mentions only.
-		sb.WriteString("\n### URLs Mentioned (lossy summary — a mention is not evidence of testing)\n")
-		count := 0
+		sorted := make([]string, 0, len(endpoints))
 		for ep := range endpoints {
-			if count >= 30 { // cap to avoid bloat
-				sb.WriteString(fmt.Sprintf("- ... and %d more\n", len(endpoints)-30))
+			sorted = append(sorted, ep)
+		}
+		sort.Strings(sorted)
+		sb.WriteString("\n### URLs Mentioned (lossy summary — a mention is not evidence of testing)\n")
+		for i, ep := range sorted {
+			if i >= 30 { // cap to avoid bloat
+				sb.WriteString(fmt.Sprintf("- ... and %d more\n", len(sorted)-30))
 				break
 			}
 			sb.WriteString(fmt.Sprintf("- %s\n", ep))
-			count++
 		}
 	}
 
 	if len(findings) > 0 {
-		sb.WriteString("\n### Key Findings\n")
+		sb.WriteString("\n### Candidate Finding Mentions (UNVERIFIED — the report gate decides acceptance)\n")
 		seen := make(map[string]bool)
 		for _, f := range findings {
 			if !seen[f] && len(seen) < 15 {
@@ -494,11 +611,47 @@ func compactMessages(msgs []llm.Message) string {
 		}
 	}
 
-	if sb.Len() == 0 {
+	if len(toolsRun) == 0 && toolResults == 0 && len(endpoints) == 0 && len(findings) == 0 && len(errors) == 0 {
 		sb.WriteString("(No structured data could be extracted from pruned messages)\n")
 	}
 
 	return sb.String()
+}
+
+// hasFindingSignal is the deterministic candidate-mention heuristic. It only
+// decides which dropped lines are worth quoting in the digest; it has no
+// authority over finding acceptance (that is the report gate).
+func hasFindingSignal(lower string) bool {
+	for _, needle := range []string{
+		"vulnerability", "injection", "xss", "sqli", "rce", "ssrf",
+		"idor", "bypass", "leak", "exposed",
+	} {
+		if strings.Contains(lower, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+// firstFindingLine returns the first usable transcript line that itself
+// contains a finding signal, skipping the formatted tool-result header. When no
+// line matches, it falls back to the first usable line so the digest still
+// points the agent at where to look.
+func firstFindingLine(content string) string {
+	fallback := ""
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if len(line) <= 20 || len(line) >= 200 || strings.HasPrefix(line, "Tool '") {
+			continue
+		}
+		if hasFindingSignal(strings.ToLower(line)) {
+			return line
+		}
+		if fallback == "" {
+			fallback = line
+		}
+	}
+	return fallback
 }
 
 // hasActiveContent reports whether snippet (or its truncated version as produced by

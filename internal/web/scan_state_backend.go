@@ -33,6 +33,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/c1ayooo/xalgorix/v4/internal/graph"
 	"github.com/c1ayooo/xalgorix/v4/internal/runstate"
 )
 
@@ -267,6 +268,11 @@ func (s *Server) deleteScanRecordState(dirID, recID string) {
 		if p := runStatePurgeBackend(); p != nil {
 			if err := p.PurgeScanState(ctx, id); err != nil {
 				log.Printf("[scan] durable run-state purge for %s failed: %v", id, err)
+			}
+		}
+		if gm, ok := graph.Backend().(graph.ConformanceMaintenance); ok {
+			if err := gm.DeleteConformance(ctx, id); err != nil {
+				log.Printf("[scan] graph conformance purge for %s failed: %v", id, err)
 			}
 		}
 	}

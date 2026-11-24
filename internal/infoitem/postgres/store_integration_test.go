@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"testing"
@@ -337,14 +338,111 @@ func TestStoreRegionKeysetPagingAndAssociationRels(t *testing.T) {
 	if err != nil {
 		t.Fatalf("associate: %v", err)
 	}
-	if len(assoc.Hits) != 1 || assoc.Hits[0].Item.ID != "k-2" {
-		t.Fatalf("association hits = %+v", assoc.Hits)
+	// k-2 is the explicit supports hop. InferRelations also emits
+	// same_subject edges between items that share a subject, so k-3 is a
+	// legitimate second hit; assert the semantic hop rather than a stale count.
+	var supportHit, sameSubjectHit *infoitem.AssociationHit
+	for i := range assoc.Hits {
+		switch assoc.Hits[i].Item.ID {
+		case "k-2":
+			supportHit = &assoc.Hits[i]
+		case "k-3":
+			sameSubjectHit = &assoc.Hits[i]
+		}
 	}
-	hit := assoc.Hits[0]
-	if len(hit.Rels) != len(hit.Path)-1 {
-		t.Fatalf("rels/path mismatch: path=%v rels=%v", hit.Path, hit.Rels)
+	if supportHit == nil {
+		t.Fatalf("association hits = %+v, want k-2 supports hop", assoc.Hits)
 	}
-	if len(hit.Rels) != 1 || hit.Rels[0] != infoitem.RelationSupports {
-		t.Fatalf("hop type = %v, want [supports]", hit.Rels)
+	if len(supportHit.Rels) != len(supportHit.Path)-1 {
+		t.Fatalf("rels/path mismatch: path=%v rels=%v", supportHit.Path, supportHit.Rels)
+	}
+	// k-2 has both an explicit supports edge and the inferred same_subject
+	// edge; the traversal may return either real hop type. The supports edge
+	// itself is asserted below.
+	if len(supportHit.Rels) != 1 ||
+		(supportHit.Rels[0] != infoitem.RelationSupports && supportHit.Rels[0] != infoitem.RelationSameSubject) {
+		t.Fatalf("k-2 hop type = %v, want a real relation", supportHit.Rels)
+	}
+	var supportEdges int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM info_item_edges
+		WHERE scan_id = $1 AND from_id = 'k-2' AND to_id = 'k-1' AND type = 'supports'`,
+		scanID).Scan(&supportEdges); err != nil {
+		t.Fatal(err)
+	}
+	if supportEdges != 1 {
+		t.Fatalf("supports edge rows = %d, want 1", supportEdges)
+	}
+	if sameSubjectHit != nil && (len(sameSubjectHit.Rels) != 1 || sameSubjectHit.Rels[0] != infoitem.RelationSameSubject) {
+		t.Fatalf("k-3 hop type = %v, want [same_subject]", sameSubjectHit.Rels)
+	}
+}
+
+func TestStoreApplyInfersLexicalReferences(t *testing.T) {
+	pool := integrationPool(t)
+	ctx := context.Background()
+	scanID := fmt.Sprintf("coldpath-recall-%d", time.Now().UnixNano())
+	store := New(pool)
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM info_item_edges WHERE scan_id=$1`, scanID)
+		_, _ = pool.Exec(context.Background(), `DELETE FROM info_items WHERE scan_id=$1`, scanID)
+		_, _ = pool.Exec(context.Background(), `DELETE FROM info_audit_records WHERE scan_id=$1`, scanID)
+		_, _ = pool.Exec(context.Background(), `DELETE FROM info_sync_watermarks WHERE scan_id=$1`, scanID)
+	})
+
+	now := time.Now().UTC()
+	first := testInfoItem(scanID, "recall-1", 1, infoitem.NatureObserved, nil)
+	first.Coordinates.Content.Text = "SQL injection error on /login username parameter"
+	second := testInfoItem(scanID, "recall-2", 2, infoitem.NatureObserved, nil)
+	second.Coordinates.Content.Text = "error-based SQL injection observed on /login username"
+	for i, item := range []infoitem.Item{first, second} {
+		seq := uint64(i + 1)
+		rec := domainjournal.Record{
+			ScanID: scanID, Seq: seq, At: now,
+			Actor:     domainjournal.Actor{Kind: domainjournal.ActorEngine, Source: "test"},
+			Operation: domainjournal.OpInfoItemProjected, InfoItem: &item,
+		}
+		if err := store.Apply(ctx, rec); err != nil {
+			t.Fatalf("apply seq %d: %v", seq, err)
+		}
+	}
+
+	var count int
+	if err := pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM info_item_edges
+		WHERE scan_id=$1 AND from_id='recall-2' AND type='references'`, scanID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count == 0 {
+		t.Fatal("expected a lexical references edge from recall-2")
+	}
+}
+
+func TestStoreGetByID(t *testing.T) {
+	pool := integrationPool(t)
+	ctx := context.Background()
+	scanID := fmt.Sprintf("coldpath-getbyid-%d", time.Now().UnixNano())
+	store := New(pool)
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM info_item_edges WHERE scan_id=$1`, scanID)
+		_, _ = pool.Exec(context.Background(), `DELETE FROM info_items WHERE scan_id=$1`, scanID)
+		_, _ = pool.Exec(context.Background(), `DELETE FROM info_audit_records WHERE scan_id=$1`, scanID)
+		_, _ = pool.Exec(context.Background(), `DELETE FROM info_sync_watermarks WHERE scan_id=$1`, scanID)
+	})
+	item := testInfoItem(scanID, "get-1", 1, infoitem.NatureObserved, nil)
+	rec := domainjournal.Record{
+		ScanID: scanID, Seq: 1, At: time.Now().UTC(),
+		Actor:     domainjournal.Actor{Kind: domainjournal.ActorEngine, Source: "test"},
+		Operation: domainjournal.OpInfoItemProjected, InfoItem: &item,
+	}
+	if err := store.Apply(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.GetByID(ctx, scanID, "get-1")
+	if err != nil || got.ID != "get-1" || got.ScanID != scanID {
+		t.Fatalf("get = %+v err=%v", got, err)
+	}
+	if _, err := store.GetByID(ctx, scanID, "missing"); !errors.Is(err, infoitem.ErrNotFound) {
+		t.Fatalf("missing err = %v, want ErrNotFound", err)
 	}
 }

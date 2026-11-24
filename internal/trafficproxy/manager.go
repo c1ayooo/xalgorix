@@ -24,6 +24,7 @@
 package trafficproxy
 
 import (
+	"context"
 	"crypto/x509"
 	"fmt"
 	"net"
@@ -75,6 +76,16 @@ type Manager struct {
 
 	tunnelsMu sync.Mutex
 	tunnels   map[*tunnel]struct{}
+	// record distinguishes the recorder (MITM interception + journal/archive)
+	// from the forward-only egress router: the router still selects the run's
+	// upstream but writes no traffic evidence.
+	record bool
+
+	// scanListeners are per-run listeners bound on the manager's bind host.
+	// Chromium cannot send proxy credentials, so a port that already implies
+	// the run is the only attribution channel that works for browser traffic
+	// (and for containerised tools, whose env proxy URL carries no token).
+	scanListeners map[string]*scanListener
 }
 
 var defaultManager atomic.Pointer[Manager]
@@ -116,10 +127,12 @@ func Configure(enabled bool, caDir string, tlsSkipVerify bool) error {
 func ConfigureWithListen(enabled bool, caDir string, tlsSkipVerify bool, bind, advertise string) error {
 	m := &Manager{
 		enabled:                    enabled,
+		record:                     true,
 		tlsSkipVerify:              tlsSkipVerify,
 		bind:                       strings.TrimSpace(bind),
 		advertise:                  strings.TrimSpace(advertise),
 		tunnels:                    make(map[*tunnel]struct{}),
+		scanListeners:              make(map[string]*scanListener),
 		upstreamTransports:         make(map[string]*http.Transport),
 		directTransports:           make(map[string]*http.Transport),
 		insecureUpstreamTransports: make(map[string]*http.Transport),
@@ -134,6 +147,31 @@ func ConfigureWithListen(enabled bool, caDir string, tlsSkipVerify bool, bind, a
 			m.ca = ca
 			m.mitm = true
 		}
+	}
+	m.sink.Store(NewBufferedSink(observeTraffic, observationQueueSize))
+	if old := defaultManager.Swap(m); old != nil {
+		_ = old.Close()
+	}
+	return nil
+}
+
+// ConfigureForwardOnly starts the platform-internal egress router: the same
+// listener/attribution/tunnel machinery as the recorder, but with interception
+// and evidence writes disabled. It exists so a task's egress proxy can change
+// mid-run (and containers never need recreating) while recording is OFF.
+func ConfigureForwardOnly(bind, advertise string) error {
+	m := &Manager{
+		enabled:                    true,
+		record:                     false,
+		bind:                       strings.TrimSpace(bind),
+		advertise:                  strings.TrimSpace(advertise),
+		tunnels:                    make(map[*tunnel]struct{}),
+		scanListeners:              make(map[string]*scanListener),
+		upstreamTransports:         make(map[string]*http.Transport),
+		directTransports:           make(map[string]*http.Transport),
+		insecureUpstreamTransports: make(map[string]*http.Transport),
+		insecureDirectTransports:   make(map[string]*http.Transport),
+		dialGuard:                  currentDialGuard(),
 	}
 	m.sink.Store(NewBufferedSink(observeTraffic, observationQueueSize))
 	if old := defaultManager.Swap(m); old != nil {
@@ -337,10 +375,22 @@ func (m *Manager) Close() error {
 			return firstErr // bounded wait; a wedged tunnel is visible to the operator
 		}
 	}
+	for id, sl := range m.scanListeners {
+		if sl.server != nil {
+			_ = sl.server.Close()
+		}
+		if sl.listener != nil {
+			_ = sl.listener.Close()
+		}
+		delete(m.scanListeners, id)
+	}
 	m.closeTransports()
 	if sink := m.sink.Load(); sink != nil {
 		sink.Close()
 	}
+	// Best-effort audit flush: usage accumulated by this manager must not be
+	// lost when settings re-configure or the process shuts down.
+	go func() { _ = FlushEgressUsage(context.Background()) }()
 	return firstErr
 }
 
@@ -358,9 +408,10 @@ func Reset() {
 // Close can tear it down deterministically — http.Server stops tracking
 // connections once they are hijacked.
 type tunnel struct {
-	conn  net.Conn     // the hijacked client-side connection
-	inner *http.Server // per-connection server for intercepted tunnels; nil when blind
-	done  chan struct{}
+	conn   net.Conn     // the hijacked client-side connection
+	inner  *http.Server // per-connection server for intercepted tunnels; nil when blind
+	done   chan struct{}
+	scanID string // owning run (attribution); used to force-close one run's tunnels
 }
 
 func (m *Manager) registerTunnel(t *tunnel) {
@@ -376,11 +427,158 @@ func (m *Manager) registerTunnel(t *tunnel) {
 	m.tunnelsMu.Unlock()
 }
 
+// CloseScanTunnels force-closes every open tunnel belonging to one run. Used
+// when a task's egress proxy changes so the next request reconnects through the
+// new proxy instead of draining the old connection for minutes. Returns the
+// number of tunnels closed.
+func (m *Manager) CloseScanTunnels(scanCtxID string) int {
+	if m == nil || scanCtxID == "" {
+		return 0
+	}
+	m.tunnelsMu.Lock()
+	defer m.tunnelsMu.Unlock()
+	closed := 0
+	for t := range m.tunnels {
+		if t.scanID != scanCtxID {
+			continue
+		}
+		_ = t.conn.Close()
+		closed++
+	}
+	return closed
+}
+
+// CloseScanTunnels is the package-level wrapper over the default manager.
+func CloseScanTunnels(scanCtxID string) int {
+	m := defaultManager.Load()
+	if m == nil {
+		return 0
+	}
+	return m.CloseScanTunnels(scanCtxID)
+}
+
 func (m *Manager) unregisterTunnel(t *tunnel) {
 	m.tunnelsMu.Lock()
 	delete(m.tunnels, t)
 	m.tunnelsMu.Unlock()
 	close(t.done)
+}
+
+// scanListener is one run-scoped loopback listener. Every request arriving on
+// it is attributed to that run by construction (baseAttr), which is how
+// browser traffic — Chromium has no proxy-auth channel — and containerised
+// tools (whose env proxy URL carries no run token) still become observed,
+// archived, and approval-gated.
+type scanListener struct {
+	listener net.Listener
+	server   *http.Server
+	url      string
+	port     int
+}
+
+// ListenForScan returns the run-scoped proxy URL, binding a dedicated listener
+// on first use. The listener binds on the manager's configured host with an
+// ephemeral port; the returned URL always uses a dialable host (loopback when
+// the bind is unspecified). The same URL is stable for the life of the run so
+// Chromium's process arguments never need to change mid-scan.
+func ListenForScan(scanCtxID string) (string, error) {
+	m := defaultManager.Load()
+	if m == nil {
+		return "", fmt.Errorf("traffic proxy is not initialized")
+	}
+	return m.listenForScan(scanCtxID)
+}
+
+// ScanListenerPort reports the TCP port of a run-scoped listener (0,false when
+// none). Container runtimes need the port alone: they address the platform
+// through their project network's gateway.
+func ScanListenerPort(scanCtxID string) (int, bool) {
+	m := defaultManager.Load()
+	if m == nil {
+		return 0, false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if sl, ok := m.scanListeners[scanCtxID]; ok && sl.port > 0 {
+		return sl.port, true
+	}
+	return 0, false
+}
+
+// CloseScanListener tears down one run-scoped listener (scan teardown/resume
+// session rotation). Unknown ids are a no-op.
+func CloseScanListener(scanCtxID string) {
+	m := defaultManager.Load()
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if sl, ok := m.scanListeners[scanCtxID]; ok {
+		if sl.server != nil {
+			_ = sl.server.Close()
+		}
+		if sl.listener != nil {
+			_ = sl.listener.Close()
+		}
+		delete(m.scanListeners, scanCtxID)
+	}
+}
+
+func (m *Manager) listenForScan(scanCtxID string) (string, error) {
+	scanCtxID = strings.TrimSpace(scanCtxID)
+	if scanCtxID == "" {
+		return "", fmt.Errorf("traffic proxy: scan context id is required")
+	}
+	if !m.enabled && !proxy.Required() {
+		return "", fmt.Errorf("traffic proxy requires XALGORIX_TRAFFICPROXY enabled or proxy-required mode")
+	}
+	// Read the registry before taking m.mu: ListenForScan → attributionMu and
+	// UnregisterRun → attributionMu → CloseScanListener → m.mu would otherwise
+	// invert the lock order.
+	instanceID, _ := attributionForScan(scanCtxID)
+	baseAttr := Attribution{ScanCtxID: scanCtxID, InstanceID: instanceID, Channel: ChannelSubprocess}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return "", fmt.Errorf("traffic proxy manager is closed")
+	}
+	if sl, ok := m.scanListeners[scanCtxID]; ok {
+		return sl.url, nil
+	}
+
+	host := ""
+	if m.bind != "" {
+		if h, _, err := net.SplitHostPort(m.bind); err == nil {
+			host = h
+		}
+	}
+	ln, err := net.Listen("tcp", net.JoinHostPort(host, "0"))
+	if err != nil {
+		return "", fmt.Errorf("traffic proxy: listen for scan %s: %w", scanCtxID, err)
+	}
+	srv := &http.Server{
+		Handler:           &proxyHandler{m: m, baseAttr: baseAttr},
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	if m.mitm {
+		srv.IdleTimeout = 120 * time.Second
+	}
+	go func() { _ = srv.Serve(ln) }()
+
+	tcp, _ := ln.Addr().(*net.TCPAddr)
+	port := 0
+	if tcp != nil {
+		port = tcp.Port
+	}
+	advHost := "127.0.0.1"
+	if tcp != nil && !tcp.IP.IsUnspecified() {
+		advHost = tcp.IP.String()
+	}
+	url := "http://" + net.JoinHostPort(advHost, strconv.Itoa(port))
+	m.scanListeners[scanCtxID] = &scanListener{listener: ln, server: srv, url: url, port: port}
+	return url, nil
 }
 
 func (t *tunnel) closeConn() {
@@ -413,8 +611,8 @@ func (m *Manager) isClosed() bool {
 // observe hands one observation to the buffered sink. Never blocks the
 // request path: overflow drops and counts.
 func (m *Manager) observe(obs *TrafficObservation) {
-	if m == nil || obs == nil {
-		return
+	if m == nil || obs == nil || !m.record {
+		return // forward-only egress router: route, never record
 	}
 	if sink := m.sink.Load(); sink != nil {
 		sink.Enqueue(*obs)

@@ -384,6 +384,55 @@ func TestBuildProjectAcceptsGatewayProxy(t *testing.T) {
 	}
 }
 
+// TestBuildProjectHostNetworkInjectsGatewayProxyEnv pins the host-network
+// variant of the gateway proxy: the container shares the host network
+// namespace, so the run-scoped traffic listener is reachable at
+// 127.0.0.1:<port> and MUST be injected as HTTP(S)_PROXY. Without it every
+// in-container curl/ffuf/nuclei bypasses the MITM proxy and the run records no
+// traffic, which freezes the dashboard's live HTTP feed.
+func TestBuildProjectHostNetworkInjectsGatewayProxyEnv(t *testing.T) {
+	t.Setenv("XALGORIX_ALLOW_UNPINNED_TOOLBOX", "yes")
+	opt := ProjectOptions{
+		ScanID:           "scan-hostproxy",
+		ScanDir:          t.TempDir(),
+		SharedDir:        t.TempDir(),
+		Image:            "xalgorix-toolbox:dev-core",
+		NetProfile:       NetProfileProxyOnly,
+		NetworkMode:      "host",
+		ProxyGatewayPort: 8081,
+		CACertPath:       "/host/ca.pem",
+	}
+	spec, err := BuildProject(opt)
+	if err != nil {
+		t.Fatalf("host-network gateway proxy must be accepted: %v", err)
+	}
+	if !spec.Network.Host {
+		t.Fatalf("expected a host-network project, got %#v", spec.Network)
+	}
+	if spec.Network.ProxyGatewayPort != 0 {
+		t.Fatalf("host networking has no project gateway, got port %d", spec.Network.ProxyGatewayPort)
+	}
+	for _, want := range []string{
+		"HTTP_PROXY=http://127.0.0.1:8081",
+		"HTTPS_PROXY=http://127.0.0.1:8081",
+		"http_proxy=http://127.0.0.1:8081",
+		"https_proxy=http://127.0.0.1:8081",
+	} {
+		if !envContains(spec.Env, want) {
+			t.Fatalf("host-network container env missing %q: %v", want, spec.Env)
+		}
+	}
+}
+
+func envContains(env []string, want string) bool {
+	for _, kv := range env {
+		if kv == want {
+			return true
+		}
+	}
+	return false
+}
+
 // TestBuildProjectMountsHTTPWorkerSocketDir keeps the short socket path
 // dialable from both sides: the worker binds it inside the container, the
 // platform dials the same absolute path on the host.
@@ -448,5 +497,27 @@ func TestBuildProjectPointsCACertAtContainerMount(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("container env must trust %s: %#v", MountCACert, spec.Env)
+	}
+}
+
+func TestBuildProjectHostNetwork(t *testing.T) {
+	t.Setenv("XALGORIX_ALLOW_UNPINNED_TOOLBOX", "")
+	opt := ProjectOptions{
+		ScanID:      "scan-host",
+		ScanDir:     t.TempDir(),
+		SharedDir:   t.TempDir(),
+		Image:       pinnedRef("ghcr.io/c1ayooo/xalgorix-toolbox:1.0.0-core"),
+		NetProfile:  NetProfileNone,
+		NetworkMode: "host",
+	}
+	spec, err := BuildProject(opt)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if !spec.Network.Host || spec.Network.Name != "" {
+		t.Fatalf("host network spec = %+v", spec.Network)
+	}
+	if spec.PublishCDP {
+		t.Fatal("host network must not request a CDP port binding")
 	}
 }

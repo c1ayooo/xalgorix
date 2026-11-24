@@ -17,14 +17,17 @@ func TestEmbeddedMigrationsAreOrderedAndNonEmpty(t *testing.T) {
 	if len(migrations) == 0 {
 		t.Fatal("no migrations")
 	}
-	// The info-model migration defines the cold-path tables; later migrations
-	// (e.g. 0002 platform) add their own schemas, so the containment check
-	// applies to the set as a whole rather than every file.
+	// Versions must be strictly increasing, but need not be contiguous:
+	// concurrent feature branches reserve ranges (for example the information
+	// space views at 9000+) so two sessions adding migrations cannot collide on
+	// the next sequential number.
 	someMigrationDefinesInfoItems := false
-	for i, m := range migrations {
-		if m.version != i+1 {
-			t.Fatalf("migration %d has version %d", i, m.version)
+	prevVersion := 0
+	for _, m := range migrations {
+		if m.version <= prevVersion {
+			t.Fatalf("migration %q has version %d after %d", m.name, m.version, prevVersion)
 		}
+		prevVersion = m.version
 		if strings.Contains(m.sql, "info_items") {
 			someMigrationDefinesInfoItems = true
 		}
@@ -34,7 +37,9 @@ func TestEmbeddedMigrationsAreOrderedAndNonEmpty(t *testing.T) {
 		if !strings.Contains(m.sql, "CREATE TABLE") &&
 			!strings.Contains(m.sql, "ALTER TABLE") &&
 			!strings.Contains(m.sql, "CREATE INDEX") &&
-			!strings.Contains(m.sql, "CREATE UNIQUE INDEX") {
+			!strings.Contains(m.sql, "CREATE UNIQUE INDEX") &&
+			!strings.Contains(m.sql, "CREATE VIEW") &&
+			!strings.Contains(m.sql, "CREATE OR REPLACE VIEW") {
 			t.Fatalf("migration %q contains no DDL", m.name)
 		}
 	}

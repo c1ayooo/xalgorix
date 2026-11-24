@@ -104,6 +104,11 @@ func ValidateMounts(mounts []Mount) error {
 			return fmt.Errorf("runtime: unsupported mount mode %q for %q", m.Mode, m.Container)
 		}
 		clean := filepath.Clean(m.Container)
+		// Containers must never see the host docker daemon: a socket mount is
+		// a privilege-escalation path that bypasses every platform gate.
+		if isDockerSocketPath(m.Host) || isDockerSocketPath(clean) {
+			return fmt.Errorf("runtime: refusing docker socket mount %q -> %q", m.Host, clean)
+		}
 		if _, dup := seen[clean]; dup {
 			return fmt.Errorf("runtime: duplicate mount target %q", clean)
 		}
@@ -122,6 +127,17 @@ func ValidateMounts(mounts []Mount) error {
 		}
 	}
 	return nil
+}
+
+func isDockerSocketPath(p string) bool {
+	if p == "" {
+		return false
+	}
+	clean := filepath.Clean(p)
+	if filepath.Base(clean) == "docker.sock" {
+		return true
+	}
+	return strings.HasPrefix(clean, "/var/run/docker.sock")
 }
 
 func isSharedMountTarget(container string) bool {

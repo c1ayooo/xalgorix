@@ -32,13 +32,13 @@ func Register(r *tools.Registry) {
 		Name:        "http_request",
 		Description: "Make a structured HTTP request. Use this instead of terminal curl/wget for any HTTP call — it returns status code, response headers, and body in a clean format the agent can reason about. Perfect for: API testing, auth bypass attempts, JWT manipulation, SSRF probing, parameter fuzzing, cookie inspection, redirect chain analysis, and any HTTP-based recon.",
 		Parameters: []tools.Parameter{
-			{Name: "url", Description: "Target URL (include protocol, e.g. https://example.com/api/users)", Required: true},
-			{Name: "method", Description: "HTTP method: GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS (default: GET)", Required: false},
-			{Name: "headers", Description: `JSON object of request headers. Values may be strings, numbers, or arrays of strings for multi-value headers. e.g. {"Authorization":"Bearer eyJ...","Content-Type":"application/json","X-Ids":[1,2,3]}`, Required: false},
-			{Name: "body", Description: "Request body (for POST/PUT/PATCH). Pass the raw string to send.", Required: false},
-			{Name: "follow_redirects", Description: "Follow HTTP redirects (default: true). Set to false to inspect 3xx responses directly — useful for open redirect and SSRF testing.", Required: false},
-			{Name: "timeout", Description: "Request timeout in seconds (default: 30, max: 60)", Required: false},
-			{Name: "max_bytes", Description: "Max response body bytes to return (default 51200, max 524288). Raise it to read large client-side JS bundles when hunting hidden API endpoints, routes, and secrets on SPAs.", Required: false},
+			{Name: "url", Description: "Target URL (include protocol, e.g. https://example.com/api/users)", Required: true, Type: "string"},
+			{Name: "method", Description: "HTTP method: GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS (default: GET)", Required: false, Type: "string", Enum: []string{"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"}, Default: "GET"},
+			{Name: "headers", Description: `JSON object of request headers. Values may be strings, numbers, or arrays of strings for multi-value headers. e.g. {"Authorization":"Bearer eyJ...","Content-Type":"application/json","X-Ids":[1,2,3]}`, Required: false, Type: "string"},
+			{Name: "body", Description: "Request body (for POST/PUT/PATCH). Pass the raw string to send.", Required: false, Type: "string"},
+			{Name: "follow_redirects", Description: "Follow HTTP redirects (default: true). Set to false to inspect 3xx responses directly — useful for open redirect and SSRF testing.", Required: false, Type: "boolean", Default: "true"},
+			{Name: "timeout", Description: "Request timeout in seconds (default: 30, max: 60)", Required: false, Type: "integer", Default: "30"},
+			{Name: "max_bytes", Description: "Max response body bytes to return (default 51200, max 524288). Raise it to read large client-side JS bundles when hunting hidden API endpoints, routes, and secrets on SPAs.", Required: false, Type: "integer", Default: "51200"},
 		},
 		Execute: func(args map[string]string) (tools.Result, error) {
 			return executeWithContext(r.GetScanContextID(), r.RequestGuard(), r.DialGuard(), args)
@@ -126,6 +126,18 @@ func executeWithContextCtx(parent context.Context, contextID string, guard tools
 		}
 	}
 
+	// Parse the response cap before dispatch so the container-side worker can
+	// stop reading at the same bound the native path applies.
+	bodyCap := maxBodyBytes
+	if s := strings.TrimSpace(args["max_bytes"]); s != "" {
+		if n, err := strconv.Atoi(s); err == nil && n > 0 {
+			bodyCap = n
+			if bodyCap > maxBodyBytesHard {
+				bodyCap = maxBodyBytesHard
+			}
+		}
+	}
+
 	var bodyReader io.Reader
 	if body := strings.TrimSpace(args["body"]); body != "" {
 		bodyReader = strings.NewReader(body)
@@ -137,6 +149,16 @@ func executeWithContextCtx(parent context.Context, contextID string, guard tools
 	}
 	if parsedURL.Scheme == "" {
 		parsedURL.Scheme = "https"
+	}
+	// The request guard applies to the INITIAL destination as well as every
+	// redirect hop. Without this, an orchestrator/API lane bypassed its host
+	// allowlist by calling a container URL directly (the redirect guard only
+	// fired on the first 302), and an enforced engagement scope could still be
+	// reached with follow_redirects=false.
+	if guard != nil {
+		if err := guard(parsedURL.String()); err != nil {
+			return tools.Result{Output: fmt.Sprintf("⛔ REQUEST NOT SENT — %s: %s\n", parsedURL.String(), err)}, nil
+		}
 	}
 
 	reqCtx := parent
@@ -217,6 +239,7 @@ func executeWithContextCtx(parent context.Context, contextID string, guard tools
 		refusedHop = tools.GuardRedirects(client, guard)
 	}
 
+	req = req.WithContext(tools.WithHTTPWorkerBodyLimit(req.Context(), int64(bodyCap)))
 	start := time.Now()
 	resp, err := client.Do(req)
 	if err != nil {
@@ -241,17 +264,6 @@ func executeWithContextCtx(parent context.Context, contextID string, guard tools
 		}
 	}
 
-	// Read body (capped). Callers can raise the cap (up to maxBodyBytesHard)
-	// to read large JS bundles when hunting hidden endpoints/secrets on SPAs.
-	bodyCap := maxBodyBytes
-	if s := strings.TrimSpace(args["max_bytes"]); s != "" {
-		if n, err := strconv.Atoi(s); err == nil && n > 0 {
-			bodyCap = n
-			if bodyCap > maxBodyBytesHard {
-				bodyCap = maxBodyBytesHard
-			}
-		}
-	}
 	// Use LimitReader + io.ReadAll so we always get the full (truncated)
 	// content without short reads.
 	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, int64(bodyCap)+1))
@@ -351,7 +363,39 @@ var testTLSInsecure bool
 // non-nil, checks every direct connection it makes (see tools.GuardDials).
 // scanCtxID, when non-empty, stamps the run-token attribution header for the
 // loopback traffic proxy.
+// egressProxyURL resolves the outbound (egress) proxy for one run — the
+// task's pin first, then the global pool. proxied=false means direct; an error
+// is the fail-closed required-mode case.
+func egressProxyURL(scanCtxID string) (u *url.URL, proxied bool, err error) {
+	p, direct, ok := proxy.UpstreamFor(scanCtxID)
+	if direct && ok && proxy.Required() {
+		return nil, false, fmt.Errorf("proxy-required mode cannot honor a direct egress pin")
+	}
+	if !direct && ok && p != nil {
+		proxyURL, perr := p.URL()
+		if perr != nil {
+			return nil, false, fmt.Errorf("invalid configured proxy: %w", perr)
+		}
+		return proxyURL, true, nil
+	}
+	if proxy.Required() {
+		return nil, false, fmt.Errorf("proxy-required mode has no upstream")
+	}
+	return nil, false, nil
+}
+
 func buildClient(timeoutSec int, followRedirects bool, tlsSkipVerify bool, dialGuard tools.DialGuard, scanCtxID string) (*http.Client, error) {
+	// Docker execution plane: every single-hop request runs in the project
+	// container. Redirects, guards and response formatting stay here.
+	if rt, ok := tools.ContainerHTTPTransport(scanCtxID); ok {
+		c := &http.Client{Transport: rt, Timeout: time.Duration(timeoutSec) * time.Second}
+		if !followRedirects {
+			c.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			}
+		}
+		return c, nil
+	}
 	tr, ok := http.DefaultTransport.(*http.Transport)
 	if ok {
 		tr = tr.Clone()
@@ -372,7 +416,10 @@ func buildClient(timeoutSec int, followRedirects bool, tlsSkipVerify bool, dialG
 	if config.Get().ProxyRequired && !proxy.Required() {
 		return nil, fmt.Errorf("proxy-required mode is not initialized")
 	}
-	if trafficproxy.MITMEnabled() {
+	// Recording (MITM) or the forward-only egress router: both expose a
+	// platform-internal listener that selects this run's egress per request, so
+	// a task proxy change applies to the next call without rebuilding anything.
+	if trafficproxy.Enabled() {
 		// R2b default posture: route through the shared loopback traffic
 		// proxy (also in proxy-required mode). The MITM owns upstream
 		// selection (pool rotation or direct) and applies the
@@ -399,17 +446,15 @@ func buildClient(timeoutSec int, followRedirects bool, tlsSkipVerify bool, dialG
 			}
 			tr.TLSClientConfig.RootCAs = caPool
 		}
-	} else if proxy.Enabled() {
-		p := proxy.GetProxy()
-		if p == nil {
-			if proxy.Required() {
-				return nil, fmt.Errorf("proxy-required mode has no upstream")
-			}
-		} else {
-			proxyURL, err := p.URL()
-			if err != nil {
-				return nil, fmt.Errorf("invalid configured proxy: %w", err)
-			}
+	} else {
+		// Egress selection (not the MITM): a task may pin one entry of the
+		// outbound pool. Same resolver the MITM uses when interception is on,
+		// so turning the recorder off cannot silently change the exit.
+		proxyURL, proxied, perr := egressProxyURL(scanCtxID)
+		if perr != nil {
+			return nil, perr
+		}
+		if proxied {
 			tr.Proxy = http.ProxyURL(proxyURL)
 		}
 	}

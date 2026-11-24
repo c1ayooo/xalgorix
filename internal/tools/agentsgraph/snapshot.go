@@ -17,8 +17,13 @@ type AgentState struct {
 	AgentID string `json:"agent_id"`
 	// Lane is the delegated role name ("injection-serverside", ...). The UI
 	// groups sessions by lane and keys them by AgentID.
-	Lane    string `json:"lane"`
-	Status  string `json:"status"` // queued | running | completed | failed
+	Lane   string `json:"lane"`
+	Status string `json:"status"` // queued | running | completed | failed
+	// UnitID is the authoritative intent this worker owns (pool path only).
+	// The panel groups worker sessions by this id so one work unit stays one
+	// visible worker across re-dispatch and retry; empty means the legacy
+	// model-initiated spawn (no unit) and the agent id remains the identity.
+	UnitID  string `json:"unit_id,omitempty"`
 	Task    string `json:"task,omitempty"`
 	Target  string `json:"target,omitempty"`
 	Started string `json:"started_at,omitempty"`
@@ -54,6 +59,10 @@ type StateEvent struct {
 	AgentID string
 	Lane    string
 	Status  string
+	// UnitID is the intent this worker owns (pool path only). Persisted with
+	// the lifecycle row so transcript lanes can resolve unit → agent ids after
+	// the live graph is gone.
+	UnitID string
 	// Task/Target travel with the lifecycle notification so the durable
 	// worker record (run_workers) carries what the worker was doing, not just
 	// its id — the session page lists history without a live graph.
@@ -81,7 +90,7 @@ func (g *Graph) SetStateSink(fn func(StateEvent)) {
 
 // notify delivers one lifecycle event to the configured sink. Callers must not
 // hold g.mu (notify re-locks it to read the sink).
-func (g *Graph) notify(kind, agentID, lane, status, task, target string) {
+func (g *Graph) notify(kind, agentID, lane, unitID, status, task, target string) {
 	if g == nil {
 		return
 	}
@@ -94,6 +103,7 @@ func (g *Graph) notify(kind, agentID, lane, status, task, target string) {
 	ev := StateEvent{
 		Kind:    kind,
 		AgentID: agentID,
+		UnitID:  unitID,
 		Task:    task,
 		Target:  target,
 		Lane:    lane,
@@ -153,6 +163,7 @@ func (g *Graph) snapshotLocked() GraphState {
 		agent := AgentState{
 			AgentID:        state.ID,
 			Lane:           state.Name,
+			UnitID:         state.UnitID,
 			Status:         state.Status,
 			Task:           state.Task,
 			Error:          state.Error,

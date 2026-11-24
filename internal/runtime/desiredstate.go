@@ -91,6 +91,10 @@ type DesiredStateStore interface {
 	Active(ctx context.Context) ([]DesiredProject, error)
 	// Get returns one row.
 	Get(ctx context.Context, projectID string) (DesiredProject, error)
+	// ListByProjectIDs returns the rows for the given project IDs. It exists for
+	// read-only projections (the dashboard joins a page of scans against their
+	// containers); missing IDs are simply absent from the result.
+	ListByProjectIDs(ctx context.Context, projectIDs []string) ([]DesiredProject, error)
 	// Delete drops bookkeeping for a removed project.
 	Delete(ctx context.Context, projectID string) error
 }
@@ -245,6 +249,27 @@ func (m *MemoryDesiredState) Get(_ context.Context, projectID string) (DesiredPr
 		return DesiredProject{}, ErrProjectNotFound
 	}
 	return row, nil
+}
+
+// ListByProjectIDs implements DesiredStateStore.
+func (m *MemoryDesiredState) ListByProjectIDs(_ context.Context, projectIDs []string) ([]DesiredProject, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]DesiredProject, 0, len(projectIDs))
+	seen := make(map[string]struct{}, len(projectIDs))
+	for _, id := range projectIDs {
+		if id == "" {
+			continue
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		if row, ok := m.rows[id]; ok {
+			out = append(out, row)
+		}
+	}
+	return out, nil
 }
 
 // Delete implements DesiredStateStore.

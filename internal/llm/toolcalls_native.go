@@ -78,6 +78,9 @@ type chatToolProperty struct {
 // spec `arguments` is a JSON *string*, but some servers send a raw object; the
 // jsonString decoder accepts both and preserves the exact bytes either way.
 type chatToolCall struct {
+	// Index is present on streamed deltas, which split one call across
+	// chunks; non-streaming responses carry every call whole and may omit it.
+	Index    int    `json:"index"`
 	ID       string `json:"id"`
 	Type     string `json:"type"`
 	Function struct {
@@ -194,6 +197,13 @@ func rawValueToString(v json.RawMessage) (string, error) {
 		return "", err
 	}
 	return buf.String(), nil
+}
+
+// ParseToolArguments converts a raw `arguments` JSON payload into the flat
+// map[string]string the tool executors consume. It is exported for streaming
+// adapters that assemble tool-call fragments before executing the call.
+func ParseToolArguments(raw string) (map[string]string, error) {
+	return argumentsToArgs(raw)
 }
 
 // parseOpenAIToolCalls converts the wire-level tool_calls of a response into

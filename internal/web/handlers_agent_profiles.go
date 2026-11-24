@@ -26,23 +26,30 @@ import (
 )
 
 // builtinProfileRows renders the code-defined specialists as read-only wire
-// rows (fresh IDs per response — they are not store rows).
+// rows (fresh IDs per response — they are not store rows). The canonical
+// focus/contract/stopping-rule strings and the effective tool-scope hide list
+// come from the agent package so the console shows exactly what the engine
+// enforces.
 func builtinProfileRows() []platform.AgentProfile {
-	roles := agent.BuiltinSpecialistRoles()
-	out := make([]platform.AgentProfile, 0, len(roles))
-	// The contract text lives in the agent package's renderSpecialistProfiles;
-	// the wire rows expose the identity surface the UI needs (role + builtin
-	// flag). Focus/contract details stay engine-owned to avoid duplicating
-	// the canonical strings here.
-	for _, role := range roles {
+	views := agent.BuiltinSpecialistProfiles()
+	out := make([]platform.AgentProfile, 0, len(views))
+	for _, p := range views {
+		// Both slices are non-omitempty wire fields; keep the empty-array
+		// contract (nil would marshal as null).
+		hidden := p.ToolScopeHidden
+		if hidden == nil {
+			hidden = []string{}
+		}
 		out = append(out, platform.AgentProfile{
-			ID:   "builtin:" + role,
-			Role: role,
-			// vuln_classes is a non-omitempty wire field; keep the empty-array
-			// contract (nil would marshal as null in every builtin row).
-			VulnClasses: []string{},
-			Builtin:     true,
-			Enabled:     true,
+			ID:               "builtin:" + p.Role,
+			Role:             p.Role,
+			Focus:            p.Focus,
+			VulnClasses:      append([]string{}, p.VulnClasses...),
+			EvidenceContract: p.EvidenceContract,
+			StoppingRule:     p.StoppingRule,
+			ToolScopeHidden:  hidden,
+			Builtin:          true,
+			Enabled:          true,
 		})
 	}
 	return out

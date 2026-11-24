@@ -123,12 +123,18 @@ func runGogo(parent context.Context, o scanOptions) (*scanOutcome, error) {
 		"TMPDIR="+filepath.Join(o.WorkDir, "tmp"),
 	)
 	_ = os.MkdirAll(filepath.Join(o.WorkDir, "tmp"), 0o700)
-	if config.Get().ProxyRequired || egressproxy.Required() || trafficproxy.Enabled() {
+	if trafficproxy.Enabled() {
 		// Required-proxy posture is fail-closed: no proxy, no scan.
 		cmdEnv, err = trafficproxy.Environment(cmdEnv)
 		if err != nil {
 			return nil, fmt.Errorf("required proxy unavailable: %w", err)
 		}
+	} else {
+		egressEnv, eerr := egressproxy.EgressEnv(o.ContextID, config.Get().ProxyRequired)
+		if eerr != nil {
+			return nil, fmt.Errorf("required proxy unavailable: %w", eerr)
+		}
+		cmdEnv = append(cmdEnv, egressEnv...)
 	}
 	cmdEnv = append(cmdEnv, egress.EnvForChild(o.ContextID)...)
 	cmd.Env = cmdEnv

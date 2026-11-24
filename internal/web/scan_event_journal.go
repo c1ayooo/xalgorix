@@ -414,7 +414,11 @@ func appendScanEventJournal(dir string, event WSEvent) error {
 	if err != nil {
 		return err
 	}
-	f, err := os.OpenFile(filepath.Join(dir, scanEventJournalFile), os.O_WRONLY|os.O_APPEND, 0o600)
+	// O_CREATE: out-of-band conversation appends (side questions, answers) may
+	// be the first writer for a run whose journal file was never opened (all
+	// embedded in scan.json, or removed). The append is still the durable
+	// record; failing here would silently drop the operator's turn.
+	f, err := os.OpenFile(filepath.Join(dir, scanEventJournalFile), os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
 	if err != nil {
 		return err
 	}

@@ -2,6 +2,7 @@ package web
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"image"
 	_ "image/jpeg" // register JPEG decoder for image.Decode on uploaded logos
@@ -18,6 +19,7 @@ import (
 
 	"github.com/go-pdf/fpdf"
 
+	"github.com/c1ayooo/xalgorix/v4/internal/domainjournal"
 	"github.com/c1ayooo/xalgorix/v4/internal/methodology"
 	"github.com/c1ayooo/xalgorix/v4/internal/reporting"
 )
@@ -518,6 +520,23 @@ var methodologyPhaseNames = func() map[int]string {
 // generateReport creates a professional PDF pentest report for a scan. scanDir
 // is supplied by the caller so concurrent reports never share a mutable
 // server-global output directory.
+// collectReportDeviations reads the run journal's executor deviations. It is
+// best-effort: a missing/legacy journal simply omits the report section.
+func collectReportDeviations(scanDir string) []domainjournal.Deviation {
+	scanDir = strings.TrimSpace(scanDir)
+	if scanDir == "" {
+		return nil
+	}
+	scanID := filepath.Base(scanDir)
+	records, _, err := domainjournal.ReadRecordsResolved(
+		context.Background(), filepath.Join(scanDir, domainjournal.FileName), scanID,
+	)
+	if err != nil {
+		return nil
+	}
+	return domainjournal.Project(scanID, records).Deviations
+}
+
 func (s *Server) generateReport(scan *ScanRecord, scanDir string) (string, error) {
 	language := ""
 	if cfg := s.configSnapshot(); cfg != nil {
@@ -1532,6 +1551,51 @@ func (s *Server) generateReport(scan *ScanRecord, scanDir string) (string, error
 			pdf.SetFont("Helvetica", "", 9)
 			setColor(gray)
 			pdf.CellFormat(190, 5, fmt.Sprintf("... and %d more endpoints", len(endpoints)-30), "", 1, "L", false, 0, "")
+		}
+	}
+
+	// ─── PLANNING DEVIATIONS ─────────────────────────────
+	if devs := collectReportDeviations(scanDir); len(devs) > 0 {
+		pdf.AddPage()
+		drawRect(0, 0, 210, 297, darkBg)
+		drawRect(0, 0, 210, 1.5, coral)
+
+		pdf.SetY(15)
+		pdf.SetFont("Helvetica", "B", 22)
+		setColor(amber)
+		pdf.CellFormat(190, 12, tr("Planning Deviations"), "", 1, "L", false, 0, "")
+		drawRect(10, pdf.GetY()+2, 50, 0.8, teal)
+		pdf.Ln(8)
+
+		pdf.SetFont("Helvetica", "", 9)
+		setColor(gray)
+		pdf.MultiCell(182, 5, tr("Executor-reported departures from the assigned intent; audit only."), "", "L", false)
+		pdf.Ln(4)
+
+		for i, d := range devs {
+			if i >= 25 {
+				break
+			}
+			if pdf.GetY() > 265 {
+				pdf.AddPage()
+				drawRect(0, 0, 210, 297, darkBg)
+				drawRect(0, 0, 210, 1.5, coral)
+				pdf.SetY(15)
+			}
+			line := "- "
+			if d.IntentID != "" {
+				line += d.IntentID + ": "
+			}
+			line += truncateRunes(d.Summary, 300)
+			pdf.SetFont("Helvetica", "", 9)
+			setColor(white)
+			pdf.MultiCell(182, 4.5, line, "", "L", false)
+			pdf.Ln(1)
+		}
+		if len(devs) > 25 {
+			pdf.SetFont("Helvetica", "", 8)
+			setColor(gray)
+			pdf.CellFormat(190, 5, fmt.Sprintf("... and %d more deviations", len(devs)-25), "", 1, "L", false, 0, "")
 		}
 	}
 

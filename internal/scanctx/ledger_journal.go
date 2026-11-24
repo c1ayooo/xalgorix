@@ -1,6 +1,8 @@
 package scanctx
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"path/filepath"
@@ -89,6 +91,98 @@ func (ls *LedgerStore) AppendToolObservation(item *infoitem.Item, summary string
 // finding carries an InfoItem even when the model never linked a hypothesis.
 func (ls *LedgerStore) AppendFindingObservation(item *infoitem.Item, summary string) error {
 	return ls.appendObservation(domainjournal.OpFindingRecorded, engineActor("report-gate"), item, summary)
+}
+
+// AppendContextDigest projects one context-compaction snapshot into the
+// information space as an inferred InfoItem (IG6b). The caller must supply
+// non-empty Supports: an inferred digest without provenance cannot be used as
+// evidence or as a finish basis. Like the other observation appends this is
+// audit/cold-path only — it never mutates ledger, plan or scheduling state.
+func (ls *LedgerStore) AppendContextDigest(item *infoitem.Item, summary string) error {
+	if item == nil {
+		return fmt.Errorf("scanctx: nil info item for context digest")
+	}
+	if item.Nature != infoitem.NatureInferred {
+		return fmt.Errorf("scanctx: context digest must be inferred, got %q", item.Nature)
+	}
+	if len(item.Supports) == 0 {
+		return fmt.Errorf("scanctx: context digest requires non-empty supports")
+	}
+	return ls.appendObservation(domainjournal.OpContextDigest, engineActor("context-compactor"), item, summary)
+}
+
+// AppendInjectionObservation records untrusted prompt text that matched an
+// injection marker. It is an observed InfoItem (source engine/prompt-guard,
+// purpose=injection_suspected): audit and cold-path only, never a hypothesis
+// mutation, never a verdict, and never executed.
+func (ls *LedgerStore) AppendInjectionObservation(field, text string) error {
+	// Dedupe: the same notes/hint block is rendered every planner round and
+	// every worker task; journaling each pass would flood the audit.
+	sum := sha256.Sum256([]byte(strings.TrimSpace(field) + "\x00" + text))
+	key := hex.EncodeToString(sum[:])
+	ls.injectionMu.Lock()
+	if ls.injectionSeen == nil {
+		ls.injectionSeen = make(map[string]struct{})
+	}
+	if _, seen := ls.injectionSeen[key]; seen {
+		ls.injectionMu.Unlock()
+		return nil
+	}
+	ls.injectionSeen[key] = struct{}{}
+	ls.injectionMu.Unlock()
+
+	id, err := infoitem.NewID()
+	if err != nil {
+		return fmt.Errorf("scanctx: injection observation id: %w", err)
+	}
+	now := time.Now().UTC()
+	body := strings.ToValidUTF8(text, "")
+	if r := []rune(body); len(r) > 512 {
+		body = string(r[:512]) + "…"
+	}
+	item := infoitem.Item{
+		ID:     id,
+		Nature: infoitem.NatureObserved,
+		Coordinates: infoitem.Coordinates{
+			Content:    infoitem.Content{Text: body, MediaType: "text/plain"},
+			Source:     infoitem.Source{Kind: "engine", Name: "prompt-guard"},
+			ObservedAt: now,
+			Subject:    infoitem.Subject{Kind: "prompt_field", Identifier: strings.TrimSpace(field)},
+			Purpose:    "injection_suspected",
+			Context:    map[string]string{"field": strings.TrimSpace(field)},
+		},
+		CreatedAt:        now,
+		CoordinateStatus: infoitem.CoordinatesComplete,
+	}
+	item.Normalize()
+	return ls.AppendToolObservation(&item, "prompt injection markers neutralized in "+field)
+}
+
+// AppendDeviation records an executor's stated departure from its assigned
+// intent. Audit-only: no plan/ledger state changes, no verdict.
+func (ls *LedgerStore) AppendDeviation(intentID, deviation, agentID string) error {
+	deviation = strings.TrimSpace(deviation)
+	if deviation == "" {
+		return fmt.Errorf("scanctx: deviation is empty")
+	}
+	ls.mu.RLock()
+	j := ls.journal
+	scanID := ls.scanID
+	ls.mu.RUnlock()
+	if j == nil {
+		return fmt.Errorf("scanctx: no journal for deviation")
+	}
+	rec := domainjournal.Record{
+		ScanID:    scanID,
+		Actor:     modelActor(agentID),
+		Operation: domainjournal.OpRecordDeviation,
+		IntentID:  strings.TrimSpace(intentID),
+		Summary:   truncate(deviation, 1024),
+	}
+	if _, err := j.Append(rec); err != nil {
+		return fmt.Errorf("scanctx: append deviation: %w", err)
+	}
+	return nil
 }
 
 // appendObservation is the shared journal-only append used by observation
@@ -275,6 +369,16 @@ func (ls *LedgerStore) evidenceInfoItemLocked(h *Hypothesis, ev Evidence) (*info
 		"scan_id":    ls.scanID,
 		"vuln_class": h.VulnClass,
 		"hypothesis": h.ID,
+	}
+	// Kind is the evidence-role dimension (baseline/control/probe/exploit/
+	// finding_ref). It is not the nature dimension; the cold-path relation
+	// inference uses it to derive deterministic contradiction edges without
+	// reading prose.
+	if ev.Kind != "" {
+		context["evidence_kind"] = strings.ToLower(strings.TrimSpace(ev.Kind))
+	}
+	if ev.AgentID != "" {
+		context["agent_id"] = ev.AgentID
 	}
 	if h.Parameter != "" {
 		context["parameter"] = h.Parameter

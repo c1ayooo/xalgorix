@@ -209,3 +209,30 @@ func TestPrepareTrafficProxyClientConfigEmbedsRunToken(t *testing.T) {
 		t.Fatalf("credential lines written without a registered token: %q", wgetrc)
 	}
 }
+
+// TestPrepareTrafficProxyClientConfigMirrorsContainerHome pins the container
+// case: internal/runtime roots HOME at <scanDir>/home, so the same client
+// config must land there when that directory exists. Without it an
+// in-container curl sees no CA and no run token even when the proxy env is
+// correct.
+func TestPrepareTrafficProxyClientConfigMirrorsContainerHome(t *testing.T) {
+	configureMITMForTerminal(t)
+	workDir := t.TempDir()
+	home := filepath.Join(workDir, "home")
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepareTrafficProxyClientConfig(workDir, "home-scan"); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{".curlrc", ".wgetrc"} {
+		path := filepath.Join(home, name)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("container HOME %s: %v", name, err)
+		}
+		if !strings.Contains(string(data), "cacert") && !strings.Contains(string(data), "ca_certificate") {
+			t.Fatalf("%s missing CA trust: %q", name, data)
+		}
+	}
+}

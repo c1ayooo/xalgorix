@@ -35,6 +35,7 @@ package web
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"net/url"
@@ -393,6 +394,28 @@ func (r refusedEndpointResolver) Resolve(context.Context) (llm.Endpoint, error) 
 //
 // Validates: B1 (per-scan provider_profile resolver wiring).
 func (s *Server) buildScanLLMClient(ctx context.Context, req ScanRequest, cfg *config.Config) (*llm.Client, error) {
+	// Ordered model chain (task-level): resolve every entry now so a
+	// misconfigured downstream entry fails the run at start instead of
+	// surfacing as a mid-scan 401. Two or more endpoints install a
+	// ChainResolver; a single entry behaves exactly like the fixed path.
+	if len(req.ProviderProfileChain) > 1 {
+		eps := make([]llm.Endpoint, 0, len(req.ProviderProfileChain))
+		for _, key := range req.ProviderProfileChain {
+			ep, err := s.resolveScanCredentials(ctx, ScanRequest{ProviderProfile: key}, cfg)
+			if err != nil {
+				return nil, fmt.Errorf("model chain entry %q: %w", key, err)
+			}
+			if !isZeroEndpoint(ep) {
+				eps = append(eps, ep)
+			}
+		}
+		// Always a ChainResolver when the task names a chain (even one entry):
+		// the resolver is the hot-swap seam for a mid-run model edit, and the
+		// main agent + planner clone share this pointer.
+		if len(eps) > 0 {
+			return llm.NewClient(cfg, llm.WithResolver(llm.NewChainResolver(eps))), nil
+		}
+	}
 	ep, err := s.resolveScanCredentials(ctx, req, cfg)
 	if err != nil {
 		return nil, err

@@ -239,10 +239,337 @@ func (m *ChatModel) providerMessages(input []*schema.Message) ([]llm.Message, er
 	return toXMLProviderMessages(messages), nil
 }
 
-// Stream is deliberately disabled: the scan uses the non-streaming client and
-// streaming would need a separate verifier/accounting parity review.
-func (m *ChatModel) Stream(context.Context, []*schema.Message, ...model.Option) (*schema.StreamReader[*schema.Message], error) {
-	return nil, errors.New("engine: streaming is not enabled")
+// ChatStreamClient is the optional streaming capability the adapter needs.
+// *llm.Client satisfies it. Probed at call time like ChatMetaClient, so test
+// fakes implementing only ChatClient keep working (and simply cannot stream).
+type ChatStreamClient interface {
+	ChatStreamWithTools(messages []llm.Message, tools []llm.ToolDefinition) <-chan llm.StreamChunk
+}
+
+var _ ChatStreamClient = (*llm.Client)(nil)
+
+// Stream implements model.ToolCallingChatModel by consuming the client's SSE
+// stream. Text is surfaced incrementally; tool-call fragments are accumulated
+// by index and delivered complete on the final frame, so the concatenated
+// stream matches the message Generate would have returned.
+//
+// The scan's recovery policy applies on this path too: BeforeModel runs per
+// attempt, and a provider error or an empty/reasoning-only response is handed
+// to OnModelError / OnModelResponse exactly as Generate does. The one
+// streaming-specific rule is that a retry is only possible while nothing has
+// been surfaced to the consumer: a replay after a delta reached the reader
+// would duplicate text, so such a response is accepted (or its provider error
+// surfaced) instead of retried.
+//
+// Cancelling ctx closes the reader with ctx.Err() and drains the producer
+// channel so the client goroutine cannot block on an unread send.
+func (m *ChatModel) Stream(ctx context.Context, input []*schema.Message, opts ...model.Option) (*schema.StreamReader[*schema.Message], error) {
+	if m == nil || m.client == nil {
+		return nil, errors.New("engine: chat client is nil")
+	}
+	streamer, ok := m.client.(ChatStreamClient)
+	if !ok {
+		// Streaming is an optimization, not a capability requirement: a client
+		// without SSE (test fakes, a gateway that only speaks non-streaming)
+		// degrades to one complete message, which the ADK consumes identically.
+		msg, genErr := m.Generate(ctx, input, opts...)
+		if genErr != nil {
+			return nil, genErr
+		}
+		return schema.StreamReaderFromArray([]*schema.Message{msg}), nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if m.stopCheck != nil && m.stopCheck() {
+		return nil, &ErrTurnStopped{Reason: "scan complete"}
+	}
+
+	tools := m.tools
+	if len(opts) > 0 {
+		common := model.GetCommonOptions(&model.Options{}, opts...)
+		if len(common.Tools) > 0 {
+			bound, bindErr := toolDefinitionsFromInfo(common.Tools)
+			if bindErr != nil {
+				return nil, bindErr
+			}
+			tools = bound
+		}
+	}
+	working := cloneSchemaMessages(input)
+	if m.compactor != nil {
+		working = m.compactor(working)
+	}
+	wireTools := tools
+	if !m.nativeTools {
+		wireTools = nil
+	}
+
+	reader, writer := schema.Pipe[*schema.Message](16)
+	go func() {
+		defer writer.Close()
+		m.streamWithRecovery(ctx, writer, working, wireTools, streamer, !m.nativeTools)
+	}()
+	return reader, nil
+}
+
+// streamWithRecovery runs the streaming provider request through the same
+// policy loop Generate uses. Attempts that surfaced nothing to the consumer
+// (empty responses, errors before the first delta) retry with the recovery
+// decision applied to the working context; once a delta is out, a retry is
+// refused because the reader cannot unsee it.
+func (m *ChatModel) streamWithRecovery(
+	ctx context.Context,
+	writer *schema.StreamWriter[*schema.Message],
+	working []*schema.Message,
+	wireTools []llm.ToolDefinition,
+	streamer ChatStreamClient,
+	bufferContent bool,
+) {
+	for attempt := 0; ; attempt++ {
+		if attempt > 256 {
+			writer.Send(nil, errors.New("engine: model recovery did not converge"))
+			return
+		}
+		if err := ctx.Err(); err != nil {
+			writer.Send(nil, err)
+			return
+		}
+		if m.stopCheck != nil && m.stopCheck() {
+			writer.Send(nil, &ErrTurnStopped{Reason: "scan complete"})
+			return
+		}
+		if m.recovery != nil {
+			_ = m.recovery.BeforeModel(ctx, attempt)
+		}
+		messages, err := m.providerMessages(working)
+		if err != nil {
+			writer.Send(nil, err)
+			return
+		}
+		chunks := streamer.ChatStreamWithTools(messages, wireTools)
+		res := m.forwardStreamAttempt(ctx, chunks, writer, bufferContent)
+		if res.consumerClosed {
+			return
+		}
+		if res.err != nil {
+			if m.recovery == nil {
+				writer.Send(nil, res.err)
+				return
+			}
+			decision := m.recovery.OnModelError(ctx, res.err)
+			if decision.Fatal != nil {
+				writer.Send(nil, decision.Fatal)
+				return
+			}
+			if !decision.Retry || res.emitted {
+				writer.Send(nil, res.err)
+				return
+			}
+			switch {
+			case decision.ResetContext:
+				working = resetSchemaMessages(working, decision.Nudge)
+			case decision.CompactContext:
+				working = compactForOverflow(working)
+			default:
+				working = appendSchemaNudge(working, decision.Nudge)
+			}
+			continue
+		}
+		if m.recovery != nil {
+			decision := m.recovery.OnModelResponse(ctx, messages, res.content, res.calls, res.usage)
+			if decision.Fatal != nil {
+				writer.Send(nil, decision.Fatal)
+				return
+			}
+			// An empty or reasoning-only turn surfaced nothing, so the same
+			// retry Generate performs is safe here.
+			if (decision.Retry || decision.ResetContext) && !res.emitted {
+				if decision.ResetContext {
+					working = resetSchemaMessages(working, decision.Nudge)
+				} else {
+					working = appendSchemaNudge(working, decision.Nudge)
+				}
+				continue
+			}
+		}
+		// Reasoning surfaces only after the recovery policy accepted the
+		// response, mirroring Generate: failed or retried attempts never emit a
+		// thinking row.
+		if res.reasoning != "" && m.onReasoning != nil {
+			m.onReasoning(res.reasoning)
+		}
+		if !writer.Send(responseMessage(res.finalContent, res.calls, res.usage), nil) {
+			go drainStreamChunks(chunks)
+		}
+		return
+	}
+}
+
+// streamAttempt is one provider stream reduced to what the recovery policy and
+// the final frame need. content is the text Generate would have returned;
+// finalContent is the text for the final frame (empty when deltas already
+// carried it, so the reader never receives the same text twice).
+type streamAttempt struct {
+	content        string
+	finalContent   string
+	reasoning      string
+	calls          []llm.ToolCall
+	usage          *llm.TokenUsage
+	emitted        bool
+	consumerClosed bool
+	err            error
+}
+
+// forwardStreamAttempt relays one client stream into the Eino pipe and returns
+// the reduced response. It sends deltas but never the final frame: the caller
+// sends that only after the recovery policy accepts the turn.
+//
+// bufferContent is true on the XML fallback: there tool calls live inside the
+// text, so the deltas are held until the end and the final frame carries the
+// cleaned content plus parsed calls (mirroring Generate). On the native
+// channel text streams immediately and the final frame only completes the
+// tool calls and usage.
+func (m *ChatModel) forwardStreamAttempt(
+	ctx context.Context,
+	chunks <-chan llm.StreamChunk,
+	writer *schema.StreamWriter[*schema.Message],
+	bufferContent bool,
+) streamAttempt {
+	var (
+		content   strings.Builder
+		reasoning strings.Builder
+		builders  = make(map[int]*streamCallBuilder)
+		order     []int
+		usage     *llm.TokenUsage
+		emitted   bool
+	)
+
+	finalize := func() streamAttempt {
+		raw := content.String()
+		recoveryContent := raw
+		finalContent := ""
+		if bufferContent {
+			finalContent = strings.TrimSpace(raw)
+			recoveryContent = finalContent
+		}
+		calls := assembleStreamCalls(builders, order)
+		// Native calls take precedence; the XML parser is the same
+		// compatibility fallback Generate applies on the non-streaming path.
+		if len(calls) == 0 {
+			if parsed := llm.ParseToolCalls(raw); len(parsed) > 0 {
+				calls = llm.EnsureToolCallIDs(parsed, "xmlstream")
+				if bufferContent {
+					recoveryContent = strings.TrimSpace(llm.CleanContent(raw))
+					finalContent = recoveryContent
+				}
+			}
+		}
+		return streamAttempt{
+			content:      recoveryContent,
+			finalContent: finalContent,
+			reasoning:    reasoning.String(),
+			calls:        calls,
+			usage:        usage,
+			emitted:      emitted,
+		}
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			writer.Send(nil, ctx.Err())
+			go drainStreamChunks(chunks)
+			return streamAttempt{err: ctx.Err(), emitted: emitted, consumerClosed: true}
+		case chunk, ok := <-chunks:
+			if !ok {
+				return finalize()
+			}
+			if chunk.Err != nil {
+				// The provider failed mid-stream. The caller decides whether the
+				// policy may retry (only when nothing was surfaced). Drain so a
+				// producer goroutine cannot block on an unread send.
+				go drainStreamChunks(chunks)
+				return streamAttempt{err: chunk.Err, emitted: emitted}
+			}
+			if chunk.Reasoning != "" {
+				reasoning.WriteString(chunk.Reasoning)
+			}
+			if chunk.Content != "" {
+				content.WriteString(chunk.Content)
+				if !bufferContent {
+					if writer.Send(&schema.Message{Role: schema.Assistant, Content: chunk.Content}, nil) {
+						go drainStreamChunks(chunks)
+						return streamAttempt{consumerClosed: true, emitted: true}
+					}
+					emitted = true
+				}
+			}
+			for _, fragment := range chunk.ToolCalls {
+				builder := builders[fragment.Index]
+				if builder == nil {
+					builder = &streamCallBuilder{}
+					builders[fragment.Index] = builder
+					order = append(order, fragment.Index)
+				}
+				builder.apply(fragment)
+			}
+			if chunk.Usage != nil {
+				usage = chunk.Usage
+			}
+			if chunk.Done {
+				return finalize()
+			}
+		}
+	}
+}
+
+// streamCallBuilder accumulates the fragments of one tool call.
+type streamCallBuilder struct {
+	id   string
+	name string
+	args strings.Builder
+}
+
+func (b *streamCallBuilder) apply(fragment llm.StreamToolCall) {
+	if fragment.ID != "" {
+		b.id = fragment.ID
+	}
+	if fragment.Name != "" {
+		b.name = fragment.Name
+	}
+	if fragment.Arguments != "" {
+		b.args.WriteString(fragment.Arguments)
+	}
+}
+
+// assembleStreamCalls turns the index-keyed fragments into complete calls in
+// the order the provider opened them.
+func assembleStreamCalls(builders map[int]*streamCallBuilder, order []int) []llm.ToolCall {
+	if len(order) == 0 {
+		return nil
+	}
+	sort.Ints(order)
+	out := make([]llm.ToolCall, 0, len(order))
+	for _, index := range order {
+		builder := builders[index]
+		if builder == nil || (builder.name == "" && builder.args.Len() == 0) {
+			continue
+		}
+		out = append(out, llm.ToolCall{
+			ID:           builder.id,
+			Name:         builder.name,
+			RawArguments: strings.TrimSpace(builder.args.String()),
+		})
+	}
+	return out
+}
+
+// drainStreamChunks unblocks the producing goroutine after the consumer has
+// stopped reading (ctx cancelled or reader closed).
+func drainStreamChunks(chunks <-chan llm.StreamChunk) {
+	for range chunks {
+	}
 }
 
 func responseMessage(content string, calls []llm.ToolCall, usage *llm.TokenUsage) *schema.Message {

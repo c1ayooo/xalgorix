@@ -49,9 +49,11 @@ type scanListItem struct {
 	TaskID   string `json:"task_id,omitempty"`
 	TaskName string `json:"task_name,omitempty"`
 	Trigger  string `json:"trigger,omitempty"`
-	// InstanceID carries the record's dispatch instance for the §3.2
-	// project_id filter. json:"-": the wire shape is unchanged.
-	InstanceID string `json:"-"`
+	// InstanceID is the record's dispatch instance. Exposed so run-scoped
+	// projections (the live traffic panel) can address a run — with its
+	// sibling sessions merged — even after a restart dropped the in-memory
+	// instance entry. The §3.2 project_id filter also matches on it.
+	InstanceID string `json:"instance_id,omitempty"`
 }
 
 // scanListCacheTTL bounds how long a built scan list is reused. Building the
