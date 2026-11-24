@@ -8,7 +8,9 @@ package assetgraph
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -35,6 +37,72 @@ func Register(r *tools.Registry) {
 			return record(r, args)
 		},
 	})
+	r.Register(&tools.Tool{
+		Name: "read_asset",
+		Description: "Read one project asset identity by id: kind/key, run/task links, structural edges and the " +
+			"time-ordered locator history. Read-only; it returns references and metadata, never target content or credentials.",
+		Parameters: []tools.Parameter{
+			{Name: "id", Description: "Asset id returned by record_asset or list_assets", Required: true},
+		},
+		Execute: func(args map[string]string) (tools.Result, error) {
+			return readAsset(r, args)
+		},
+	})
+}
+
+// readAsset is the read side of the asset graph. Locators are identity
+// history, not authorization: the caller must still satisfy the scope guard
+// before using any locator as a network destination.
+func readAsset(r *tools.Registry, args map[string]string) (tools.Result, error) {
+	repo := assets.Backend()
+	if repo == nil {
+		return tools.Result{Output: "Asset graph unavailable (no PostgreSQL asset authority)."}, nil
+	}
+	sc := scanctx.Get(r.GetScanContextID())
+	if sc == nil {
+		return tools.Result{Error: "read_asset: scan context unavailable"}, nil
+	}
+	projectID := strings.TrimSpace(sc.ProjectID)
+	if projectID == "" {
+		return tools.Result{Error: "read_asset: this run has no project scope; assets are project-scoped"}, nil
+	}
+	id, err := strconv.ParseInt(strings.TrimSpace(args["id"]), 10, 64)
+	if err != nil || id <= 0 {
+		return tools.Result{Error: "read_asset: id must be a positive asset id"}, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	detail, err := repo.GetAssetDetail(ctx, projectID, id)
+	if err != nil {
+		if err == assets.ErrNotFound {
+			return tools.Result{Output: fmt.Sprintf("asset not found: %d", id)}, nil
+		}
+		return tools.Result{Error: "read_asset: " + err.Error()}, nil
+	}
+	locators, lerr := repo.ListAssetLocators(ctx, projectID, id)
+	if lerr != nil {
+		return tools.Result{Error: "read_asset: locator history: " + lerr.Error()}, nil
+	}
+	// Bound the projection so one busy asset cannot flood the model context.
+	if len(detail.Links) > 20 {
+		detail.Links = detail.Links[:20]
+	}
+	if len(detail.Edges) > 20 {
+		detail.Edges = detail.Edges[:20]
+	}
+	if len(locators) > 20 {
+		locators = locators[:20]
+	}
+	out, err := json.Marshal(map[string]any{
+		"asset":    detail.Asset,
+		"links":    detail.Links,
+		"edges":    detail.Edges,
+		"locators": locators,
+	})
+	if err != nil {
+		return tools.Result{Error: "read_asset: encode: " + err.Error()}, nil
+	}
+	return tools.Result{Output: string(out)}, nil
 }
 
 func record(r *tools.Registry, args map[string]string) (tools.Result, error) {

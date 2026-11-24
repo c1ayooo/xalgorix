@@ -98,6 +98,12 @@ func (a *Agent) searchInfoTool(args map[string]string) (tools.Result, error) {
 		ctx = context.Background()
 	}
 
+	// R3: record the query itself (mode + refs) before execution. Result-level
+	// truncation/incomplete flags are carried by the tool output; the trace
+	// records that the read happened and against which IDs.
+	a.recordInfoRead("search_info", mode, parsePreconditions(args["ids"]), true, false, false,
+		"subject="+strings.TrimSpace(args["subject"])+" purpose="+strings.TrimSpace(args["purpose"]))
+
 	switch mode {
 	case "region":
 		q := infoitem.RegionQuery{

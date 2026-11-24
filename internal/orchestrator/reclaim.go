@@ -26,14 +26,17 @@ package orchestrator
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/c1ayooo/xalgorix/v4/internal/agent"
 	"github.com/c1ayooo/xalgorix/v4/internal/graph"
 )
 
@@ -107,6 +110,7 @@ func (p *Pool) watchProgress(unitID, agentID, surface string) *progressWatch {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		started := time.Now()
+		activeLogged := false
 		for {
 			select {
 			case <-w.done:
@@ -119,9 +123,25 @@ func (p *Pool) watchProgress(unitID, agentID, surface string) *progressWatch {
 			if idle < limit {
 				continue
 			}
+			// A legitimate long tool has no result to record yet: pause the
+			// reclaim clock while it is actually executing. The worker budget
+			// remains the hard backstop for a tool that never returns.
+			if p.cfg.ScanCtx != nil && p.cfg.ScanCtx.Progress != nil {
+				if name, since, ok := p.cfg.ScanCtx.Progress.ActiveTool(agentID); ok {
+					deadline, _ := p.cfg.ScanCtx.Progress.ActiveToolDeadline(agentID)
+					if deadline.IsZero() || time.Now().Before(deadline) {
+						if !activeLogged {
+							log.Printf("[orchestrator] reclaim %s paused: tool %s running for %s", unitID, name, time.Since(since).Round(time.Second))
+							activeLogged = true
+						}
+						continue
+					}
+					log.Printf("[orchestrator] reclaim %s: tool %s exceeded its %s deadline; treating as stalled", unitID, name, time.Since(since).Round(time.Second))
+				}
+			}
+			activeLogged = false
 			reason := fmt.Sprintf("no information-layer progress for %s (limit %s); intent reclaimed so the slot can rotate", idle.Round(time.Second), limit)
-			w.setReason(reason)
-			log.Printf("[orchestrator] reclaim %s: %s", unitID, reason)
+			log.Printf("[orchestrator] reclaim candidate %s: %s", unitID, reason)
 			p.steer(unitID, noProgressMessage)
 			grace := p.cfg.WindDown
 			if grace <= 0 {
@@ -134,8 +154,28 @@ func (p *Pool) watchProgress(unitID, agentID, surface string) *progressWatch {
 				return
 			case <-time.After(grace):
 			}
-			p.killStagnant(unitID, reason)
-			return
+			delivered, refused := p.killStagnant(unitID, reason)
+			if delivered {
+				w.setReason(reason)
+				log.Printf("[orchestrator] reclaimed %s: %s", unitID, reason)
+				return
+			}
+			if !refused {
+				// The worker already exited or the kill request failed; the run
+				// path settles the real status. Do not keep trying behind it.
+				return
+			}
+			// The engine refused because the worker produced progress inside the
+			// guard window. Resume watching; do not fall back to a human-labeled
+			// plain cancel (round-5 bug).
+			log.Printf("[orchestrator] reclaim %s deferred: the worker made progress inside the kill guard window", unitID)
+			select {
+			case <-w.done:
+				return
+			case <-p.ctx.Done():
+				return
+			case <-time.After(agent.KillProgressWindow):
+			}
 		}
 	}()
 	return w
@@ -166,20 +206,36 @@ func (p *Pool) steer(unitID, msg string) {
 }
 
 // killStagnant kills a reclaimed worker with the typed stagnant cause so the
-// engine's own validation runs and the audit trail says why.
-func (p *Pool) killStagnant(unitID, reason string) {
+// engine's own validation runs and the audit trail says why. delivered reports a
+// confirmed kill request; refused reports an engine refusal due to recent
+// progress (the caller must resume watching, never fall back to a plain kill).
+func (p *Pool) killStagnant(unitID, reason string) (delivered, refused bool) {
 	if p == nil || p.cfg.Root == nil {
-		return
+		return false, false
 	}
 	if killer, ok := p.cfg.Root.(workerStagnantKiller); ok {
-		if err := killer.KillWorkerWithReason(unitID, "stagnant", reason); err == nil {
+		err := killer.KillWorkerWithReason(unitID, "stagnant", reason)
+		if err == nil {
 			log.Printf("[orchestrator] killed stagnant worker for %s", unitID)
-			return
-		} else {
-			log.Printf("[orchestrator] typed stagnant kill for %s refused (%v); falling back to plain kill", unitID, err)
+			return true, false
 		}
+		if errors.Is(err, agent.ErrStagnantKillRefused) {
+			log.Printf("[orchestrator] typed stagnant kill for %s refused: %v", unitID, err)
+			return false, true
+		}
+		// A typed root's error is authoritative. Falling back to KillWorker would
+		// relabel the cause as "human" and could cancel a worker the engine just
+		// decided to keep.
+		log.Printf("[orchestrator] typed stagnant kill for %s failed: %v", unitID, err)
+		return false, false
 	}
-	p.killWorker(unitID, reason)
+	// Legacy/test roots only expose the plain kill path; this is the one case a
+	// fallback is legitimate.
+	if err := p.killWorker(unitID, reason); err != nil {
+		log.Printf("[orchestrator] plain kill fallback for %s failed: %v", unitID, err)
+		return false, false
+	}
+	return true, false
 }
 
 // platformChallengesPrefixRE finds the platform API base path in the task
@@ -201,20 +257,43 @@ func (p *Pool) closeEndpoint(code string) string {
 }
 
 // containerCodeFor recovers the challenge code of an engine-materialized
-// container intent ("container-attack:<code>").
+// containerCodeFor recovers the challenge code of an engine-materialized
+// container intent ("container-attack:<code>" or "...:g<N>").
 func containerCodeFor(node *graph.Node) string {
 	if node == nil {
 		return ""
 	}
 	unit := strings.ToLower(strings.TrimSpace(node.UnitKey))
 	if strings.HasPrefix(unit, "container-attack:") {
-		return strings.TrimPrefix(unit, "container-attack:")
+		return containerGenerationSuffixRE.ReplaceAllString(strings.TrimPrefix(unit, "container-attack:"), "")
 	}
 	payload := node.PayloadJSON()
 	if code := strings.ToLower(strings.TrimSpace(str(payload["unique_code"]))); code != "" {
 		return code
 	}
 	return ""
+}
+
+// containerGenerationSuffixRE matches the ":g<N>" reuse suffix appended when a
+// terminal container intent already used the same code/address.
+var containerGenerationSuffixRE = regexp.MustCompile(`:g\d+$`)
+
+// containerUnitGeneration parses a container unit key's generation: 0 for the
+// base key, N for "<base>:g<N>". ok is false for an unrelated unit key.
+func containerUnitGeneration(unit, base string) (int, bool) {
+	unit = strings.TrimSpace(unit)
+	if unit == base {
+		return 0, true
+	}
+	prefix := base + ":g"
+	if !strings.HasPrefix(unit, prefix) {
+		return 0, false
+	}
+	n, err := strconv.Atoi(strings.TrimPrefix(unit, prefix))
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
 }
 
 // enqueueContainerClose reacts to a reclaimed container intent by asking the
@@ -242,12 +321,27 @@ func (p *Pool) enqueueContainerClose(node *graph.Node, target graph.State) {
 	if err != nil {
 		return
 	}
-	closeUnit := "container-close:" + code
+	closePrefix := "container-close:" + code
+	failedCloses := 0
 	for i := range nodes {
 		n := &nodes[i]
-		if strings.EqualFold(strings.TrimSpace(n.UnitKey), closeUnit) {
-			// Already requested once; a second close would just burn a slot.
-			return
+		unit := strings.ToLower(strings.TrimSpace(n.UnitKey))
+		if unit == closePrefix || strings.HasPrefix(unit, closePrefix+":r") {
+			switch n.State {
+			case graph.StateDone:
+				// A close request already ran to completion; do not burn a slot
+				// on a duplicate. done is a request receipt, not proof that the
+				// platform released the slot (see the close intent notes).
+				return
+			case graph.StateOpen, graph.StateRunning, graph.StatePaused:
+				// The request is already in flight.
+				return
+			default:
+				// blocked/exhausted/stopped: the close did NOT complete, so a
+				// later reclaim may retry with an attempt-suffixed unit key.
+				failedCloses++
+			}
+			continue
 		}
 		if n.ID == node.ID {
 			continue
@@ -264,6 +358,17 @@ func (p *Pool) enqueueContainerClose(node *graph.Node, target graph.State) {
 			// destroy live work. Wait for that intent to settle.
 			return
 		}
+	}
+	const maxContainerCloseAttempts = 3
+	if failedCloses >= maxContainerCloseAttempts {
+		log.Printf("[orchestrator] close for %s already failed %d times; not retrying", code, failedCloses)
+		return
+	}
+	closeUnit := closePrefix
+	if failedCloses > 0 {
+		// Keep every attempt in the audit trail instead of overwriting a failed
+		// close row or reusing a unit key the graph may treat as done.
+		closeUnit = fmt.Sprintf("%s:r%d", closePrefix, failedCloses+1)
 	}
 	cpHost := strings.TrimSpace(p.cfg.ControlPlaneHosts[0])
 	if cpHost == "" {
@@ -299,5 +404,5 @@ func (p *Pool) enqueueContainerClose(node *graph.Node, target graph.State) {
 		log.Printf("[orchestrator] enqueue close for %s failed: %v", code, err)
 		return
 	}
-	log.Printf("[orchestrator] enqueued platform close for %s (%s)", code, addr)
+	log.Printf("[orchestrator] enqueued platform close request for %s (%s) as %s", code, addr, closeUnit)
 }

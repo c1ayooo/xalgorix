@@ -748,6 +748,9 @@ func TestFinishGatekeeper_ProfessionalCompletedPlanSkipsLegacyIterationQuota(t *
 // grounded in a fully mapped surface.
 func TestFinishGatekeeper_ProfessionalPlanRequiresContentDiscovery(t *testing.T) {
 	state := NewScanState()
+	// R1: content discovery is owed only when requested/loud; this test pins
+	// the finish gate for that case.
+	state.OperatorRequestedDiscovery = true
 	state.ProfessionalAssessment = true
 	state.Iteration = 60
 	state.TerminalCalls = 30
@@ -774,6 +777,7 @@ func TestFinishGatekeeper_ProfessionalPlanRequiresContentDiscovery(t *testing.T)
 // pass.
 func TestFinishGatekeeper_ProfessionalPlanRequiresWordlistDirbust(t *testing.T) {
 	state := NewScanState()
+	state.OperatorRequestedDiscovery = true
 	state.ProfessionalAssessment = true
 	state.Iteration = 60
 	state.TerminalCalls = 30
@@ -1719,7 +1723,7 @@ func TestDelegationCoordinatorNudgesOnceAfterRecon(t *testing.T) {
 	state.DiscoveredEndpoints = []string{"/api/users", "/graphql"}
 	state.Plan = AutoPlan(state.DiscoveredEndpoints, state.DetectedTechs)
 	state.PlanBuilt = true
-	state.LedgerSeeded = true
+	state.CoverageOpportunitiesSent = true
 
 	result := fireDirectives(t, state, hookDelegationCoordinator)
 	// The nudge is now ledger-driven and built from the deterministic specialist
@@ -1765,7 +1769,7 @@ func TestDelegationCoordinatorRetriesMalformedSpawnWithoutLooping(t *testing.T) 
 	state.EndpointInventorySaved = true
 	state.Plan = AutoPlan([]string{"/api/users"}, nil)
 	state.PlanBuilt = true
-	state.LedgerSeeded = true
+	state.CoverageOpportunitiesSent = true
 
 	if first := fireDirectives(t, state, hookDelegationCoordinator); first.Nudge == "" {
 		t.Fatal("expected initial delegation nudge")

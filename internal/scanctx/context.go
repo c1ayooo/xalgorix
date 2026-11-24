@@ -145,6 +145,17 @@ type ScanContext struct {
 	requestRatePolicy RequestRatePolicy
 	targetsMu         sync.RWMutex
 	targets           []string
+	// targetBackoff is the target's own Retry-After cooldown (R1). It is set
+	// when the target answers 429 with a Retry-After and read by every
+	// target-facing tool before it sends anything. It is a run-scoped
+	// instruction from the target, not engine state authority.
+	backoffMu     sync.RWMutex
+	backoffUntil  time.Time
+	backoffReason string
+	// egress is the Engagement-wide rate/concurrency/budget policy (R4). One
+	// budget per ScanContext is shared by the root agent and every worker.
+	egressMu sync.RWMutex
+	egress   *EgressBudget
 
 	// assetSeen dedupes observed-asset ingestion within one session. It is
 	// per-scan scratch state, not an authority: the asset graph itself owns
@@ -332,6 +343,96 @@ func (sc *ScanContext) RequestRatePolicy() RequestRatePolicy {
 	sc.policyMu.RLock()
 	defer sc.policyMu.RUnlock()
 	return sc.requestRatePolicy
+}
+
+// SetEgressPolicy installs (or replaces) the Engagement-wide egress budget.
+// Workers share the ScanContext, so this is the single policy all execution
+// faces consult. Policy changes are audited; existing counters reset.
+func (sc *ScanContext) SetEgressPolicy(policy EgressPolicy) {
+	if sc == nil || !policy.Enabled() {
+		return
+	}
+	b := NewEgressBudget(policy, func(operation, summary string) {
+		if sc.Ledger != nil {
+			_ = sc.Ledger.AppendEngagementEvent(operation, summary)
+		}
+	})
+	sc.egressMu.Lock()
+	sc.egress = b
+	sc.egressMu.Unlock()
+}
+
+// Egress returns the scan's shared budget (nil when no policy is installed).
+func (sc *ScanContext) Egress() *EgressBudget {
+	if sc == nil {
+		return nil
+	}
+	sc.egressMu.RLock()
+	defer sc.egressMu.RUnlock()
+	return sc.egress
+}
+
+// SetTargetBackoff records the target's Retry-After cooldown. Until it expires,
+// target-facing tools refuse to send (they return a soft output, not an error,
+// so the tool circuit breaker is untouched).
+func (sc *ScanContext) SetTargetBackoff(until time.Time, reason string) {
+	if sc == nil {
+		return
+	}
+	if until.IsZero() {
+		return
+	}
+	sc.backoffMu.Lock()
+	defer sc.backoffMu.Unlock()
+	if until.After(sc.backoffUntil) {
+		sc.backoffUntil = until
+		sc.backoffReason = reason
+	}
+}
+
+// ClearTargetBackoff ends the cooldown early (a real target success proves the
+// target accepted traffic again).
+func (sc *ScanContext) ClearTargetBackoff() {
+	if sc == nil {
+		return
+	}
+	sc.backoffMu.Lock()
+	defer sc.backoffMu.Unlock()
+	sc.backoffUntil = time.Time{}
+	sc.backoffReason = ""
+}
+
+// TargetBackoff reports the remaining cooldown and its reason. active is false
+// once the deadline has passed.
+func (sc *ScanContext) TargetBackoff() (remaining time.Duration, reason string, active bool) {
+	if sc == nil {
+		return 0, "", false
+	}
+	sc.backoffMu.RLock()
+	until, why := sc.backoffUntil, sc.backoffReason
+	sc.backoffMu.RUnlock()
+	if until.IsZero() {
+		return 0, "", false
+	}
+	remaining = time.Until(until)
+	if remaining <= 0 {
+		return 0, why, false
+	}
+	return remaining, why, true
+}
+
+// TargetBackoffMessage returns the operator/model-facing rejection line for an
+// active cooldown, or "" when traffic may proceed.
+func (sc *ScanContext) TargetBackoffMessage() string {
+	remaining, reason, active := sc.TargetBackoff()
+	if !active {
+		return ""
+	}
+	if reason == "" {
+		reason = "target asked for a pause"
+	}
+	return fmt.Sprintf("[TARGET BACKOFF] %s; retry in %s. Target-rate limiting is respected: do not bypass it with a different tool, proxy or identity.",
+		reason, remaining.Round(time.Second))
 }
 
 // SetTargets stores the root coordinator's declared targets for tools that

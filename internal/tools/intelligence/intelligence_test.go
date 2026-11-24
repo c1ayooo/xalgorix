@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/c1ayooo/xalgorix/v4/internal/storage"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools"
 )
 
 func testContext(t *testing.T) (string, string) {
@@ -174,4 +175,148 @@ func TestPersistUsesAtomicWrite(t *testing.T) {
 	// WriteAtomic is what we call; assert the primitive still exists so a
 	// future refactor cannot silently regress to hand-rolled writes.
 	_ = storage.WriteAtomic
+}
+
+// ── read_intelligence contract (INTEL_HANDOFF_SPEC D5 / M1a) ──
+
+// The listing is what a seed or a casual consult sees: identity only. Content
+// must not travel there, or every prompt that mentions intel leaks its body.
+func TestReadIntelligenceListingIsIdentityOnly(t *testing.T) {
+	ctxID, _ := testContext(t)
+	res, err := RecordForContext(ctxID, map[string]string{
+		"kind": "credential", "title": "SSH password for app-01",
+		"content":  "root uses Passw0rd! on 10.0.177.5:22",
+		"endpoint": "10.0.177.5:22", "confidence": "0.9",
+	})
+	if err != nil || res.Error != "" {
+		t.Fatalf("record: err=%v res=%+v", err, res)
+	}
+	fp, _ := res.Metadata["intel_fingerprint"].(string)
+
+	listing := ReadForContext(ctxID)
+	if strings.Contains(listing, "Passw0rd!") {
+		t.Fatalf("listing leaked intel content:\n%s", listing)
+	}
+	for _, want := range []string{fp, "credential", "10.0.177.5:22", "read_intelligence(fingerprint="} {
+		if !strings.Contains(listing, want) {
+			t.Fatalf("listing missing %q:\n%s", want, listing)
+		}
+	}
+	// The store still holds the content — it is withheld from the listing only.
+	items := ItemsForContext(ctxID)
+	if len(items) != 1 || !strings.Contains(items[0].Content, "Passw0rd!") {
+		t.Fatalf("store lost the item: %+v", items)
+	}
+}
+
+// One item's full content is one explicit fetch away, by fingerprint or by the
+// I-N instance id, case-insensitively. Prefixes do not resolve (ambiguity is
+// worse than a miss).
+func TestReadIntelligenceDetailByFingerprintOrID(t *testing.T) {
+	ctxID, _ := testContext(t)
+	res, err := RecordForContext(ctxID, map[string]string{
+		"kind": "credential", "title": "SSH password for app-01",
+		"content": "root uses Passw0rd! on 10.0.177.5:22",
+	})
+	if err != nil || res.Error != "" {
+		t.Fatalf("record: err=%v res=%+v", err, res)
+	}
+	fp, _ := res.Metadata["intel_fingerprint"].(string)
+
+	byFP, ok := ReadItemForContext(ctxID, strings.ToUpper(fp))
+	if !ok || !strings.Contains(byFP.Content, "Passw0rd!") {
+		t.Fatalf("detail by fingerprint (upper case) = %+v ok=%v", byFP, ok)
+	}
+	byID, ok := ReadItemForContext(ctxID, "i-1")
+	if !ok || byID.Fingerprint != fp {
+		t.Fatalf("detail by instance id = %+v ok=%v", byID, ok)
+	}
+	if _, ok := ReadItemForContext(ctxID, fp[:8]); ok {
+		t.Fatal("prefix matching must not resolve: an ambiguous hit is worse than a miss")
+	}
+	if _, ok := ReadItemForContext(ctxID, "deadbeefdeadbeef"); ok {
+		t.Fatal("unknown reference resolved")
+	}
+}
+
+// A miss is an expected model mistake, not a tool failure: returning it as
+// Result.Error would feed the registry circuit breaker and brick the tool.
+func TestReadIntelligenceToolMissIsOutputNotError(t *testing.T) {
+	ctxID, _ := testContext(t)
+	res, err := RecordForContext(ctxID, map[string]string{
+		"kind": "lead", "title": "admin route", "content": "hidden admin route responds",
+	})
+	if err != nil || res.Error != "" {
+		t.Fatalf("record: err=%v res=%+v", err, res)
+	}
+	fp, _ := res.Metadata["intel_fingerprint"].(string)
+
+	r := tools.NewRegistry()
+	r.SetScanContextID(ctxID)
+	Register(r)
+
+	miss, err := r.Execute("read_intelligence", map[string]string{"fingerprint": "deadbeefdeadbeef"})
+	if err != nil {
+		t.Fatalf("execute miss: %v", err)
+	}
+	if miss.Error != "" {
+		t.Fatalf("miss must not be a tool failure: %+v", miss)
+	}
+	if !strings.Contains(miss.Output, "No intel item matches") || !strings.Contains(miss.Output, fp) {
+		t.Fatalf("miss output must name the reference and list valid identities:\n%s", miss.Output)
+	}
+
+	hit, err := r.Execute("read_intelligence", map[string]string{"fingerprint": fp})
+	if err != nil || hit.Error != "" {
+		t.Fatalf("execute hit: err=%v res=%+v", err, hit)
+	}
+	if hit.Metadata["intel_detail"] != true || !strings.Contains(hit.Output, "hidden admin route responds") {
+		t.Fatalf("detail fetch = %+v", hit)
+	}
+
+	listing, err := r.Execute("read_intelligence", nil)
+	if err != nil || listing.Error != "" {
+		t.Fatalf("execute listing: err=%v res=%+v", err, listing)
+	}
+	if strings.Contains(listing.Output, "hidden admin route responds") {
+		t.Fatalf("no-argument listing leaked content:\n%s", listing.Output)
+	}
+	if !strings.Contains(listing.Output, fp) {
+		t.Fatalf("no-argument listing must carry identities:\n%s", listing.Output)
+	}
+}
+
+// The detail fetch is the one place content reaches the model; the audit sink
+// must hear about it (INTEL_HANDOFF_SPEC M4).
+func TestDetailFetchNotifiesObserver(t *testing.T) {
+	ctxID, _ := testContext(t)
+	res, err := RecordForContext(ctxID, map[string]string{
+		"kind": "credential", "title": "SSH", "content": "root:Passw0rd!",
+	})
+	if err != nil || res.Error != "" {
+		t.Fatalf("record: err=%v res=%+v", err, res)
+	}
+	fp, _ := res.Metadata["intel_fingerprint"].(string)
+
+	type hit struct{ ctxID, fp string }
+	var hits []hit
+	SetDetailObserver(func(c, f string) { hits = append(hits, hit{c, f}) })
+	t.Cleanup(func() { SetDetailObserver(nil) })
+
+	reg := tools.NewRegistry()
+	reg.SetScanContextID(ctxID)
+	Register(reg)
+	if _, err := reg.Execute("read_intelligence", map[string]string{"fingerprint": fp}); err != nil {
+		t.Fatal(err)
+	}
+	// A listing and a miss are not detail fetches.
+	if _, err := reg.Execute("read_intelligence", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reg.Execute("read_intelligence", map[string]string{"fingerprint": "deadbeefdeadbeef"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 1 || hits[0].ctxID != ctxID || hits[0].fp != fp {
+		t.Fatalf("observer hits = %+v, want exactly the detail fetch", hits)
+	}
 }

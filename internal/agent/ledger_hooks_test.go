@@ -47,31 +47,56 @@ func TestSeedLedgerFromPlan(t *testing.T) {
 	}
 }
 
-func TestHookLedgerSeedLifecycle(t *testing.T) {
+func TestHookCoverageOpportunityLifecycle(t *testing.T) {
 	ctx, state := newTestCtxState(t)
 
-	// No plan yet -> no-op, not marked seeded.
-	if r := hookLedgerSeed(state, nil); r.Nudge != "" || state.LedgerSeeded {
+	// No plan yet -> no-op, nothing marked delivered.
+	if r := hookLedgerSeed(state, nil); len(r.Directives) != 0 || state.CoverageOpportunitiesSent {
 		t.Fatal("expected no-op before a plan exists")
 	}
 
 	plan := NewPlan()
-	plan.add(&Task{ID: "test-idor", VulnClass: "idor", Status: TaskPending})
+	plan.add(&Task{ID: "test-idor", VulnClass: "idor", Endpoint: "/api/orders", Status: TaskPending})
+	plan.add(&Task{ID: "test-sqli", VulnClass: "sqli", Status: TaskPending})
 	state.Plan = plan
 
-	hookLedgerSeed(state, nil)
-	if !state.LedgerSeeded {
-		t.Fatal("expected LedgerSeeded to be set")
+	res := hookLedgerSeed(state, nil)
+	if !state.CoverageOpportunitiesSent {
+		t.Fatal("expected the coverage advisory to be marked delivered")
 	}
-	if ctx.Ledger.Len() != 1 {
-		t.Fatalf("expected 1 hypothesis after seed, got %d", ctx.Ledger.Len())
+	if len(res.Directives) != 1 {
+		t.Fatalf("expected one coverage advisory, got %d", len(res.Directives))
+	}
+	content := res.Directives[0].Content
+	for _, want := range []string{"COVERAGE OPPORTUNITIES", "NOT hypotheses", "must not be claimed", "idor", "sqli", "/api/orders"} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("coverage advisory missing %q:\n%s", want, content)
+		}
+	}
+	// R2: coverage is a prompt, not a belief: nothing is written to the ledger.
+	if ctx.Ledger.Len() != 0 {
+		t.Fatalf("coverage advisory must not seed hypotheses, ledger has %d", ctx.Ledger.Len())
 	}
 
-	// Second call is a no-op (already seeded).
-	before := ctx.Ledger.Len()
-	hookLedgerSeed(state, nil)
-	if ctx.Ledger.Len() != before {
-		t.Fatal("expected a second hookLedgerSeed call to be a no-op")
+	// Second call is a one-shot no-op.
+	if again := hookLedgerSeed(state, nil); len(again.Directives) != 0 {
+		t.Fatal("expected the coverage advisory to be delivered only once")
+	}
+}
+
+func TestHookCoverageOpportunitySkipsCoveredClasses(t *testing.T) {
+	ctx, state := newTestCtxState(t)
+	plan := NewPlan()
+	plan.add(&Task{ID: "test-idor", VulnClass: "idor", Endpoint: "/api/orders", Status: TaskPending})
+	state.Plan = plan
+	ctx.Ledger.Upsert(scanctx.Hypothesis{
+		Title: "Orders are enumerable across users", VulnClass: "idor", Endpoint: "/api/orders",
+		Preconditions: []string{"a low-privilege session"}, Status: scanctx.HypothesisQueued,
+		Origin: "coordinator",
+	})
+	res := hookLedgerSeed(state, nil)
+	if len(res.Directives) != 0 {
+		t.Fatalf("a class with a formal hypothesis must not be advertised as uncovered: %s", res.Directives[0].Content)
 	}
 }
 
@@ -221,18 +246,19 @@ func TestHookAdvisoryLeadSeedsBoundedRankedRoutes(t *testing.T) {
 	}
 }
 
-func TestHookLedgerSeedNoActiveContext(t *testing.T) {
+func TestHookCoverageOpportunityWithoutActiveLedger(t *testing.T) {
 	state := NewScanState()
 	state.ScanContextID = "no-such-active-context"
 	plan := NewPlan()
 	plan.add(&Task{ID: "test-sqli", VulnClass: "sqli", Status: TaskPending})
 	state.Plan = plan
 
-	if r := hookLedgerSeed(state, nil); r.Nudge != "" {
-		t.Fatal("expected no nudge without an active context")
+	res := hookLedgerSeed(state, nil)
+	if len(res.Directives) != 1 || !strings.Contains(res.Directives[0].Content, "sqli") {
+		t.Fatal("coverage advisory must not depend on a live ledger")
 	}
 	if state.LedgerSeeded {
-		t.Fatal("expected LedgerSeeded to stay false when no ledger is reachable")
+		t.Fatal("R2 must not seed the ledger")
 	}
 }
 
@@ -515,7 +541,7 @@ func TestHookDelegationCoordinatorFiresOnceWithLedger(t *testing.T) {
 	state.Iteration = 6
 	state.Plan = AutoPlan([]string{"/api/orders"}, nil)
 	state.PlanBuilt = true
-	state.LedgerSeeded = true
+	state.CoverageOpportunitiesSent = true
 	ctx.Ledger.Upsert(scanctx.Hypothesis{VulnClass: "idor", Endpoint: "/api/orders", Confidence: 0.7})
 
 	r := fireDirectives(t, state, hookDelegationCoordinator)
@@ -550,7 +576,7 @@ func TestHookDelegationCoordinatorWaitsForPlanAndLedger(t *testing.T) {
 	if got := fireDirectives(t, state, hookDelegationCoordinator); got.Nudge != "" || state.DelegationNudgeFired {
 		t.Fatal("delegation must wait until the plan has been seeded into the ledger")
 	}
-	state.LedgerSeeded = true
+	state.CoverageOpportunitiesSent = true
 	if got := fireDirectives(t, state, hookDelegationCoordinator); got.Nudge != "" || state.DelegationNudgeFired {
 		t.Fatal("delegation must wait for a real endpoint inventory")
 	}
@@ -565,7 +591,7 @@ func TestHookDelegationCoordinatorWaitsForPlanAndLedger(t *testing.T) {
 	child.Iteration = 20
 	child.Plan = AutoPlan([]string{"/api/orders"}, nil)
 	child.PlanBuilt = true
-	child.LedgerSeeded = true
+	child.CoverageOpportunitiesSent = true
 	if got := hookDelegationCoordinator(child, nil); got.Nudge != "" || child.DelegationNudgeFired {
 		t.Fatal("delegated specialists must never receive another delegation nudge")
 	}

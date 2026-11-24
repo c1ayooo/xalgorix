@@ -1793,6 +1793,13 @@ func (s *Server) Start() error {
 			s.handleScanUnits(w, r)
 			return
 		}
+		// GET /api/scans/{id}/intel-access — read-only intel reachability
+		// projection: access rows, issued capabilities and the audit tail
+		// (INTEL_HANDOFF_SPEC M4; handlers_intel_access.go).
+		if strings.HasSuffix(r.URL.Path, "/intel-access") && r.Method == http.MethodGet {
+			s.handleScanIntelAccess(w, r)
+			return
+		}
 		s.handleGetScan(w, r)
 	})
 	// DELETE /api/data-dirs/{name} — delete one top-level Scan_Folder under

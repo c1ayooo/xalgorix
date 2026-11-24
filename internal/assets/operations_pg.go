@@ -239,7 +239,7 @@ func (s *PGStore) SetAssetsArchived(ctx context.Context, projectID string, ids [
 			archived_by = CASE WHEN $3 THEN $4 ELSE '' END,
 			updated_at = now()
 		WHERE project_id = $1 AND id = ANY($2)
-		  AND (archived_at IS NULL) <> $3
+		  AND (archived_at IS NULL) = $3
 		  AND ($3 OR merged_into_id IS NULL)`,
 		strings.TrimSpace(projectID), ids, archived, strings.TrimSpace(actor))
 	if err != nil {

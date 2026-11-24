@@ -74,7 +74,7 @@
 - `internal/agent/graph_projection.go:30` 把 ledger 的 hypothesis/evidence、accepted findings 投影成 belief/fact 节点；fact payload 带 `info_item_id`（`:318`）。
 - `internal/scanctx/ledger_journal.go:332` 用 `StableEvidenceID` 把 evidence 映射到 InfoItem；`:385` 写 `supports` 关系。
 - 三类点亮已实现于 `internal/infoitem/postgres/store.go`：`Region:412`、`Associate:510`、`ContextSlice:611`；`RegionQuery/AssociationQuery/ContextQuery` 在 `internal/infoitem/query.go`。
-- 消费者：worker 的 `search_info`（`internal/agent/info_tools.go:15`）、Web 只读 API（`internal/web/scan_info.go`）、跨扫描历史（`internal/agent/ledger_cross_scan.go:72`）、报告渲染的 InfoItem 引用。
+- 消费者：worker 的 `search_info`（`internal/agent/info_tools.go:15`）、Web 只读 API（`internal/web/scan_info.go`）、跨扫描历史（`internal/agent/ledger_cross_scan.go:72`，限本项目任务之间）、报告渲染的 InfoItem 引用。
 - planner 的 prior-work 是 `infoitem.Rank` 对 **ledger 文档**做词法排序（`internal/orchestrator/planner.go:516`），不是查 `info_items`；planner 的 intent 优先级固定 `1000 - phase*10`（`:859`）。
 - VOI 只在 hypothesis 认领排序：`(1-w)*confidence + w*VOI`，`w<=0.30`，稳定排序（`internal/scanctx/ledger_voi.go:53`）。
 
@@ -350,8 +350,9 @@ tie-break: score desc, priority desc, id asc
 ### IG2 — planner 消费点亮 — 已落地（2026-11-24）
 
 - `overview()` 新增有界 `Information space` 块：`Region`（subject=目标，purpose=唯一明确类，kinds 排除 intent 避免与 Existing intents 重复，limit 12）+ `ContextSlice`（limit 8），总行数 ≤20；只渲染 layer/kind/state/id/unit/subject/purpose/nature，不内联 payload；`Incomplete/GapReason` 如实展示。
-- 读取器来源：`graph.Backend().(infospace.Reader)`；`PlannerConfig.InfoSpace` 作为测试注入。任何读取失败/缺失/空结果回退到原词法 `priorWorkBlock`，行为不 panic。
-- 测试：`planner_infospace_test.go`（有界、确定性、坐标、回退、空结果回退）。
+- 读取器来源：`graph.Backend().(infospace.Reader)`；`PlannerConfig.InfoSpace` 作为测试注入。读取成功即权威：空结果不回退词法 `priorWorkBlock`，`Incomplete` 即使零条也渲染 `GapReason`；只有读取器缺失/查询失败才回退。
+- 详情入口：聚合层的 `info_id` 是图节点数字 ID，不是 ledger ID；`read_info_item` 在 ledger miss 后通过 `infospace.ItemReader`（`ItemQuery{run_id, info_id}`，layer 可空、先 aggregate 后 atom）解析详情，避免“看得到但报 not found”。
+- 测试：`planner_infospace_test.go`（有界、确定性、坐标、回退、空结果权威、缺口可见、详情解析）。
 - 回滚：删除该块与配置项；恢复旧 overview。
 
 ### IG3 — 聚合↔原子链接 — 已落地（2026-11-24）
@@ -421,7 +422,7 @@ tie-break: score desc, priority desc, id asc
   - `goal/hint/digest` 不上图（工作/控制对象，经 Region 查询）。
 - **热力语义**：每个主体取**到达的最远环**（finding > fact > intent > belief > inference > observation）作为颜色（冷→热）；块面积 = 信息条数。前端从计数推导阶段，不在后端引入第二套真实状态。
 - **API**：`GET /api/info/heatmap`（契约见 `docs/API_CONTRACT.md` §3.3）。行数上限默认 40、最大 200（主体行数，不是条目数）；排序 `total DESC, subject ASC, subject_kind ASC`；`q` 是主体子串搜索（区分大小写无关）；返回 `truncated/subject_total/unlabeled/incomplete/gap_reason`。授权与 Region 相同：project 白名单 + 可选 `task_id` + 可选 `scan_id`（跨界 400）；无 graph reader 返回 503 `heatmap_unavailable`。
-- **前端**：`/info` 就是项目信息星云（canvas 散点），不是表格/表单——一个主体一个点；**正圆布局**（面板居中，圆直径 = 短边）；离中心距离、点大小、颜色（冷灰蓝 → 品牌红）都编码信息量（`log1p(total)` 固定标尺 + 幂曲线，低量形成冷核）；角度与抖动来自 subject 哈希，同快照同图；对相连主体做关系感知松弛（角度靠拢、半径保持 ±20% 内），边裁剪到节点边缘、轻微弧形、长边淡化；首次有数据时从中心绽开约 0.52s、页面淡入 0.22s（`prefers-reduced-motion` 全关），15s 刷新不重播。**节点可拖、空白平移、滚轮缩放、可重置**；选中节点高亮其关系边、其余变淡。Top 200 + 服务端 `q` 搜索；点一个点写 `?subject=&subjectKind=` 开详情，详情里的阶段 chips 把 Region 收窄到某一环，并列出该主体的关系段（可跳到另一端）；列表视图是键盘/读屏兜底。性能：单 canvas + DPR、手势期间从 ref 重绘（不触发 React state）、悬停只动 DOM tooltip、无逐帧动画、查询 15s 节流。URL 契约：`?project=&task=&run=&window=24h|7d|all&subject=&subjectKind=&focus=`；`?project=` 是一次性作用域指令（切到侧栏项目切换器并清理参数，之后页面跟随项目切换）。
+- **前端**：`/info` 就是项目信息星云（canvas 散点），不是表格/表单——一个主体一个点；**正圆布局**（面板居中，圆直径 = 短边）；**热量在核心**：离中心距离、点大小、颜色（冷灰蓝 → 品牌红）都编码信息量（`log1p(total)` 固定标尺 + 幂曲线，高量贴近圆心、低量在外圈）；角度与抖动来自 subject 哈希，同快照同图；对相连主体做关系感知松弛（角度靠拢、半径保持 ±20% 内），边裁剪到节点边缘、轻微弧形、长边淡化。**A 档动效**：暗色热核光晕（sprite + `lighter`）、动作/证据链光点流动（方向可视化、无箭头）、选中波纹、约 0.02 rad/s 极慢自转（拖拽/平移/切后台暂停）、首次数据从中心爆发 0.52s + 页面淡入 0.22s；`prefers-reduced-motion` 关闭全部循环动效，15s 刷新不重播。**节点可拖、空白平移、滚轮缩放、可重置**；选中节点高亮其关系边、其余变淡。Top 200 + 服务端 `q` 搜索；点一个点写 `?subject=&subjectKind=` 开详情，详情里的阶段 chips 把 Region 收窄到某一环，并列出该主体的关系段（可跳到另一端）；列表视图是键盘/读屏兜底。性能：单 canvas + DPR、30fps ambient loop、光晕 sprite 缓存、粒子只跑 chain 边且上限、手势期间从 ref 重绘（不触发 React state）、悬停只动 DOM tooltip、查询 15s 节流。URL 契约：`?project=&task=&run=&window=24h|7d|all&subject=&subjectKind=&focus=`；`?project=` 是一次性作用域指令（切到侧栏项目切换器并清理参数，之后页面跟随项目切换）。
 - **关系图（2026-11-24 增补）**：`GET /api/info/relations` 把 `info_space_edges` 投影成**主体级边**（同 run 内 join 两端 `info_space_items`，排除同主体，继承白名单/时间窗/激活规则）。`category=chain` = `spawns/derived_from/yields/proves/supports/covers/depends_on`，`info` = `references/contradicts/same_session/same_subject/materializes`；前端默认只画 chain（实线），信息关联由开关打开（虚线）；**边不画箭头**，方向在详情的关系段里读。**没有 pivot/tunnel 一等关系**：图上看到的是真实关系链，边方向就是存储方向；不得把 `supports` 反推成攻击步骤或给边改名。
 - **测试**：`internal/web/scan_info_heatmap_test.go`（授权/参数/q/503/非法类型）、`internal/graph/heatmap_integration_test.go`（双层计数、intent 阶段、无支持推断剔除、行上限、类型收窄、时间窗）、`internal/infospace/query_test.go`（query 校验）。
 - **回滚**：删除 heatmap handler、`PGStore.Heatmap` 与项目树图组件；Region/Context/Association 行为不变。
@@ -434,7 +435,7 @@ tie-break: score desc, priority desc, id asc
 - 不把事件溯源作为状态权威；`run_events` 仍是审计投影。
 - 不引入 A*/MCTS/POMCP/DESPOT；不引入 POMDP 状态转移/观测模型。
 - 不引入 pgvector/embedding；相似度仍是确定性词法重叠。
-- 不支持跨扫描关系边；跨扫描只做 Region 历史。
+- 不支持跨扫描关系边；跨扫描 Region 历史只限本项目任务之间（项目是隔离边界）。
 - 不绕过 `ConcludeIntent`、claim 谓词、precondition/confirmation、Verifier、`report_vulnerability` 门管线。
 - 不新增用户可见环境变量或设置页开关。
 
@@ -480,5 +481,5 @@ v3.3 已落地；后续冲突仍以 CORE 的更新版本为准。
 1. **原子层是否升级为图节点（`kind='info'`）？** 已定：不升级。IG3 用 `graph_info_links` + `materializes` 读模型跨层，原子仍是 InfoItem 实例；节点化会放大图规模并与“聚合”语义冲突。
 2. **`contradicts` 是否落图？** 未落图。当前由 ledger 证据角色与 InfoItem 关系边表达；若后续关联点亮需要图上矛盾传播，再单独加 migration。
 3. **intent 是否属于“信息”？** 已定：是，按“关于下一步行动的信息”纳入统一视图；它不承载真值，state/owner/lease 仍是控制字段。
-4. **跨扫描关联**：维持“仅 Region 跨扫描”；跨扫描关系边需要单独的存储与权限设计，不并入本期。
+4. **跨扫描关联**：维持“仅 Region 跨扫描”，且范围严格限于本项目任务之间；跨扫描关系边需要单独的存储与权限设计，不并入本期。
 5. **VOI 的 intent 聚合口径**：已定并落地为 **max**（匹配 endpoint/target + vuln_class 且 `VOIEstimated` 的假设），缺失=0；见 `planner_voi_test.go`。

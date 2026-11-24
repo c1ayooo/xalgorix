@@ -565,6 +565,44 @@ func (s *PGStore) ContextSlice(ctx context.Context, q infospace.ContextQuery) (i
 	return res, nil
 }
 
+// Item implements infospace.ItemReader. Aggregate ids are graph node ids
+// (numeric text); atom ids are InfoItem ids. An empty layer searches aggregate
+// first, then atom, so a caller that only has the rendered id can resolve the
+// detail without knowing the layer.
+func (s *PGStore) Item(ctx context.Context, q infospace.ItemQuery) (infospace.Item, bool, error) {
+	if !s.infoSpaceAvailable() {
+		return infospace.Item{}, false, errors.New("graph: information space unavailable")
+	}
+	if err := q.Validate(); err != nil {
+		return infospace.Item{}, false, err
+	}
+	ctx, cancel := context.WithTimeout(ctx, infoSpaceTimeout)
+	defer cancel()
+	layers := []infospace.Layer{q.Layer}
+	if q.Layer == "" {
+		layers = []infospace.Layer{infospace.LayerAggregate, infospace.LayerAtom}
+	}
+	for _, layer := range layers {
+		rows, err := s.pool.Query(ctx, `
+			SELECT scan_id, run_id, info_id, layer, kind, state, unit_key, priority, origin,
+			       subject, subject_kind, purpose, nature, observed_at, context, payload, created_at
+			FROM info_space_items
+			WHERE run_id = $1 AND info_id = $2 AND layer = $3
+			LIMIT 1`, q.RunID, q.InfoID, string(layer))
+		if err != nil {
+			return infospace.Item{}, false, fmt.Errorf("graph: info space item: %w", err)
+		}
+		items, err := scanInfoSpaceItems(rows)
+		if err != nil {
+			return infospace.Item{}, false, err
+		}
+		if len(items) > 0 {
+			return items[0], true, nil
+		}
+	}
+	return infospace.Item{}, false, nil
+}
+
 func (s *PGStore) infoSpaceItemsByIDs(ctx context.Context, runID string, ids []string) (map[string]infospace.Item, error) {
 	if len(ids) == 0 {
 		return map[string]infospace.Item{}, nil

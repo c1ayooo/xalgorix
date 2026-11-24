@@ -11,7 +11,7 @@
 1. **主循环七环**：观察 → 信念（hypothesis）→ 义务（obligation）→ 行动（plan task / tool call）→ 证据（evidence）→ 判定（verifier）→ 收工（finish gate）。任何新能力先回答它落在哪一环，答不出来的不做。
 2. **对象映射不得反向**：Hypothesis = 待证主张（Belief）；PlanTask = 意图（Intent）；引擎义务（阶段义务、收工闸门、覆盖收敛、hook 拦截）= Hint，**不是人工输入**。人工输入 = `source=human` 的 InfoItem。
 3. **信息为中心建模（InfoItem）**：七维坐标（内容/来源/时间/主体/目的/情境/关系）+ 全局唯一 ID + 重复观测算独立实例 + **observed / inferred 二分**（inferred 必须关联支持证据）。ledger Evidence 是它在 hypothesis 下的投影视图，仍受 40 条/假设与 4096 字符上限。
-4. **三类点亮必须点名消费者**：区域点亮（`claim_next_hypothesis` 可调度池、覆盖缺口计算）、关联点亮（Verifier baseline 装配、报告同类去重、跨扫描同主体历史）、语境切片（`VerificationRequest` 字段装配、报告生成）。**旁路** = 凭上下文记忆复述证据；直接调用 ledger/surface 的确定性 API 不算旁路。
+4. **三类点亮必须点名消费者**：区域点亮（`claim_next_hypothesis` 可调度池、覆盖缺口计算）、关联点亮（Verifier baseline 装配、报告同类去重、跨扫描同主体历史——**限本项目任务之间**，项目是隔离边界）、语境切片（`VerificationRequest` 字段装配、报告生成）。**旁路** = 凭上下文记忆复述证据；直接调用 ledger/surface 的确定性 API 不算旁路。
 5. **字段级权威，而非全局"高置信度覆盖"**：原始请求/响应/工具输出 → 对应原始 Observation；finding 接受与验证标签 → `report_vulnerability` 报告门管线；hypothesis 生命周期与调度 → ledger；InfoItem 标注 → InfoItem 及其补全记录；独立复测 → 所属 Agent 的 Verifier；确定性验证（`verify_*`、浏览器执行信号）→ 引擎来源；模型自述 → 最低等级。同字段冲突保留冲突、来源与时间，低权威不得静默覆盖高权威；"置信度高所以判真"一律违规。
 6. **事件是审计投影，不是状态权威**：状态权威 = 进程内内存（`scanctx`）+ PG 持久态（v3.0/R6.1 起）。理由三条：prompt 每次动态拼装、对话窗口有损压缩、工具超长输出落盘只留引用——事件重放不出同一决策。
 7. **存储分层（D12，v3.0）**：状态与面板数据（run 状态/events/domain journal/ledger/intelligence/notes/coverage/queue/dispatch/token 归档）唯一持久态是 PG，变更边界同步事务，幂等键 `(scan_id, seq)` + 行级盖章 `instance_id`；文件只承载字节产物（工具输出归档、流量原始包、上传物、交付物、沙箱工作区），继续 `storage.WriteAtomic`。**不做跨存储分布式事务**；PG 写失败不阻断已启动 Run（记 failed + reconciler 追赶）。续跑产生的 sibling 会话目录不是持久单元——R6.2 起面板读 PG，禁止新代码再实现"选哪个目录"式投影。
@@ -19,7 +19,26 @@
 9. **单二进制形态必须保住（v3.0 修订）**：go:embed 前端 + 自包含引擎不变；PG 是**必需部署依赖**（2026-11-22 用户裁决路线 B，废止无 DSN 降级）：无 DSN 启动 fail-fast 并给出指引，仓库提供 compose 模板。
 10. **搜索算法与研究项不进路线图**：A*/MCTS/POMCP/DESPOT 需三条同时满足（动作可回滚或幂等重放、有可采样的结果模型、预算可分区），当前一条都不满足；VOI 只作排序加权项（权重 ≤30%）且必须保留确定性 tie-break，同一份 ledger 快照给出同一排序。
 
-> **R7 双图编排修订（2026-11-23）**：本节第 2/5/6/7 项在 R7 下有一个**显式例外**，详见 `docs/CORE_PHILOSOPHY.md` 顶部 v3.1/R7 块与 `docs/DUAL_GRAPH_ORCHESTRATION.md`：Intent 的权威是探索图 `intent` 节点（PlanTask/PlanView 是视图）；Belief 的权威是 `belief` 节点（Evidence 明细仍在 ledger/InfoItem）；探索图与资产图是 PG 实时权威（读写 PG），事件/图投影仍不是决策权威。**planner_worker 是默认内置拓扑**；`XALGORIX_ORCHESTRATOR=legacy` 仅为隐藏的紧急回滚，不出现在设置页；worker 并发由设置页 `XALGORIX_WORKER_CONCURRENCY`（1–10）配置；该值热生效——新扫描启动时读取 `~/.xalgorix.env`，运行中的 pool 由 `SetWorkers` 热扩容/缩容（同时同步 `agentsgraph.SetMaxConcurrent`，扩容后排队 worker 立即出队；缩容等待当前 intent 结束），并发上限严格等于设置值。planner 有生产侧背压：池满时阻塞在 `Pool.WaitForSlot`，worker settle 后唤醒，每轮新增 intent 上限等于 worker 数。worker 预算默认 60 分钟；执行 lane 的合同 timebox 只可缩短到 30 分钟下限，control-plane API lane 仍用短 timebox；超时先 steer 收尾（wind-down）、宽限期内未完成再 `KillWorker`，随后结算 exhausted，禁止“intent 已 exhausted、worker 还在打容器”。`target_kind=task` 是分析 lane（`SurfaceAnalysis`：只有 notes/ledger/研究工具，没有 terminal/HTTP/browser），symbolic target（`task`、`task:*`）不构成网络授权；攻击容器必须由 `target_kind=container` 且 target 为具体 `IP:port` 的独立 intent 执行。改这些区域前先读该规格。
+> **R7 双图编排修订（2026-11-23）**：本节第 2/5/6/7 项在 R7 下有一个**显式例外**，详见 `docs/CORE_PHILOSOPHY.md` 顶部 v3.1/R7 块与 `docs/DUAL_GRAPH_ORCHESTRATION.md`：Intent 的权威是探索图 `intent` 节点（PlanTask/PlanView 是视图）；Belief 的权威是 `belief` 节点（Evidence 明细仍在 ledger/InfoItem）；探索图与资产图是 PG 实时权威（读写 PG），事件/图投影仍不是决策权威。**planner_worker 是默认内置拓扑**；`XALGORIX_ORCHESTRATOR=legacy` 仅为隐藏的紧急回滚，不出现在设置页；worker 并发由设置页 `XALGORIX_WORKER_CONCURRENCY`（1–10）配置；该值热生效——新扫描启动时读取 `~/.xalgorix.env`，运行中的 pool 由 `SetWorkers` 热扩容/缩容（同时同步 `agentsgraph.SetMaxConcurrent`，扩容后排队 worker 立即出队；缩容等待当前 intent 结束），并发上限严格等于设置值。planner 有生产侧准入：`Pool.AvailableSlots` 在 `apply` 时裁剪新增 intent（每轮上限 = 空闲槽位），池满不会阻塞读图、steer、kill 等纠偏动作。worker 预算默认 60 分钟；执行 lane 的合同 timebox 只可缩短到 30 分钟下限，control-plane API lane 仍用短 timebox；超时先 steer 收尾（wind-down）、宽限期内未完成再 `KillWorker`，随后结算 exhausted，禁止“intent 已 exhausted、worker 还在打容器”。`target_kind=task` 是分析 lane（`SurfaceAnalysis`：只有 notes/ledger/研究工具，没有 terminal/HTTP/browser），symbolic target（`task`、`task:*`）不构成网络授权；攻击容器必须由 `target_kind=container` 且 target 为具体 `IP:port` 的独立 intent 执行。改这些区域前先读该规格。
+
+## 架构抽象准入（强制性工程规范）
+
+> 每新增一个架构抽象，必须同时回答 **权威来源、实际消费者、状态生命周期、可验证收益** 四个问题。这是架构设计、功能开发、重构与代码评审必须遵守的约束，不是建议。本条是工程约束，不是新治理框架：不为落实它新增架构模块、抽象类或检查系统；`docs/CORE_PHILOSOPHY.md` 与 `docs/ARCHITECTURE.md` 仍是权威来源，本条不与它们冲突。
+
+**触发审查的改动**：新增模块/组件/服务/管理器、接口/抽象基类/协议、Registry/Provider/Factory/Adapter/Dispatcher、Context/State/Session/Metadata 等状态载体、配置层/缓存层/事件总线/中间层、Agent/Tool/Workflow/Pipeline 等协调机制；把原逻辑拆成多个职责层；引入新的间接调用/委托/包装。
+
+**四项必答**：
+
+1. **权威来源（Authority）**：它管理或表达的信息唯一权威来源是什么？是否存在重复存储/重复计算/多事实来源？冲突时谁有最终决定权？它是权威数据源，还是投影/缓存/索引？——没有明确权威来源，禁止创建第二套事实源。
+2. **实际消费者（Consumers）**：哪些真实模块或调用链会用它？解决了哪个现存实际问题？有没有真实调用者（而不是为未来预留）？删掉它哪些实际功能会受影响？——禁止空壳抽象、预留层、纯转发层。
+3. **状态生命周期（Lifecycle）**：状态在哪创建、谁初始化、谁可修改、如何传播同步、何时失效/重置/销毁？是否存在重复状态、过期状态、生命周期不一致？——禁止生命周期不明的全局状态、隐式缓存、跨模块共享状态。
+4. **可验证收益（Verifiable Benefits）**：它具体改善了什么（重复代码/耦合/复杂度/状态不一致/可测性/可靠性）？如何用测试、调用链或复杂度对比证明？与直接实现相比成本是否合理？——禁止以"提高扩展性/符合架构/方便未来"等不可验证理由作为引入抽象的唯一依据。
+
+**准入规则**：四项有一项答不上，就优先直接实现；不得以"未来可能用"作为抽象的理由；确有必要时记录未解问题与风险；不得用接口/代理/管理器/中间层掩盖职责不清。**默认选最简单、最直接、能满足当前需求的实现**——抽象由实际复杂度驱动，不由预想需求驱动。
+
+**反向审查**：新增抽象要证明存在必要性；删除抽象不需要证明它未来永不被使用。任何抽象一旦失去实际消费者、权威职责或可验证收益，优先删除或合并。
+
+**评审检查项**（发现即优先提删除/合并/简化，而不是继续叠加抽象）：无消费者的抽象 / 多模块重复维护同一事实 / 多余状态副本 / 生命周期不清的状态 / 只增调用层级不降复杂度 / 无法证明收益的设计模式 / 为凑架构形式的无效代码。
 
 ## 先读文档（按任务路由）
 
@@ -27,6 +46,7 @@
 - **做二开改造（项目/任务管理、流量代理/HITL、Eino 引擎、前端）前**：读 `docs/REDESIGN.md` —— 实现层设计总档（决策记录 D1–D12、里程碑 R0–R6 与宪章 M0–M5 并轨）。
 - **做 PG 主存储 / R6 / 状态持久化相关改动前**：读 `docs/PG_PRIMARY_STORAGE_SPEC.md` —— 对象清单、幂等键、写失败姿态、批次切分与测试接缝的唯一规格。
 - **改探索图 / intent 生命周期 / 图投影 / 运行期合规前**：读 `docs/INFO_GRAPH_CONTRACT.md` —— intent 契约、结论事务、确认门、不变量码表与 `/graph/validate` 的运行期判据。`done` intent 只能经 `ConcludeIntent` 事务产生，禁止直接 `Transition` 到 done。
+- **改情报（intelligence）的读取 / worker 种子 / 跨 intent 交棒 / 越界授权前**：读 `docs/INTEL_HANDOFF_SPEC.md` —— `read_intelligence` 的身份-only 列表 + fingerprint 详情契约（M1a/M1b 已实现）、可达性投影与 capability 数据模型（M2+）。种子与自动注入的 prompt 不得含情报正文，正文只能由模型显式 `read_intelligence(fingerprint=…)` 拉取。
 - **做跑分 / 长时基准任务前**：读 `docs/BENCHMARK_OPTIMIZATION.md` —— 第四轮 5400/23000 的根因、lane 分离/并发/截止检测/网络可达性的整改与下一轮验收指标。
 - **改任何 `internal/` 代码前**：读 `docs/ARCHITECTURE.md` —— 分层、包职责、数据流、并发模型的权威来源（v4.5.44 后 `internal/web` 已按文件拆分，`server.go` 只是薄核心+路由枢纽）。
 - **改任何 `webui/` 代码前**：读 `UI_DESIGN.md`（仓库根）—— 设计令牌、组件边界、反模式、验收清单。

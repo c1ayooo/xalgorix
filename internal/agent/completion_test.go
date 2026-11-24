@@ -150,6 +150,9 @@ func TestReconNA_MarkedTypedDimensions(t *testing.T) {
 // Case 27: content discovery on host A does not complete host B.
 func TestReconPerHost_DiscoveryDoesNotLeakAcrossHosts(t *testing.T) {
 	state := NewScanState()
+	// Pins the per-host coverage guarantee; explicit discovery keeps the R1
+	// policy from waiving it as evidence-led.
+	state.OperatorRequestedDiscovery = true
 	state.EndpointInventorySaved = true
 	state.ReconDone = true
 	state.ReconCoverage.HTTPProbed = true

@@ -10,8 +10,8 @@ import (
 	"regexp"
 	"runtime/debug"
 	"sort"
-	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -20,10 +20,10 @@ import (
 	"github.com/c1ayooo/xalgorix/v4/internal/egress"
 	"github.com/c1ayooo/xalgorix/v4/internal/engine"
 	"github.com/c1ayooo/xalgorix/v4/internal/graph"
+	"github.com/c1ayooo/xalgorix/v4/internal/intelaccess"
 	"github.com/c1ayooo/xalgorix/v4/internal/llm"
 	"github.com/c1ayooo/xalgorix/v4/internal/orchestrator"
 	"github.com/c1ayooo/xalgorix/v4/internal/platform"
-	"github.com/c1ayooo/xalgorix/v4/internal/proxy"
 	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
 	"github.com/c1ayooo/xalgorix/v4/internal/scopeguard"
 	"github.com/c1ayooo/xalgorix/v4/internal/tools/intelligence"
@@ -285,29 +285,30 @@ func (s *Server) backfillSessionTaskCoordinates(sess *scanSession, sctx *scanctx
 	if strings.TrimSpace(sess.objectiveTaskID) == "" {
 		sess.objectiveTaskID = task.ID
 	}
+	if strings.TrimSpace(sess.proxyPin) == "" {
+		// A resumed run created before the pin was persisted still needs the
+		// task's egress selection.
+		sess.proxyPin = strings.TrimSpace(task.Proxy)
+	}
 	if strings.TrimSpace(sess.auditMode) == "" {
 		sess.auditMode = effectiveTaskAuditMode(task, s.cfg)
 		sctx.AuditMode = strings.TrimSpace(sess.auditMode)
-		// Task-level outbound proxy pin: snapshotted for the run like audit_mode.
-		// The MITM upstream selector reads this per exchange, so a task can use a
-		// different pool entry (or explicit direct egress) without changing the
-		// process-wide default. An unresolvable entry was rejected at dispatch.
-		if pin := strings.TrimSpace(sess.proxyPin); pin != "" {
-			switch pin {
-			case "direct":
-				proxy.SetScanUpstream(sctx.ID, proxy.ScanUpstream{Direct: true})
-			default:
-				if idx, err := strconv.Atoi(pin); err == nil {
-					if entry := proxy.EntryAt(idx); entry != nil {
-						proxy.SetScanUpstream(sctx.ID, proxy.ScanUpstream{Entry: entry})
-					}
-				}
-			}
-		}
 	}
 	if sess.objective == nil && task.Objective != nil {
 		sess.objective = task.Objective
 	}
+}
+
+// installSessionEgressPin installs the task's egress selection into the run's
+// ScanContext namespace before any target traffic. It is called on every
+// normal start, not only on the resumed-coordinate repair path (XALG021), and
+// keys by ScanContext ID — the same key the proxy and tunnel layers read
+// (XALG022).
+func (s *Server) installSessionEgressPin(sess *scanSession, sctx *scanctx.ScanContext) {
+	if sess == nil || sctx == nil || strings.TrimSpace(sctx.ID) == "" {
+		return
+	}
+	applyLiveEgressPin(sctx.ID, sess.proxyPin)
 }
 
 // executeScanSession runs a single scan in complete isolation.
@@ -351,6 +352,9 @@ func (s *Server) executeScanSession(sess *scanSession) {
 	// when the run is mounted on one; ad-hoc /api/scan runs have no run row and
 	// stay unchanged.
 	s.backfillSessionTaskCoordinates(sess, sctx)
+	// Install the egress selection before the agent or any tool can make a
+	// target request. This is intentionally outside the resume repair path.
+	s.installSessionEgressPin(sess, sctx)
 	// Stamp the run identity on the ledger (D11): with the PG backend the
 	// snapshot carries it, and a re-dispatched session's first ledger load
 	// inherits the previous sibling session's chain (charter v3.0 §6.3).
@@ -670,6 +674,44 @@ func (s *Server) executeScanSession(sess *scanSession) {
 		}
 		return false
 	})
+	// The M4 cross-scan history annotations (read_ledger/claim_next_hypothesis)
+	// read cold-path items across scans. The project is the isolation fence:
+	// tasks inside one project share history, projects never do (D7). Give the
+	// agent the project's scan whitelist, expanded with the on-disk sibling
+	// sessions of its runs (the same primitive /api/info/* uses), and resolve
+	// it once per scan.
+	var crossScanIDsOnce sync.Once
+	var crossScanIDs []string
+	agnt.SetCrossScanScanIDsResolver(func() []string {
+		crossScanIDsOnce.Do(func() {
+			store := s.currentPlatformStore()
+			projectID := strings.TrimSpace(sctx.ProjectID)
+			if store == nil || projectID == "" {
+				return
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			ids, err := store.ProjectScanIDs(ctx, projectID)
+			if err != nil {
+				log.Printf("[agent] cross-scan history: project %s scan lookup failed: %v", projectID, err)
+				return
+			}
+			ids = s.expandSiblingScanIDs(ids)
+			seen := make(map[string]bool, len(ids)+1)
+			for _, id := range ids {
+				id = strings.TrimSpace(id)
+				if id == "" || seen[id] {
+					continue
+				}
+				seen[id] = true
+				crossScanIDs = append(crossScanIDs, id)
+			}
+			if sctx.ID != "" && !seen[sctx.ID] {
+				crossScanIDs = append(crossScanIDs, sctx.ID)
+			}
+		})
+		return crossScanIDs
+	})
 	// The operator objective (REDESIGN 3.1) is intent for the loop: the
 	// engine marks the plan tasks that serve a criterion, and the objective
 	// statement travels in its own prompt section. It never changes what
@@ -887,23 +929,31 @@ func (s *Server) executeScanSession(sess *scanSession) {
 			goalText = objStatement
 		}
 		if plannerClient != nil {
+			// R1 progressive recon: the planner needs the same depth/budget
+			// inputs the agent uses, or its discovery gate would disagree with
+			// the worker path.
+			plannerDeep := len(sess.phases) == 0 || len(sess.phases) >= 20
+			plannerBudget := agent.EffectiveRequestRatePolicy(sess.cfg, instruction).Enabled()
 			planner = orchestrator.NewPlanner(sctx.Ctx, orchestrator.PlannerConfig{
-				ScanID:               runID,
-				SessionID:            sctx.ID,
-				Target:               sess.target,
-				Goal:                 goalText,
-				Instruction:          sess.instruction,
-				UserInstruction:      sess.userInstruction,
-				ObjectiveStatement:   objStatement,
-				ObjectiveConstraints: objConstraints,
-				ObjectiveCriteria:    objCriteria,
-				Client:               plannerClient,
-				Repo:                 graph.Backend(),
-				ScanCtx:              sctx,
-				ControlPlaneHosts:    sess.cfg.ControlPlaneHosts,
-				ScopeTargets:         scopeTargets,
-				ScopeDeny:            scopeDeny,
-				ScopeAllowPorts:      scopePorts,
+				ScanID:                  runID,
+				SessionID:               sctx.ID,
+				Target:                  sess.target,
+				Goal:                    goalText,
+				Instruction:             sess.instruction,
+				UserInstruction:         sess.userInstruction,
+				Deep:                    plannerDeep,
+				RequestBudgetConfigured: plannerBudget,
+				ObjectiveStatement:      objStatement,
+				ObjectiveConstraints:    objConstraints,
+				ObjectiveCriteria:       objCriteria,
+				Client:                  plannerClient,
+				Repo:                    graph.Backend(),
+				ScanCtx:                 sctx,
+				ControlPlaneHosts:       sess.cfg.ControlPlaneHosts,
+				ScopeTargets:            scopeTargets,
+				ScopeDeny:               scopeDeny,
+				ScopeAllowPorts:         scopePorts,
+				NoiseProfile:            sess.cfg.NoiseProfile,
 				Emit: func(kind, content string, meta map[string]any) {
 					select {
 					case events <- agent.Event{Type: kind, Content: content, Meta: meta, AgentID: "planner", Timestamp: time.Now()}:
@@ -936,7 +986,21 @@ func (s *Server) executeScanSession(sess *scanSession) {
 			})
 			defer planner.Stop()
 		}
-		pool, poolErr := orchestrator.New(sctx.Ctx, orchestrator.Config{
+		workerProgressTimeout, workerProgressDisabled := workerProgressTimeoutFromEnv()
+		// Dispatch authorization (INTEL_HANDOFF_SPEC M3): one judge per run,
+		// backed by the reachability projection and the project's fence. With
+		// no projection store the pool keeps the pre-M3 path; with no enforced
+		// fence the judge allows everything except scope intents without a
+		// scope list, exactly as before.
+		var dispatchJudge *intelaccess.Judge
+		if accessStore := intelaccess.StoreOrNil(); accessStore != nil {
+			if engagementScope != nil {
+				dispatchJudge = intelaccess.NewJudge(accessStore, engagementScope, true)
+			} else {
+				dispatchJudge = intelaccess.NewJudge(accessStore, nil, false)
+			}
+		}
+		poolCfg := orchestrator.Config{
 			ScanID:            runID,
 			Workers:           workerCount,
 			Targets:           []string{sess.target},
@@ -948,11 +1012,12 @@ func (s *Server) executeScanSession(sess *scanSession) {
 			ScopeAllowPorts:   scopePorts,
 			// Round-5 P0-1: how long an execution-lane worker may produce no
 			// information-layer increment before the engine reclaims its slot.
-			WorkerProgressTimeout: workerProgressTimeoutFromEnv(),
-			Goal:                  goalText,
-			Instruction:           sess.instruction,
-			UserInstruction:       sess.userInstruction,
-			ScanCtx:               sctx,
+			WorkerProgressTimeout:  workerProgressTimeout,
+			WorkerProgressDisabled: workerProgressDisabled,
+			Goal:                   goalText,
+			Instruction:            sess.instruction,
+			UserInstruction:        sess.userInstruction,
+			ScanCtx:                sctx,
 			OnSettled: func(unitID string) {
 				if planner != nil {
 					planner.Notify()
@@ -964,7 +1029,11 @@ func (s *Server) executeScanSession(sess *scanSession) {
 					planner.Stall()
 				}
 			},
-		})
+		}
+		if dispatchJudge != nil {
+			poolCfg.Judge = dispatchJudge
+		}
+		pool, poolErr := orchestrator.New(sctx.Ctx, poolCfg)
 		if poolErr != nil {
 			log.Printf("[orchestrator] pool unavailable for %s: %v — continuing without workers", sess.instanceID, poolErr)
 		} else {
@@ -986,7 +1055,7 @@ func (s *Server) executeScanSession(sess *scanSession) {
 			// pool size instead of accumulating ahead of execution.
 			if planner != nil {
 				planner.SetMaxIntents(workerCount)
-				planner.SetWaitForCapacity(pool.WaitForSlot)
+				planner.SetAvailableSlots(pool.AvailableSlots)
 				planner.SetStallReport(pool.StallReport)
 			}
 			s.registerWorkerPool(runID, pool)
@@ -2224,18 +2293,19 @@ func (s *Server) mergeQueuedGuidance(sess *scanSession, instruction string) stri
 
 // workerProgressTimeoutFromEnv reads XALGORIX_WORKER_PROGRESS_TIMEOUT (Go
 // duration, e.g. "20m"). Unset or invalid leaves the orchestrator default
-// (20m); "0" or "off" disables the reclaim clock for this deployment.
-func workerProgressTimeoutFromEnv() time.Duration {
+// (20m); "0" or "off" disables the reclaim clock explicitly. The boolean is a
+// separate flag because a zero duration already means "use the default".
+func workerProgressTimeoutFromEnv() (time.Duration, bool) {
 	raw := strings.TrimSpace(os.Getenv("XALGORIX_WORKER_PROGRESS_TIMEOUT"))
 	if raw == "" {
-		return 0
+		return 0, false
 	}
 	if raw == "0" || strings.EqualFold(raw, "off") || strings.EqualFold(raw, "disabled") {
-		return -time.Second
+		return 0, true
 	}
 	if d, err := time.ParseDuration(raw); err == nil {
-		return d
+		return d, false
 	}
 	log.Printf("[orchestrator] XALGORIX_WORKER_PROGRESS_TIMEOUT=%q is not a duration; using the default", raw)
-	return 0
+	return 0, false
 }

@@ -43,3 +43,24 @@
 完整 orchestrator 包测试未进入测试阶段。离线环境缺少模块依赖，归档本身还缺少 `internal/honeydetect/honeydetect.go:23` 要求嵌入的 `signatures.json`。已有专项测试分别覆盖容量等待、两轮无纠偏后的提醒、正常回收；这些单项行为不足以证明它们组合之后可靠。设计版本也要区分：`PLANNER_OBSERVATION_AND_CORRECTION.md` 自标草案，它描述的长工具保护和观察窗适合作为验收目标；第五轮报告 §11 则记录了另一项引擎确定性回收设计。两者对数字和决策者有差异，不能把任一组数字当作统一生效合同。
 
 平台验收可以完全使用假 worker 和本地状态库。一次运行分别观察“停滞首次可见 → planner 记录决定”“决定停止 → 执行确认退出”“退出 → 图终态及原因提交”。把重复写同值、长期等待后正常返回、宽限期恢复、拒绝取消、数据库写原因失败和换租后旧 worker 返回作为独立样本。每个样本核对 run、unit、派发 agent、决定来源和终态；补充记录无实质增量时间、误停数、终态后仍活动数、原因缺失数。这样可以验证监督和审计是否可靠，也能在后续 benchmark 中定位时间花在哪里。
+
+## 整改落地（2026-11-24）
+
+以下改动与本文逐条对应；`go test ./internal/...`、`go test -race`（改动包）通过。
+
+| 审查项 | 落地位置 | 关键测试 |
+|---|---|---|
+| 高 1 满池阻塞 supervision | `planner.round` 去掉 `WaitForCapacity`；`PlannerConfig.AvailableSlots` + `Pool.AvailableSlots` 在 `apply` 做准入裁剪；`shouldPlan` 满池短路 | `TestPlannerApplyCapsAtAvailableSlots`、`TestPlannerSkipsFullPoolTimerRound` |
+| 高 2 无效活动/长工具 | `add_note` 返回 `state_changed`；`ProgressStore.BeginTool/EndTool/ActiveTool`；回收与 `applyStallGuard` 跳过活动工具；typed kill 也拒绝活动工具 | `TestHookProgressIgnoresUnchangedNoteWrite`、`TestProgressWatchPausesForActiveTool`、`TestKillWorkerWithReasonStagnantValidation` |
+| 高 3 拒绝被降级成 human kill | `ErrStagnantKillRefused` 哨兵；`killStagnant` 只有 legacy root 才回落；`budget_exhausted` 成为引擎原因码；回收原因保留真实失败分类 | `TestKillStagnantRefusalDoesNotFallBackToPlainKill`、`TestCancelLikeClassifiesEngineCauses` |
+| 高 4 终态早于退出 | `Graph.WaitUnitExit` / `Agent.WaitWorkerExit`；queued worker kill 立即终结；`windDown` 等待退出并写 `exit=confirmed/unconfirmed`；worker 表写 `killed: <reason>` | `TestKillUnitCancelsWorker`、`TestKillQueuedUnitTerminatesImmediately`、`TestReclaimSettlesOnlyAfterWorkerExit` |
+| 高 5 换租后旧 worker 改写新状态 | `Repository.SettleIntent`：owner 围栏 + 状态/租约/原因单条 UPDATE；`conclude` 的 conflict/lease 错误不再降级结算 | `TestSettleIntentFencesOnOwner`、`TestSettleIntentOpenReleasesClaim`、`TestPGSettleIntentOwnerFenceAndAtomicReason`（需 `XALGORIX_TEST_DATABASE_URL`） |
+| 中 6 看得到但查不到 | `infospace.ItemReader` + `PGStore.Item`；`read_info_item` ledger miss 后按 run/id 解析；空结果不静默回退，Incomplete 永远渲染 GapReason | `TestReadInfoItemResolvesInformationSpaceID`、`TestPlannerOverviewInfoSpaceIncompleteGapIsVisible`、`TestPlannerOverviewInfoSpaceEmptyResultIsAuthoritative` |
+| 中 7 原因两次提交 / close 假成功 | 原因合并进 `SettleIntent`；close intent 按状态判断：done/in-flight 不重发，失败可 `:r<N>` 重试（上限 3 次），日志明确为 request | `TestEnqueueContainerCloseRetriesFailedAttempt` |
+| 中 8 关闭值反转 | `WorkerProgressDisabled` 显式布尔；env 返回 `(timeout, disabled)` | `TestWorkerProgressDisabledIsNotDefault` |
+| 约束：容量范围过宽 | 容量只约束 apply 新增 intent，不再阻塞读图/steer/kill | 同高 1 |
+| 约束：analysis 被 30m 下限拉长 | `workerBudget` 按 lane 分流：control-plane/analysis 尊重声明合同，execution 保留 30m 下限 | `TestWorkerBudgetKeepsAttackLanesLong` |
+| 约束：回收覆盖不对称 | 文档明确 execution lane 用独立回收，control-plane/analysis 用合同预算；未扩大行为面 | `docs/PLANNER_OBSERVATION_AND_CORRECTION.md` 状态块 |
+
+仍未改动：Verifier、`report_vulnerability` 门管线、六环安全链、`done` 只能经 `ConcludeIntent` 的语义。
+建议第六轮按 §验证与验收 的样本分别核对 `exit=confirmed/unconfirmed`、typed kill 来源、owner 围栏结果与 `GapReason`。

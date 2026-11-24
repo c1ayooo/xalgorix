@@ -614,3 +614,41 @@ foreach ($reviewSuite in @('approval', 'progress', 'orchestration', 'proxy', 'sc
 ```
 
 修复验收还需在项目要求的工具链下运行相关原生单测，并补充默认 planner worker 拓扑、PG 失败、Docker 取消、实际代理出口与浏览器网络路径的集成测试。测试和构建继续禁用 Git 及 VCS 元数据探测。
+
+## 14 整改状态（2026-11-24 第二批）
+
+本节只记录代码现状，不替代真实 PG/Docker/网络集成验收。`go build ./...`、`go test ./...`
+与变更包 `-race` 已通过；标注“部分”的项仍有明确缺口。
+
+| 编号 | 状态 | 落地与缺口 |
+|---|---|---|
+| XALG001 P0 | 已修复 | 新增 `complete_work` 工具（worker/analysis/control-plane 可用，root 被拒）；`AfterTool` 结束本 lane 的模型循环并经 `ConcludeIntent` 结算；worker 提示词改为显式收尾。测试：`TestCompleteWorkIsReservedForDelegatedWorkers`、`TestCompleteWorkEndsDelegatedLane` |
+| XALG002 P0 | 已修复 | 去掉 planner 前置 `WaitForCapacity`；`AvailableSlots` 在 `apply` 做准入裁剪；满池无触发时短路。测试见 `planner_test.go` |
+| XALG003 | 已修复 | 新增 `planRounds` 只统计有效计划；非法 JSON / 全部被拒的计划不再标记 drained。测试：`TestPlannerRetriesAfterInvalidFirstPlan` |
+| XALG004 | 已修复 | 重复 note 已去重；引擎侧路径也接入 worker 进展钟：确定性 verifier 实际执行、client-route 发现、recon 维度完成。原始工具输出本身仍不算进展（需先形成证据/覆盖）。测试：`TestHookProgressIgnoresUnchangedNoteWrite`、`TestVerifierBridgeMarksWorkerProgress`、`TestReconCompletionMarksWorkerProgress` |
+| XALG005 | 已修复 | 每个工具记录 `ToolDeadline`（terminal 60m / python 30m / browser 10m / http 5m / 默认 15m）；deadline 内暂停停滞钟并拒绝 stagnant kill，超期后允许回收/kill。测试：`TestToolActiveBudget`、`TestProgressWatchReclaimsExpiredTool`、`TestKillWorkerAllowsExpiredActiveTool` |
+| XALG006 | 已修复 | typed kill 被拒不再回落普通 kill；拒绝后继续观察。测试：`TestKillStagnantRefusalDoesNotFallBackToPlainKill` |
+| XALG007 | 部分 | Agent 层 `WaitWorkerExit` 确认退出；queued kill 立即终结；`windDown` 等退出才结算。Docker 每次 exec 的进程/进程组终止仍未实现，需 runtime 集成验收 |
+| XALG008 | 已修复 | 租约丢失/连续续约失败会 cancel 旧 worker（`lease_lost`）；owner 围栏结算防止改写新 owner。测试：`TestRenewLeaseLossStopsWorker`、`TestSettleIntentFencesOnOwner` |
+| XALG009 | 已修复 | 主聊天新增周期性图投影（默认 30s），空闲无人工输入也刷新。测试：`TestStartGraphProjectionLoopProjectsWithoutInput` |
+| XALG010 | 已修复 | `read_info_item` 可解析 ledger、aggregate node id、atom id 与 `to_<seq>` 归档引用；查询始终受 run scope 约束。测试：`TestReadInfoItemResolvesInformationSpaceID`、`TestReadInfoItemResolvesArchivedToolOutput`、`TestMainChatReadsToolArchiveAndCoverage` |
+| XALG011 | 已修复 | 列表全部支持 `offset`/`next_offset`；`list_units` 显示真实 `progress=`/`tool=`；新增 `read_notes`、`read_info_item`、`read_tool_output`、`list_coverage`、`list_assets`、`list_deviations`。测试：`TestMainChatListIntentsPaginates`、`TestMainChatListUnitsShowsLiveWorkerProgress`、`TestMainChatReadNotesAndInfoItem`、`TestMainChatReadsToolArchiveAndCoverage`、`TestMainChatListsAssetsAndDeviations` |
+| XALG012 | 已修复 | 主聊天 finish 重跑 `hookGoalFinishGate`；显式操作者停止仍立即生效。测试：`TestMainChatFinishRechecksRequiredObjective` |
+| XALG013 | 部分 | GET/HEAD/OPTIONS 携带破坏性原语现在进入审批；普通 read 仍免审。更完整的“风险不由 method 决定”规则集仍需设计裁决 |
+| XALG014 | 已修复 | query/body 做有界 percent/form 解码与 JSON 反转义后再匹配，保留原始字节供审计。测试见 `TestAssessHTTP` 编码用例 |
+| XALG015 | 已修复 | eino broker 在 front Allow 前执行 fence + scope observer；proxy gate 同样先 fence/observer 再提交人工审批；legacy registry `SetApprovalGate` 无生产接线（仅测试使用），不构成生产路径 |
+| XALG016 | 已修复 | 始终安装动态审批适配器；`RequestApproval` 每次读取 run 的 effective audit mode。测试：`TestTaskAuditEnforceCreatesCommandApprovalWithGlobalOff`、`TestApprovalBrokerInstalledForObserveRun` |
+| XALG017 | 已修复（裁决：fail-closed） | enforce 下审批 store 不可用：broker 对 Require 调用返回错误；legacy `submit` 返回 `store_unavailable` 拒绝；代理 gate 在 scan context 消失时阻断。observe/off 保持原可用性策略。测试：`TestApprovalSubmitFailsClosedUnderEnforce`、`TestApprovalBrokerFailsClosedUnderEnforceWithoutStore` |
+| XALG018 | 部分（边界已裁决） | 围栏只覆盖平台主动操作：HTTP/命令/端口扫描/显式浏览器导航/重定向每跳；页面自身加载的 CDN、统计、字体、XHR 不拦。`browser_action`/`page_agent` 已纳入 scope 检查；`execute_js` 静态 URL 会检查，运行时拼接 URL 仍是 best-effort。测试：`TestScopeFenceOnlyChecksPlatformInitiatedOperations`、`TestCheckHTTPHopEnforcesEngagementScope`；真实浏览器网络路径未集成验证 |
+| XALG019 | 已修复 | Agent（含已注册子 worker）、Planner、Pool 增加 live `SetScope`；PUT 项目 scope 后遍历 project 的 live run 替换快照并通知主 Agent。测试：`TestSetEngagementScopePropagatesToChildren`、`TestPlannerSetScopeAppliesToNextPlan`、`TestPoolSetScopeAppliesToNextDispatch`、`TestApplyProjectScopeToLiveRuns` |
+| XALG020 | 已修复 | Web `targetHostPort` 保留 CIDR，`hostInScope` 按网段包含匹配。测试：`TestCIDRScopeMatchesAgentSemantics`、`TestValidateTargetsInScopeAcceptsCIDR` |
+| XALG021 | 已修复 | 代理 pin 安装移出 resume 修复分支，正常启动在目标流量前安装。测试：`TestInstallSessionEgressPinKeysByScanContext` |
+| XALG022 | 已修复 | 热切换与隧道关闭改用 ScanContext ID。同上测试 |
+| XALG023 | 已修复 | 历史 terminal 容器 lane 不再压制同地址新实例；新 lane 使用 `:g<N>` 身份与 `unique_code`。测试：`TestMaterializeContainerIntentsReusesTerminalAddress` |
+| XALG024 | 已修复 | 显式 `WorkerProgressDisabled`；`off` 不再回落默认 20m。测试：`TestWorkerProgressDisabledIsNotDefault` |
+| XALG025 | 已修复 | `observeScope` 不再用进程全局 mode 覆盖 run 的 enforce 选择 |
+| XALG026 | 部分 | native browser 在自动解析 egress pin 时优先走本地 MITM listener，显式代理仍优先；浏览器网络路径尚未做集成测试 |
+
+**仍属未关闭的主干缺口**：XALG018（浏览器运行时拼接 URL / 子进程实际出口的 best-effort 边界）、
+XALG007（Docker 每 exec 进程终止），以及 XALG013/XALG026 的标注缺口。
+当前计数：已修复 22、部分 4、未修复 0。这些不应被“单测通过”表述为已完成端到端验收。

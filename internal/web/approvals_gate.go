@@ -343,11 +343,14 @@ func (s *ApprovalService) waitApproval(ctx context.Context, approvalID string) (
 func (s *ApprovalService) submit(instanceID string, sctx *scanctx.ScanContext, verdict approval.Verdict, secrets []string) submitOutcome {
 	store := s.srv.currentPlatformStore()
 	if store == nil {
-		// No platform store: the approval pipeline is a cold-path capability
-		// and scanning never depends on it (charter §6.6). Fail-open with a
-		// loud log — silently blocking every tool call on a missing store
-		// would break the no-DSN degradation red line.
-		log.Printf("[approval] store unavailable — failing open for %s call in run %s", verdict.Kind, instanceID)
+		// Enforce is fail-closed: no store means no approval can be recorded, so
+		// a regulated call is refused. Observe/off keeps the old availability
+		// posture because no approval is required there anyway.
+		if s.srv.runAuditMode(sctx) == approval.ModeEnforce {
+			log.Printf("[approval] store unavailable under enforce — refusing %s call in run %s", verdict.Kind, instanceID)
+			return submitOutcome{Approved: false, Status: "store_unavailable"}
+		}
+		log.Printf("[approval] store unavailable — failing open for %s call in run %s (observe/off)", verdict.Kind, instanceID)
 		return submitOutcome{Approved: true, Status: "store_unavailable"}
 	}
 

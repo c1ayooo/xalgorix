@@ -2,9 +2,11 @@ package agent
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
+	"github.com/c1ayooo/xalgorix/v4/internal/assets"
 	"github.com/c1ayooo/xalgorix/v4/internal/graph"
 	"github.com/c1ayooo/xalgorix/v4/internal/llm"
 	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
@@ -330,5 +332,155 @@ func TestMainChatInitialHistoryIncludesResumeTranscript(t *testing.T) {
 	empty := (&Agent{}).mainChatInitialHistory("system prompt")
 	if len(empty) != 1 {
 		t.Fatalf("fresh history = %d, want system only", len(empty))
+	}
+}
+
+// TestMainChatListIntentsPaginates pins XALG011's pagination acceptance: more
+// than the per-call limit can still be traversed via offset/next_offset.
+func TestMainChatListIntentsPaginates(t *testing.T) {
+	store := graph.NewMemoryStore()
+	graph.SetBackend(store)
+	t.Cleanup(func() { graph.SetBackend(nil) })
+	sctx, state := newTestCtxState(t)
+	sctx.SetInstanceID("run-pages")
+	a := &Agent{scanCtx: sctx, state: state}
+	for i := 0; i < 55; i++ {
+		if _, err := store.AddNode(context.Background(), graph.NodeInput{
+			ScanID: "run-pages", Kind: graph.KindIntent, UnitKey: fmt.Sprintf("T-%02d", i),
+			Payload: fmt.Sprintf(`{"task_id":"T-%02d","title":"intent %d"}`, i, i),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out, err := a.mainChatListIntents(map[string]string{"limit": "20", "offset": "20"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lines := strings.Count(out, "\n- "); lines != 20 {
+		t.Fatalf("page lines = %d, want 20\n%s", lines, out)
+	}
+	if !strings.Contains(out, "next_offset=40") {
+		t.Fatalf("missing next_offset: %s", out)
+	}
+	if !strings.Contains(out, "match=55") {
+		t.Fatalf("missing total match count: %s", out)
+	}
+}
+
+// TestMainChatListUnitsShowsLiveWorkerProgress pins XALG011's worker-progress
+// leg: the main agent can see the real active tool and last increment, not just
+// a lease owner.
+func TestMainChatListUnitsShowsLiveWorkerProgress(t *testing.T) {
+	store := graph.NewMemoryStore()
+	graph.SetBackend(store)
+	t.Cleanup(func() { graph.SetBackend(nil) })
+	sctx, state := newTestCtxState(t)
+	sctx.SetInstanceID("run-progress")
+	if _, err := store.AddNode(context.Background(), graph.NodeInput{
+		ScanID: "run-progress", Kind: graph.KindIntent, UnitKey: "unit-live",
+		Payload: `{"task_id":"unit-live","title":"live worker"}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sctx.Progress.BindUnit("unit-live", "agent-live")
+	sctx.Progress.MarkProgress("agent-live")
+	sctx.Progress.BeginTool("agent-live", "terminal_execute")
+
+	a := &Agent{scanCtx: sctx, state: state}
+	out, err := a.mainChatListUnits(map[string]string{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"unit-live", "progress=", "tool=terminal_execute"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("units output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestMainChatReadNotesAndInfoItem pins the new read-only decision inputs
+// (XALG011): notes and one information item are readable without event replay.
+func TestMainChatReadNotesAndInfoItem(t *testing.T) {
+	sctx, state := newTestCtxState(t)
+	if err := sctx.Notes.Set("handoff", "container 10.0.0.5:8080 ready"); err != nil {
+		t.Fatal(err)
+	}
+	h := sctx.Ledger.Upsert(scanctx.Hypothesis{
+		Title: "SQLi", VulnClass: "sqli", Endpoint: "/login",
+		Status: scanctx.HypothesisQueued, Confidence: 0.6,
+	})
+	a := &Agent{scanCtx: sctx, state: state}
+
+	if out := a.mainChatReadNotes(map[string]string{"key": "handoff"}); !strings.Contains(out, "10.0.0.5:8080") {
+		t.Fatalf("read_notes key = %q", out)
+	}
+	if out := a.mainChatReadNotes(map[string]string{}); !strings.Contains(out, "handoff") {
+		t.Fatalf("read_notes all = %q", out)
+	}
+	if out := a.mainChatReadInfoItem(map[string]string{"id": h.ID}); !strings.Contains(out, "belief "+h.ID) {
+		t.Fatalf("read_info_item = %q", out)
+	}
+}
+
+// TestMainChatReadsToolArchiveAndCoverage pins the remaining XALG011 read
+// surfaces: archived raw outputs and probed/verified coverage.
+func TestMainChatReadsToolArchiveAndCoverage(t *testing.T) {
+	sctx, state := newTestCtxStateWithDir(t)
+	id := sctx.ToolOutputs.Archive("curl", "BYTE-IDENTICAL-ARCHIVED-OUTPUT", 1)
+	if id == "" {
+		t.Fatal("archive returned no id")
+	}
+	sctx.Coverage.Mark("/login", "sqli")
+	sctx.Coverage.MarkVerified("/login", "sqli")
+	sctx.Coverage.Mark("/search", "xss")
+
+	a := &Agent{scanCtx: sctx, state: state}
+	if out := a.mainChatReadToolOutput(map[string]string{"id": id}); !strings.Contains(out, "BYTE-IDENTICAL-ARCHIVED-OUTPUT") {
+		t.Fatalf("read_tool_output = %q", out)
+	}
+	if out := a.mainChatReadInfoItem(map[string]string{"id": id}); !strings.Contains(out, "BYTE-IDENTICAL-ARCHIVED-OUTPUT") {
+		t.Fatalf("read_info_item archive ref = %q", out)
+	}
+	out := a.mainChatListCoverage(map[string]string{})
+	for _, want := range []string{"/login", "probed=sqli", "verified=sqli", "/search"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("coverage output missing %q:\n%s", want, out)
+		}
+	}
+	verifiedOnly := a.mainChatListCoverage(map[string]string{"verified_only": "true"})
+	if strings.Contains(verifiedOnly, "/search") {
+		t.Fatalf("verified_only included an unverified endpoint: %s", verifiedOnly)
+	}
+}
+
+// TestMainChatListsAssetsAndDeviations pins the last two XALG011 read inputs.
+func TestMainChatListsAssetsAndDeviations(t *testing.T) {
+	store := assets.NewMemoryStore()
+	assets.SetBackend(store)
+	t.Cleanup(func() { assets.SetBackend(nil) })
+	sctx, state := newTestCtxStateWithDir(t)
+	sctx.SetInstanceID("run-inventory")
+	sctx.ProjectID = "proj-inventory"
+	asset, err := store.UpsertAsset(context.Background(), assets.AssetInput{
+		ProjectID: "proj-inventory", Kind: assets.KindEndpoint, Key: "/login",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.LinkTaskAsset(context.Background(), assets.Link{
+		ScanID: "run-inventory", AssetID: asset.ID, Source: "test",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sctx.Ledger.AppendDeviation("T-1", "target redirected to /new-login", "agent-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	a := &Agent{scanCtx: sctx, state: state}
+	if out := a.mainChatListAssets(map[string]string{}); !strings.Contains(out, "/login") || !strings.Contains(out, "endpoint") {
+		t.Fatalf("list_assets = %q", out)
+	}
+	if out := a.mainChatListDeviations(map[string]string{}); !strings.Contains(out, "T-1") || !strings.Contains(out, "/new-login") {
+		t.Fatalf("list_deviations = %q", out)
 	}
 }

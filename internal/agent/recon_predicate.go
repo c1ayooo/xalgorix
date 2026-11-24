@@ -78,10 +78,14 @@ func ComprehensiveReconMissing(state *ScanState) []string {
 	if !s.EndpointInventorySaved {
 		add("an Endpoint Inventory note listing every live route")
 	}
-	if !s.DirBustingDone {
+	// Content discovery is evidence-led: a mature JS/API/crawl inventory makes a
+	// blind wordlist pass redundant (and noisy), so the demand is scoped by the
+	// engagement's noise profile. Completion credit for a pass that DID run is
+	// still granted by recon_results.go at any profile.
+	if contentDiscoveryOwed(s) && !s.DirBustingDone {
 		add("content discovery with a real wordlist on the primary host (ffuf/gobuster/dirsearch, -maxtime bounded)")
 	}
-	if s.DirBustingDone && !s.DirBustingUsedWordlist && !reconDimDispositionSettled(s, "content_discovery") {
+	if contentDiscoveryOwed(s) && s.DirBustingDone && !s.DirBustingUsedWordlist && !reconDimDispositionSettled(s, "content_discovery") {
 		add("content discovery must run a REAL wordlist pass (ffuf -w common.txt / gobuster -w, bounded -maxtime; a few targeted probes are not content discovery)")
 	}
 	if len(s.DetectedTechs) == 0 {
@@ -98,18 +102,22 @@ func ComprehensiveReconMissing(state *ScanState) []string {
 	if !rc.Crawled && !reconDimDispositionSettled(s, "crawling") {
 		add("web crawling (katana/gospider/sitemap/robots or browser navigation)")
 	}
-	if len(rc.ContentDiscoveredHosts) == 0 && !reconDimDispositionSettled(s, "content_discovery") {
+	if contentDiscoveryOwed(s) && len(rc.ContentDiscoveredHosts) == 0 && !reconDimDispositionSettled(s, "content_discovery") {
 		add("content discovery with a real wordlist on the primary host")
 	}
 	// Per-application coverage: every distinct host the surface surfaced
 	// (bounded) must be content-discovered with a validated result or carry a
 	// typed disposition. One pass on app.example.com never satisfies
-	// api/admin/files.example.com.
-	for _, host := range distinctApplicationHosts(s) {
-		if rc.ContentDiscoveredHosts[host] || reconHostDispositioned(s, host) {
-			continue
+	// api/admin/files.example.com. The obligation itself follows the noise
+	// posture (quiet never owes it; balanced owes it only while the inventory is
+	// thin).
+	if perHostContentDiscoveryOwed(s) {
+		for _, host := range distinctApplicationHosts(s) {
+			if rc.ContentDiscoveredHosts[host] || reconHostDispositioned(s, host) {
+				continue
+			}
+			add("content discovery on %s (or a typed disposition via update_plan: \"host %s: blocked/na/covered_by_equivalent\" after bounded retries)", host, host)
 		}
-		add("content discovery on %s (or a typed disposition via update_plan: \"host %s: blocked/na/covered_by_equivalent\" after bounded retries)", host, host)
 	}
 	// First-party JS analysis is CONDITIONAL BUT REAL: crawling alone no
 	// longer satisfies a surface that ships meaningful client JS.
@@ -137,7 +145,7 @@ func ComprehensiveReconMissing(state *ScanState) []string {
 	// Parameter discovery activates from forms, query strings, seeded
 	// parameters, and state-changing methods — not only from POSTs already
 	// observed.
-	if parameterizedSurfaceExists(s) && !rc.ParamDiscovered && !reconDimDispositionSettled(s, "parameter_discovery") {
+	if parameterDiscoveryOwed(s) && parameterizedSurfaceExists(s) && !rc.ParamDiscovered && !reconDimDispositionSettled(s, "parameter_discovery") {
 		add("parameter/input discovery (arjun/x8, HTML forms, query strings)")
 	}
 	// Scope-aware DNS/subdomain discovery: a bare-domain or wildcard scope
@@ -152,16 +160,17 @@ func ComprehensiveReconMissing(state *ScanState) []string {
 	}
 	// Historical URLs only for deep scans against public targets: local
 	// fixtures and private IPs owe nothing (and may record N/A).
-	if historicalApplicable(s) && !rc.HistoricalChecked && !reconDimDispositionSettled(s, "historical") {
+	if historicalURLsOwed(s) && historicalApplicable(s) && !rc.HistoricalChecked && !reconDimDispositionSettled(s, "historical") {
 		add("historical URL discovery (gau/waybackurls) for the public target")
 	}
 	// Deep mode expects additional breadth; standard mode does not inherit
-	// deep obligations. Derived from ScanDepth, never from specialists.
-	if s.DeepReconRequired {
+	// deep obligations. Derived from ScanDepth + noise posture, never from
+	// specialists: a quiet engagement never owes a port sweep.
+	if serviceDiscoveryOwed(s) {
 		if !rc.ServicesProbed && !reconDimDispositionSettled(s, "service_discovery") {
 			add("service/port enumeration (nmap/naabu) — deep mode")
 		}
-		if !rc.ParamDiscovered && !reconDimDispositionSettled(s, "parameter_discovery") {
+		if parameterDiscoveryOwed(s) && !rc.ParamDiscovered && !reconDimDispositionSettled(s, "parameter_discovery") {
 			add("parameter/input discovery — deep mode (arjun/x8, forms, query strings)")
 		}
 	}

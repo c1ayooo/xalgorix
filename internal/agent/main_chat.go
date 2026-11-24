@@ -8,6 +8,7 @@ package agent
 // execution; the orchestrator planner owns autonomous intent generation.
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -16,12 +17,16 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/c1ayooo/xalgorix/v4/internal/assets"
 	"github.com/c1ayooo/xalgorix/v4/internal/graph"
+	"github.com/c1ayooo/xalgorix/v4/internal/infospace"
 	"github.com/c1ayooo/xalgorix/v4/internal/llm"
 	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
 	"github.com/c1ayooo/xalgorix/v4/internal/tools"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools/notes"
 	"github.com/c1ayooo/xalgorix/v4/internal/tools/reporting"
 )
 
@@ -61,6 +66,7 @@ var mainChatToolDefs = []llm.ToolDefinition{
 			{Name: "status", Description: "Filter: all (default), open, running, paused, done, blocked.", Required: false},
 			{Name: "phase", Description: "Only intents of this methodology phase (1-22).", Required: false},
 			{Name: "limit", Description: "Max rows (default 20, max 50).", Required: false},
+			{Name: "offset", Description: "Pagination offset (rows to skip; default 0). Use the next_offset printed by a previous call.", Required: false},
 		},
 	},
 	{
@@ -70,6 +76,7 @@ var mainChatToolDefs = []llm.ToolDefinition{
 			{Name: "kind", Description: "Filter: all (default), intent, belief.", Required: false},
 			{Name: "state", Description: "Filter by graph state, e.g. open, running, paused, done, blocked, queued, testing, proven.", Required: false},
 			{Name: "limit", Description: "Max rows (default 20, max 50).", Required: false},
+			{Name: "offset", Description: "Pagination offset (rows to skip; default 0). Use the next_offset printed by a previous call.", Required: false},
 		},
 	},
 	{
@@ -78,6 +85,7 @@ var mainChatToolDefs = []llm.ToolDefinition{
 		Parameters: []llm.ToolParameter{
 			{Name: "severity", Description: "Filter: all (default), critical, high, medium, low, info.", Required: false},
 			{Name: "limit", Description: "Max rows (default 20, max 50).", Required: false},
+			{Name: "offset", Description: "Pagination offset (rows to skip; default 0). Use the next_offset printed by a previous call.", Required: false},
 		},
 	},
 	{
@@ -86,6 +94,7 @@ var mainChatToolDefs = []llm.ToolDefinition{
 		Parameters: []llm.ToolParameter{
 			{Name: "status", Description: "Filter: all (default), queued, testing, proven, rejected, blocked, exhausted.", Required: false},
 			{Name: "limit", Description: "Max rows (default 20, max 50).", Required: false},
+			{Name: "offset", Description: "Pagination offset (rows to skip; default 0). Use the next_offset printed by a previous call.", Required: false},
 		},
 	},
 	{
@@ -94,6 +103,54 @@ var mainChatToolDefs = []llm.ToolDefinition{
 		Parameters: []llm.ToolParameter{
 			{Name: "state", Description: "Filter: all (default), active, consumed.", Required: false},
 			{Name: "limit", Description: "Max rows (default 20, max 50).", Required: false},
+			{Name: "offset", Description: "Pagination offset (rows to skip; default 0). Use the next_offset printed by a previous call.", Required: false},
+		},
+	},
+	{
+		Name:        "read_notes",
+		Description: "READ-ONLY: read the run's notes (the shared information mirror written by every lane). Omit key to list all notes within the bounded output budget.",
+		Parameters: []llm.ToolParameter{
+			{Name: "key", Description: "Exact note key to read; omit for all notes.", Required: false},
+		},
+	},
+	{
+		Name:        "read_info_item",
+		Description: "READ-ONLY: read one ledger hypothesis/evidence or information-space item by ID. Use IDs printed by list_hypotheses or list_units.",
+		Parameters: []llm.ToolParameter{
+			{Name: "id", Description: "Hypothesis, evidence, or information-space item ID.", Required: true},
+		},
+	},
+	{
+		Name:        "read_tool_output",
+		Description: "READ-ONLY: read one archived raw tool output by its retrieval id (to_000123), byte-identical to what the tool produced.",
+		Parameters: []llm.ToolParameter{
+			{Name: "id", Description: "Archive retrieval id, e.g. to_000123.", Required: true},
+		},
+	},
+	{
+		Name:        "list_coverage",
+		Description: "READ-ONLY: list endpoint × vulnerability-class coverage, distinguishing probed from independently verified pairs.",
+		Parameters: []llm.ToolParameter{
+			{Name: "verified_only", Description: "true to list only verifier-attributed pairs.", Required: false},
+			{Name: "limit", Description: "Max rows (default 20, max 50).", Required: false},
+			{Name: "offset", Description: "Pagination offset (rows to skip; default 0).", Required: false},
+		},
+	},
+	{
+		Name:        "list_assets",
+		Description: "READ-ONLY: list the project assets linked to this run (hosts, subdomains, endpoints, services).",
+		Parameters: []llm.ToolParameter{
+			{Name: "kind", Description: "Filter: all (default) or endpoint, root_domain, subdomain, ip, service.", Required: false},
+			{Name: "limit", Description: "Max rows (default 20, max 50).", Required: false},
+			{Name: "offset", Description: "Pagination offset (rows to skip; default 0).", Required: false},
+		},
+	},
+	{
+		Name:        "list_deviations",
+		Description: "READ-ONLY: list executor-recorded deviations from assigned intents (what changed and why).",
+		Parameters: []llm.ToolParameter{
+			{Name: "limit", Description: "Max rows (default 20, max 50).", Required: false},
+			{Name: "offset", Description: "Pagination offset (rows to skip; default 0).", Required: false},
 		},
 	},
 	{
@@ -168,8 +225,65 @@ func (a *Agent) runMainChatOnly(targets []string, instruction string) {
 	if a.objective != nil {
 		a.state.Objective = a.objective
 	}
+	// The default topology's main chat only projects at turn boundaries and on
+	// exit. Workers mutate the shared ledger while no operator message arrives,
+	// so a periodic projection keeps the graph/panel within a bounded lag
+	// (XALG009). The projector reads the ledger; it never writes scan state.
+	stopProjection := a.startGraphProjectionLoop()
+	defer stopProjection()
+	a.syncExplorationGraph()
 	defer a.syncExplorationGraph()
 	a.runMainChatLoop(a.syncBudgetTokens)
+}
+
+// mainChatGraphProjectionInterval bounds how stale the graph may be while the
+// main chat is idle. It is a variable so tests can shorten it.
+var mainChatGraphProjectionInterval = 30 * time.Second
+
+// isExplicitOperatorStop reports whether the current operator message is an
+// explicit instruction to stop now. Only that path bypasses the required
+// objective gate; a model-declared finish on a drained frontier does not.
+func isExplicitOperatorStop(msg string) bool {
+	text := strings.ToLower(strings.TrimSpace(msg))
+	if text == "" {
+		return false
+	}
+	for _, marker := range []string{
+		"stop", "halt", "abort", "shut down", "call it off",
+		"停止", "终止", "结束", "收工", "别扫了", "停下来",
+	} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// startGraphProjectionLoop projects the shared ledger into the graph while the
+// main chat is alive, even without operator input. The returned function stops
+// the loop; it is safe to call once.
+func (a *Agent) startGraphProjectionLoop() func() {
+	ctx := a.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	done := make(chan struct{})
+	var once sync.Once
+	go func() {
+		ticker := time.NewTicker(mainChatGraphProjectionInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-done:
+				return
+			case <-ticker.C:
+				a.syncExplorationGraph()
+			}
+		}
+	}()
+	return func() { once.Do(func() { close(done) }) }
 }
 
 // mainChatInitialHistory seeds the main chat with the bounded hot-resume
@@ -461,12 +575,32 @@ func (a *Agent) mainChatToolResult(call llm.ToolCall, userMsg string) (string, b
 		if active := counts.OpenIntents + counts.RunningIntents + counts.PausedIntents; active > 0 {
 			return fmt.Sprintf("error: %d intent(s) are still open/running/paused; wait for the worker pool or steer/kill first", active), false
 		}
+		// An explicit operator stop is immediate. A completion declaration is
+		// not: it must re-run the deterministic required-objective gate instead
+		// of treating an empty frontier as goal achievement (XALG012).
+		if !isExplicitOperatorStop(userMsg) {
+			if gate := hookGoalFinishGate(a.state, nil); gate.Block {
+				return "error: " + gate.BlockReason + " To abort immediately, use the operator Stop control.", false
+			}
+		}
 		reason := strings.TrimSpace(call.Args["reason"])
 		if reason == "" {
 			reason = "user requested finish"
 		}
 		a.completeWithFinish("Run finished: "+reason+". Reported findings are saved.", a.syncBudgetTokens)
 		return "finished", true
+	case "read_notes":
+		return a.mainChatReadNotes(call.Args), false
+	case "read_info_item":
+		return a.mainChatReadInfoItem(call.Args), false
+	case "read_tool_output":
+		return a.mainChatReadToolOutput(call.Args), false
+	case "list_coverage":
+		return a.mainChatListCoverage(call.Args), false
+	case "list_assets":
+		return a.mainChatListAssets(call.Args), false
+	case "list_deviations":
+		return a.mainChatListDeviations(call.Args), false
 	case "list_intents":
 		out, err := a.mainChatListIntents(call.Args)
 		if err != nil {
@@ -986,21 +1120,31 @@ func mainChatReadLimit(raw string) int {
 	return n
 }
 
+func mainChatReadOffset(raw string) int {
+	n := intValueStr(raw)
+	if n < 0 {
+		return 0
+	}
+	return n
+}
+
 // mainChatReadResult joins bounded lines and appends an honest overflow note
-// instead of silently dropping rows.
-func mainChatReadResult(header string, lines []string, matched int) string {
+// with the next offset instead of silently dropping rows.
+func mainChatReadResult(header string, lines []string, matched, offset int) string {
 	var b strings.Builder
 	b.WriteString(header)
+	wrote := 0
 	for _, line := range lines {
 		if b.Len()+len(line)+1 > mainChatReadChars {
-			fmt.Fprintf(&b, "\n… output truncated; %d more row(s) match. Narrow the filter or raise limit (max %d).", matched-len(lines), mainChatReadMax)
-			return b.String()
+			break
 		}
 		b.WriteString("\n")
 		b.WriteString(line)
+		wrote++
 	}
-	if matched > len(lines) {
-		fmt.Fprintf(&b, "\n… %d more row(s) match; narrow the filter or raise limit (max %d).", matched-len(lines), mainChatReadMax)
+	remaining := matched - offset - wrote
+	if remaining > 0 {
+		fmt.Fprintf(&b, "\n… %d more row(s) match; next_offset=%d (limit max %d).", remaining, offset+wrote, mainChatReadMax)
 	}
 	return b.String()
 }
@@ -1048,6 +1192,7 @@ func (a *Agent) mainChatListIntents(args map[string]string) (string, error) {
 	status := strings.ToLower(strings.TrimSpace(args["status"]))
 	phase := intValueStr(args["phase"])
 	limit := mainChatReadLimit(args["limit"])
+	offset := mainChatReadOffset(args["offset"])
 	lines := make([]string, 0, limit)
 	matched := 0
 	for _, t := range tasks {
@@ -1062,14 +1207,14 @@ func (a *Agent) mainChatListIntents(args map[string]string) (string, error) {
 			continue
 		}
 		matched++
-		if len(lines) < limit {
+		if matched > offset && len(lines) < limit {
 			lines = append(lines, mainChatIntentLine(t, state, targetByNode[t.NodeID]))
 		}
 	}
 	if matched == 0 {
 		return "No intents match. The plan graph may still be empty.", nil
 	}
-	return mainChatReadResult(fmt.Sprintf("Intents for %s (match=%d):", scanID, matched), lines, matched), nil
+	return mainChatReadResult(fmt.Sprintf("Intents for %s (match=%d, offset=%d):", scanID, matched, offset), lines, matched, offset), nil
 }
 
 func mainChatIntentLine(t graph.PlanTask, state, target string) string {
@@ -1112,6 +1257,7 @@ func (a *Agent) mainChatListUnits(args map[string]string) (string, error) {
 	kind := strings.ToLower(strings.TrimSpace(args["kind"]))
 	state := strings.ToLower(strings.TrimSpace(args["state"]))
 	limit := mainChatReadLimit(args["limit"])
+	offset := mainChatReadOffset(args["offset"])
 	lines := make([]string, 0, limit)
 	matched := 0
 	for _, u := range units {
@@ -1122,17 +1268,17 @@ func (a *Agent) mainChatListUnits(args map[string]string) (string, error) {
 			continue
 		}
 		matched++
-		if len(lines) < limit {
-			lines = append(lines, mainChatUnitLine(u))
+		if matched > offset && len(lines) < limit {
+			lines = append(lines, a.mainChatUnitLine(u))
 		}
 	}
 	if matched == 0 {
 		return "No units match. The exploration graph has no intent/belief nodes for this filter.", nil
 	}
-	return mainChatReadResult(fmt.Sprintf("Units for %s (match=%d):", scanID, matched), lines, matched), nil
+	return mainChatReadResult(fmt.Sprintf("Units for %s (match=%d, offset=%d):", scanID, matched, offset), lines, matched, offset), nil
 }
 
-func mainChatUnitLine(u graph.Unit) string {
+func (a *Agent) mainChatUnitLine(u graph.Unit) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "- %s %s | state=%s", u.Kind, u.UnitID, u.State)
 	if u.Owner != "" {
@@ -1150,7 +1296,19 @@ func mainChatUnitLine(u graph.Unit) string {
 	if u.Expired {
 		b.WriteString(" | lease-expired")
 	}
-	return truncStr(b.String(), 240)
+	if a != nil && a.scanCtx != nil && a.scanCtx.Progress != nil {
+		agentID, _ := a.scanCtx.Progress.UnitAgent(u.UnitID)
+		if agentID == "" {
+			agentID = u.UnitID
+		}
+		if _, last, ok := a.scanCtx.Progress.AgentTimes(agentID); ok && !last.IsZero() {
+			fmt.Fprintf(&b, " | progress=%s ago", time.Since(last).Round(time.Second))
+		}
+		if name, started, ok := a.scanCtx.Progress.ActiveTool(agentID); ok {
+			fmt.Fprintf(&b, " | tool=%s(%s)", name, time.Since(started).Round(time.Second))
+		}
+	}
+	return truncStr(b.String(), 300)
 }
 
 // mainChatListFindings reads the run's confirmed findings projection. It only
@@ -1161,6 +1319,7 @@ func (a *Agent) mainChatListFindings(args map[string]string) (string, error) {
 	}
 	severity := strings.ToLower(strings.TrimSpace(args["severity"]))
 	limit := mainChatReadLimit(args["limit"])
+	offset := mainChatReadOffset(args["offset"])
 	vulns := reporting.GetVulnerabilitiesForContext(a.scanCtx.ID)
 	lines := make([]string, 0, limit)
 	matched := 0
@@ -1169,14 +1328,14 @@ func (a *Agent) mainChatListFindings(args map[string]string) (string, error) {
 			continue
 		}
 		matched++
-		if len(lines) < limit {
+		if matched > offset && len(lines) < limit {
 			lines = append(lines, mainChatFindingLine(v))
 		}
 	}
 	if matched == 0 {
 		return "No findings recorded for this run yet.", nil
 	}
-	return mainChatReadResult(fmt.Sprintf("Findings (match=%d):", matched), lines, matched), nil
+	return mainChatReadResult(fmt.Sprintf("Findings (match=%d, offset=%d):", matched, offset), lines, matched, offset), nil
 }
 
 func mainChatFindingLine(v reporting.Vulnerability) string {
@@ -1220,6 +1379,7 @@ func (a *Agent) mainChatListHypotheses(args map[string]string) (string, error) {
 	}
 	status := strings.ToLower(strings.TrimSpace(args["status"]))
 	limit := mainChatReadLimit(args["limit"])
+	offset := mainChatReadOffset(args["offset"])
 	lines := make([]string, 0, limit)
 	matched := 0
 	for _, h := range ledger.All() {
@@ -1227,7 +1387,7 @@ func (a *Agent) mainChatListHypotheses(args map[string]string) (string, error) {
 			continue
 		}
 		matched++
-		if len(lines) < limit {
+		if matched > offset && len(lines) < limit {
 			lines = append(lines, mainChatHypothesisLine(h))
 		}
 	}
@@ -1235,8 +1395,8 @@ func (a *Agent) mainChatListHypotheses(args map[string]string) (string, error) {
 		return "No hypotheses match. The ledger is empty for this run.", nil
 	}
 	return mainChatReadResult(
-		fmt.Sprintf("Hypotheses (match=%d, evidence_items=%d):", matched, ledger.EvidenceCount()),
-		lines, matched,
+		fmt.Sprintf("Hypotheses (match=%d, offset=%d, evidence_items=%d):", matched, offset, ledger.EvidenceCount()),
+		lines, matched, offset,
 	), nil
 }
 
@@ -1251,6 +1411,7 @@ func (a *Agent) mainChatListHints(args map[string]string) (string, error) {
 	}
 	state := strings.ToLower(strings.TrimSpace(args["state"]))
 	limit := mainChatReadLimit(args["limit"])
+	offset := mainChatReadOffset(args["offset"])
 	var states []graph.State
 	switch state {
 	case "", "all":
@@ -1274,12 +1435,14 @@ func (a *Agent) mainChatListHints(args map[string]string) (string, error) {
 		return nodes[i].ID < nodes[j].ID
 	})
 	lines := make([]string, 0, limit)
+	matched := 0
 	for _, n := range nodes {
-		if len(lines) >= limit {
-			break
-		}
 		msg := strings.TrimSpace(stringField(n.PayloadJSON(), "message"))
 		if msg == "" {
+			continue
+		}
+		matched++
+		if matched <= offset || len(lines) >= limit {
 			continue
 		}
 		key := strings.TrimSpace(n.UnitKey)
@@ -1288,10 +1451,229 @@ func (a *Agent) mainChatListHints(args map[string]string) (string, error) {
 		}
 		lines = append(lines, fmt.Sprintf("- %s | %s | %s", key, n.State, clipSnapshotText(msg, 240)))
 	}
-	if len(lines) == 0 {
+	if matched == 0 {
 		return "No operator hints recorded for this run.", nil
 	}
-	return mainChatReadResult(fmt.Sprintf("Operator hints (match=%d):", len(nodes)), lines, len(nodes)), nil
+	return mainChatReadResult(fmt.Sprintf("Operator hints (match=%d, offset=%d):", matched, offset), lines, matched, offset), nil
+}
+
+// mainChatReadNotes reads the run's notes from both the engine note store and
+// the tool note store (add_note writes the latter). Read-only and bounded.
+func (a *Agent) mainChatReadNotes(args map[string]string) string {
+	if a == nil || a.scanCtx == nil {
+		return "error: scan context unavailable"
+	}
+	merged := map[string]string{}
+	if a.scanCtx.Notes != nil {
+		for k, v := range a.scanCtx.Notes.GetAll() {
+			merged[k] = v
+		}
+	}
+	for k, v := range notes.GetAllNotesForContext(a.scanCtx.ID) {
+		merged[k] = v
+	}
+	key := strings.TrimSpace(args["key"])
+	if key != "" {
+		v, ok := merged[key]
+		if !ok {
+			return "note not found: " + key
+		}
+		return truncateMainChatText(v, 4000)
+	}
+	if len(merged) == 0 {
+		return "No notes recorded for this run yet."
+	}
+	keys := make([]string, 0, len(merged))
+	for k := range merged {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	fmt.Fprintf(&b, "Notes (%d):", len(merged))
+	for _, k := range keys {
+		line := fmt.Sprintf("\n- %s: %s", k, clipSnapshotText(merged[k], 600))
+		if b.Len()+len(line) > mainChatReadChars {
+			fmt.Fprintf(&b, "\n… output truncated; narrow with key=.")
+			break
+		}
+		b.WriteString(line)
+	}
+	return b.String()
+}
+
+// mainChatReadInfoItem resolves a ledger hypothesis/evidence or a unified
+// information-space item by ID. Read-only.
+func (a *Agent) mainChatReadInfoItem(args map[string]string) string {
+	id := strings.TrimSpace(args["id"])
+	if id == "" {
+		return "error: id is required"
+	}
+	if a.scanCtx != nil && a.scanCtx.Ledger != nil {
+		for _, h := range a.scanCtx.Ledger.All() {
+			if h.ID == id {
+				return fmt.Sprintf("belief %s [%s] %s @ %s conf=%.2f\nnext: %s", h.ID, h.Status,
+					h.VulnClass, h.Endpoint, h.Confidence, truncateMainChatText(h.NextAction, 800))
+			}
+			for _, ev := range h.Evidence {
+				if ev.ID != id {
+					continue
+				}
+				return fmt.Sprintf("evidence %s (hypothesis %s, kind=%s, nature=%s)\n%s\nrequest: %s\nresponse: %s",
+					ev.ID, h.ID, ev.Kind, ev.Nature, truncateMainChatText(ev.Summary, 1200),
+					truncateMainChatText(ev.Request, 1200), truncateMainChatText(ev.Response, 1200))
+			}
+		}
+	}
+	if strings.HasPrefix(id, "to_") && a.scanCtx != nil && a.scanCtx.ToolOutputs != nil {
+		if content, ok := a.scanCtx.ToolOutputs.Get(id); ok {
+			return "tool_output " + id + " (archived raw output)\n" + truncateMainChatText(content, 4000)
+		}
+	}
+	repo := graph.Backend()
+	reader, ok := repo.(infospace.ItemReader)
+	if !ok {
+		return "info item not found: " + id
+	}
+	ctx, cancel := planGraphContext()
+	defer cancel()
+	item, found, err := reader.Item(ctx, infospace.ItemQuery{RunID: a.planGraphScanID(), InfoID: id})
+	if err != nil || !found {
+		return "info item not found: " + id
+	}
+	return fmt.Sprintf("info_item %s [%s/%s/%s]\npayload: %s", item.InfoID, item.Layer, item.Kind, item.State,
+		truncateMainChatText(string(item.Payload), 4000))
+}
+
+// mainChatReadToolOutput returns one archived raw tool output by retrieval id.
+func (a *Agent) mainChatReadToolOutput(args map[string]string) string {
+	id := strings.TrimSpace(args["id"])
+	if id == "" {
+		return "error: id is required"
+	}
+	if a == nil || a.scanCtx == nil || a.scanCtx.ToolOutputs == nil {
+		return "error: tool archive unavailable"
+	}
+	content, ok := a.scanCtx.ToolOutputs.Get(id)
+	if !ok {
+		return "tool output not found: " + id
+	}
+	return truncateMainChatText(content, mainChatReadChars)
+}
+
+// mainChatListCoverage lists endpoint × class coverage. Probed pairs are raw
+// request coverage; verified pairs are verifier-attributed execution.
+func (a *Agent) mainChatListCoverage(args map[string]string) string {
+	if a == nil || a.scanCtx == nil || a.scanCtx.Coverage == nil {
+		return "error: coverage store unavailable"
+	}
+	probed, verified := a.scanCtx.Coverage.Snapshot()
+	verifiedOnly := strings.EqualFold(strings.TrimSpace(args["verified_only"]), "true")
+	limit := mainChatReadLimit(args["limit"])
+	offset := mainChatReadOffset(args["offset"])
+	endpoints := make([]string, 0, len(probed)+len(verified))
+	seen := map[string]bool{}
+	for ep := range probed {
+		if !seen[ep] {
+			seen[ep] = true
+			endpoints = append(endpoints, ep)
+		}
+	}
+	for ep := range verified {
+		if !seen[ep] {
+			seen[ep] = true
+			endpoints = append(endpoints, ep)
+		}
+	}
+	sort.Strings(endpoints)
+	lines := make([]string, 0, limit)
+	matched := 0
+	for _, ep := range endpoints {
+		v := verified[ep]
+		if verifiedOnly && len(v) == 0 {
+			continue
+		}
+		matched++
+		if matched <= offset || len(lines) >= limit {
+			continue
+		}
+		line := fmt.Sprintf("- %s | probed=%s", ep, strings.Join(probed[ep], ","))
+		if len(v) > 0 {
+			line += " | verified=" + strings.Join(v, ",")
+		}
+		lines = append(lines, truncStr(line, 300))
+	}
+	if matched == 0 {
+		return "No coverage pairs recorded yet."
+	}
+	return mainChatReadResult(fmt.Sprintf("Coverage (match=%d, offset=%d):", matched, offset), lines, matched, offset)
+}
+
+// mainChatListAssets lists the project assets linked to this run.
+func (a *Agent) mainChatListAssets(args map[string]string) string {
+	repo := assets.Backend()
+	runID := a.planGraphScanID()
+	if repo == nil || runID == "" {
+		return "error: asset graph unavailable"
+	}
+	ctx, cancel := planGraphContext()
+	defer cancel()
+	all, err := repo.ListTaskAssets(ctx, runID)
+	if err != nil {
+		return "error: " + err.Error()
+	}
+	kind := strings.ToLower(strings.TrimSpace(args["kind"]))
+	limit := mainChatReadLimit(args["limit"])
+	offset := mainChatReadOffset(args["offset"])
+	sort.SliceStable(all, func(i, j int) bool {
+		if all[i].Kind != all[j].Kind {
+			return all[i].Kind < all[j].Kind
+		}
+		return all[i].Key < all[j].Key
+	})
+	lines := make([]string, 0, limit)
+	matched := 0
+	for _, asset := range all {
+		if kind != "" && kind != "all" && string(asset.Kind) != kind {
+			continue
+		}
+		matched++
+		if matched <= offset || len(lines) >= limit {
+			continue
+		}
+		line := fmt.Sprintf("- %s %s", asset.Kind, asset.Key)
+		if asset.DisplayName != "" && asset.DisplayName != asset.Key {
+			line += " (" + asset.DisplayName + ")"
+		}
+		lines = append(lines, truncStr(line, 240))
+	}
+	if matched == 0 {
+		return "No assets linked to this run yet."
+	}
+	return mainChatReadResult(fmt.Sprintf("Assets (match=%d, offset=%d):", matched, offset), lines, matched, offset)
+}
+
+// mainChatListDeviations lists executor-recorded deviations.
+func (a *Agent) mainChatListDeviations(args map[string]string) string {
+	if a == nil || a.scanCtx == nil || a.scanCtx.Ledger == nil {
+		return "error: ledger unavailable"
+	}
+	all := a.scanCtx.Ledger.Deviations()
+	limit := mainChatReadLimit(args["limit"])
+	offset := mainChatReadOffset(args["offset"])
+	lines := make([]string, 0, limit)
+	matched := 0
+	for _, d := range all {
+		matched++
+		if matched <= offset || len(lines) >= limit {
+			continue
+		}
+		line := fmt.Sprintf("- intent=%s agent=%s: %s", d.IntentID, d.AgentID, clipSnapshotText(d.Text, 240))
+		lines = append(lines, truncStr(line, 300))
+	}
+	if matched == 0 {
+		return "No deviations recorded for this run."
+	}
+	return mainChatReadResult(fmt.Sprintf("Deviations (match=%d, offset=%d):", matched, offset), lines, matched, offset)
 }
 
 func mainChatHypothesisLine(h scanctx.Hypothesis) string {

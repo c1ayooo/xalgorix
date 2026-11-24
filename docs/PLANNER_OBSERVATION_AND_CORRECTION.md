@@ -1,8 +1,17 @@
 # Planner 观测、纠偏与停滞治理（轻量设计草案）
 
-> **状态**：草案，未实现。本文只定义目标行为、判定口径与实施边界，不改动当前代码。
+> **状态**：核心机制已落地，阈值表仍以代码为准。2026-11-24 控制审查整改后，
+> §3 的进展账本（note 实质变化去重、活动工具暂停停滞时钟）、§4.1 的 typed kill
+> 校验（`stagnant`/`budget_exhausted`、拒绝不降级）、planner 不再因满池阻塞
+> supervision、以及 owner 围栏的原子结算都已实现。当前默认值：execution lane
+> 无进展 20m 回收、kill guard 窗口 2m；`XALGORIX_WORKER_PROGRESS_TIMEOUT=off`
+> 显式关闭。本文表格（10/15/25/30m）是目标设计，不是当前生效合同。
 >
 > **定位**：替代“execution profile”式的场景枚举。场景差异由**任务自带的两段提示词**表达；planner 只做规划与纠偏；安全与状态一致性仍由代码不变量保证。
+>
+> **当前回收覆盖**：独立进度看门狗只覆盖 execution lane（它占用容器槽）。control-plane lane 依赖短合同
+> timebox，analysis lane 依赖合同预算；两者仍会向 planner 上报停滞，但引擎不会用 execution 的 20m
+> 时钟去回收。观察告警、独立回收、任务预算是三种不同保证，复盘时不可互相替代。
 >
 > **边界**：图/信息空间的查询能力由 `docs/INFO_AS_GRAPH_SPEC.md` 定义（另一会话维护）。本文不定义存储、读视图、迁移或检索算法，只定义 planner 如何消费这些查询、如何观测 worker、何时纠正或终止。
 

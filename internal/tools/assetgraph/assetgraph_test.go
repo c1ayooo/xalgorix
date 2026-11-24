@@ -35,6 +35,12 @@ func (f *fakeRepo) ListProjectAssets(context.Context, assets.AssetFilter) ([]ass
 func (f *fakeRepo) GetAssetDetail(context.Context, string, int64) (assets.AssetDetail, error) {
 	return assets.AssetDetail{}, nil
 }
+func (f *fakeRepo) RecordLocator(_ context.Context, in assets.LocatorInput) (*assets.Locator, error) {
+	return &assets.Locator{ID: 1, ProjectID: in.ProjectID, AssetID: in.AssetID, Locator: in.Locator}, nil
+}
+func (f *fakeRepo) ListAssetLocators(context.Context, string, int64) ([]assets.Locator, error) {
+	return nil, nil
+}
 func (f *fakeRepo) MergeAssets(context.Context, string, int64, int64, string) error { return nil }
 func (f *fakeRepo) SetAssetsArchived(context.Context, string, []int64, bool, string) (int, error) {
 	return 0, nil

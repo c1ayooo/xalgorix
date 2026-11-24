@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/c1ayooo/xalgorix/v4/internal/graph"
 	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
@@ -67,14 +68,36 @@ func TestSyncExplorationGraphProjectsBeliefsFactsGoals(t *testing.T) {
 	}
 
 	goals, _ := store.ListNodes(ctx, "run-proj", graph.KindGoal)
-	if len(goals) != 1 {
-		t.Fatalf("goals = %d, want 1", len(goals))
+	if len(goals) != 2 {
+		t.Fatalf("goals = %d, want root + one criterion", len(goals))
 	}
-	if goals[0].UnitKey != "criterion-1" || goals[0].State != graph.StateOpen {
-		t.Fatalf("goal node = %+v", goals[0])
+	var rootGoal, criterionGoal *graph.Node
+	for i := range goals {
+		switch goals[i].UnitKey {
+		case "GOAL":
+			rootGoal = &goals[i]
+		case "criterion-1":
+			criterionGoal = &goals[i]
+		}
+	}
+	if rootGoal == nil || criterionGoal == nil {
+		t.Fatalf("goal nodes = %+v", goals)
+	}
+	if rootGoal.State != graph.StateOpen || criterionGoal.State != graph.StateOpen {
+		t.Fatalf("goal states = root:%s criterion:%s", rootGoal.State, criterionGoal.State)
+	}
+	edges, _ := store.ListEdges(ctx, "run-proj")
+	var rootSpawnsCriterion bool
+	for _, e := range edges {
+		if e.Rel == graph.RelSpawns && e.SrcID == rootGoal.ID && e.DstID == criterionGoal.ID {
+			rootSpawnsCriterion = true
+		}
+	}
+	if !rootSpawnsCriterion {
+		t.Fatalf("missing root->criterion spawns edge: %+v", edges)
 	}
 
-	edges, _ := store.ListEdges(ctx, "run-proj")
+	edges, _ = store.ListEdges(ctx, "run-proj")
 	var supports bool
 	for _, e := range edges {
 		if e.Rel == graph.RelSupports && e.SrcID == fact.ID && e.DstID == belief.ID {
@@ -104,4 +127,37 @@ func TestSyncExplorationGraphProjectsBeliefsFactsGoals(t *testing.T) {
 	if !sawBelief {
 		t.Fatalf("units missing proven belief: %+v", units)
 	}
+}
+
+// TestStartGraphProjectionLoopProjectsWithoutInput pins XALG009: while the main
+// chat is idle, the shared ledger is still folded into the graph within the
+// projection interval.
+func TestStartGraphProjectionLoopProjectsWithoutInput(t *testing.T) {
+	store := graph.NewMemoryStore()
+	graph.SetBackend(store)
+	t.Cleanup(func() { graph.SetBackend(nil) })
+
+	sctx := scanctx.New("scan-proj-loop", "")
+	sctx.Ledger.Upsert(scanctx.Hypothesis{
+		Title: "idle projection", VulnClass: "sqli", Endpoint: "/idle",
+		Status: scanctx.HypothesisQueued, Confidence: 0.5, Origin: "worker",
+	})
+	a := &Agent{scanCtx: sctx, state: NewScanState(), ctx: context.Background()}
+	a.state.ScanContextID = sctx.ID
+
+	old := mainChatGraphProjectionInterval
+	mainChatGraphProjectionInterval = 5 * time.Millisecond
+	t.Cleanup(func() { mainChatGraphProjectionInterval = old })
+
+	stop := a.startGraphProjectionLoop()
+	t.Cleanup(stop)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		nodes, _ := store.ListNodes(context.Background(), sctx.ID, graph.KindBelief)
+		if len(nodes) > 0 {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("idle main chat did not project the ledger into the graph")
 }

@@ -485,6 +485,38 @@ func hookReconResultTracker(state *ScanState, args map[string]string) HookResult
 	if state == nil {
 		return HookResult{}
 	}
+	before := reconCompletedDimensionCount(state)
+	res := hookReconResultTrackerInner(state, args)
+	if reconCompletedDimensionCount(state) > before {
+		// A newly completed recon dimension is an information-layer increment
+		// for the worker that produced it (XALG004).
+		noteEngineProgress(state)
+	}
+	return res
+}
+
+// reconCompletedDimensionCount counts completed boolean recon dimensions. It is
+// a cheap change detector for progress attribution; the maps are not counted
+// because their growth is already implied by the dimension booleans.
+func reconCompletedDimensionCount(state *ScanState) int {
+	if state == nil {
+		return 0
+	}
+	rc := state.ReconCoverage
+	n := 0
+	for _, done := range []bool{
+		rc.DNSResolved, rc.ServicesProbed, rc.HTTPProbed, rc.TechFingerprinted,
+		rc.Crawled, rc.JSAnalyzed, rc.APISurfaceDiscovered, rc.ParamDiscovered,
+		rc.HistoricalChecked, rc.SubdomainEnumerated,
+	} {
+		if done {
+			n++
+		}
+	}
+	return n
+}
+
+func hookReconResultTrackerInner(state *ScanState, args map[string]string) HookResult {
 	toolName := args["tool_name"]
 	errStr := strings.TrimSpace(args["error"])
 	out := args["output"]

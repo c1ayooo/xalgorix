@@ -1728,7 +1728,32 @@ func runShellInternal(contextID string, command string) (string, int) {
 }
 
 func runShellInternalContext(parent context.Context, contextID string, command string) (string, int) {
+	// R1: a target that asked for a pause (429 + Retry-After) must not be
+	// probed by a different tool. Return a soft result, not a failure.
+	if sc := scanctx.Get(contextID); sc != nil {
+		if msg := sc.TargetBackoffMessage(); msg != "" {
+			return msg, 0
+		}
+	}
 	contextID = normalizeContextID(contextID)
+	// R4: shared Engagement budget (global slot for one command/tool run).
+	var ticket *scanctx.Ticket
+	if sc := scanctx.Get(contextID); sc != nil {
+		if budget := sc.Egress(); budget != nil {
+			base := parent
+			if base == nil {
+				base = context.Background()
+			}
+			acqCtx, cancel := context.WithTimeout(base, 30*time.Second)
+			t, aerr := budget.Acquire(acqCtx, "")
+			cancel()
+			if aerr != nil {
+				return scanctx.EgressSoftMessage(aerr), 0
+			}
+			ticket = t
+			defer func() { ticket.Done(0, 0) }()
+		}
+	}
 	// Ensure venv exists. This is pre-launch work, so it must observe the
 	// same cancellation as the command itself.
 	ensureVenv(parent)

@@ -176,6 +176,9 @@ func (o *einoObserver) BeforeTool(_ context.Context, name string, args map[strin
 	if blocked, reason := a.shouldBlockForDelegationDuplicate(name, merged); blocked {
 		return block("⛔ DELEGATION DUPLICATE — ", reason)
 	}
+	if name == "complete_work" && !a.state.DelegatedAgent {
+		return block("⛔ COMPLETE_WORK IS RESERVED FOR DELEGATED WORKERS — ", "the root scan must use finish; complete_work only settles one delegated intent.")
+	}
 	if name == "finish" {
 		finish := a.hooks.Fire(OnFinishAttempt, a.state, nil)
 		if finish.Block {
@@ -269,6 +272,16 @@ func (o *einoObserver) AfterTool(_ context.Context, name string, args map[string
 		if v, ok := metadata["skill_duplicate"].(bool); ok && v {
 			merged["skill_duplicate"] = "true"
 		}
+		// add_note reports whether the write actually changed the stored value.
+		// A repeated identical write is a successful call but not an
+		// information-layer increment.
+		if v, ok := metadata["state_changed"].(bool); ok {
+			if v {
+				merged["state_changed"] = "true"
+			} else {
+				merged["state_changed"] = "false"
+			}
+		}
 	}
 	if callErr == nil && isExecChannelTool(name) {
 		a.execTimeoutStreak.Store(0)
@@ -298,6 +311,23 @@ func (o *einoObserver) AfterTool(_ context.Context, name string, args map[string
 		Output: output, Error: merged["error"], Success: merged["error"] == "",
 		Metadata: metadata,
 	}, TotalTokens: a.syncBudgetTokens()})
+
+	// Worker completion protocol: complete_work ends only this delegated lane.
+	// It never runs the root scan's finish assessment and never creates a
+	// finding; the pool's ConcludeIntent path remains the settlement authority.
+	if metadata != nil {
+		if v, ok := metadata["work_completed"].(bool); ok && v && callErr == nil && a.state.DelegatedAgent {
+			// Persist the declared lane outcome before the lane ends: the
+			// scheduler's conclusion gate reads it (INTEL_HANDOFF_SPEC D6).
+			if a.scanCtx != nil && a.scanCtx.Progress != nil {
+				exit, _ := metadata["exit"].(string)
+				reason, _ := metadata["blocked_reason"].(string)
+				a.scanCtx.Progress.RecordExit(a.ID, exit, reason)
+			}
+			a.completeWithFinish(output, func() int { return a.syncBudgetTokens() })
+			return
+		}
+	}
 
 	if a.targetUnresponsiveAfterTool(previousTargetErrors) {
 		return

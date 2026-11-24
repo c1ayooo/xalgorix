@@ -229,7 +229,7 @@ http_request / --noproxy curl 均不可达。
 #### P1-1 攻击 lane 的并发预算（worker 5，容器上限 3）
 
 - worker 池设为 5（`XALGORIX_WORKER_CONCURRENCY=5`）；运行中的 pool 支持热扩容/缩容（`Pool.SetWorkers`：扩容立即加 loop，缩容等待当前 intent 结束后退出）。并发上限硬约束为设置值：`Pool.SetWorkers` 同时同步 `agentsgraph.SetMaxConcurrent`，扩容后排队中的 worker 立即出队，不会出现“池扩了但图仍按旧上限排队”；
-- **planner 生产侧背压**：N 个 worker 全忙时 planner 阻塞在 `Pool.WaitForSlot`，worker settle 后被唤醒；每轮新增 intent 上限同步为 N。open intent 不再先于执行无限堆积；
+- **planner 生产侧准入**：N 个 worker 全忙时 planner 不阻塞，`Pool.AvailableSlots` 在 apply 时把新增 intent 裁到空闲槽位数；读图、steer、kill 保持即时。open intent 不再先于执行无限堆积；
 - **worker 预算**：默认 60 分钟；执行 lane（container/web/task）合同 timebox 只可缩短到 30 分钟下限，避免 10 分钟就把正在拿 flag 的 worker 杀掉；control-plane API lane 仍按短 timebox；
 - **超时必须真正停 worker**：`WaitWorkerResult` 超时后调用 `KillWorker` 再结算 exhausted，禁止“图里已 exhausted、进程还在打容器”；
 - 为 container attack intent 预留至少 2–3 个槽，编排 lane 不再吃满全部槽；
@@ -342,7 +342,7 @@ where instance_id='03dca344d00df6b0f1fd3d2fb8d38d4d'
 | P0-2 网络可达 | 已实现（配置项） | `XALGORIX_TOOLBOX_NETWORK_MODE=internal|host`；host 模式 `NetworkMode=host`、不建项目桥、不注 CDP 端口映射；本机 `.xalgorix.env` 已设 `host` |
 | P0-3 截止停止 | 已实现（已收紧） | `hookPlatformFinished` 只认平台级结束信号：仅 `http_request`（`/challenges`）或 terminal/python 的 `/challenges` 调用可触发；排除 `max active challenge instances` 这类槽位限流；`read_notes` / `read_ledger` 等本地读永远不能停任务。命中才写 `platform_finished` 并取消 scan |
 | P1-1 三攻击 lane | 已实现（派生侧） | materializer 以 `Workers`（设置值）为上限补容器攻击 intent；执行面与编排面分离后不再被 API lane 吃掉；`Pool.SetWorkers` 同步 `agentsgraph.SetMaxConcurrent`，扩容立即出队 |
-| P1-1a 生产侧背压 | 已实现 | planner 在 N 个 worker 全忙时阻塞于 `Pool.WaitForSlot`，worker settle 后唤醒；每轮新增 intent 上限 = 设置 worker 数，open intent 不再无限堆积 |
+| P1-1a 生产侧准入 | 已实现 | `Pool.AvailableSlots` 在 apply 时裁剪新增 intent；池满不阻塞 planner 纠偏；每轮新增上限 = 空闲槽位，open intent 不再无限堆积 |
 | P1-1b worker 预算 | 已实现 | 默认 60 分钟；执行 lane timebox 下限 30 分钟；control-plane API lane 仍用短 timebox；超时先 `KillWorker` 再结算 exhausted |
 | P1-2 cycle 约束 | 部分实现 | 同 endpoint 的 read/state 编排 intent 5 分钟内不重复；`/start` `/submit` `/close` 不受限；prompt 增加“禁止假 flag / API lane 只编排”规则 |
 | P2 conformance | 已实现 | `CheckProjection` 对 `intent-result:*` 回执 fact 不再报 stale |

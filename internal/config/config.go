@@ -44,9 +44,19 @@ type Config struct {
 	Orchestrator string // XALGORIX_ORCHESTRATOR
 	// WorkerConcurrency is the planner_worker pool size, clamped to 1..10.
 	WorkerConcurrency int    // XALGORIX_WORKER_CONCURRENCY, default 3
-	Checklist         string // XALGORIX_CHECKLIST - full or professional
-	LLMProfile        string // XALGORIX_LLM_PROFILE — active credential pointer "<provider>:<profileId>" (v4.4.22+)
-	ReasoningEffort   string // XALGORIX_REASONING_EFFORT — "none", "low", "medium", "high", or "xhigh"
+	Checklist         string // XALGORIX_CHECKLIST - lean (default) | professional | full
+	// NoiseProfile is the engagement's traffic posture. It scopes how much
+	// active discovery the engine may DEMAND (never what an operator may
+	// request explicitly):
+	//   quiet    - evidence-led only: JavaScript/crawl/API artifacts + targeted
+	//              probes; no wordlist content discovery, no port sweep.
+	//   balanced - bounded defaults: one wordlist pass only when the inventory
+	//              is thin; top-ports service discovery only in deep mode.
+	//   loud     - full obligations (wordlist per host, deep service discovery).
+	// XALGORIX_NOISE_PROFILE, default "balanced".
+	NoiseProfile    string
+	LLMProfile      string // XALGORIX_LLM_PROFILE — active credential pointer "<provider>:<profileId>" (v4.4.22+)
+	ReasoningEffort string // XALGORIX_REASONING_EFFORT — "none", "low", "medium", "high", or "xhigh"
 
 	// Language is the output language for human-readable AI content — agent
 	// reasoning, notes, vulnerability findings, and post-scan chat. It does
@@ -444,7 +454,12 @@ type Config struct {
 	RateLimitWindow   int // XALGORIX_RATE_LIMIT_WINDOW — window in seconds
 	RateLimitRPS      float64
 	RateLimitBurst    int
-	TLSSkipVerify     bool
+	// Engagement-wide egress budget (R4), shared by every worker.
+	EgressMaxConcurrency     int     // XALGORIX_EGRESS_MAX_CONCURRENCY, default 8
+	EgressPerHostConcurrency int     // XALGORIX_EGRESS_PER_HOST_CONCURRENCY, default 4
+	EgressPerHostRPS         float64 // XALGORIX_EGRESS_PER_HOST_RPS, 0 = inherit global
+	EgressTotalBudget        int64   // XALGORIX_EGRESS_TOTAL_BUDGET, 0 = unlimited
+	TLSSkipVerify            bool
 
 	// Caido proxy
 	CaidoPort     int    // CAIDO_PORT
@@ -654,7 +669,8 @@ func load() *Config {
 		DisabledSpecialists:      envOrStringSlice("XALGORIX_DISABLED_SPECIALISTS"),
 		Orchestrator:             envOr("XALGORIX_ORCHESTRATOR", "planner_worker"),
 		WorkerConcurrency:        envOrInt("XALGORIX_WORKER_CONCURRENCY", 3),
-		Checklist:                envOrChecklist(envOr("XALGORIX_CHECKLIST", "full")),
+		Checklist:                envOrChecklist(envOr("XALGORIX_CHECKLIST", "lean")),
+		NoiseProfile:             NormalizeNoiseProfile(envOr("XALGORIX_NOISE_PROFILE", "")),
 		LLMProfile:               envOr("XALGORIX_LLM_PROFILE", ""),
 		ReasoningEffort:          envOr("XALGORIX_REASONING_EFFORT", "high"),
 		Language:                 NormalizeLanguage(envOr("XALGORIX_LANGUAGE", DefaultLanguage)),
@@ -751,11 +767,15 @@ func load() *Config {
 		ScanRetentionDays: envOrInt("XALGORIX_SCAN_RETENTION_DAYS", 0),
 
 		// Rate limiting (defaults: 60 requests per 60 seconds)
-		RateLimitRequests: envOrInt("XALGORIX_RATE_LIMIT_REQUESTS", 60),
-		RateLimitWindow:   envOrInt("XALGORIX_RATE_LIMIT_WINDOW", 60),
-		RateLimitRPS:      envOrFloat("XALGORIX_RATE_RPS", 10),
-		RateLimitBurst:    envOrInt("XALGORIX_RATE_BURST", 20),
-		TLSSkipVerify:     envOrBool("XALGORIX_TLS_SKIP_VERIFY", envOrBool("XALGORIX_TLS_INSECURE_SKIP_VERIFY", false)),
+		RateLimitRequests:        envOrInt("XALGORIX_RATE_LIMIT_REQUESTS", 60),
+		RateLimitWindow:          envOrInt("XALGORIX_RATE_LIMIT_WINDOW", 60),
+		RateLimitRPS:             envOrFloat("XALGORIX_RATE_RPS", 10),
+		RateLimitBurst:           envOrInt("XALGORIX_RATE_BURST", 20),
+		EgressMaxConcurrency:     envOrInt("XALGORIX_EGRESS_MAX_CONCURRENCY", 8),
+		EgressPerHostConcurrency: envOrInt("XALGORIX_EGRESS_PER_HOST_CONCURRENCY", 4),
+		EgressPerHostRPS:         envOrFloat("XALGORIX_EGRESS_PER_HOST_RPS", 0),
+		EgressTotalBudget:        int64(envOrInt("XALGORIX_EGRESS_TOTAL_BUDGET", 0)),
+		TLSSkipVerify:            envOrBool("XALGORIX_TLS_SKIP_VERIFY", envOrBool("XALGORIX_TLS_INSECURE_SKIP_VERIFY", false)),
 
 		// Caido
 		CaidoPort:     envOrInt("CAIDO_PORT", 0), // 0 = auto-detect
@@ -1396,12 +1416,39 @@ func ParseAPIKeyList(raw string) []string {
 }
 
 // envOrChecklist validates the XALGORIX_CHECKLIST value.
+//
+// lean is the default: the engine's methodology lives in the graph/recon
+// evidence and the worker's hypothesis protocol, not in a 22-phase answer
+// sheet. full/professional remain opt-in for operators who explicitly want the
+// checklist text in the root prompt.
 func envOrChecklist(raw string) string {
-	v := strings.ToLower(strings.TrimSpace(raw))
-	if v == "professional" {
-		return "professional"
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "full", "professional":
+		return strings.ToLower(strings.TrimSpace(raw))
+	default:
+		return "lean"
 	}
-	return "full"
+}
+
+// Canonical noise profiles. Kept in config so every consumer (agent state,
+// planner, prompts) reads the same closed set.
+const (
+	NoiseQuiet    = "quiet"
+	NoiseBalanced = "balanced"
+	NoiseLoud     = "loud"
+)
+
+// NormalizeNoiseProfile maps any input to the closed set, defaulting to
+// balanced (the historical engine posture).
+func NormalizeNoiseProfile(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case NoiseQuiet, "low", "stealth", "passive":
+		return NoiseQuiet
+	case NoiseLoud, "high", "aggressive":
+		return NoiseLoud
+	default:
+		return NoiseBalanced
+	}
 }
 
 // envJSONMap parses a JSON object environment variable into a string map.

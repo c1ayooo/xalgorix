@@ -11,7 +11,7 @@ func TestRecordHypothesisRequiresPreconditions(t *testing.T) {
 	a := &Agent{scanCtx: scanctx.New("scan-test", "")}
 	t.Cleanup(a.scanCtx.Close)
 
-	res, err := a.recordHypothesisTool(map[string]string{"vuln_class": "idor", "endpoint": "/orders"})
+	res, err := a.recordHypothesisTool(map[string]string{"vuln_class": "idor", "endpoint": "/orders", "title": "IDOR on /orders"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -22,6 +22,7 @@ func TestRecordHypothesisRequiresPreconditions(t *testing.T) {
 	res, err = a.recordHypothesisTool(map[string]string{
 		"vuln_class":    "idor",
 		"endpoint":      "/orders",
+		"title":         "IDOR on /orders",
 		"preconditions": "unknown",
 	})
 	if err != nil {
@@ -41,13 +42,13 @@ func TestRecordHypothesisValidatesAndStoresVOI(t *testing.T) {
 	t.Cleanup(a.scanCtx.Close)
 
 	res, err := a.recordHypothesisTool(map[string]string{
-		"vuln_class": "xss", "preconditions": "unknown", "voi": "1.2",
+		"vuln_class": "xss", "title": "Reflected XSS on /search", "preconditions": "unknown", "voi": "1.2",
 	})
 	if err != nil || res.Error == "" {
 		t.Fatalf("expected VOI validation error, got result=%+v err=%v", res, err)
 	}
 	res, err = a.recordHypothesisTool(map[string]string{
-		"vuln_class": "xss", "preconditions": "unknown", "voi": "0.4",
+		"vuln_class": "xss", "title": "Reflected XSS on /search", "preconditions": "unknown", "voi": "0.4",
 	})
 	if err != nil || res.Error != "" {
 		t.Fatalf("record VOI: result=%+v err=%v", res, err)
@@ -61,7 +62,7 @@ func TestRecordHypothesisValidatesAndStoresVOI(t *testing.T) {
 func TestAddEvidenceObservedRequiresRawData(t *testing.T) {
 	a := &Agent{scanCtx: scanctx.New("scan-test", "")}
 	t.Cleanup(a.scanCtx.Close)
-	a.recordHypothesisTool(map[string]string{"vuln_class": "xss", "preconditions": "unknown"})
+	a.recordHypothesisTool(map[string]string{"vuln_class": "xss", "title": "Reflected XSS on /search", "preconditions": "unknown"})
 	h := a.scanCtx.Ledger.All()[0]
 
 	res, err := a.addHypothesisEvidenceTool(map[string]string{
@@ -80,7 +81,7 @@ func TestAddEvidenceObservedRequiresRawData(t *testing.T) {
 func TestAddEvidenceInferredSupportsMustExist(t *testing.T) {
 	a := &Agent{scanCtx: scanctx.New("scan-test", "")}
 	t.Cleanup(a.scanCtx.Close)
-	a.recordHypothesisTool(map[string]string{"vuln_class": "xss", "preconditions": "unknown"})
+	a.recordHypothesisTool(map[string]string{"vuln_class": "xss", "title": "Reflected XSS on /search", "preconditions": "unknown"})
 	h := a.scanCtx.Ledger.All()[0]
 
 	res, err := a.addHypothesisEvidenceTool(map[string]string{

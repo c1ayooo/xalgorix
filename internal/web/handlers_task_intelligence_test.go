@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/c1ayooo/xalgorix/v4/internal/intelaccess"
 	"github.com/c1ayooo/xalgorix/v4/internal/platform"
 	"github.com/c1ayooo/xalgorix/v4/internal/tools/intelligence"
 )
@@ -234,5 +235,95 @@ func TestTaskIntelligenceUnknownTaskIsEmpty(t *testing.T) {
 	}
 	if len(view.Items) != 0 {
 		t.Fatalf("unknown task must aggregate to zero items, got %d", len(view.Items))
+	}
+}
+
+// Confirming an item endorses its derived access row for every run that
+// recorded it, and the same request can add operator grants (M2). Dismissing
+// revokes it; an unparseable grant is refused before anything is written.
+func TestIntelTriageEndorsesDerivedAccessAndGrants(t *testing.T) {
+	s := newPlatformTestServer(t)
+	access := intelaccess.NewMemoryStore()
+	intelaccess.SetStore(access)
+	t.Cleanup(func() { intelaccess.SetStore(nil) })
+
+	fp := ""
+	taskID, _ := intelTestTask(t, s, "intel-access-inst", func(dir string) {
+		fp = intelRecordInto(t, dir, map[string]string{
+			"kind":     "credential",
+			"title":    "Admin panel accepts default creds",
+			"content":  "admin:admin accepted at /app/admin/login",
+			"endpoint": "https://intel.example:8443/app/admin",
+		})
+	})
+
+	rr := doJSON(t, s, http.MethodPatch, "/api/tasks/"+taskID+"/intelligence/"+fp,
+		`{"status":"confirmed","grants":["10.0.177.9:22"]}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("PATCH triage+grants code = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var ack struct {
+		AccessUpdated   int  `json:"access_updated"`
+		AccessAvailable bool `json:"access_available"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &ack); err != nil {
+		t.Fatal(err)
+	}
+	if !ack.AccessAvailable || ack.AccessUpdated != 1 {
+		t.Fatalf("access ack = %+v, want available with one updated run", ack)
+	}
+
+	row, ok, err := access.Get(t.Context(), "intel-access-inst", fp)
+	if err != nil || !ok {
+		t.Fatalf("access row after confirm: ok=%v err=%v", ok, err)
+	}
+	if row.State != intelaccess.StateConfirmed || row.ConfirmedBy != "operator" {
+		t.Fatalf("access row = %+v", row)
+	}
+	wantTargets := map[string]bool{"intel.example:8443": true, "10.0.177.9:22": true}
+	if len(row.Targets) != len(wantTargets) {
+		t.Fatalf("grants = %v, want derived + operator targets", row.Targets)
+	}
+	for _, target := range row.Targets {
+		if !wantTargets[target] {
+			t.Fatalf("unexpected grant %q in %v", target, row.Targets)
+		}
+	}
+
+	// The GET overlay carries the same projection for the UI status column.
+	rr = doJSON(t, s, http.MethodGet, "/api/tasks/"+taskID+"/intelligence", "")
+	var view struct {
+		Items []struct {
+			Access *struct {
+				State   string   `json:"state"`
+				Targets []string `json:"grants"`
+			} `json:"access"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &view); err != nil {
+		t.Fatal(err)
+	}
+	if len(view.Items) != 1 || view.Items[0].Access == nil || view.Items[0].Access.State != intelaccess.StateConfirmed {
+		t.Fatalf("GET access overlay = %+v", view.Items)
+	}
+
+	// An unparseable grant is a 400 before any write.
+	rr = doJSON(t, s, http.MethodPatch, "/api/tasks/"+taskID+"/intelligence/"+fp,
+		`{"status":"dismissed","grants":["not a target"]}`)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("invalid grant code = %d, want 400 (body=%s)", rr.Code, rr.Body.String())
+	}
+	if row, _, _ := access.Get(t.Context(), "intel-access-inst", fp); row.State != intelaccess.StateConfirmed {
+		t.Fatalf("a rejected request must not revoke the row: %+v", row)
+	}
+
+	// Dismissing revokes with an explicit reason.
+	rr = doJSON(t, s, http.MethodPatch, "/api/tasks/"+taskID+"/intelligence/"+fp, `{"status":"dismissed"}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("dismiss code = %d body=%s", rr.Code, rr.Body.String())
+	}
+	row, _, _ = access.Get(t.Context(), "intel-access-inst", fp)
+	if row.State != intelaccess.StateRevoked || row.RevokeReason == "" {
+		t.Fatalf("dismissed access = %+v", row)
 	}
 }

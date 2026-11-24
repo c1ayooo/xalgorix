@@ -227,6 +227,7 @@ func TestSingleAgent_ReconTaskCompletesOnlyUnderComprehensivePredicate(t *testin
 // incomplete, and names the missing dimensions from the same generator.
 func TestSingleAgent_ProfessionalFinishBlocksOnIncompleteRecon(t *testing.T) {
 	state := NewScanState()
+	state.OperatorRequestedDiscovery = true
 	state.ProfessionalAssessment = true
 	state.ReconDone = true
 	state.Iteration = 60
@@ -538,6 +539,7 @@ func TestSingleAgent_DomainScopeRequiresSubdomainEnumeration(t *testing.T) {
 // and inherit content-discovery obligations.
 func TestSingleAgent_DiscoveredSubdomainsEnterHostInventory(t *testing.T) {
 	state := NewScanState()
+	state.OperatorRequestedDiscovery = true
 	satisfyComprehensiveRecon(state)
 	state.ScanTargets = []string{"example.com"}
 	fireExec(state, "subfinder -d example.com", "app.example.com\napi.example.com\nstaging.example.com")
@@ -560,6 +562,7 @@ func TestSingleAgent_DiscoveredSubdomainsEnterHostInventory(t *testing.T) {
 // Scenario 31: content discovery on the app host does not complete the api host.
 func TestSingleAgent_ContentDiscoveryIsPerApplicationHost(t *testing.T) {
 	state := NewScanState()
+	state.OperatorRequestedDiscovery = true
 	satisfyComprehensiveRecon(state)
 	state.DiscoveredEndpoints = []string{"https://app.example.com/", "https://api.example.com/v1/users"}
 	missing := strings.Join(ComprehensiveReconMissing(state), ";")
@@ -571,6 +574,7 @@ func TestSingleAgent_ContentDiscoveryIsPerApplicationHost(t *testing.T) {
 // Scenario 32: a typed covered-by-equivalent-app disposition settles a host.
 func TestSingleAgent_EquivalentAppDispositionSettlesHost(t *testing.T) {
 	state := NewScanState()
+	state.OperatorRequestedDiscovery = true
 	satisfyComprehensiveRecon(state)
 	state.DiscoveredEndpoints = []string{"https://app.example.com/", "https://api.example.com/v1/users"}
 	applied := applyReconDispositions(state, "host api.example.com: covered_by_equivalent_app (api.example.com serves the same backend vhost as app.example.com)")
@@ -586,6 +590,7 @@ func TestSingleAgent_EquivalentAppDispositionSettlesHost(t *testing.T) {
 // Scenario 33: bare discovered hostnames are not lost for lacking https://.
 func TestSingleAgent_BareHostnamesAreNotLost(t *testing.T) {
 	state := NewScanState()
+	state.OperatorRequestedDiscovery = true
 	satisfyComprehensiveRecon(state)
 	state.DiscoveredHosts["files.example.com"] = true
 	hosts := distinctApplicationHosts(state)
@@ -609,6 +614,9 @@ func TestSingleAgent_BareHostnamesAreNotLost(t *testing.T) {
 // Scenario 34: a deep scan owes service discovery (when unsettled).
 func TestSingleAgent_DeepScanRequiresServiceDiscovery(t *testing.T) {
 	state := NewScanState()
+	state.OperatorRequestedPortScan = true
+	state.PortDiscoveryAuthorized = true
+	state.RequestBudgetConfigured = true
 	satisfyComprehensiveRecon(state)
 	state.DeepReconRequired = true
 	missing := strings.Join(ComprehensiveReconMissing(state), ";")
@@ -620,6 +628,9 @@ func TestSingleAgent_DeepScanRequiresServiceDiscovery(t *testing.T) {
 // Scenario 35: a standard scan does not inherit deep obligations.
 func TestSingleAgent_StandardScanSkipsDeepObligations(t *testing.T) {
 	state := NewScanState()
+	state.OperatorRequestedPortScan = true
+	state.PortDiscoveryAuthorized = true
+	state.RequestBudgetConfigured = true
 	satisfyComprehensiveRecon(state)
 	state.DeepReconRequired = false
 	missing := strings.Join(ComprehensiveReconMissing(state), ";")
@@ -777,6 +788,7 @@ func TestSingleAgent_NextLaneSkillRecommendations(t *testing.T) {
 // specialist must reach the root as applicability-scoped directives.
 func TestSingleAgent_DeepReconDirectorGivesRootTheSpecialistPlaybook(t *testing.T) {
 	state := NewScanState()
+	state.OperatorRequestedDiscovery = true
 	state.Iteration = 6
 	state.ReconDone = true
 	state.EndpointInventorySaved = true

@@ -80,7 +80,7 @@ Only the tools listed above exist here. Calling any other tool name (for example
 3. Verify every response: status code, body fields, ids. Never assume a request succeeded because it returned 200.
 4. Record durable results with add_note: challenge ids, container addresses, flags, submission results, and anything a later lane needs. The planner and other lanes read notes, not your transcript.
 5. If the API rejects the credential or route, record the exact status and body in a note and stop the lane. Do not retry blindly and do not pivot into scanning.
-6. Stop when the intent is settled. The scheduler settles the intent when your run ends; there is no finish tool in this lane.
+6. When the API work is complete (or the lane cannot proceed), call complete_work with a short summary and any unfinished/partial items. The scheduler settles the intent; there is no finish tool in this lane.
 
 ## RULES
 

@@ -11,8 +11,9 @@ func TestTaskBlocksPrincipledFinish(t *testing.T) {
 	}{
 		{"recon blocks when recon not done", &ScanState{ReconDone: false}, &Task{ID: "recon"}, true},
 		{"recon does NOT block once ReconDone (stale task status)", &ScanState{ReconDone: true}, &Task{ID: "recon"}, false},
-		{"dirbust blocks when not done", &ScanState{}, &Task{ID: "dirbust"}, true},
-		{"dirbust does NOT block once DirBustingDone", &ScanState{DirBustingDone: true}, &Task{ID: "dirbust"}, false},
+		{"dirbust blocks when owed and not done", &ScanState{OperatorRequestedDiscovery: true}, &Task{ID: "dirbust"}, true},
+		{"dirbust does NOT block once DirBustingDone", &ScanState{OperatorRequestedDiscovery: true, DirBustingDone: true}, &Task{ID: "dirbust"}, false},
+		{"dirbust does NOT block when R1 policy does not owe it", &ScanState{}, &Task{ID: "dirbust"}, false},
 		{"auth-session does NOT block (closes as residual)", &ScanState{}, &Task{ID: "auth-session", VulnClass: "auth"}, false},
 		{"specific-endpoint llm hypothesis is soft (closes as residual)", &ScanState{}, &Task{ID: "x", VulnClass: "sqli", Origin: "llm", Endpoint: "/login"}, false},
 		{"generic auto per-endpoint class task is soft", &ScanState{}, &Task{ID: "x", VulnClass: "sqli", Origin: "auto"}, false},

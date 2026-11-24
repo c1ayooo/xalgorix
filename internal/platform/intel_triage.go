@@ -1,18 +1,21 @@
 package platform
 
 // Intel triage store — operator annotations on recorded intelligence (task
-// detail 情报 tab). The observed intel ITEMS live in <scanDir>/intelligence.json
-// (hot path, written by the record_intelligence tool) and are never mutated by
-// triage; this store holds only the human label, keyed (task_id, fingerprint)
-// so re-recorded observations across runs keep one decision. Field authority:
-// engine observation and human annotation stay separate, conflict kept visible
-// by overlaying at read time (charter §5).
+// detail 情报 tab). The observed intel ITEMS live in the run's intelligence
+// snapshot — the PG run_state_files row (scan_id, kind=intelligence) since
+// R6.1, with intelligence.json only as the test-mode/import fallback — written
+// by the record_intelligence tool and never mutated by triage; this store
+// holds only the human label, keyed (task_id, fingerprint) so re-recorded
+// observations across runs keep one decision. Field authority: engine
+// observation and human annotation stay separate, conflict kept visible by
+// overlaying at read time (charter §5).
 //
 // Dual implementation matches approval_rules (0006): PostgreSQL rows here,
 // platform.json snapshot fields in the file store — one file, both backs.
 // The optional IntelTriageStore interface is type-asserted by the web layer;
 // a file-mode store without triage simply doesn't implement it and triage is
-// unavailable while aggregation still works (charter §9: no-DSN scans run).
+// unavailable while aggregation still works. Production always has a DSN
+// (v3.0 fail-fast, no file-mode scans), so file mode serves test harnesses.
 
 import (
 	"context"

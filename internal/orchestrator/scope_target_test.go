@@ -133,8 +133,8 @@ func TestPlannerPromptScopeRulesOnlyForEngagement(t *testing.T) {
 		t.Fatal("prompt without a configured scope must be unchanged")
 	}
 	bench := plannerPromptFor([]string{"bench.local"}, true)
-	if bench != plannerSystemPrompt+plannerBenchmarkRules {
-		t.Fatal("benchmark prompt must be byte-for-byte unchanged")
+	if bench != plannerSystemPrompt+plannerReasoningRules+plannerBenchmarkRules {
+		t.Fatal("benchmark prompt must be byte-for-byte unchanged apart from the always-on decision discipline")
 	}
 	if strings.Contains(bench, "Engagement scope rules") {
 		t.Fatal("benchmark prompt must not include engagement scope rules")

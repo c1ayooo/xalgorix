@@ -182,6 +182,17 @@ func (ls *LedgerStore) AppendDeviation(intentID, deviation, agentID string) erro
 	if _, err := j.Append(rec); err != nil {
 		return fmt.Errorf("scanctx: append deviation: %w", err)
 	}
+	ls.mu.Lock()
+	ls.deviations = append(ls.deviations, Deviation{
+		IntentID: strings.TrimSpace(intentID),
+		AgentID:  strings.TrimSpace(agentID),
+		Text:     truncate(deviation, 1024),
+		At:       time.Now().UTC(),
+	})
+	if len(ls.deviations) > maxDeviationProjection {
+		ls.deviations = append([]Deviation(nil), ls.deviations[len(ls.deviations)-maxDeviationProjection:]...)
+	}
+	ls.mu.Unlock()
 	return nil
 }
 

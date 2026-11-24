@@ -24,11 +24,10 @@ func TestPlannerWorkerFinishGate(t *testing.T) {
 		t.Fatal("finish must be blocked before any intent exists")
 	}
 
-	n, err := store.UpsertNode(ctx, graph.NodeInput{
+	if _, err := store.UpsertNode(ctx, graph.NodeInput{
 		ScanID: runID, Kind: graph.KindIntent, UnitKey: "recon", State: graph.StateOpen,
 		Priority: 990, Payload: `{"task_id":"recon","phase":1}`,
-	})
-	if err != nil {
+	}); err != nil {
 		t.Fatalf("add intent: %v", err)
 	}
 	if gate := hookFinishGatekeeper(state, nil); !gate.Block || gate.BlockReason == "" {
@@ -41,8 +40,11 @@ func TestPlannerWorkerFinishGate(t *testing.T) {
 	if gate := hookFinishGatekeeper(state, nil); !gate.Block {
 		t.Fatal("finish must be blocked while the intent is running")
 	}
-	if ok, err := store.Transition(ctx, runID, n.ID, graph.KindIntent, graph.StateRunning, graph.StateDone); err != nil || !ok {
-		t.Fatalf("settle: ok=%v err=%v", ok, err)
+	if _, err := store.ConcludeIntent(ctx, runID, claimed.ID, "work#1", graph.StateDone, []graph.NodeInput{{
+		ScanID: runID, Kind: graph.KindFact, State: graph.StateOrigin,
+		UnitKey: "intent-result:recon", Origin: "worker:work#1", Payload: `{"status":"completed"}`,
+	}}); err != nil {
+		t.Fatalf("settle: %v", err)
 	}
 	if gate := hookFinishGatekeeper(state, nil); gate.Block {
 		t.Fatalf("finish must be allowed after the frontier drains: %+v", gate)

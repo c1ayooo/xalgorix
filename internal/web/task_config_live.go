@@ -121,6 +121,13 @@ func (s *Server) applyTaskConfigToLiveRun(ctx context.Context, h *liveRunHandles
 		h.scanCtx.AuditMode = effectiveTaskAuditMode(task, s.cfg)
 	}
 
+	if containsDiff(diff, "objective") && h.agent != nil {
+		// The finish gate and the graph projection read ScanState.Objective, not
+		// the planner brief. Replacing only the brief let a mid-run goal edit
+		// diverge from the closing decision (P0 Mission Continuity).
+		h.agent.SetObjective(agentObjectiveSpec(task.Objective))
+	}
+
 	if containsDiff(diff, "llm_chain", "active_llm") && h.llmClient != nil {
 		eps := s.taskModelEndpoints(ctx, task)
 		if len(eps) > 0 && !h.llmClient.SetChainEndpoints(eps) {
@@ -129,9 +136,15 @@ func (s *Server) applyTaskConfigToLiveRun(ctx context.Context, h *liveRunHandles
 	}
 
 	if containsDiff(diff, "proxy") {
-		applyLiveEgressPin(h.instanceID, task.Proxy)
-		if closed := trafficproxy.CloseScanTunnels(h.instanceID); closed > 0 {
-			log.Printf("[task-config] %s: closed %d tunnel(s) after the egress proxy changed", h.instanceID, closed)
+		// The proxy/tunnel layers key by ScanContext ID, not the instance id.
+		// Using the instance id silently left the old pin in place (XALG022).
+		key := strings.TrimSpace(h.instanceID)
+		if h.scanCtx != nil && strings.TrimSpace(h.scanCtx.ID) != "" {
+			key = strings.TrimSpace(h.scanCtx.ID)
+		}
+		applyLiveEgressPin(key, task.Proxy)
+		if closed := trafficproxy.CloseScanTunnels(key); closed > 0 {
+			log.Printf("[task-config] %s: closed %d tunnel(s) after the egress proxy changed", key, closed)
 		}
 	}
 

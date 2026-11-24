@@ -1041,8 +1041,14 @@ func FormatGaps(gaps []CoverageGap) string {
 // AutoPlan is the FULL-methodology entry (no phase restriction); the
 // phase-scoped variant is AutoPlanFromState, which consults
 // state.AllowedPhases and derives bounded technical prerequisites.
+//
+// This constructor carries no scan state, so it preserves the legacy
+// full-methodology shape (a bounded dirbust task). Production plans are built
+// through AutoPlanFromState, where the R1 progressive-recon policy decides
+// whether active discovery is owed at all.
 func AutoPlan(endpoints []string, detectedTechs map[string]bool) *Plan {
-	return buildEnginePlan(nil, endpoints, detectedTechs, phaseScopeFor(nil))
+	legacy := &ScanState{OperatorRequestedDiscovery: true}
+	return buildEnginePlan(legacy, endpoints, detectedTechs, phaseScopeFor(nil))
 }
 
 // buildEnginePlan is the single engine plan constructor. scope carries the
@@ -1153,6 +1159,13 @@ func buildEnginePlan(state *ScanState, endpoints []string, detectedTechs map[str
 	dirbustWanted := scope.allows(3)
 	if !dirbustWanted && scope.restricted {
 		dirbustWanted = selectionNeedsRouteDiscovery(scope.allowed)
+	}
+	// Noise posture: a quiet engagement never owes a wordlist pass, and a
+	// balanced engagement stops owing one once evidence-led discovery produced a
+	// mature inventory. The task is omitted entirely (not left pending) so the
+	// finish contract and the UI agree with the operator's posture.
+	if dirbustWanted && !contentDiscoveryOwed(state) {
+		dirbustWanted = false
 	}
 	if dirbustWanted {
 		dirbustTitle := "Directory & file discovery (ffuf/gobuster) + hidden paths"

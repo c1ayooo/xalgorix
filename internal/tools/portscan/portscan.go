@@ -80,12 +80,32 @@ Full-range service sweep of a subnet:
 // (registry_test.go pins this), and an unreachable target is a normal finding
 // about the target, not a broken tool.
 func Execute(ctx context.Context, contextID string, args map[string]string) (tools.Result, error) {
+	// R1: no port traffic while the target asked for a pause.
+	if sc := scanctx.Get(contextID); sc != nil {
+		if msg := sc.TargetBackoffMessage(); msg != "" {
+			return tools.Result{Output: msg}, nil
+		}
+	}
+
 	target := strings.TrimSpace(args["target"])
 	if target == "" {
 		return tools.Result{Error: "target is required: pass an IP, CIDR or hostname (this tool never scans a default range)"}, nil
 	}
 	if err := validateTarget(target); err != nil {
 		return tools.Result{Error: err.Error()}, nil
+	}
+	var ticket *scanctx.Ticket
+	if sc := scanctx.Get(contextID); sc != nil {
+		if budget := sc.Egress(); budget != nil {
+			acqCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			t, aerr := budget.Acquire(acqCtx, target)
+			cancel()
+			if aerr != nil {
+				return tools.Result{Output: scanctx.EgressSoftMessage(aerr)}, nil
+			}
+			ticket = t
+			defer func() { ticket.Done(0, 0) }()
+		}
 	}
 
 	ports := strings.TrimSpace(args["ports"])

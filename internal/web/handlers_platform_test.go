@@ -58,6 +58,10 @@ func doJSON(t *testing.T, s *Server, method, path, body string) *httptest.Respon
 		s.handleFindingsSummary(rr, req)
 	case routePath == "/api/scans":
 		s.handleListScans(rr, req)
+	case strings.HasPrefix(routePath, "/api/scans/") && strings.HasSuffix(routePath, "/decisions"):
+		s.handleScanDecisions(rr, req)
+	case strings.HasPrefix(routePath, "/api/scans/") && strings.HasSuffix(routePath, "/intel-access"):
+		s.handleScanIntelAccess(rr, req)
 	case routePath == "/api/schedules":
 		s.handleSchedules(rr, req)
 	case strings.HasPrefix(routePath, "/api/schedules"):

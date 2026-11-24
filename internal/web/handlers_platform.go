@@ -42,6 +42,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/c1ayooo/xalgorix/v4/internal/agent"
 	"github.com/c1ayooo/xalgorix/v4/internal/platform"
 	"github.com/c1ayooo/xalgorix/v4/internal/proxy"
 )
@@ -1502,6 +1503,12 @@ func targetHostPort(target string) (host, port string) {
 	if t == "" {
 		return "", ""
 	}
+	// A CIDR is a scope entry, not a URL path: preserve the mask instead of
+	// truncating at the slash. The agent-side matcher already accepts CIDR, and
+	// the web firewall must agree (XALG020).
+	if _, _, err := net.ParseCIDR(t); err == nil {
+		return strings.ToLower(t), ""
+	}
 	if strings.Contains(t, "://") {
 		if u, err := url.Parse(t); err == nil && u.Host != "" {
 			t = u.Host
@@ -1521,26 +1528,17 @@ func targetHostPort(target string) (host, port string) {
 // use must be listed — including the HTTP/HTTPS default ports. A scheme-less
 // host can be probed over both defaults, so it requires both to be allowed.
 func validateTargetsInScope(targets []string, scope platform.Scope) error {
-	scopeHosts := make([]string, 0, len(scope.Targets))
-	for _, e := range scope.Targets {
-		host, _ := targetHostPort(e)
-		if host != "" {
-			scopeHosts = append(scopeHosts, host)
-		}
-	}
 	for _, t := range targets {
 		host, _ := targetHostPort(t)
 		if host == "" {
 			return fmt.Errorf("target %q is not a valid host", t)
 		}
-		inScope := false
-		for _, entry := range scopeHosts {
-			if hostInScope(host, entry) {
-				inScope = true
-				break
-			}
-		}
-		if !inScope {
+		// Host matching is the shared matcher (XALG020), not a second
+		// implementation. AllowPorts is deliberately not passed: this path has
+		// its own stricter rule — every port a scheme-less target could use
+		// must be listed — and delegating that would loosen it.
+		engagement := &agent.EngagementScope{Targets: scope.Targets}
+		if ok, _ := engagement.DestinationAllowed(t); !ok {
 			return fmt.Errorf("target %q is outside the project scope", t)
 		}
 		if len(scope.AllowPorts) == 0 {
@@ -1597,21 +1595,6 @@ func targetPorts(target string) ([]int, error) {
 		return []int{n}, nil
 	}
 	return []int{80, 443}, nil
-}
-
-// hostInScope matches exact hosts, subdomains of a bare scope entry, and the
-// explicit "*.domain" wildcard form. The wildcard deliberately does not match
-// the apex (the bare domain must be listed separately).
-func hostInScope(host, entry string) bool {
-	host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
-	entry = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(entry)), ".")
-	if host == entry {
-		return true
-	}
-	if suffix, ok := strings.CutPrefix(entry, "*."); ok {
-		return suffix != "" && strings.HasSuffix(host, "."+suffix)
-	}
-	return strings.HasSuffix(host, "."+entry)
 }
 
 func portAllowed(allow []int, port int) bool {

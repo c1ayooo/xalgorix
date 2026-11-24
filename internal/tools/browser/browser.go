@@ -447,6 +447,12 @@ func ensureBrowser(ctxID, proxy string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	requiredProxy := config.Get().ProxyRequired || egressproxy.Required()
+	// Did the caller explicitly choose a proxy ("caido", a URL, "none")? An
+	// auto-resolved run egress pin must NOT look explicit: with interception on,
+	// the run-scoped loopback listener has to be the Chromium proxy so browser
+	// traffic is observable and attributable. The listener forwards through the
+	// same pinned egress (XALG026).
+	explicitProxy := strings.TrimSpace(proxy) != ""
 	// Egress pin (task proxy selector) when interception is off and the caller
 	// did not name a proxy itself. With interception on the run-scoped loopback
 	// listener is used and forwards through this same pinned egress.
@@ -487,7 +493,7 @@ func ensureBrowser(ctxID, proxy string) error {
 		} else {
 			return fmt.Errorf("required browser proxy unavailable: %v", scanErr)
 		}
-	} else if proxy == "" && trafficproxy.Enabled() {
+	} else if !explicitProxy && trafficproxy.Enabled() {
 		// R2b default posture: route Chromium through the traffic proxy so
 		// browser traffic flows through the configured upstream chain and
 		// becomes observable. The per-run listener is preferred: Chromium has
@@ -731,6 +737,29 @@ func browserActionWithContext(ctxID string, args map[string]string) (tools.Resul
 // withBrowserTransportRecoveryCtx) serializes the binding, so no other action
 // can observe or overwrite it.
 func browserActionWithContextCtx(ctx context.Context, ctxID string, args map[string]string) (tools.Result, error) {
+	// R1: a browser action still sends target traffic; honor the target's
+	// Retry-After cooldown before touching the page.
+	if sc := scanctx.Get(ctxID); sc != nil {
+		if msg := sc.TargetBackoffMessage(); msg != "" {
+			return tools.Result{Output: msg}, nil
+		}
+	}
+	// R4: shared Engagement budget for this browser action.
+	if sc := scanctx.Get(ctxID); sc != nil {
+		if budget := sc.Egress(); budget != nil {
+			base := ctx
+			if base == nil {
+				base = context.Background()
+			}
+			acqCtx, cancel := context.WithTimeout(base, 30*time.Second)
+			t, aerr := budget.Acquire(acqCtx, args["url"])
+			cancel()
+			if aerr != nil {
+				return tools.Result{Output: scanctx.EgressSoftMessage(aerr)}, nil
+			}
+			defer func() { t.Done(0, 0) }()
+		}
+	}
 	return withBrowserTransportRecoveryCtx(ctxID, ctx, func() (tools.Result, error) {
 		return dispatchBrowserAction(ctxID, args)
 	})

@@ -81,15 +81,17 @@ var workerDenied = map[string]bool{
 
 // orchestratorTools is the control-plane API lane: HTTP + notes only.
 var orchestratorTools = map[string]bool{
-	"http_request":     true,
-	"read_notes":       true,
-	"add_note":         true,
-	"read_ledger":      true,
-	"read_info_item":   true,
-	"record_deviation": true,
-	"read_tool_output": true,
-	"read_skill":       true,
-	"list_skills":      true,
+	"http_request":      true,
+	"read_notes":        true,
+	"add_note":          true,
+	"read_ledger":       true,
+	"read_info_item":    true,
+	"read_intelligence": true,
+	"record_deviation":  true,
+	"read_tool_output":  true,
+	"read_skill":        true,
+	"list_skills":       true,
+	"complete_work":     true,
 	// Deterministic decision aids: pure text/byte inputs, no network or
 	// execution, so they are safe on the control-plane lane too.
 	"detect_honeypot":      true,
@@ -107,7 +109,9 @@ var analysisTools = map[string]bool{
 	"add_note":                true,
 	"read_ledger":             true,
 	"read_info_item":          true,
+	"read_intelligence":       true,
 	"read_tool_output":        true,
+	"read_asset":              true,
 	"read_skill":              true,
 	"list_skills":             true,
 	"search_skills":           true,
@@ -119,6 +123,7 @@ var analysisTools = map[string]bool{
 	"add_hypothesis_evidence": true,
 	"update_hypothesis":       true,
 	"record_deviation":        true,
+	"complete_work":           true,
 	// Deterministic decision aids (no terminal/HTTP/browser access).
 	"detect_honeypot":      true,
 	"assess_nuclei_hit":    true,

@@ -41,6 +41,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/c1ayooo/xalgorix/v4/internal/agent"
 	"github.com/c1ayooo/xalgorix/v4/internal/approval"
 	"github.com/c1ayooo/xalgorix/v4/internal/platform"
 	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
@@ -119,46 +120,38 @@ func fenceHostPortReason(scope platform.Scope, f platform.Fence, dest string) st
 		// hops in command lines must not read as fence violations.
 		return ""
 	}
-	if denied := fenceDenyMatch(f, host); denied != "" {
-		return fmt.Sprintf("host %q is excluded by the project fence (deny_targets entry %q)", host, denied)
+	// One matcher for the whole repo (XALG020): the same EngagementScope the
+	// dispatch judge and the agent guard use, so the four places cannot
+	// disagree. A CIDR destination keeps its mask and the matcher judges the
+	// whole range (a range is not authorized because its base address is).
+	engagement := &agent.EngagementScope{
+		Targets:    scope.Targets,
+		Deny:       f.DenyTargets,
+		AllowPorts: scope.AllowPorts,
 	}
-	allowed := false
-	for _, entry := range scope.Targets {
-		entryHost, _ := targetHostPort(entry)
-		if entryHost == "" {
-			continue
-		}
-		if hostInScope(host, entryHost) {
-			allowed = true
-			break
-		}
+	if ok, _ := engagement.DestinationAllowed(hostPortString(host, port)); ok {
+		return ""
 	}
-	if !allowed {
-		return fmt.Sprintf("host %q is outside the project scope targets", host)
+	// Keep the fence's operator-facing vocabulary while the decision itself
+	// comes from the shared matcher.
+	if denied, _ := engagement.DestinationDenied(hostPortString(host, port)); denied {
+		return fmt.Sprintf("host %q is excluded by the project fence (deny_targets)", host)
 	}
 	if port != "" && len(scope.AllowPorts) > 0 {
-		n, err := strconv.Atoi(port)
-		if err != nil || !portAllowed(scope.AllowPorts, n) {
-			return fmt.Sprintf("port %s is not in the project allow_ports", port)
+		if n, err := strconv.Atoi(port); err == nil {
+			allowed := false
+			for _, p := range scope.AllowPorts {
+				if p == n {
+					allowed = true
+					break
+				}
+			}
+			if !allowed {
+				return fmt.Sprintf("port %s is not in the project allow_ports", port)
+			}
 		}
 	}
-	return ""
-}
-
-// fenceDenyMatch returns the matching deny entry, empty when the host is not
-// excluded. Entries follow the scope-host grammar: exact host, implicit
-// subdomain of a bare entry, or an explicit "*.domain" wildcard.
-func fenceDenyMatch(f platform.Fence, host string) string {
-	for _, entry := range f.DenyTargets {
-		entryHost, _ := targetHostPort(entry)
-		if entryHost == "" {
-			continue
-		}
-		if hostInScope(host, entryHost) {
-			return entry
-		}
-	}
-	return ""
+	return fmt.Sprintf("host %q is outside the project scope targets", host)
 }
 
 // fenceMethodAllowed: an empty allow list means "no method restriction".

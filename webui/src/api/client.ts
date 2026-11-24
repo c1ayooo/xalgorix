@@ -71,6 +71,7 @@ import type {
   ScanAuditView,
   ExplorationView,
   DecisionInboxView,
+  IntelAccessView,
   DecisionRequest,
   DecisionResult,
   ScanPlanView,
@@ -632,11 +633,26 @@ export const api = {
     taskId: string,
     fingerprint: string,
     status: IntelTriageStatus,
+    grants?: string[],
   ) =>
-    http<{ fingerprint: string; status: IntelTriageStatus }>(
+    http<{
+      fingerprint: string;
+      status: IntelTriageStatus;
+      access_updated?: number;
+      access_available?: boolean;
+    }>(
       `/api/tasks/${taskId}/intelligence/${encodeURIComponent(fingerprint)}`,
-      { method: "PATCH", json: { status } },
+      { method: "PATCH", json: grants && grants.length > 0 ? { status, grants } : { status } },
     ),
+
+  // 情报可达性投影（M4）：access 行 + 已签发通行证 + 审计尾部，只读。
+  scanIntelAccess: (scanId: string) =>
+    http<IntelAccessView>(`/api/scans/${encodeURIComponent(scanId)}/intel-access`).then((v) => ({
+      ...v,
+      access: arr(v.access),
+      capabilities: arr(v.capabilities),
+      uses: arr(v.uses),
+    })),
 
   legacyImportStatus: () =>
     http<{ count: number; dismissed: boolean }>("/api/legacy-import/status"),
@@ -1109,6 +1125,7 @@ export const api = {
       ...v,
       stalled: arr(v.stalled),
       blocked: arr(v.blocked),
+      paused: arr(v.paused),
       open_intents: arr(v.open_intents),
       deviations: arr(v.deviations),
     })),

@@ -253,6 +253,13 @@ replace scan state or the report/verifier authority chain.
 - `internal/infoitem/postgres` — optional PostgreSQL replica for InfoItems,
   relation edges, audit records and contiguous sync watermarks. It implements
   the three activation queries and never participates in verdicts.
+- `internal/intelaccess` — the reachability projection of recorded
+  intelligence (`docs/INTEL_HANDOFF_SPEC.md` M2): `intel_access` rows are
+  derived on the intent-conclusion savepoint (`graph.SetConcludeHook`), keyed
+  `(scan_id, fingerprint)`, and carry canonical `host:port`/CIDR grants instead
+  of content. `NormalizeTarget` is the only target normalizer; readers are the
+  worker seed (`ListUsable`) and the task-intelligence overlay. No content ever
+  enters the projection, and a derivation failure never blocks a conclusion.
 - `internal/jobs` — pinned River v0.51.2 client/workers. Jobs only carry bounded
   cold-path journal ranges; they do not own scan lifecycle, HITL, agentsgraph,
   or event-stream (SSE) work.
@@ -270,16 +277,20 @@ replace scan state or the report/verifier authority chain.
   configured, and never feeds finding acceptance.
 - Two engine-side M4 consumers annotate the ledger tools
   (`internal/agent/ledger_cross_scan.go`): region =
-  `read_ledger(filter=schedulable)` per-entry same-endpoint cross-scan note,
-  association = `claim_next_hypothesis` same-subject cross-scan section plus a
+  `read_ledger(filter=schedulable)` per-entry same-endpoint history note,
+  association = `claim_next_hypothesis` same-subject history section plus a
   current-scan edge traversal rooted at this scan's items (relation edges are
   per-scan; cross-scan edge graphs are charter §13 research). Both are
   output-only, capped by a per-call query budget, and degrade to unchanged
-  output without a cold-path reader; reader errors and §6.4 sync gaps surface
-  as visible notes (never silent). Contract tests pin the shapes, degradation,
-  budget and gap passthrough in `internal/agent/ledger_cross_scan_test.go`,
-  and real-store bridges in `ledger_cross_scan_pg_test.go`. The cross-scan
-  region query uses `RegionQuery.AllScans` (mutually exclusive with ScanIDs).
+  output without a cold-path reader or project scope; reader errors and §6.4
+  sync gaps surface as visible notes (never silent). Contract tests pin the
+  shapes, degradation, budget and gap passthrough in
+  `internal/agent/ledger_cross_scan_test.go`, and real-store bridges in
+  `ledger_cross_scan_pg_test.go`. The project is the isolation fence: the
+  region query uses `RegionQuery.ScanIDs` = the project's scan whitelist
+  (`ProjectScanIDs` + sibling sessions) and never `RegionQuery.AllScans`, so
+  tasks inside one project share history while another project's scans stay
+  invisible.
 - Two read-only HTTP views expose the audit surfaces (charter §5.2/§6.4 and
   the §4.3 human audit view): `GET /api/scans/{id}/audit` serves the domain
   audit projection (claim history, duplicate/gap/disorder detection, explicit

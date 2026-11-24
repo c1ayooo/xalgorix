@@ -99,6 +99,7 @@ func TestLaneCompletion_AssignedUnclaimedBlocksFinish(t *testing.T) {
 	h := ctx.Ledger.Upsert(scanctx.Hypothesis{
 		Title: "Test business-logic on /api/checkout", VulnClass: "business-logic",
 		Endpoint: "/api/checkout", Status: scanctx.HypothesisQueued,
+		Preconditions: []string{"unknown"},
 	})
 	if !ctx.Ledger.MarkAssigned(h.ID, "agent-biz") {
 		t.Fatal("MarkAssigned must succeed")

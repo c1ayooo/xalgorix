@@ -179,7 +179,7 @@ func endpointInTargetBoundary(state *ScanState, endpoint string) bool {
 // Tools that never reach the network; the target-scope guard skips them so
 // notes and plans can still mention excluded services.
 var targetScopeExemptTools = map[string]bool{
-	"add_note": true, "read_notes": true, "finish": true, "update_plan": true,
+	"add_note": true, "read_notes": true, "finish": true, "complete_work": true, "update_plan": true,
 	"list_skills": true, "read_skill": true, "search_skills": true,
 	"web_search": true, "cve_search": true, "exploit_search": true,
 	"str_replace_editor": true, "list_files": true, "search_files": true,

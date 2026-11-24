@@ -1,6 +1,7 @@
 package assets
 
 import (
+	"net"
 	"net/url"
 	"strings"
 )
@@ -17,14 +18,17 @@ func InputsFromURL(projectID, raw string) []AssetInput {
 	if strings.Contains(raw, "://") {
 		if u, err := url.Parse(raw); err == nil && u.Host != "" {
 			host := strings.ToLower(u.Hostname())
+			hostLocator := strings.ToLower(u.Host)
 			if host != "" {
 				out = append(out, AssetInput{
 					ProjectID: projectID, Kind: hostKind(host), Key: host, DisplayName: host,
+					Locator: hostLocator,
 				})
 			}
 			if p := strings.TrimSpace(u.Path); p != "" && p != "/" {
 				out = append(out, AssetInput{
 					ProjectID: projectID, Kind: KindEndpoint, Key: p, DisplayName: p,
+					Locator: strings.ToLower(u.Host + p),
 				})
 			}
 			return out
@@ -32,20 +36,24 @@ func InputsFromURL(projectID, raw string) []AssetInput {
 	}
 	if strings.HasPrefix(raw, "/") {
 		return append(out, AssetInput{
-			ProjectID: projectID, Kind: KindEndpoint, Key: raw, DisplayName: raw,
+			ProjectID: projectID, Kind: KindEndpoint, Key: raw, DisplayName: raw, Locator: raw,
 		})
 	}
 	// A bare host is a subdomain/root-domain identity; do not fabricate a path.
 	if !strings.ContainsAny(raw, " \t?=") && strings.Contains(raw, ".") {
 		return append(out, AssetInput{
-			ProjectID: projectID, Kind: hostKind(raw), Key: raw, DisplayName: raw,
+			ProjectID: projectID, Kind: hostKind(raw), Key: raw, DisplayName: raw, Locator: raw,
 		})
 	}
 	return nil
 }
 
 func hostKind(host string) Kind {
-	if strings.Count(strings.TrimSuffix(host, "."), ".") <= 1 {
+	host = strings.TrimSuffix(strings.TrimSpace(host), ".")
+	if ip := net.ParseIP(strings.Trim(host, "[]")); ip != nil {
+		return KindIP
+	}
+	if strings.Count(host, ".") <= 1 {
 		return KindRootDomain
 	}
 	return KindSubdomain

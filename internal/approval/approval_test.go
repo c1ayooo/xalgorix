@@ -183,6 +183,9 @@ func TestAssessHTTP(t *testing.T) {
 		reason  string
 	}{
 		{"GET passes", "GET", "http://example.com/api/users", "", false, ""},
+		{"GET destructive query requires", "GET", "http://example.com/x?cmd=rm%20-rf%20%2F", "", true, "rm -rf"},
+		{"GET admin read stays allowed", "GET", "http://example.com/admin/config", "", false, ""},
+		{"HEAD destructive query requires", "HEAD", "http://example.com/x?cmd=DROP%20TABLE%20users", "", true, "drop table"},
 		{"HEAD passes", "head", "http://example.com/", "", false, ""},
 		{"OPTIONS passes", "OPTIONS", "http://example.com/api", "", false, ""},
 		{"empty method defaults GET", "", "http://example.com/", "", false, ""},
@@ -200,6 +203,12 @@ func TestAssessHTTP(t *testing.T) {
 		{"destructive mongo", "POST", "http://example.com/api/db", "eval=db.dropDatabase()", true, "dropdatabase"},
 		{"destructive redis", "POST", "http://example.com/redis", "cmd=FLUSHALL", true, "flushall"},
 		{"destructive shell", "POST", "http://example.com/run", "cmd=rm -rf /", true, "rm -rf"},
+		{"destructive form-encoded", "POST", "http://example.com/run", "cmd=rm+-rf+%2F", true, "rm -rf"},
+		{"destructive percent-encoded", "POST", "http://example.com/run", "cmd=rm%20-rf%20%2F", true, "rm -rf"},
+		{"destructive JSON", "POST", "http://example.com/run", `{"cmd":"rm -rf /"}`, true, "rm -rf"},
+		{"destructive JSON unicode", "POST", "http://example.com/run", `{"cmd":"rm\u0020-rf\u0020/"}`, true, "rm -rf"},
+		{"benign encoded search", "POST", "http://example.com/search", "q=rm%20policy", false, ""},
+		{"encoded auth field name", "POST", "http://example.com/api/profile", "pass%77ord=b", true, "auth"},
 		{"destructive via query", "PUT", "http://example.com/x?cmd=shutdown%20now", "", true, "shutdown"},
 		{"auth payload field", "POST", "http://example.com/api/profile", "username=a&password=b", true, "auth"},
 		{"auth json field", "PUT", "http://example.com/api/me", `{"token":"abc"}`, true, "auth"},

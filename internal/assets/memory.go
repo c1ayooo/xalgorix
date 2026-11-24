@@ -13,13 +13,15 @@ import (
 // MemoryStore is the test/legacy asset implementation. Production uses
 // PGStore: assets are project-scoped and shared across runs.
 type MemoryStore struct {
-	mu      sync.RWMutex
-	assets  map[int64]*Asset
-	byKey   map[string]int64 // project|kind|key -> id
-	links   map[string]map[int64]struct{}
-	details map[int64]map[string]AssetLink // asset id -> scan|source -> link
-	edges   map[string]Edge
-	nextID  int64
+	mu            sync.RWMutex
+	assets        map[int64]*Asset
+	byKey         map[string]int64 // project|kind|key -> id
+	links         map[string]map[int64]struct{}
+	details       map[int64]map[string]AssetLink // asset id -> scan|source -> link
+	edges         map[string]Edge
+	locators      []Locator
+	nextID        int64
+	nextLocatorID int64
 }
 
 // NewMemoryStore returns an empty in-memory asset graph.
@@ -363,4 +365,70 @@ func sortAssets(out []Asset) {
 // String is a debug helper.
 func (a Asset) String() string {
 	return fmt.Sprintf("%s:%s", a.Kind, a.Key)
+}
+
+// RecordLocator appends one locator row for an existing asset. The same
+// (asset, locator, observed_at) observation is idempotent.
+func (m *MemoryStore) RecordLocator(_ context.Context, in LocatorInput) (*Locator, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	projectID := strings.TrimSpace(in.ProjectID)
+	locator := strings.TrimSpace(in.Locator)
+	if projectID == "" || in.AssetID <= 0 || locator == "" {
+		return nil, fmt.Errorf("assets: locator requires project_id, asset_id and locator")
+	}
+	a := m.assets[in.AssetID]
+	if a == nil || a.ProjectID != projectID {
+		return nil, ErrNotFound
+	}
+	observed := in.ObservedAt.UTC()
+	if observed.IsZero() {
+		observed = time.Now().UTC()
+	}
+	for i := range m.locators {
+		l := &m.locators[i]
+		if l.ProjectID == projectID && l.AssetID == in.AssetID && l.Locator == locator && l.ObservedAt.Equal(observed) {
+			l.ValidUntil = in.ValidUntil
+			l.SourceInfoItemID = strings.TrimSpace(in.SourceInfoItemID)
+			out := *l
+			return &out, nil
+		}
+	}
+	m.nextLocatorID++
+	out := Locator{
+		ID:               m.nextLocatorID,
+		ProjectID:        projectID,
+		AssetID:          in.AssetID,
+		Locator:          locator,
+		InstanceID:       strings.TrimSpace(in.InstanceID),
+		ObservedAt:       observed,
+		ValidFrom:        observed,
+		ValidUntil:       in.ValidUntil,
+		SourceInfoItemID: strings.TrimSpace(in.SourceInfoItemID),
+	}
+	m.locators = append(m.locators, out)
+	return &out, nil
+}
+
+// ListAssetLocators returns one asset's locator history, newest first.
+func (m *MemoryStore) ListAssetLocators(_ context.Context, projectID string, assetID int64) ([]Locator, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	a := m.assets[assetID]
+	if a == nil || a.ProjectID != projectID {
+		return nil, ErrNotFound
+	}
+	out := make([]Locator, 0)
+	for _, l := range m.locators {
+		if l.ProjectID == projectID && l.AssetID == assetID {
+			out = append(out, l)
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if !out[i].ObservedAt.Equal(out[j].ObservedAt) {
+			return out[i].ObservedAt.After(out[j].ObservedAt)
+		}
+		return out[i].ID > out[j].ID
+	})
+	return out, nil
 }

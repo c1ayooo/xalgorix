@@ -2,6 +2,7 @@ package agentsgraph
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 )
@@ -111,7 +112,47 @@ func TestKillUnitCancelsWorker(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if _, status, _ := g.DispatchResult(ctx, id); status != "failed" {
+	if _, status, errText := g.DispatchResult(ctx, id); status != "failed" {
 		t.Fatalf("status = %q, want failed", status)
+	} else if !strings.Contains(errText, "killed: operator stop") {
+		t.Fatalf("worker error = %q, want the kill cause", errText)
 	}
+	// The kill is only half the contract: the exit must be observable before the
+	// scheduler writes a terminal intent state.
+	if err := g.WaitUnitExit(ctx, "unit-kill"); err != nil {
+		t.Fatalf("wait exit after kill: %v", err)
+	}
+}
+
+// TestKillQueuedUnitTerminatesImmediately pins the queued-worker kill path: a
+// worker that never started must close its done channel at kill time, otherwise
+// exit confirmation waits for a slot that may never free.
+func TestKillQueuedUnitTerminatesImmediately(t *testing.T) {
+	release := make(chan struct{})
+	started := make(chan struct{})
+	g := NewWithConfig(context.Background(), 4, 1, func(ctx context.Context, agentID, name string, targets []string, task string) (string, error) {
+		if name == "first" {
+			close(started)
+			<-release
+			return "done", nil
+		}
+		return "unexpected run", nil
+	})
+	defer g.Stop()
+	if _, err := g.Dispatch("first", "hold the only slot", []string{"example.com"}, "unit-first"); err != nil {
+		t.Fatalf("dispatch first: %v", err)
+	}
+	<-started
+	if _, err := g.Dispatch("second", "queued work", []string{"example.com"}, "unit-second"); err != nil {
+		t.Fatalf("dispatch second: %v", err)
+	}
+	if err := g.KillUnit("unit-second", "planner stop"); err != nil {
+		t.Fatalf("kill queued: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := g.WaitUnitExit(ctx, "unit-second"); err != nil {
+		t.Fatalf("queued worker did not exit at kill time: %v", err)
+	}
+	close(release)
 }

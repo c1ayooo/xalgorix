@@ -27,6 +27,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/c1ayooo/xalgorix/v4/internal/sandbox"
 	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
@@ -95,7 +96,28 @@ type intelSnapshot struct {
 var (
 	intelStores   = make(map[string]*intelStore)
 	intelStoresMu sync.RWMutex
+
+	detailMu       sync.RWMutex
+	detailObserver func(contextID, fingerprint string)
 )
+
+// SetDetailObserver registers the audit sink for explicit detail fetches
+// (INTEL_HANDOFF_SPEC M4: the only moment intel content reaches the model).
+// The callback must be fast and non-blocking; it never gates the read.
+func SetDetailObserver(fn func(contextID, fingerprint string)) {
+	detailMu.Lock()
+	defer detailMu.Unlock()
+	detailObserver = fn
+}
+
+func notifyDetailFetch(contextID, fingerprint string) {
+	detailMu.RLock()
+	fn := detailObserver
+	detailMu.RUnlock()
+	if fn != nil {
+		fn(contextID, fingerprint)
+	}
+}
 
 type intelStore struct {
 	mu            sync.RWMutex
@@ -472,7 +494,13 @@ func RecordForContext(contextID string, args map[string]string) (tools.Result, e
 	}, nil
 }
 
-// ReadForContext returns a compact listing for the model (read_intelligence).
+// ReadForContext returns the model-facing identity listing for
+// read_intelligence without a reference (INTEL_HANDOFF_SPEC D5/M1a): one line
+// per item carrying identity fields only — fingerprint, instance id, kind,
+// endpoint, confidence, title. Content is deliberately withheld so the listing
+// can be consulted (and injected) without moving credential plaintext into the
+// transcript; one item's full content is fetched on demand through
+// ReadItemForContext.
 func ReadForContext(contextID string) string {
 	if contextID == "" {
 		contextID = scanctx.Default().ID
@@ -489,16 +517,94 @@ func ReadForContext(contextID string) string {
 	sort.SliceStable(ordered, func(i, j int) bool { return ordered[i].CreatedAt.Before(ordered[j].CreatedAt) })
 
 	var b strings.Builder
-	b.WriteString("=== RECORDED INTELLIGENCE (record_intelligence) ===\n")
+	b.WriteString("=== RECORDED INTELLIGENCE (identity only; content withheld) ===\n")
 	for _, item := range ordered {
-		content := item.Content
-		if len(content) > 300 {
-			content = content[:300] + "... (truncated)"
+		endpoint := item.Endpoint
+		if endpoint == "" {
+			endpoint = "-"
 		}
-		b.WriteString(fmt.Sprintf("• %s %s [%s] conf=%.2f %s\n  %s\n", item.Kind, item.ID, item.Fingerprint, item.Confidence, item.Endpoint, content))
+		fmt.Fprintf(&b, "• [%s] %s fp=%s endpoint=%s conf=%.2f title=%s\n",
+			item.Kind, item.ID, item.Fingerprint, endpoint, item.Confidence, clipIntelLine(item.Title, 120))
 	}
-	b.WriteString("=== END INTELLIGENCE ===")
+	fmt.Fprintf(&b, "=== END INTELLIGENCE (%d item(s)) — read_intelligence(fingerprint=<fp or id>) for one item's full content ===", len(ordered))
 	return b.String()
+}
+
+// ReadItemForContext resolves one item by fingerprint or instance id (I-N).
+// Matching is exact and case-insensitive — no prefix matching, because an
+// ambiguous hit is worse than an honest miss. found distinguishes "no such
+// item" from an empty store.
+func ReadItemForContext(contextID, ref string) (Item, bool) {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return Item{}, false
+	}
+	if contextID == "" {
+		contextID = scanctx.Default().ID
+	}
+	s := getIntelStoreForContext(contextID)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if idx, ok := s.byFingerprint[strings.ToLower(ref)]; ok {
+		return s.items[idx], true
+	}
+	for _, item := range s.items {
+		if strings.EqualFold(item.ID, ref) {
+			return item, true
+		}
+	}
+	return Item{}, false
+}
+
+// ItemsForContext returns a snapshot copy of one context's items for read-only
+// projections (the worker seed). Callers must not mutate the result and must
+// not treat it as proof: content stays out of auto-injected prompts.
+func ItemsForContext(contextID string) []Item {
+	if contextID == "" {
+		contextID = scanctx.Default().ID
+	}
+	s := getIntelStoreForContext(contextID)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(s.items) == 0 {
+		return nil
+	}
+	out := make([]Item, len(s.items))
+	copy(out, s.items)
+	return out
+}
+
+// formatIntelDetail renders one item's full record for the explicit
+// detail fetch (the only place intel content is handed to the model).
+func formatIntelDetail(item Item) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Intel %s [%s] fp=%s\n", item.ID, item.Kind, item.Fingerprint)
+	fmt.Fprintf(&b, "Title: %s\n", item.Title)
+	if item.Endpoint != "" {
+		fmt.Fprintf(&b, "Endpoint: %s\n", item.Endpoint)
+	}
+	fmt.Fprintf(&b, "Confidence: %.2f\n", item.Confidence)
+	fmt.Fprintf(&b, "Recorded: %s\n", item.CreatedAt.UTC().Format(time.RFC3339))
+	if item.UpdatedAt.After(item.CreatedAt) {
+		fmt.Fprintf(&b, "Last re-confirmed: %s\n", item.UpdatedAt.UTC().Format(time.RFC3339))
+	}
+	b.WriteString("Content (observed data; verify before use):\n")
+	b.WriteString(item.Content)
+	return b.String()
+}
+
+// clipIntelLine collapses whitespace and bounds one listing field without
+// splitting a UTF-8 rune.
+func clipIntelLine(s string, max int) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if len(s) <= max {
+		return s
+	}
+	cut := max
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "…"
 }
 
 // Register adds the intelligence tools to a registry.
@@ -520,10 +626,38 @@ func Register(r *tools.Registry) {
 
 	r.Register(&tools.Tool{
 		Name:        "read_intelligence",
-		Description: "Read the intelligence items recorded so far in this run (credentials, leads, sensitive data). Useful before recording to avoid repeating yourself and to build on earlier findings.",
-		Parameters:  []tools.Parameter{},
-		Execute: func(_ map[string]string) (tools.Result, error) {
-			return tools.Result{Output: ReadForContext(r.GetScanContextID())}, nil
+		Description: "Read recorded intelligence (credentials, leads, sensitive data). Without arguments: an identity-only listing (fingerprint, id, kind, endpoint, confidence, title) — content is withheld so consulting what the run holds does not move plaintext into the conversation. Pass fingerprint (the fp= value or the I-N id) to read one item's full content.",
+		Parameters: []tools.Parameter{
+			{Name: "fingerprint", Description: "Fingerprint (fp= value) or I-N item id to read in full; omit for the identity listing", Required: false},
+		},
+		Execute: func(args map[string]string) (tools.Result, error) {
+			contextID := r.GetScanContextID()
+			ref := strings.TrimSpace(args["fingerprint"])
+			if ref == "" {
+				return tools.Result{
+					Output:   ReadForContext(contextID),
+					Metadata: map[string]any{"intel_listing": true},
+				}, nil
+			}
+			item, ok := ReadItemForContext(contextID, ref)
+			if !ok {
+				// A miss is an expected model mistake, not an engine failure:
+				// returning it as Output keeps the registry circuit breaker out of
+				// the picture (Result.Error counts as tool failure — read_notes
+				// precedent). The listing gives the model the valid identities.
+				return tools.Result{
+					Output: fmt.Sprintf("No intel item matches %q. Recorded items (identity only):\n%s", ref, ReadForContext(contextID)),
+				}, nil
+			}
+			notifyDetailFetch(contextID, item.Fingerprint)
+			return tools.Result{
+				Output: formatIntelDetail(item),
+				Metadata: map[string]any{
+					"intel_fingerprint": item.Fingerprint,
+					"intel_kind":        item.Kind,
+					"intel_detail":      true,
+				},
+			}, nil
 		},
 	})
 }

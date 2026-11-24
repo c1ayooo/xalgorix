@@ -89,3 +89,6 @@ __pycache__/
 .vite/
 gui-test-screenshots/
 .zcode/
+
+# Windows metadata
+*:Zone.Identifier

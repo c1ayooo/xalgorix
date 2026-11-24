@@ -133,6 +133,10 @@ type Evidence struct {
 	Supports []string `json:"supports,omitempty"`
 	// InfoItemID links this projection to the global InfoItem cold path.
 	InfoItemID string `json:"info_item_id,omitempty"`
+	// IntentID links this observation to the intent whose execution produced
+	// it (R3 Information-to-Decision Trace). Empty for engine-derived
+	// evidence that no single intent owns.
+	IntentID string `json:"intent_id,omitempty"`
 	// Confidence is the quality of THIS observation in [0,1].
 	Confidence float64   `json:"confidence,omitempty"`
 	CreatedAt  time.Time `json:"created_at"`
@@ -164,6 +168,13 @@ type Hypothesis struct {
 	// Baseline is the control/negative result used to distinguish a real
 	// vulnerability from intended behavior.
 	Baseline string `json:"baseline,omitempty"`
+	// Falsification states what observation would refute this claim. R2
+	// quality field (JSON only; ledger snapshots are JSON documents, so this is
+	// backward compatible and needs no migration).
+	Falsification string `json:"falsification,omitempty"`
+	// NextObservation is the single observation most likely to discriminate
+	// this hypothesis from its alternatives.
+	NextObservation string `json:"next_observation,omitempty"`
 
 	Status HypothesisStatus `json:"status"`
 	// Confidence is the current belief (in [0,1]) that this is exploitable.
@@ -240,6 +251,37 @@ type LedgerStore struct {
 
 	injectionMu   sync.Mutex
 	injectionSeen map[string]struct{} // dedupe key for injection observations
+
+	// deviations is a bounded in-memory projection of AppendDeviation records
+	// for the main agent's decision inbox. The domain journal remains the
+	// audit authority; this projection is not persisted or replayed.
+	deviations []Deviation
+	// infoReads / actionAttempts are bounded R3 trace projections. The journal
+	// is the audit authority; these are read-only joins for tracing.
+	infoReads      []InfoRead
+	actionAttempts []ActionAttempt
+	actionSeq      int
+}
+
+// Deviation is one executor-recorded departure from its assigned intent.
+type Deviation struct {
+	IntentID string
+	AgentID  string
+	Text     string
+	At       time.Time
+}
+
+// maxDeviationProjection bounds the in-memory deviation list.
+const maxDeviationProjection = 500
+
+// Deviations returns a copy of the in-memory deviation projection.
+func (ls *LedgerStore) Deviations() []Deviation {
+	if ls == nil {
+		return nil
+	}
+	ls.mu.RLock()
+	defer ls.mu.RUnlock()
+	return append([]Deviation(nil), ls.deviations...)
 }
 
 // defaultHypothesisLease bounds how long a claimed (testing) hypothesis may
@@ -429,7 +471,10 @@ func (ls *LedgerStore) AddEvidenceAs(hypID string, ev Evidence, actor domainjour
 	cp := h.clone()
 	nextSeq := ls.evSeq + 1
 	ev.ID = fmt.Sprintf("EV-%d", nextSeq)
-	if ls.scanID != "" {
+	// Keep an explicit InfoItem/Evidence link supplied by the caller (R3
+	// trace anchor). Only engine-created evidence with no link gets the
+	// deterministic stable ID.
+	if ls.scanID != "" && strings.TrimSpace(ev.InfoItemID) == "" {
 		ev.InfoItemID = infoitem.StableEvidenceID(ls.scanID, ev.ID)
 	}
 	// Supports may only point at evidence already stored on this hypothesis.
@@ -587,6 +632,9 @@ func (ls *LedgerStore) claimNextAs(vulnClass, agentID string, unassignedOnly boo
 		if h == nil || h.Status != HypothesisQueued {
 			continue
 		}
+		if !h.ClaimEligible() {
+			continue // R2: coverage seeds are prompts, not schedulable beliefs
+		}
 		if classFilter != "" && h.VulnClass != classFilter {
 			continue
 		}
@@ -711,6 +759,9 @@ func (ls *LedgerStore) Schedulable(limit int) []Hypothesis {
 			continue
 		}
 		if h.Status == HypothesisQueued || h.Status == HypothesisBlocked {
+			if !h.ClaimEligible() {
+				continue // R2: sources of coverage prompts are not schedulable
+			}
 			cands = append(cands, h.clone())
 		}
 	}
@@ -1164,6 +1215,12 @@ func (h *Hypothesis) mergeFrom(src Hypothesis) {
 	if h.Baseline == "" && src.Baseline != "" {
 		h.Baseline = src.Baseline
 	}
+	if h.Falsification == "" && src.Falsification != "" {
+		h.Falsification = src.Falsification
+	}
+	if h.NextObservation == "" && src.NextObservation != "" {
+		h.NextObservation = src.NextObservation
+	}
 	if src.NextAction != "" {
 		h.NextAction = src.NextAction
 	}
@@ -1203,6 +1260,50 @@ func IsModelOrigin(origin string) bool {
 	return origin == "coordinator" || strings.HasPrefix(origin, "agent_")
 }
 
+// coverageSeedOrigins are the engine's coverage-matrix seed origins. R2: a row
+// with one of these origins is a Coverage opportunity, not a Formal Hypothesis,
+// so it never enters the schedulable/claim pool. A model recording the same
+// dedup key upgrades the row's origin via mergeFrom, which is the only way a
+// seed becomes claimable.
+var coverageSeedOrigins = map[string]bool{
+	"auto":               true,
+	"auto-plan":          true,
+	"auto-plan-surface":  true,
+	"auto-surface-param": true,
+	"engine":             true,
+	"recon":              true,
+}
+
+// IsCoverageSeedOrigin reports whether an origin is an engine coverage seed.
+func IsCoverageSeedOrigin(origin string) bool {
+	return coverageSeedOrigins[strings.ToLower(strings.TrimSpace(origin))]
+}
+
+// ClaimEligible reports whether this row is a Formal Hypothesis the scheduler
+// may hand out. It is the single claim-entry quality gate:
+//
+//   - engine coverage seeds are never claimable (Coverage opportunity ≠ Belief);
+//   - the row must carry a concrete claim/identity (a title, endpoint, target
+//     or source→sink path). A bare class row is not scheduling work.
+//
+// Preconditions/falsification quality is enforced where a model CREATES a
+// hypothesis (record_hypothesis), not by retroactively rejecting historical
+// rows; legacy ledgers stay claimable and auditable. Stored state and history
+// are never rewritten by this predicate.
+func (h *Hypothesis) ClaimEligible() bool {
+	if h == nil {
+		return false
+	}
+	origin := strings.ToLower(strings.TrimSpace(h.Origin))
+	if IsCoverageSeedOrigin(origin) {
+		return false
+	}
+	return strings.TrimSpace(h.Title) != "" ||
+		strings.TrimSpace(h.Endpoint) != "" ||
+		strings.TrimSpace(h.Target) != "" ||
+		strings.TrimSpace(h.DataFlow) != ""
+}
+
 // sanitize bounds and normalizes external hypothesis input.
 func (h *Hypothesis) sanitize() {
 	h.Title = truncate(strings.TrimSpace(h.Title), maxSummaryLen)
@@ -1214,6 +1315,8 @@ func (h *Hypothesis) sanitize() {
 	h.DataFlow = truncate(strings.TrimSpace(h.DataFlow), maxSummaryLen)
 	h.RequiredPrivilege = truncate(strings.TrimSpace(h.RequiredPrivilege), maxHypothesisFieldLen)
 	h.Baseline = truncate(strings.TrimSpace(h.Baseline), maxSummaryLen)
+	h.Falsification = truncate(strings.TrimSpace(h.Falsification), maxSummaryLen)
+	h.NextObservation = truncate(strings.TrimSpace(h.NextObservation), maxSummaryLen)
 	h.NextAction = truncate(strings.TrimSpace(h.NextAction), maxSummaryLen)
 	h.Origin = truncate(strings.TrimSpace(h.Origin), maxHypothesisFieldLen)
 	h.Confidence = clampConfidence(h.Confidence)
@@ -1248,6 +1351,7 @@ func (ev *Evidence) sanitize() {
 	ev.Source = truncate(strings.TrimSpace(ev.Source), maxHypothesisFieldLen)
 	ev.Nature = NormalizeEvidenceNature(ev.Nature)
 	ev.InfoItemID = truncate(strings.TrimSpace(ev.InfoItemID), maxHypothesisFieldLen)
+	ev.IntentID = truncate(strings.TrimSpace(ev.IntentID), maxHypothesisFieldLen)
 	ev.Confidence = clampConfidence(ev.Confidence)
 	if len(ev.Supports) > 0 {
 		seen := make(map[string]bool, len(ev.Supports))

@@ -65,12 +65,18 @@ type crossScanHistory struct {
 	gapReason  string
 }
 
-// fetchCrossScanHistory runs one cross-scan region query (AllScans — the
-// cross-scan shape §4.1) for the subject identifier and folds the result into
-// counts. The query is validated here so a test stub that skips validation
-// cannot mask a malformed query against the real store.
-func fetchCrossScanHistory(ctx context.Context, reader infoitem.Reader, currentScanID, subject string, limit int) (crossScanHistory, error) {
-	q := infoitem.RegionQuery{AllScans: true, Subject: subject, Limit: limit}
+// fetchCrossScanHistory runs one region query across the PROJECT's scans (the
+// cross-scan shape §4.1; the project is the isolation fence, tasks inside one
+// project share history) for the subject identifier and folds the result into
+// counts. An empty whitelist means the caller has no project scope, so nothing
+// is queried — an AllScans fallback would leak another project's scan IDs and
+// counts into this model's output. The query is validated here so a test stub
+// that skips validation cannot mask a malformed query against the real store.
+func fetchCrossScanHistory(ctx context.Context, reader infoitem.Reader, scanIDs []string, currentScanID, subject string, limit int) (crossScanHistory, error) {
+	if len(scanIDs) == 0 {
+		return crossScanHistory{}, nil
+	}
+	q := infoitem.RegionQuery{ScanIDs: append([]string(nil), scanIDs...), Subject: subject, Limit: limit}
 	if err := q.Validate(); err != nil {
 		return crossScanHistory{}, err
 	}
@@ -78,9 +84,18 @@ func fetchCrossScanHistory(ctx context.Context, reader infoitem.Reader, currentS
 	if err != nil {
 		return crossScanHistory{}, err
 	}
+	// Defence in depth: even if the store ignored the whitelist, a foreign
+	// project's items must never be counted, labelled or handed back as IDs.
+	allowed := make(map[string]bool, len(scanIDs))
+	for _, id := range scanIDs {
+		allowed[id] = true
+	}
 	hist := crossScanHistory{truncated: res.Truncated, incomplete: res.Incomplete, gapReason: res.GapReason}
 	seen := make(map[string]bool)
 	for _, item := range res.Items {
+		if item.ScanID != "" && !allowed[item.ScanID] {
+			continue
+		}
 		if currentScanID != "" && item.ScanID == currentScanID {
 			if len(hist.currentIDs) < crossScanAssocLimit {
 				hist.currentIDs = append(hist.currentIDs, item.ID)
@@ -127,6 +142,7 @@ type crossScanRegionCache struct {
 	reader     infoitem.Reader
 	ctx        context.Context
 	scanID     string
+	scanIDs    []string
 	failed     bool
 	budgetLeft int
 	budgetNote string
@@ -134,11 +150,17 @@ type crossScanRegionCache struct {
 }
 
 // newCrossScanRegionCache returns nil when the optional cold-path reader is
-// not configured; the caller's nil-receiver fast path keeps the tool output
-// unchanged in the no-PG mode required by the charter.
+// not configured OR the agent has no project scan whitelist; the caller's
+// nil-receiver fast path keeps the tool output unchanged in the no-PG mode
+// required by the charter and in project-less runs (where a cross-scan query
+// would have no isolated scope to read).
 func newCrossScanRegionCache(a *Agent) *crossScanRegionCache {
 	reader := infoitem.DefaultReader()
 	if reader == nil {
+		return nil
+	}
+	scanIDs := a.crossScanScanIDsAllowed()
+	if len(scanIDs) == 0 {
 		return nil
 	}
 	ctx := a.ctx
@@ -153,6 +175,7 @@ func newCrossScanRegionCache(a *Agent) *crossScanRegionCache {
 		reader:     reader,
 		ctx:        ctx,
 		scanID:     scanID,
+		scanIDs:    append([]string(nil), scanIDs...),
 		budgetLeft: crossScanMaxRegionQueries,
 		notes:      make(map[string]string),
 	}
@@ -191,7 +214,7 @@ func (c *crossScanRegionCache) query(endpoint string) string {
 		return ""
 	}
 	c.budgetLeft--
-	hist, err := fetchCrossScanHistory(c.ctx, c.reader, c.scanID, endpoint, crossScanRegionLimit)
+	hist, err := fetchCrossScanHistory(c.ctx, c.reader, c.scanIDs, c.scanID, endpoint, crossScanRegionLimit)
 	if err != nil {
 		// §3.4: a cold-path failure must be visible, not silently dropped. The
 		// listing itself keeps working; later entries stay quiet to avoid spam.
@@ -241,7 +264,11 @@ func (a *Agent) appendCrossScanAssociationNote(b *strings.Builder, h scanctx.Hyp
 	if a.scanCtx != nil {
 		scanID = a.scanCtx.ID
 	}
-	hist, err := fetchCrossScanHistory(ctx, reader, scanID, subject, crossScanRegionLimit)
+	scanIDs := a.crossScanScanIDsAllowed()
+	if len(scanIDs) == 0 {
+		return
+	}
+	hist, err := fetchCrossScanHistory(ctx, reader, scanIDs, scanID, subject, crossScanRegionLimit)
 	if err != nil {
 		log.Printf("[ledger] cross-scan history lookup failed for %q: %v", subject, err)
 		fmt.Fprintf(b, "\n冷路径查询失败，跨扫描历史暂不可用: %v\n", err)

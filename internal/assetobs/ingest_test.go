@@ -11,11 +11,12 @@ import (
 )
 
 type fakeRepo struct {
-	mu      sync.Mutex
-	upserts []assets.AssetInput
-	links   []assets.Link
-	edges   []assets.Edge
-	wrote   chan struct{}
+	locators []assets.LocatorInput
+	mu       sync.Mutex
+	upserts  []assets.AssetInput
+	links    []assets.Link
+	edges    []assets.Edge
+	wrote    chan struct{}
 }
 
 func newFakeRepo() *fakeRepo { return &fakeRepo{wrote: make(chan struct{}, 16)} }
@@ -50,6 +51,15 @@ func (f *fakeRepo) ListProjectAssets(context.Context, assets.AssetFilter) ([]ass
 }
 func (f *fakeRepo) GetAssetDetail(context.Context, string, int64) (assets.AssetDetail, error) {
 	return assets.AssetDetail{}, nil
+}
+func (f *fakeRepo) RecordLocator(_ context.Context, in assets.LocatorInput) (*assets.Locator, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.locators = append(f.locators, in)
+	return &assets.Locator{ID: int64(len(f.locators)), ProjectID: in.ProjectID, AssetID: in.AssetID, Locator: in.Locator}, nil
+}
+func (f *fakeRepo) ListAssetLocators(context.Context, string, int64) ([]assets.Locator, error) {
+	return nil, nil
 }
 func (f *fakeRepo) MergeAssets(context.Context, string, int64, int64, string) error { return nil }
 func (f *fakeRepo) SetAssetsArchived(context.Context, string, []int64, bool, string) (int, error) {

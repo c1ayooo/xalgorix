@@ -174,3 +174,25 @@ func preconditionKind(k Kind) bool {
 		return false
 	}
 }
+
+// ValidateProducedYields reports whether the produced nodes satisfy the kinds
+// the contract declared. An empty declaration defaults to fact (the mandatory
+// origin receipt), so a normal done intent satisfies it. This is the first
+// production consumer of Contract.Yields: a declared finding cannot be
+// satisfied by an origin receipt alone.
+func ValidateProducedYields(c Contract, produced []NodeInput) error {
+	have := make(map[Kind]bool, len(produced))
+	for i := range produced {
+		k := produced[i].Kind
+		if k == "" {
+			k = KindFact
+		}
+		have[k] = true
+	}
+	for _, want := range c.YieldKinds() {
+		if !have[want] {
+			return fmt.Errorf("%w: declared %s", ErrYieldUnmet, want)
+		}
+	}
+	return nil
+}

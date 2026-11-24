@@ -18,6 +18,7 @@ import (
 
 	"github.com/c1ayooo/xalgorix/v4/internal/config"
 	"github.com/c1ayooo/xalgorix/v4/internal/proxy"
+	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
 	"github.com/c1ayooo/xalgorix/v4/internal/scanheaders"
 	"github.com/c1ayooo/xalgorix/v4/internal/tools"
 	"github.com/c1ayooo/xalgorix/v4/internal/trafficproxy"
@@ -98,6 +99,33 @@ func executeWithContextCtx(parent context.Context, contextID string, guard tools
 	}
 	if !strings.HasPrefix(targetURL, "http://") && !strings.HasPrefix(targetURL, "https://") {
 		targetURL = "https://" + targetURL
+	}
+
+	// R1: the target's Retry-After cooldown is respected at the execution
+	// surface, not just in the prompt. A soft output keeps the tool healthy.
+	if sc := scanctx.Get(contextID); sc != nil {
+		if msg := sc.TargetBackoffMessage(); msg != "" {
+			return tools.Result{Output: msg}, nil
+		}
+	}
+	// R4: Engagement-wide egress budget (shared with every worker).
+	var ticket *scanctx.Ticket
+	status, retryAfter := 0, time.Duration(0)
+	if sc := scanctx.Get(contextID); sc != nil {
+		if budget := sc.Egress(); budget != nil {
+			acqBase := parent
+			if acqBase == nil {
+				acqBase = context.Background()
+			}
+			acqCtx, cancel := context.WithTimeout(acqBase, 30*time.Second)
+			t, aerr := budget.Acquire(acqCtx, targetURL)
+			cancel()
+			if aerr != nil {
+				return tools.Result{Output: scanctx.EgressSoftMessage(aerr)}, nil
+			}
+			ticket = t
+			defer func() { ticket.Done(status, retryAfter) }()
+		}
 	}
 
 	method := strings.ToUpper(strings.TrimSpace(args["method"]))
@@ -246,6 +274,8 @@ func executeWithContextCtx(parent context.Context, contextID string, guard tools
 		return tools.Result{}, fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
+	status = resp.StatusCode
+	retryAfter = scanctx.ParseRetryAfter(resp.Header.Get("Retry-After"))
 
 	elapsed := time.Since(start)
 

@@ -145,8 +145,8 @@
 
 | 类型 | 语义 | 消费者 |
 |---|---|---|
-| **区域点亮** | 按主体/时间/来源/目的/类型/扫描做确定性过滤 | `claim_next_hypothesis` 可调度池；`taskCoverageComplete` 与 coverage epoch 缺口计算；`read_ledger(filter=schedulable)`；跨扫描同主体候选检索 |
-| **关联点亮** | 沿支持/矛盾/引用/同会话/同主体关系边传播（跳数 ≤ 3，受结果数与时间预算截断） | Verifier 的 baseline/控制组装；`report_vulnerability` 同类同端点去重与证据引用；`verify_*` 复用既有 baseline；跨扫描同主体历史 |
+| **区域点亮** | 按主体/时间/来源/目的/类型/扫描做确定性过滤 | `claim_next_hypothesis` 可调度池；`taskCoverageComplete` 与 coverage epoch 缺口计算；`read_ledger(filter=schedulable)`；跨扫描同主体候选检索（本项目任务之间） |
+| **关联点亮** | 沿支持/矛盾/引用/同会话/同主体关系边传播（跳数 ≤ 3，受结果数与时间预算截断） | Verifier 的 baseline/控制组装；`report_vulnerability` 同类同端点去重与证据引用；`verify_*` 复用既有 baseline；跨扫描同主体历史（本项目任务之间） |
 | **语境切片** | 固定部分维度，投影同一语境下的混合信息视图 | `VerificationRequest` 的字段装配；报告生成的 finding + evidence + traffic 引用；人工审计视图 |
 
 **共同查询契约**：明确调用方与场景、输入过滤与 `limit`/预算/确定性排序、返回项的 ID/来源/nature/关系引用、是否截断与同步缺口、空结果与错误的区别。
@@ -302,7 +302,7 @@ v4.5.44 拆分后 `server.go` 只是薄核心 + 路由枢纽：
 | `agent_ratepolicy.go` | 从指令解析请求速率策略 |
 | `hooks.go` | 义务 hook，含卡死/循环检测（重复相同调用） |
 | `verifier.go` | 独立 Verifier Agent，复测候选 finding |
-| `ledger_cross_scan.go` | M4 引擎侧消费者：区域/关联点亮的跨扫描注记（只影响输出） |
+| `ledger_cross_scan.go` | M4 引擎侧消费者：区域/关联点亮的跨扫描注记，只读本项目任务（只影响输出） |
 | `authz_matrix.go` | 授权矩阵：以多身份重放同一请求做差分 |
 
 守卫把 Agent 限制在授权 scope 与已选阶段内，并按请求速率策略节流——这是“自主攻击型 Agent 可以安全指向目标”的边界。
@@ -379,7 +379,7 @@ CORE v2.1 以**增量层**实现，不替换扫描状态，也不替换报告/�
 - `scanctx.Ledger` 把 Evidence 以 `evidence:<scan_id>:<evidence_id>` 投影进 journal（进而冷路径）；Evidence 保留既有 `Kind`，另有独立 `Nature`，缺失/历史值归一为 `inferred`。
 - `scanctx` 在提交前记录 hypothesis 变更（record/claim/assign/status/evidence/attempt/VOI/reset/merge），并带显式 actor。
 - `search_info` 是面向 Agent 的只读激活消费者：每个 Agent 都注册，无 DSN 时返回解释性结果，永不参与 finding 接受。
-- 两个引擎侧 M4 消费者注记 ledger 工具（`internal/agent/ledger_cross_scan.go`）：区域 = `read_ledger(filter=schedulable)` 的逐条同端点跨扫描注记；关联 = `claim_next_hypothesis` 的同主体跨扫描段落 + 以本扫描条目为根的当前扫描边遍历（关系边是 per-scan 的，跨扫描边图属宪章 §13 研究项）。两者只影响输出、按 per-call 查询预算封顶、无 reader 时退化为原输出；reader 错误与 §6.4 同步缺口以可见注记呈现（绝不静默）。
+- 两个引擎侧 M4 消费者注记 ledger 工具（`internal/agent/ledger_cross_scan.go`）：区域 = `read_ledger(filter=schedulable)` 的逐条同端点跨扫描注记；关联 = `claim_next_hypothesis` 的同主体跨扫描段落 + 以本扫描条目为根的当前扫描边遍历（关系边是 per-scan 的，跨扫描边图属宪章 §13 研究项）。查询范围严格限定在**本项目所有任务的扫描**（`ProjectScanIDs` 白名单，项目是隔离边界），绝不做 `AllScans`；两者只影响输出、按 per-call 查询预算封顶、无 reader 或无项目作用域时退化为原输出；reader 错误与 §6.4 同步缺口以可见注记呈现（绝不静默）。
 - 两个只读 HTTP 视图暴露审计面：`GET /api/scans/{id}/audit`（认领历史、重复/缺口/乱序检测、显式 `incomplete`）与 `GET /api/scans/{id}/coldpath`（`pending`/`applied`/`gap`/`failed`，无 DSN 时为 `disabled` 而非 `failed`）。两者位于 `web/scan_audit.go`，投影永不改 ledger、永不参与判定。
 
 热路径变更仍在内存 + `ledger.json`；journal 是持久领域审计；PostgreSQL 是可读副本、可以缺席。存在 `XALGORIX_DATABASE_URL` 时启用启动迁移、River 与对账；PG 错误只会禁用冷路径，永不为扫描设门。

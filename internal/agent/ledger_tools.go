@@ -19,12 +19,13 @@
 //     blocked/exhausted), assign an owner, set the next-best action, or record
 //     an exploit attempt.
 //   - read_ledger: read the current hypotheses (all / schedulable / open).
-//     The schedulable listing carries an output-only same-endpoint cross-scan
-//     history note per entry when the optional cold-path reader is available
-//     (M4 region consumer, see ledger_cross_scan.go), and claim_next_hypothesis
-//     appends a same-subject cross-scan history section after a successful
-//     claim (M4 association consumer). Both degrade to the unchanged output
-//     when the reader is absent or a query fails.
+//     The schedulable listing carries an output-only same-endpoint history note
+//     per entry when the optional cold-path reader is available AND the agent
+//     has a project scan whitelist (M4 region consumer, see
+//     ledger_cross_scan.go), and claim_next_hypothesis appends a same-subject
+//     history section after a successful claim (M4 association consumer). Both
+//     read only THIS project's scans (the project is the isolation fence) and
+//     degrade to the unchanged output when the reader or scope is absent.
 //
 // Like plan_tools.go, the tools are deliberately tolerant of malformed input —
 // they return a corrective tool result rather than erroring out of the loop.
@@ -59,23 +60,24 @@ func (a *Agent) ledger() *scanctx.LedgerStore {
 func (a *Agent) registerLedgerTools(reg *tools.Registry) {
 	reg.Register(&tools.Tool{
 		Name: "record_hypothesis",
-		Description: "Record or refine an attack hypothesis in the shared, durable ledger — the " +
-			"team's single source of truth for what to test and what has been proven. Call this as " +
-			"soon as recon suggests a plausible weakness (e.g. 'IDOR on /api/orders?id= as user'). " +
-			"Hypotheses are deduplicated by vuln_class + endpoint + parameter + role, so re-recording " +
-			"the same target refines the existing entry instead of duplicating it. The coordinator " +
-			"and every specialist share this ledger, so recording here is how parallel agents avoid " +
-			"overlapping and how work is scheduled.",
+		Description: "Record or refine a FORMAL attack hypothesis in the shared, durable ledger — the " +
+			"team's single source of truth for what to test and what has been proven. Only record a " +
+			"claim you actually believe and can falsify; a coverage gap or a vulnerability class is not a " +
+			"hypothesis. Hypotheses are deduplicated by vuln_class + endpoint + parameter + role, so " +
+			"re-recording the same target refines the existing entry instead of duplicating it (and " +
+			"promotes an engine coverage seed into a formal hypothesis).",
 		Parameters: []tools.Parameter{
 			{Name: "vuln_class", Description: "Vulnerability class, e.g. sqli, xss, idor, ssrf, ssti, rce, auth, csrf, lfi, xxe.", Required: true},
 			{Name: "endpoint", Description: "Target endpoint/path, e.g. /api/orders. Query string is ignored for dedup.", Required: false},
 			{Name: "parameter", Description: "Input/parameter under test, e.g. id, q, redirect.", Required: false},
 			{Name: "role", Description: "Auth context this applies to: anonymous, user, admin, or a named role.", Required: false},
-			{Name: "title", Description: "Short human-readable title.", Required: false},
+			{Name: "title", Description: "REQUIRED. The falsifiable claim in one sentence, e.g. 'GET /api/orders?order_id= as user returns another user's order'.", Required: true},
 			{Name: "target", Description: "Target host/base URL if multi-target.", Required: false},
 			{Name: "data_flow", Description: "For whitebox: source->sink path, e.g. 'req.query.id -> db.query'.", Required: false},
 			{Name: "required_privilege", Description: "Privilege needed to test (e.g. 'authenticated user').", Required: false},
-			{Name: "baseline", Description: "Control/baseline result that distinguishes a real bug from intended behavior.", Required: false},
+			{Name: "baseline", Description: "Control/negative result that distinguishes a real bug from intended behavior.", Required: false},
+			{Name: "falsification", Description: "What observation would REFUTE this claim (e.g. 'the same request as another user returns 403 on every attempt').", Required: false},
+			{Name: "next_observation", Description: "The single observation most likely to discriminate this hypothesis from an alternative.", Required: false},
 			{Name: "preconditions", Description: "REQUIRED. Preconditions before testing as a JSON array or comma-separated list. If they are not known yet, pass [\"unknown\"]; never silently omit them.", Required: true},
 			{Name: "next_action", Description: "The next concrete step to attempt.", Required: false},
 			{Name: "confidence", Description: "0.0-1.0 belief this is exploitable (default 0.5).", Required: false},
@@ -101,6 +103,8 @@ func (a *Agent) registerLedgerTools(reg *tools.Registry) {
 			{Name: "request", Description: "Optional raw request evidence (bounded).", Required: false},
 			{Name: "response", Description: "Optional raw response evidence (bounded).", Required: false},
 			{Name: "finding_id", Description: "When kind=finding_ref, the reported finding id (e.g. XALG-3).", Required: false},
+			{Name: "info_item_id", Description: "Optional InfoItem/Evidence ID this observation was derived from (R3 trace link). Must resolve in this scan's ledger.", Required: false},
+			{Name: "intent_id", Description: "Optional intent/unit id whose execution produced this observation (R3 trace link).", Required: false},
 			{Name: "confidence", Description: "0.0-1.0 quality of this observation.", Required: false},
 		},
 		Execute: a.addHypothesisEvidenceTool,
@@ -211,6 +215,28 @@ func (a *Agent) crossScanOK(scanID string) bool {
 	return fn != nil && fn(scanID)
 }
 
+// SetCrossScanScanIDsResolver installs the project scan whitelist the M4
+// cross-scan history annotations may read. The project is the isolation
+// fence — tasks inside one project share history, projects never do — so
+// without a resolver the annotations are suppressed instead of falling back
+// to an AllScans query. The resolver returns the project's scan IDs
+// (including this run); an empty result disables the annotations.
+func (a *Agent) SetCrossScanScanIDsResolver(fn func() []string) {
+	a.crossScanMu.Lock()
+	a.crossScanScanIDs = fn
+	a.crossScanMu.Unlock()
+}
+
+func (a *Agent) crossScanScanIDsAllowed() []string {
+	a.crossScanMu.RLock()
+	fn := a.crossScanScanIDs
+	a.crossScanMu.RUnlock()
+	if fn == nil {
+		return nil
+	}
+	return fn()
+}
+
 // readInfoItemTool serves the L0/L1/L2 read views. It reads the shared ledger
 // first; on a miss it falls back to the cold-path Reader for the same scan
 // (or an explicitly authorized same-project scan). Cross-scan reads require a
@@ -225,8 +251,8 @@ func (a *Agent) readInfoItemTool(args map[string]string) (tools.Result, error) {
 	if layer == "" {
 		layer = "index"
 	}
-	if layer != "index" && layer != "detail" && layer != "artifact" {
-		return tools.Result{Error: "layer must be index, detail, or artifact"}, nil
+	if layer != "index" && layer != "detail" && layer != "artifact" && layer != "trace" {
+		return tools.Result{Error: "layer must be index, detail, artifact, or trace"}, nil
 	}
 	current := ""
 	if a.scanCtx != nil {
@@ -242,6 +268,19 @@ func (a *Agent) readInfoItemTool(args map[string]string) (tools.Result, error) {
 		}
 	}
 
+	if layer == "trace" {
+		if a.scanCtx == nil || a.scanCtx.Ledger == nil {
+			return tools.Result{Error: "trace requires an active ledger"}, nil
+		}
+		trace := a.scanCtx.Ledger.TraceInfoItem(id)
+		out, err := json.Marshal(trace)
+		if err != nil {
+			return tools.Result{Error: "encode trace: " + err.Error()}, nil
+		}
+		a.recordInfoRead("read_info_item", "trace", []string{id}, len(trace.Reads)+len(trace.Evidence) > 0, false, false, "trace lookup")
+		return tools.Result{Output: string(out)}, nil
+	}
+
 	if current != "" && target == current {
 		if l := a.ledger(); l != nil {
 			for _, h := range l.All() {
@@ -254,6 +293,8 @@ func (a *Agent) readInfoItemTool(args map[string]string) (tools.Result, error) {
 					if err != nil {
 						return tools.Result{Error: "encode info item: " + err.Error()}, nil
 					}
+					a.recordInfoRead("read_info_item", layer, []string{id, ev.ID}, true,
+						layer == "detail" && len(ev.Summary) > 4096, false, "ledger read")
 					return tools.Result{Output: string(out)}, nil
 				}
 			}
@@ -268,9 +309,11 @@ func (a *Agent) readInfoItemTool(args map[string]string) (tools.Result, error) {
 	defer cancel()
 	item, err := reader.GetByID(ctx, target, id)
 	if errors.Is(err, infoitem.ErrNotFound) {
+		a.recordInfoRead("read_info_item", layer, []string{id}, false, false, false, "cold-path not found")
 		return tools.Result{Error: "info item not found: " + id + " (scan " + target + ")"}, nil
 	}
 	if err != nil {
+		a.recordInfoRead("read_info_item", layer, []string{id}, false, false, true, "cold-path error: "+err.Error())
 		return tools.Result{Error: "cold-path read failed: " + err.Error()}, nil
 	}
 	var payload any
@@ -286,7 +329,20 @@ func (a *Agent) readInfoItemTool(args map[string]string) (tools.Result, error) {
 	if err != nil {
 		return tools.Result{Error: "encode info item: " + err.Error()}, nil
 	}
+	a.recordInfoRead("read_info_item", layer, []string{id}, true, false, false, "cold-path read")
 	return tools.Result{Output: string(out)}, nil
+}
+
+// recordInfoRead appends one engine-side read trace. Failures are logged by the
+// ledger but never turn a successful read into an error.
+func (a *Agent) recordInfoRead(tool, mode string, refs []string, found, truncated, incomplete bool, reason string) {
+	if a == nil || a.scanCtx == nil || a.scanCtx.Ledger == nil {
+		return
+	}
+	_ = a.scanCtx.Ledger.AppendInfoRead(scanctx.InfoRead{
+		Tool: tool, Mode: mode, Reason: reason, RefIDs: refs,
+		Actor: a.ledgerOrigin(), Found: found, Truncated: truncated, Incomplete: incomplete,
+	}, scanctx.AuditActorForAgent(a.ledgerOrigin()))
 }
 
 func infoItemView(hypothesisID string, ev *scanctx.Evidence, layer string) map[string]any {
@@ -366,6 +422,10 @@ func (a *Agent) recordHypothesisTool(args map[string]string) (tools.Result, erro
 	if vc == "" {
 		return tools.Result{Error: "vuln_class is required (e.g. sqli, idor, ssrf)"}, nil
 	}
+	claim := strings.TrimSpace(args["title"])
+	if claim == "" {
+		return tools.Result{Error: "title is required: state the falsifiable CLAIM in one sentence (a vulnerability class is not a hypothesis)"}, nil
+	}
 	conf := 0.5
 	if raw := strings.TrimSpace(args["confidence"]); raw != "" {
 		if f, err := strconv.ParseFloat(raw, 64); err == nil {
@@ -385,11 +445,13 @@ func (a *Agent) recordHypothesisTool(args map[string]string) (tools.Result, erro
 		Endpoint:          strings.TrimSpace(args["endpoint"]),
 		Parameter:         strings.TrimSpace(args["parameter"]),
 		Role:              strings.TrimSpace(args["role"]),
-		Title:             strings.TrimSpace(args["title"]),
+		Title:             claim,
 		Target:            strings.TrimSpace(args["target"]),
 		DataFlow:          strings.TrimSpace(args["data_flow"]),
 		RequiredPrivilege: strings.TrimSpace(args["required_privilege"]),
 		Baseline:          strings.TrimSpace(args["baseline"]),
+		Falsification:     strings.TrimSpace(args["falsification"]),
+		NextObservation:   strings.TrimSpace(args["next_observation"]),
 		NextAction:        strings.TrimSpace(args["next_action"]),
 		Preconditions:     preconditions,
 		Confidence:        conf,
@@ -469,10 +531,18 @@ func (a *Agent) addHypothesisEvidenceTool(args map[string]string) (tools.Result,
 			}
 		}
 	}
+	infoItemID := strings.TrimSpace(args["info_item_id"])
+	if infoItemID != "" {
+		if !evidenceLinkResolves(l, infoItemID) {
+			return tools.Result{Error: fmt.Sprintf("unknown info_item_id %q — link to an Evidence/InfoItem ID visible in this scan's ledger", infoItemID)}, nil
+		}
+	}
 	ev := scanctx.Evidence{
 		Kind:       kind,
 		Nature:     nature,
 		Supports:   supports,
+		InfoItemID: infoItemID,
+		IntentID:   strings.TrimSpace(args["intent_id"]),
 		Summary:    summary,
 		Request:    args["request"],
 		Response:   args["response"],
@@ -491,6 +561,26 @@ func (a *Agent) addHypothesisEvidenceTool(args map[string]string) (tools.Result,
 	return tools.Result{Output: summaryOut}, nil
 }
 
+// evidenceLinkResolves reports whether an InfoItem/Evidence reference exists in
+// this scan's ledger. Engine-side validation: the model cannot invent a trace
+// anchor that no authoritative object backs.
+func evidenceLinkResolves(l *scanctx.LedgerStore, ref string) bool {
+	if l == nil || strings.TrimSpace(ref) == "" {
+		return false
+	}
+	if _, ok := l.Get(ref); ok {
+		return true
+	}
+	for _, h := range l.All() {
+		for _, ev := range h.Evidence {
+			if strings.EqualFold(ev.ID, ref) || strings.EqualFold(ev.InfoItemID, ref) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (a *Agent) updateHypothesisTool(args map[string]string) (tools.Result, error) {
 	l := a.ledger()
 	if l == nil {
@@ -507,6 +597,10 @@ func (a *Agent) updateHypothesisTool(args map[string]string) (tools.Result, erro
 	var applied []string
 	if st := strings.TrimSpace(args["status"]); st != "" {
 		status := scanctx.NormalizeHypothesisStatus(st)
+		current, _ := l.Get(id)
+		if res := validateHypothesisTransition(&current, status, strings.TrimSpace(args["next_action"])); res != nil {
+			return *res, nil
+		}
 		if err := l.SetStatusAs(id, status, strings.TrimSpace(args["next_action"]), actor); err != nil {
 			return tools.Result{Error: "status audit/persistence failed: " + err.Error()}, nil
 		}
@@ -552,6 +646,52 @@ func (a *Agent) updateHypothesisTool(args map[string]string) (tools.Result, erro
 	}, nil
 }
 
+// validateHypothesisTransition enforces the R2 quality contract at the model
+// tool boundary. Store-level transitions stay permissive for engine-owned
+// paths (verifier records, reclaim), but a model may not declare a hypothesis
+// proven without a reported finding, or rejected without any refuting
+// baseline/control observation.
+func validateHypothesisTransition(h *scanctx.Hypothesis, status scanctx.HypothesisStatus, nextAction string) *tools.Result {
+	if h == nil {
+		r := tools.Result{Error: "unknown hypothesis"}
+		return &r
+	}
+	switch status {
+	case scanctx.HypothesisProven:
+		for _, ev := range h.Evidence {
+			if ev.Kind == scanctx.EvidenceFindingRef && strings.TrimSpace(ev.FindingID) != "" {
+				return nil
+			}
+		}
+		r := tools.Result{Error: "proven requires an authoritative finding: call report_vulnerability first, then add_hypothesis_evidence(kind=finding_ref, finding_id=<XALG-…>) and retry. Hypothesis confidence is not proof."}
+		return &r
+	case scanctx.HypothesisRejected:
+		if strings.TrimSpace(h.Baseline) != "" {
+			return nil
+		}
+		for _, ev := range h.Evidence {
+			// An engine-assigned stable ID is not a substantiation; only an
+			// explicit cross-object link, supports, or a real observation is.
+			explicitLink := ev.InfoItemID != "" && !strings.HasPrefix(ev.InfoItemID, "evidence:")
+			if ev.Nature == scanctx.EvidenceObserved || len(ev.Supports) > 0 || explicitLink {
+				return nil
+			}
+			switch strings.ToLower(ev.Kind) {
+			case "baseline", "control", "contradiction", "exploit":
+				return nil
+			}
+		}
+		r := tools.Result{Error: "rejected requires a refuting observation: record a baseline/control, an observed probe, or link the InfoItem it came from (add_hypothesis_evidence). An unsubstantiated inferred note is not a refutation."}
+		return &r
+	case scanctx.HypothesisBlocked:
+		if nextAction == "" && strings.TrimSpace(h.NextAction) == "" {
+			r := tools.Result{Error: "blocked requires a reason: pass next_action describing the missing precondition (credentials, feature flag, access, …)."}
+			return &r
+		}
+	}
+	return nil
+}
+
 func (a *Agent) readLedgerTool(args map[string]string) (tools.Result, error) {
 	l := a.ledger()
 	if l == nil {
@@ -575,8 +715,9 @@ func (a *Agent) readLedgerTool(args map[string]string) (tools.Result, error) {
 		}
 		var b strings.Builder
 		b.WriteString(fmt.Sprintf("Top %d hypotheses to work next (highest confidence first):\n", len(sched)))
-		// M4 region consumer (output-only): per-entry same-endpoint cross-scan
-		// history. nil cache (no cold-path reader) keeps the output unchanged.
+		// M4 region consumer (output-only): per-entry same-endpoint history
+		// across THIS project's scans. nil cache (no cold-path reader or no
+		// project scope) keeps the output unchanged.
 		regionNotes := newCrossScanRegionCache(a)
 		for _, h := range sched {
 			b.WriteString(fmt.Sprintf("• %s [%s] %s%s conf=%.2f pre=%s", h.ID, h.Status, h.VulnClass, formatLoc(h), h.Confidence, preconditionSummary(h)))
@@ -704,9 +845,10 @@ func (a *Agent) claimNextHypothesisTool(args map[string]string) (tools.Result, e
 		writeEvidenceRefs(&b, got.Evidence)
 	}
 	b.WriteString("Work this hypothesis, record evidence with add_hypothesis_evidence, then set its final status with update_hypothesis: proven (link the finding via kind=finding_ref) or rejected (with the baseline that ruled it out).")
-	// M4 association consumer (output-only): same-subject cross-scan history
-	// appended at the end. Reader absence or any query error keeps the output
-	// unchanged; claim semantics above are untouched.
+	// M4 association consumer (output-only): same-subject history across THIS
+	// project's scans appended at the end. Reader/project-scope absence or any
+	// query error keeps the output unchanged; claim semantics above are
+	// untouched.
 	a.appendCrossScanAssociationNote(&b, got)
 	return tools.Result{
 		Output:   b.String(),

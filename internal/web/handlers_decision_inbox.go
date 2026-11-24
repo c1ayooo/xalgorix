@@ -5,12 +5,16 @@ package web
 //
 //	GET  /api/scans/{id}/decisions — read-only projection of the few things a
 //	                                 human may need to decide: stalled workers,
-//	                                 blocked intents, open intents and recent
+//	                                 blocked intents, intents parked for a
+//	                                 capability, open intents and recent
 //	                                 executor deviations.
-//	POST /api/scans/{id}/decisions — the four bounded decision actions
-//	                                 (steer_work, kill_work, retire_intent,
+//	POST /api/scans/{id}/decisions — the bounded decision actions (steer_work,
+//	                                 kill_work, retire_intent,
 //	                                 reprioritize_intent) routed to the live
-//	                                 agent bound to the run.
+//	                                 agent bound to the run, plus
+//	                                 issue_capability (INTEL_HANDOFF_SPEC M3),
+//	                                 which writes a one-shot capability and
+//	                                 resumes the parked intent.
 //
 // This surface is deliberately NOT an event stream: it never subscribes to
 // run_events/SSE. Stalled workers come from the live pool's StallReport; the
@@ -29,6 +33,7 @@ import (
 
 	"github.com/c1ayooo/xalgorix/v4/internal/domainjournal"
 	"github.com/c1ayooo/xalgorix/v4/internal/graph"
+	"github.com/c1ayooo/xalgorix/v4/internal/intelaccess"
 )
 
 // decisionInboxLimit bounds each list in the inbox so one bad run cannot flood
@@ -55,6 +60,15 @@ type decisionBlockedView struct {
 	BlockedReason string `json:"blocked_reason"`
 }
 
+// decisionPausedView is one intent parked for an operator decision: it needs a
+// capability before the pool may dispatch it out of scope (M3).
+type decisionPausedView struct {
+	UnitID string `json:"unit_id"`
+	Title  string `json:"title"`
+	Reason string `json:"reason"`
+	Target string `json:"target,omitempty"`
+}
+
 // decisionOpenIntentView is one open intent awaiting a worker.
 type decisionOpenIntentView struct {
 	UnitID     string `json:"unit_id"`
@@ -78,6 +92,7 @@ type decisionInboxView struct {
 	GeneratedAt string                   `json:"generated_at"`
 	Stalled     []decisionStalledView    `json:"stalled"`
 	Blocked     []decisionBlockedView    `json:"blocked"`
+	Paused      []decisionPausedView     `json:"paused"`
 	OpenIntents []decisionOpenIntentView `json:"open_intents"`
 	Deviations  []decisionDeviationView  `json:"deviations"`
 }
@@ -91,6 +106,10 @@ type decisionRequest struct {
 	Reason     string `json:"reason"`
 	// Priority is a pointer so a missing value is distinguishable from 0.
 	Priority *int `json:"priority"`
+	// issue_capability: the scope of one approval (INTEL_HANDOFF_SPEC M3).
+	Targets    []string `json:"targets"`
+	UsesLeft   int      `json:"uses_left"`
+	TTLSeconds int      `json:"ttl_s"`
 }
 
 // scanDecisionID parses the scan id out of /api/scans/{id}/decisions.
@@ -129,6 +148,7 @@ func (s *Server) getScanDecisions(w http.ResponseWriter, r *http.Request) {
 		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
 		Stalled:     []decisionStalledView{},
 		Blocked:     []decisionBlockedView{},
+		Paused:      []decisionPausedView{},
 		OpenIntents: []decisionOpenIntentView{},
 		Deviations:  []decisionDeviationView{},
 	}
@@ -188,6 +208,22 @@ func (s *Server) getScanDecisions(w http.ResponseWriter, r *http.Request) {
 					UnitID:        task.TaskID,
 					Title:         task.Title,
 					BlockedReason: blockedReason[task.NodeID],
+				})
+			case string(graph.StatePaused):
+				if len(view.Paused) >= decisionInboxLimit {
+					continue
+				}
+				target := strings.TrimSpace(task.Target)
+				if target == "" && payloads[task.NodeID] != nil {
+					if raw, ok := payloads[task.NodeID]["target"].(string); ok {
+						target = strings.TrimSpace(raw)
+					}
+				}
+				view.Paused = append(view.Paused, decisionPausedView{
+					UnitID: task.TaskID,
+					Title:  task.Title,
+					Reason: blockedReason[task.NodeID],
+					Target: target,
 				})
 			case string(graph.StateOpen), "pending":
 				if len(view.OpenIntents) >= decisionInboxLimit {
@@ -282,6 +318,12 @@ func (s *Server) postScanDecision(w http.ResponseWriter, r *http.Request) {
 	}
 
 	runID := s.graphRunID(scanID)
+	// issue_capability acts on the graph + projection store, so it works even
+	// when no agent is live (a parked intent outlives its worker).
+	if action == "issue_capability" {
+		s.postIssueCapability(w, r, scanID, runID, unitID, req)
+		return
+	}
 	agnt := s.instanceAgent(runID)
 	if agnt == nil {
 		s.mu.RLock()
@@ -339,7 +381,7 @@ func (s *Server) postScanDecision(w http.ResponseWriter, r *http.Request) {
 		message = fmt.Sprintf("Reprioritized intent %s to %d (actor=human).", unitID, *req.Priority)
 	default:
 		writeJSONStatus(w, http.StatusBadRequest, map[string]string{
-			"error": "unsupported action (allowed: steer_work, kill_work, retire_intent, reprioritize_intent)",
+			"error": "unsupported action (allowed: steer_work, kill_work, retire_intent, reprioritize_intent, issue_capability)",
 		})
 		return
 	}
@@ -374,4 +416,166 @@ func decisionReasonCode(code string) string {
 		return "human"
 	}
 	return code
+}
+
+// capabilityApproval bounds one operator approval. The engine never issues a
+// broader permission than this, whatever the request body says.
+const (
+	capabilityDefaultUses = 1
+	capabilityMaxUses     = 10
+	capabilityDefaultTTL  = 10 * time.Minute
+	capabilityMinTTL      = time.Minute
+	capabilityMaxTTL      = 2 * time.Hour
+)
+
+// postIssueCapability issues one-shot permissions for a parked intent and
+// resumes it (INTEL_HANDOFF_SPEC M3 / D3 / D9). DenyTargets never reach this
+// endpoint: the judge refuses them before a request exists, and a target that
+// no usable intel grant covers cannot be approved here either.
+func (s *Server) postIssueCapability(w http.ResponseWriter, r *http.Request, scanID, runID, unitID string, req decisionRequest) {
+	store := intelaccess.StoreOrNil()
+	if store == nil {
+		writeJSONStatus(w, http.StatusServiceUnavailable, map[string]string{
+			"error": "intel projection store is not available",
+		})
+		return
+	}
+	repo := graph.Backend()
+	if repo == nil {
+		writeJSONStatus(w, http.StatusServiceUnavailable, map[string]string{
+			"error": "graph authority is not available",
+		})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	tasks, err := repo.PlanTasks(ctx, runID)
+	if err != nil {
+		writeJSONStatus(w, http.StatusServiceUnavailable, map[string]any{
+			"error": "graph plan read failed", "detail": err.Error(),
+		})
+		return
+	}
+	var (
+		nodeID   int64
+		fallback string
+	)
+	for _, task := range tasks {
+		if strings.TrimSpace(task.TaskID) == unitID {
+			nodeID = task.NodeID
+			fallback = strings.TrimSpace(task.Target)
+			break
+		}
+	}
+	if nodeID == 0 {
+		writeJSONStatus(w, http.StatusNotFound, map[string]any{
+			"error": "no intent named " + unitID + " in this run", "scan_id": scanID,
+		})
+		return
+	}
+
+	targets := make([]string, 0, len(req.Targets))
+	for _, raw := range req.Targets {
+		raw = strings.TrimSpace(raw)
+		if raw != "" {
+			targets = append(targets, raw)
+		}
+	}
+	if len(targets) == 0 {
+		if fallback == "" {
+			writeJSONStatus(w, http.StatusBadRequest, map[string]string{
+				"error": "targets are required (the intent names no target to approve)",
+			})
+			return
+		}
+		targets = []string{fallback}
+	}
+
+	uses := req.UsesLeft
+	if uses <= 0 {
+		uses = capabilityDefaultUses
+	}
+	if uses > capabilityMaxUses {
+		uses = capabilityMaxUses
+	}
+	ttl := time.Duration(req.TTLSeconds) * time.Second
+	if ttl <= 0 {
+		ttl = capabilityDefaultTTL
+	}
+	if ttl < capabilityMinTTL {
+		ttl = capabilityMinTTL
+	}
+	if ttl > capabilityMaxTTL {
+		ttl = capabilityMaxTTL
+	}
+
+	issued := 0
+	batches := make([]string, 0, 2)
+	for _, raw := range targets {
+		target, ok := intelaccess.NormalizeTarget(raw)
+		if !ok {
+			writeJSONStatus(w, http.StatusBadRequest, map[string]string{
+				"error": "target " + raw + " is not a host:port or CIDR",
+			})
+			return
+		}
+		access, found, err := store.FindGrant(ctx, runID, target)
+		if err != nil {
+			writeJSONStatus(w, http.StatusServiceUnavailable, map[string]any{
+				"error": "intel projection read failed", "detail": err.Error(),
+			})
+			return
+		}
+		if !found {
+			writeJSONStatus(w, http.StatusConflict, map[string]any{
+				"error":  "no usable intel grants this target",
+				"target": target,
+				"hint":   "confirm the intel item first, or add the operator grant on the 情报 tab",
+			})
+			return
+		}
+		capabilities, err := store.IssueCapabilities(ctx, intelaccess.IssueInput{
+			ScanID:   runID,
+			IntentID: nodeID,
+			AccessID: access.ID,
+			Targets:  []string{target},
+			UsesLeft: uses,
+			TTL:      ttl,
+			IssuedBy: "operator",
+		})
+		if err != nil {
+			writeJSONStatus(w, http.StatusServiceUnavailable, map[string]any{
+				"error": "capability write failed", "detail": err.Error(),
+			})
+			return
+		}
+		issued += len(capabilities)
+		for _, capability := range capabilities {
+			if capability.BatchID != "" && (len(batches) == 0 || batches[len(batches)-1] != capability.BatchID) {
+				batches = append(batches, capability.BatchID)
+			}
+		}
+	}
+
+	// Resume the parked intent. Not being paused is not an error: an approval
+	// may arrive before the pool has parked it (or after a kill), and the
+	// capability still applies when the intent is next dispatched.
+	resumed := false
+	if moved, err := repo.Transition(ctx, runID, nodeID, graph.KindIntent, graph.StatePaused, graph.StateOpen); err == nil && moved {
+		resumed = true
+	}
+
+	writeJSONStatus(w, http.StatusOK, map[string]any{
+		"ok":                  true,
+		"action":              "issue_capability",
+		"unit_id":             unitID,
+		"capabilities_issued": issued,
+		"batches":             batches,
+		"uses_left":           uses,
+		"expires_in_seconds":  int(ttl.Seconds()),
+		"resumed":             resumed,
+		"message": fmt.Sprintf("Issued %d capability row(s) for %s (uses=%d, ttl=%s).",
+			issued, unitID, uses, ttl),
+	})
 }

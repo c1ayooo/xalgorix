@@ -37,6 +37,35 @@ type EngagementScope struct {
 	AllowPorts []int
 }
 
+// DestinationDenied reports whether raw is explicitly excluded by the deny
+// list, independent of the allow list. The dispatch judge needs the
+// distinction: a denied target is a hard stop (no approval is ever offered),
+// while an out-of-scope target may be reached through an operator-issued
+// capability (INTEL_HANDOFF_SPEC D7).
+func (s *EngagementScope) DestinationDenied(raw string) (bool, string) {
+	if s == nil || len(s.Deny) == 0 {
+		return false, ""
+	}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false, ""
+	}
+	host, _ := referenceHostPort(raw)
+	if host == "" {
+		return false, ""
+	}
+	if scopeEntriesMatch(s.Deny, host) {
+		return true, "the target is explicitly denied by the project fence"
+	}
+	return false, ""
+}
+
+// Configured reports whether an allow list is installed. A scope intent on a
+// run without one stays undispatchable (the pre-M3 rule, kept verbatim).
+func (s *EngagementScope) Configured() bool {
+	return s != nil && len(s.Targets) > 0
+}
+
 // DestinationAllowed reports whether raw (URL, host:port, bare host, or a
 // literal scope entry such as a CIDR/wildcard) is inside the engagement scope,
 // not denied, and on an allowed port. The returned reason is a short clause
@@ -49,7 +78,21 @@ func (s *EngagementScope) DestinationAllowed(raw string) (bool, string) {
 	if raw == "" {
 		return true, "" // nothing named, nothing to police
 	}
-	host, port := referenceHostPort(raw)
+	// A CIDR destination names a range: it is authorized only when the WHOLE
+	// range is inside the allow list. Checking just the network address would
+	// widen the scope (a /24 is not authorized because its base is).
+	if _, targetNet, err := net.ParseCIDR(raw); err == nil {
+		return s.cidrDestinationAllowed(targetNet)
+	}
+	// A bare IP literal (including IPv6 without brackets) is its own authority:
+	// referenceHostPort parses URLs/authorities and would reject the unbracketed
+	// form the command/scope layers legitimately produce.
+	host, port := "", ""
+	if ip := net.ParseIP(strings.Trim(raw, "[]")); ip != nil {
+		host = ip.String()
+	} else {
+		host, port = referenceHostPort(raw)
+	}
 	if host == "" {
 		return false, "it is not a recognizable host"
 	}
@@ -65,13 +108,64 @@ func (s *EngagementScope) DestinationAllowed(raw string) (bool, string) {
 	return true, ""
 }
 
+// cidrDestinationAllowed judges a range destination. Deny entries (hosts or
+// networks) that overlap the range forbid it; an allow entry must be a network
+// that contains the whole range.
+func (s *EngagementScope) cidrDestinationAllowed(target *net.IPNet) (bool, string) {
+	for _, entry := range s.Deny {
+		normalized := normalizeScopeEntry(entry)
+		if normalized == "" {
+			continue
+		}
+		if _, denyNet, err := net.ParseCIDR(normalized); err == nil {
+			if cidrOverlaps(denyNet, target) {
+				return false, "the target is explicitly denied"
+			}
+			continue
+		}
+		if ip := net.ParseIP(normalized); ip != nil && target.Contains(ip) {
+			return false, "the target is explicitly denied"
+		}
+	}
+	for _, entry := range s.Targets {
+		normalized := normalizeScopeEntry(entry)
+		if normalized == "" {
+			continue
+		}
+		_, allowNet, err := net.ParseCIDR(normalized)
+		if err != nil {
+			continue // a host entry can never authorize a whole range
+		}
+		if cidrContains(allowNet, target) {
+			return true, ""
+		}
+	}
+	return false, "it is not an authorized scope target"
+}
+
+// cidrContains reports whether outer covers every address in inner.
+func cidrContains(outer, inner *net.IPNet) bool {
+	outerOnes, outerBits := outer.Mask.Size()
+	innerOnes, innerBits := inner.Mask.Size()
+	if outerBits != innerBits || outerOnes > innerOnes {
+		return false
+	}
+	return outer.Contains(inner.IP)
+}
+
+// cidrOverlaps reports whether the two networks share any address.
+func cidrOverlaps(a, b *net.IPNet) bool {
+	return a.Contains(b.IP) || b.Contains(a.IP)
+}
+
 // engagementScopeBlocked is the Agent-side check. It returns a refusal message
 // when raw is outside an enforced engagement scope.
 func (a *Agent) engagementScopeBlocked(raw string) (bool, string) {
-	if a == nil || a.engagementScope == nil {
+	scope := a.engagementScopeSnapshot()
+	if a == nil || scope == nil {
 		return false, ""
 	}
-	ok, reason := a.engagementScope.DestinationAllowed(raw)
+	ok, reason := scope.DestinationAllowed(raw)
 	if ok {
 		return false, ""
 	}

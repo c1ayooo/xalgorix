@@ -1749,6 +1749,14 @@ export interface DecisionOpenIntent {
   target_kind: string;
 }
 
+/** 一个被挂起、等操作者签发越界通行证的 intent（情报交接 M3）。 */
+export interface DecisionPausedIntent {
+  unit_id: string;
+  title: string;
+  reason: string;
+  target?: string;
+}
+
 /** 一条执行器报告的偏离。 */
 export interface DecisionDeviation {
   unit_id: string;
@@ -1761,6 +1769,8 @@ export interface DecisionInboxView {
   generated_at: string;
   stalled: DecisionStalledWorker[];
   blocked: DecisionBlockedIntent[];
+  /** 等操作者批准越界通行证的 intent（paused）。 */
+  paused: DecisionPausedIntent[];
   open_intents: DecisionOpenIntent[];
   deviations: DecisionDeviation[];
 }
@@ -1769,7 +1779,8 @@ export type DecisionAction =
   | "steer_work"
   | "kill_work"
   | "retire_intent"
-  | "reprioritize_intent";
+  | "reprioritize_intent"
+  | "issue_capability";
 
 /** POST /api/scans/{id}/decisions 请求体。 */
 export interface DecisionRequest {
@@ -1779,6 +1790,10 @@ export interface DecisionRequest {
   reason_code?: string;
   reason?: string;
   priority?: number;
+  /** issue_capability：目标（缺省取 intent 目标）、可用次数、有效期。 */
+  targets?: string[];
+  uses_left?: number;
+  ttl_s?: number;
 }
 
 export interface DecisionResult {
@@ -1786,6 +1801,8 @@ export interface DecisionResult {
   action: string;
   unit_id: string;
   message: string;
+  capabilities_issued?: number;
+  resumed?: boolean;
 }
 
 // ── 集成模块：MCP 服务器 / 用户技能 / Agent 档案（契约 §integration-*） ──
@@ -2057,6 +2074,15 @@ export interface IntelTriage {
   decided_at: string;
 }
 
+/** 情报的可达性投影（M2/M3）：这条战果能开哪扇门、状态如何。 */
+export interface IntelAccess {
+  state: "proposed" | "confirmed" | "active" | "expired" | "revoked";
+  subject?: string;
+  grants?: string[];
+  confirmed_by?: string;
+  expires_at?: string;
+}
+
 export interface IntelItem {
   id: string;
   fingerprint: string;
@@ -2070,6 +2096,8 @@ export interface IntelItem {
   /** 记录了同一观测（同指纹）的各 Run。 */
   scan_ids: string[];
   triage?: IntelTriage;
+  /** 引擎侧可达性投影（与人工 triage 是两件事）。 */
+  access?: IntelAccess;
 }
 
 export interface TaskIntelResponse {
@@ -2078,6 +2106,63 @@ export interface TaskIntelResponse {
   triage_available: boolean;
   damaged_runs?: number;
   note?: string;
+}
+
+/** GET /api/scans/{id}/intel-access — 运行级可达性只读投影（M4）。 */
+export interface IntelAccessRow {
+  id: number;
+  scan_id: string;
+  fingerprint: string;
+  kind: "credential" | "session" | "path";
+  subject?: string;
+  state: IntelAccess["state"];
+  confirmed_by?: string;
+  confirmed_at?: string;
+  expires_at?: string;
+  last_used_at?: string;
+  use_count: number;
+  fail_count: number;
+  revoke_reason?: string;
+  grants?: string[];
+  updated_at: string;
+}
+
+export interface IntelCapabilityRow {
+  id: number;
+  intent_id: number;
+  access_id: number;
+  target: string;
+  batch_id?: string;
+  uses_left: number;
+  expires_at: string;
+  issued_by: string;
+  created_at: string;
+}
+
+export type IntelUseDecision =
+  | "allow"
+  | "deny"
+  | "needs_capability"
+  | "detail_fetch";
+
+export interface IntelUseRow {
+  id?: number;
+  intent_id?: number;
+  fingerprint?: string;
+  target?: string;
+  decision: IntelUseDecision;
+  reason: string;
+  capability_id?: number;
+  created_at: string;
+}
+
+export interface IntelAccessView {
+  scan_id: string;
+  run_id: string;
+  generated_at: string;
+  access: IntelAccessRow[];
+  capabilities: IntelCapabilityRow[];
+  uses: IntelUseRow[];
 }
 
 /** 会话转录的一行（docs/CHAT_PAGE_REDESIGN.md §4.2）。 */

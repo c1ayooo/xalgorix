@@ -200,3 +200,83 @@ func scanAssets(rows pgx.Rows) ([]Asset, error) {
 	}
 	return out, rows.Err()
 }
+
+// RecordLocator appends one observed locator for an existing asset. The asset
+// must belong to the project; a locator never crosses project scope.
+func (s *PGStore) RecordLocator(ctx context.Context, in LocatorInput) (*Locator, error) {
+	if s == nil || s.pool == nil {
+		return nil, fmt.Errorf("assets: store unavailable")
+	}
+	projectID := strings.TrimSpace(in.ProjectID)
+	locator := strings.TrimSpace(in.Locator)
+	if projectID == "" || in.AssetID <= 0 || locator == "" {
+		return nil, fmt.Errorf("assets: locator requires project_id, asset_id and locator")
+	}
+	observed := in.ObservedAt.UTC()
+	if observed.IsZero() {
+		observed = time.Now().UTC()
+	}
+	validFrom := observed
+	row := s.pool.QueryRow(ctx, `
+		INSERT INTO asset_locators
+			(project_id, asset_id, locator, instance_id, observed_at, valid_from, valid_until, source_info_item_id)
+		SELECT $1, a.id, $3, $4, $5, $6, $7, $8
+		FROM assets a
+		WHERE a.project_id = $1 AND a.id = $2
+		ON CONFLICT (project_id, asset_id, locator, observed_at)
+		DO UPDATE SET valid_from = EXCLUDED.valid_from,
+		              valid_until = EXCLUDED.valid_until,
+		              source_info_item_id = EXCLUDED.source_info_item_id
+		RETURNING id, project_id, asset_id, locator, instance_id, observed_at, valid_from, valid_until, source_info_item_id`,
+		projectID, in.AssetID, locator, strings.TrimSpace(in.InstanceID), observed, validFrom, in.ValidUntil, strings.TrimSpace(in.SourceInfoItemID),
+	)
+	var out Locator
+	if err := row.Scan(&out.ID, &out.ProjectID, &out.AssetID, &out.Locator, &out.InstanceID, &out.ObservedAt, &out.ValidFrom, &out.ValidUntil, &out.SourceInfoItemID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("assets: record locator: %w", err)
+	}
+	return &out, nil
+}
+
+// ListAssetLocators returns one asset's locator history, newest first.
+func (s *PGStore) ListAssetLocators(ctx context.Context, projectID string, assetID int64) ([]Locator, error) {
+	if s == nil || s.pool == nil {
+		return nil, fmt.Errorf("assets: store unavailable")
+	}
+	projectID = strings.TrimSpace(projectID)
+	// An unknown asset inside this project is ErrNotFound, matching GetAssetDetail
+	// and the in-memory store; a known asset with no locators yet is empty.
+	var exists bool
+	if err := s.pool.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM assets WHERE project_id = $1 AND id = $2)`,
+		projectID, assetID).Scan(&exists); err != nil {
+		return nil, fmt.Errorf("assets: list locators: %w", err)
+	}
+	if !exists {
+		return nil, ErrNotFound
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, project_id, asset_id, locator, instance_id, observed_at, valid_from, valid_until, source_info_item_id
+		FROM asset_locators
+		WHERE project_id = $1 AND asset_id = $2
+		ORDER BY observed_at DESC, id DESC`,
+		projectID, assetID)
+	if err != nil {
+		return nil, fmt.Errorf("assets: list locators: %w", err)
+	}
+	defer rows.Close()
+	var out []Locator
+	for rows.Next() {
+		var l Locator
+		if err := rows.Scan(&l.ID, &l.ProjectID, &l.AssetID, &l.Locator, &l.InstanceID, &l.ObservedAt, &l.ValidFrom, &l.ValidUntil, &l.SourceInfoItemID); err != nil {
+			return nil, fmt.Errorf("assets: scan locator: %w", err)
+		}
+		out = append(out, l)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("assets: list locators: %w", err)
+	}
+	return out, nil
+}

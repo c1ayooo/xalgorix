@@ -203,6 +203,18 @@ type ScanState struct {
 	// start; the comprehensive-recon predicate reads this field only, so
 	// deep behavior can never depend on specialist availability.
 	DeepReconRequired bool
+	// NoiseProfile is the engagement's traffic posture (quiet|balanced|loud).
+	// It scopes which ACTIVE discovery dimensions the engine may demand; it
+	// never blocks an explicitly requested probe. Derived once at scan start
+	// from config so obligations read one state flag.
+	NoiseProfile string
+	// Progressive-recon (R1) authorization inputs. These are derived once at
+	// run start; the discovery policy package reads them instead of inferring
+	// authorization from prompts or tool names.
+	OperatorRequestedDiscovery bool // instruction explicitly asks for content discovery
+	OperatorRequestedPortScan  bool // instruction explicitly asks for port/service enumeration
+	PortDiscoveryAuthorized    bool // at least one target is a concrete host/IP or CIDR
+	RequestBudgetConfigured    bool // a per-scan request-rate policy is in force
 	// CompletionStatus is the honest terminal state computed when the finish
 	// gate finally allows the scan to end: "completed",
 	// "completed_with_blocked_work", or "incomplete". Finish-gate exhaustion
@@ -485,7 +497,8 @@ type ScanState struct {
 	DelegationNudgeFired        bool            // multi-agent role decomposition nudge sent once
 	DelegationNudgeAt           int             // iteration of the initial decomposition nudge
 	DelegationReminders         int             // bounded reminders after ignored/malformed spawn calls
-	LedgerSeeded                bool            // hypothesis ledger seeded from the plan once
+	LedgerSeeded                bool            // hypothesis ledger seeded from the plan once (R2: no longer written; kept for compatibility)
+	CoverageOpportunitiesSent   bool            // one-shot coverage advisory delivered (R2: replaces auto-seeding)
 	LastPlanBrief               string          // last plan brief injected into context; avoids duplicate injection when unchanged
 	BeliefPoolDigest            string          // fingerprint of the schedulable pool last delivered as a belief brief; change-triggered re-delivery
 	PlanSurfaceRevision         string          // fingerprint of the surface the engine-authored plan was built from; a change triggers an engine-owned refresh
@@ -772,6 +785,7 @@ func RegisterDefaultHooks(reg *HookRegistry) {
 	reg.Register(OnToolCall, hookStuckTracker)
 	reg.Register(OnToolCall, hookCurlPreference)
 	reg.Register(OnToolExecute, hookWorkTracker)
+	reg.Register(OnToolExecute, hookProgressToolStart)
 	reg.Register(OnStuckCheck, hookStuckNudge)
 	// Recon completion attribution runs before detectors so every result
 	// hook sees the freshly validated coverage state.
@@ -785,6 +799,7 @@ func RegisterDefaultHooks(reg *HookRegistry) {
 	reg.Register(OnToolResult, hookWAFDetector)
 	reg.Register(OnToolResult, hookRedirectDetector)
 	reg.Register(OnToolResult, hookTargetHealthDetector)
+	reg.Register(OnToolResult, hookActionTrace)
 	reg.Register(OnToolResult, hookReDoSResultTracker)
 	reg.Register(OnToolResult, hookTechDetector)
 	reg.Register(OnToolResult, hookAdvisoryLeadCommitment)
@@ -1954,7 +1969,26 @@ func hookVerifierEvidenceBridge(state *ScanState, args map[string]string) HookRe
 	for _, alias := range endpointCoverageAliases(endpoint) {
 		shared.MarkVerified(alias, class)
 	}
+	// A verifier actually executed against the endpoint: that is an
+	// information-layer increment for the worker that ran it, even when the
+	// model has not written a ledger entry yet (XALG004).
+	noteEngineProgress(state)
 	return HookResult{}
+}
+
+// noteEngineProgress attributes an engine-derived information increment to the
+// current worker's progress clock. It is used by hooks whose write path does
+// not pass through hookProgressLedger (verifier coverage, deterministic route
+// discovery).
+func noteEngineProgress(state *ScanState) {
+	if state == nil || strings.TrimSpace(state.ScanContextID) == "" {
+		return
+	}
+	sc := scanctx.Get(state.ScanContextID)
+	if sc == nil || sc.Progress == nil {
+		return
+	}
+	sc.Progress.MarkProgress(progressAgentID(state))
 }
 
 // normalizeCoverageClass resolves a class name/alias to its canonical ID via
@@ -2253,7 +2287,7 @@ func hookStuckTracker(state *ScanState, args map[string]string) HookResult {
 // advance or reset the repeated-probe counters.
 func isAdministrativeTool(name string) bool {
 	switch name {
-	case "add_note", "read_notes", "update_plan", "finish", "read_skill", "list_skills", "search_skills", "read_ledger", "record_hypothesis", "update_hypothesis", "add_hypothesis_evidence", "claim_next_hypothesis", "claim_next_task", "report_vulnerability":
+	case "add_note", "read_notes", "update_plan", "finish", "complete_work", "read_skill", "list_skills", "search_skills", "read_ledger", "record_hypothesis", "update_hypothesis", "add_hypothesis_evidence", "claim_next_hypothesis", "claim_next_task", "report_vulnerability":
 		return true
 	}
 	return false
@@ -2565,7 +2599,7 @@ var localOnlyTools = map[string]bool{
 	"read_ledger": true, "claim_next_hypothesis": true, "claim_next_task": true,
 	"build_plan": true, "update_plan": true,
 	"create_agent": true, "spawn_agent": true, "check_agent": true, "wait_agent": true,
-	"report_vulnerability": true, "submit_verdict": true, "finish": true,
+	"report_vulnerability": true, "submit_verdict": true, "finish": true, "complete_work": true,
 	"str_replace_editor": true, "list_files": true, "search_files": true,
 	"read_tool_output": true, "scan_source_sinks": true, "scan_source_routes": true,
 	"ingest_har":      true,
@@ -2747,6 +2781,28 @@ func hookTargetHealthDetector(state *ScanState, args map[string]string) HookResu
 		}
 	} else if strings.Contains(combined, "429 too many requests") || strings.Contains(combined, "rate limit exceeded") || strings.Contains(combined, "http/1.1 429") || strings.Contains(combined, "http/2 429") || strings.Contains(combined, "429 rate limit") {
 		state.ConsecutiveRateLimitErrors++
+		// R1: honor the target's Retry-After. The cooldown is stored on the
+		// scan context so every target-facing tool (HTTP, terminal, python,
+		// port scan, browser) reads the same value before sending.
+		if sc := scanctx.Get(state.ScanContextID); sc != nil {
+			delay, ok := retryAfterDelay(args["output"] + "\n" + args["error"])
+			if !ok {
+				delay = time.Minute // bounded default when the header is absent
+			}
+			if delay > maxTargetBackoff {
+				delay = maxTargetBackoff
+			}
+			sc.SetTargetBackoff(time.Now().Add(delay), fmt.Sprintf("HTTP 429 (Retry-After %s)", delay.Round(time.Second)))
+			// R4: the Engagement-wide budget pauses on the same signal, so a
+			// different tool or worker cannot keep hitting the origin.
+			if budget := sc.Egress(); budget != nil {
+				host := scanctx.EgressHost(args["url"])
+				if host == "" {
+					host = scanctx.EgressHost(args["target"])
+				}
+				budget.PauseHost(host, delay, "HTTP 429 Retry-After")
+			}
+		}
 	} else if targetHealthyCodePattern.MatchString(combined) || targetAliveCodePattern.MatchString(combined) {
 		// Only a real 2xx/3xx application response proves the target is
 		// alive. Edge 403 challenge pages, edge 404s, and non-HTTP output
@@ -2754,9 +2810,172 @@ func hookTargetHealthDetector(state *ScanState, args map[string]string) HookResu
 		state.ConsecutiveTargetErrors = 0
 		state.ConsecutiveRateLimitErrors = 0
 		state.TargetUnresponsiveSince = time.Time{}
+		if sc := scanctx.Get(state.ScanContextID); sc != nil {
+			sc.ClearTargetBackoff()
+		}
 	}
 
 	return HookResult{}
+}
+
+// maxTargetBackoff bounds a target-requested pause so a hostile or buggy
+// Retry-After cannot pin the run for hours. R1 respects the target, but the
+// operator still owns the run budget.
+const maxTargetBackoff = 30 * time.Minute
+
+var (
+	retryAfterSecondsRe = regexp.MustCompile(`(?i)retry-after\s*:\s*([0-9]{1,6})`)
+	retryAfterJSONRe    = regexp.MustCompile(`(?i)"retry[_-]?after"\s*:\s*"?([0-9]{1,6})`)
+	retryAfterDateRe    = regexp.MustCompile(`(?i)retry-after\s*:\s*([A-Za-z]{3},[^\r\n]+)`)
+)
+
+// retryAfterDelay extracts the target's Retry-After (delta-seconds, JSON field
+// or HTTP-date). ok=false means the response carried no usable value.
+func retryAfterDelay(raw string) (time.Duration, bool) {
+	if strings.TrimSpace(raw) == "" {
+		return 0, false
+	}
+	if m := retryAfterSecondsRe.FindStringSubmatch(raw); len(m) == 2 {
+		if n, err := strconv.Atoi(m[1]); err == nil && n >= 0 {
+			return time.Duration(n) * time.Second, true
+		}
+	}
+	if m := retryAfterJSONRe.FindStringSubmatch(raw); len(m) == 2 {
+		if n, err := strconv.Atoi(m[1]); err == nil && n >= 0 {
+			return time.Duration(n) * time.Second, true
+		}
+	}
+	if m := retryAfterDateRe.FindStringSubmatch(raw); len(m) == 2 {
+		for _, layout := range []string{time.RFC1123, time.RFC1123Z, time.RFC850, time.ANSIC} {
+			if t, err := time.Parse(layout, strings.TrimSpace(m[1])); err == nil {
+				if d := time.Until(t); d > 0 {
+					return d, true
+				}
+				return 0, true
+			}
+		}
+	}
+	return 0, false
+}
+
+// ── hookActionTrace (R3 repeat suppression) ─────────────────────────────────
+// Records one fingerprint per target-facing action and, on the FIRST repeat,
+// surfaces the earlier attempt so the model can cite it or change approach
+// instead of re-running the same request blindly. The journal record carries
+// both action IDs; the projection is bounded and audit-only.
+func hookActionTrace(state *ScanState, args map[string]string) HookResult {
+	if state == nil {
+		return HookResult{}
+	}
+	tool := strings.ToLower(strings.TrimSpace(args["tool_name"]))
+	fp := actionFingerprint(tool, args)
+	if fp == "" {
+		return HookResult{}
+	}
+	l := ledgerForState(state)
+	if l == nil {
+		return HookResult{}
+	}
+	summary := actionSummary(tool, args)
+	att, prior, err := l.RecordActionAttempt(fp, tool, summary, nil, scanctx.AuditActorForAgent(state.DelegatedAgentID))
+	if err != nil {
+		return HookResult{}
+	}
+	if prior == nil || att.Count != 2 {
+		return HookResult{}
+	}
+	return HookResult{Nudge: fmt.Sprintf(
+		"🔁 REPEAT ACTION (%s, first repeat): %s. The same action already ran as %s (%s). Cite that result as evidence or change the approach; do not repeat it blindly.",
+		att.ID, summary, prior.ID, prior.Summary)}
+}
+
+var actionTraceTools = map[string]bool{
+	"http_request": true, "send_request": true, "terminal_execute": true,
+	"python_action": true, "browser_action": true, "port_scan": true,
+}
+
+// actionFingerprint defines the comparable identity of one target-facing
+// action: method/host/path/query-keys for HTTP, a normalized-command hash for
+// terminal/python, command+URL for browser, target+ports for port scans.
+func actionFingerprint(tool string, args map[string]string) string {
+	if !actionTraceTools[tool] {
+		return ""
+	}
+	switch tool {
+	case "http_request", "send_request":
+		raw := strings.TrimSpace(args["url"])
+		u, err := url.Parse(raw)
+		if err != nil || u.Host == "" {
+			return ""
+		}
+		method := strings.ToUpper(strings.TrimSpace(args["method"]))
+		if method == "" {
+			method = "GET"
+		}
+		keys := make([]string, 0, 8)
+		for k := range u.Query() {
+			keys = append(keys, strings.ToLower(k))
+		}
+		sort.Strings(keys)
+		return "http|" + method + "|" + strings.ToLower(u.Host) + u.Path + "?" + strings.Join(keys, ",")
+	case "browser_action":
+		cmd := strings.ToLower(strings.TrimSpace(args["command"]))
+		raw := strings.TrimSpace(args["url"])
+		if cmd == "" && raw == "" {
+			return ""
+		}
+		return "browser|" + cmd + "|" + raw
+	case "port_scan":
+		target := strings.TrimSpace(args["target"])
+		ports := strings.TrimSpace(args["ports"])
+		if target == "" {
+			return ""
+		}
+		return "port|" + strings.ToLower(target) + "|" + ports
+	default: // terminal_execute, python_action
+		body := strings.TrimSpace(args["command"])
+		if body == "" {
+			body = strings.TrimSpace(args["code"])
+		}
+		if body == "" {
+			return ""
+		}
+		norm := strings.Join(strings.Fields(body), " ")
+		h := fnv.New64a()
+		_, _ = h.Write([]byte(norm))
+		return fmt.Sprintf("%s|%016x", tool, h.Sum64())
+	}
+}
+
+func actionSummary(tool string, args map[string]string) string {
+	out := strings.TrimSpace(args["output"])
+	if out == "" {
+		out = strings.TrimSpace(args["error"])
+	}
+	first := ""
+	if i := strings.IndexAny(out, "\r\n"); i >= 0 {
+		first = out[:i]
+	} else {
+		first = out
+	}
+	first = strings.TrimSpace(first)
+	if len([]rune(first)) > 200 {
+		first = string([]rune(first)[:200]) + "…"
+	}
+	subject := strings.TrimSpace(args["url"])
+	if subject == "" {
+		subject = strings.TrimSpace(args["target"])
+	}
+	if subject == "" {
+		subject = strings.TrimSpace(args["command"])
+	}
+	if len([]rune(subject)) > 160 {
+		subject = string([]rune(subject)[:160]) + "…"
+	}
+	if first == "" {
+		return tool + " " + subject
+	}
+	return tool + " " + subject + " → " + first
 }
 
 // ── hookTechDetector ─────────────────────────────────────────────────────────
@@ -2831,6 +3050,9 @@ func hookClientRouteWorkflow(state *ScanState, args map[string]string) HookResul
 	if toolName == "discover_client_routes" || (toolName == "browser_action" && command == "discover_client_routes") {
 		if strings.TrimSpace(args["error"]) == "" && strings.Contains(args["output"], "Discovered ") {
 			state.ClientRoutesDiscovered = true
+			// New client routes are a coverage increment attributable to the
+			// worker that discovered them (XALG004).
+			noteEngineProgress(state)
 		}
 		if strings.Contains(args["output"], "AUTOMATED PATH-XSS CONFIRMED") {
 			return HookResult{Nudge: "DETERMINISTIC CLIENT FINDING: the browser observed a fresh path-XSS nonce execute on a route extracted from the target's own assets. Call report_vulnerability for this CWE-79 now using the confirmed payload URL and browser execution proof before any further reconnaissance."}
@@ -3824,7 +4046,7 @@ func hookDelegationCoordinator(state *ScanState, args map[string]string) HookRes
 		// no reminders, and no "delegation pending" state ever exists.
 		!state.DelegationEnabled ||
 		state.DelegationAttempted || !state.ReconDone || !state.EndpointInventorySaved || state.Iteration < 5 || state.Plan == nil ||
-		!state.PlanBuilt || !state.LedgerSeeded {
+		!state.PlanBuilt || !state.CoverageOpportunitiesSent {
 		return HookResult{}
 	}
 	if state.DelegationNudgeFired {
@@ -4076,6 +4298,17 @@ func reconcilePlan(state *ScanState) {
 		case "dirbust":
 			if state.DirBustingDone || state.VulnClassesTested["dirbusting"] {
 				t.Status = TaskCompleted
+				continue
+			}
+			// The noise posture can make wordlist content discovery not owed at
+			// all. Skipping it keeps a quiet/evidence-led scan from staying open
+			// on an obligation the operator's posture explicitly declined.
+			if !contentDiscoveryOwed(state) {
+				t.Status = TaskSkipped
+				t.Disposition = DispositionNotApplicable
+				if t.Notes == "" {
+					t.Notes = "engine: content discovery not owed (noise profile " + noiseProfileOf(state) + "; evidence-led inventory is authoritative)"
+				}
 			}
 		case "auth-session":
 			// Auth/session completion is DIMENSION-DRIVEN (auth_coverage.go):

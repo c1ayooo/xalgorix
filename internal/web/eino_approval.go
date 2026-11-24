@@ -59,19 +59,20 @@ func (s *Server) einoApprovalBroker(instanceID string, sctx *scanctx.ScanContext
 	if svc == nil {
 		return nil
 	}
-	// Per-run posture: a task with audit=enforce is gated even when the process
-	// default is off (and a task with audit=off stays observe-only even when
-	// the process default is enforce).
+	// Always return a broker, even for an observe-only run: the runtime wraps
+	// tools once at construction, and a later off→enforce hot switch must apply
+	// to the next call on already-running workers. RequestApproval re-reads the
+	// run's effective mode per call (XALG016).
 	mode := s.runAuditMode(sctx)
-	if mode != approval.ModeEnforce {
-		log.Printf("[approval] run %s: HITL observe-only (effective audit mode=%s)", instanceID, mode)
-		return nil
-	}
 	taskID := ""
 	if sctx != nil {
 		taskID = sctx.TaskID
 	}
-	log.Printf("[approval] run %s: HITL ENFORCED (effective audit mode=%s, task=%s)", instanceID, mode, taskID)
+	if mode == approval.ModeEnforce {
+		log.Printf("[approval] run %s: HITL ENFORCED (effective audit mode=%s, task=%s)", instanceID, mode, taskID)
+	} else {
+		log.Printf("[approval] run %s: HITL observe-only (effective audit mode=%s; wrapper installed for hot switch)", instanceID, mode)
+	}
 	return &einoApprovalBroker{svc: svc, instanceID: instanceID, sctx: sctx, mcpExempt: s.mcpApprovalExemptSet()}
 }
 
@@ -107,6 +108,12 @@ func (b *einoApprovalBroker) RequestApproval(_ context.Context, req engine.Appro
 	if b == nil || b.svc == nil {
 		return "", nil
 	}
+	// Re-read the run's effective audit mode on every call. The broker is
+	// installed once, so this is what makes an operator's off↔enforce hot switch
+	// apply to the next call without rebuilding running workers (XALG016).
+	if b.svc.srv.runAuditMode(b.sctx) != approval.ModeEnforce {
+		return "", nil
+	}
 	// Per-server MCP approval exemption ("require_approval=false"): the
 	// policy classifies every mcp_* call as command-class (it cannot know
 	// the server's flag — it stays store-free), so the broker resolves the
@@ -120,9 +127,22 @@ func (b *einoApprovalBroker) RequestApproval(_ context.Context, req engine.Appro
 	policy := b.svc.policy
 	policy.Mode = approval.ModeEnforce
 	verdict := policy.Evaluate(req.ToolName, req.Args)
-	if verdict.Decision == approval.Allow {
+	// Enforce is fail-closed: if the approval store cannot be read, a regulated
+	// call is refused instead of being allowed through. Pure reads (the policy
+	// returned Allow) do not need a row and keep working. This is the decided
+	// XALG017 posture: availability is never traded for an unapproved
+	// high-risk action.
+	if b.svc.srv.currentPlatformStore() == nil {
+		if verdict.Decision == approval.Require {
+			return "", errors.New("approval store unavailable — enforce mode refuses the regulated call; restore the platform store and retry")
+		}
 		return "", nil
 	}
+	// Project fence and scope observer are authorization rules, not approval
+	// rules: they must run even when the front classifier would allow the call.
+	// Otherwise an ordinary POST /upload or /api/settings is Allow'ed before
+	// the project baseline is consulted (XALG015).
+	//
 	// Project fence first (scope_fence.go): a remembered rule may only exempt
 	// calls that already sit inside the authorization boundary. The denial
 	// row is terminal, so WaitApproval resolves it without waiting for the
@@ -146,6 +166,9 @@ func (b *einoApprovalBroker) RequestApproval(_ context.Context, req engine.Appro
 			return "", err
 		}
 		return row.ID, nil
+	}
+	if verdict.Decision == approval.Allow {
+		return "", nil
 	}
 	row, err := b.svc.createPendingRow(b.instanceID, b.sctx, verdict, b.secretValues())
 	if err != nil || row == nil {

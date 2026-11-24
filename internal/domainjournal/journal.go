@@ -178,6 +178,26 @@ const (
 	// reference; this record is its atomic provenance. Audit-only like the other
 	// observation ops: it never mutates ledger, plan or scheduling state.
 	OpContextDigest Operation = "context_digest"
+	// OpReadInfoItem / OpSearchInfo record an engine-side information read
+	// (R3 Information-to-Decision Trace). They name what was read, why and
+	// whether the result was truncated/incomplete. Audit-only: a read never
+	// changes a hypothesis, intent or finding.
+	OpReadInfoItem Operation = "read_info_item"
+	OpSearchInfo   Operation = "search_info"
+	// OpActionAttempt records one target-facing action fingerprint (subject +
+	// action class + scope) so a repeated action can be traced back to the
+	// earlier attempt/evidence instead of being repeated blindly (R3).
+	OpActionAttempt Operation = "action_attempt"
+	// OpDecision records one planning/control decision: the candidate set it
+	// chose from, the selected candidate, the hard constraints that were
+	// evaluated, and why. Audit-only: replaying decisions never re-runs or
+	// rewrites the plan; the graph remains the lifecycle authority.
+	OpDecision Operation = "decision"
+	// OpEgressPause / OpEgressStop record the Engagement-wide egress policy
+	// changing state (target asked for a pause, operator/authorization stop).
+	// Audit-only: they never end an intent; the agent/pool owns that decision.
+	OpEgressPause Operation = "egress_pause"
+	OpEgressStop  Operation = "egress_stop"
 )
 
 func (o Operation) Valid() bool {
@@ -186,7 +206,8 @@ func (o Operation) Valid() bool {
 		OpSetStatus, OpAddEvidence, OpRecordAttempt, OpSetVOI, OpReclaimHypothesis, OpMergeLedger, OpResetLedger,
 		OpInfoItemEnriched, OpInfoItemProjected, OpObserveTraffic, OpRecordObjective,
 		OpSkillLoad, OpAgentDelegat, OpMcpCall, OpFindingRecorded, OpToolObservation,
-		OpRecordDeviation, OpRecordGuidance, OpContextDigest:
+		OpRecordDeviation, OpRecordGuidance, OpContextDigest,
+		OpReadInfoItem, OpSearchInfo, OpActionAttempt, OpDecision, OpEgressPause, OpEgressStop:
 		return true
 	default:
 		return false
@@ -205,6 +226,42 @@ type State struct {
 	Attempts     int     `json:"attempts,omitempty"`
 }
 
+// DecisionCandidate is one option considered by a decision. Rank preserves the
+// deterministic order the engine/model presented (1 = first), so a later
+// replay can verify the same tie-break instead of re-deriving it from prose.
+type DecisionCandidate struct {
+	ID         string  `json:"id"`
+	Kind       string  `json:"kind,omitempty"`
+	Title      string  `json:"title,omitempty"`
+	Rank       int     `json:"rank,omitempty"`
+	Score      float64 `json:"score,omitempty"`
+	Selected   bool    `json:"selected,omitempty"`
+	RejectedBy string  `json:"rejected_by,omitempty"`
+}
+
+// Decision is the structured snapshot of one material planning or control
+// decision. It is an audit projection: the graph/plan remains authoritative.
+//
+// InfoUse/NoInfoReason make the "information changed the decision" question
+// answerable: a decision either cites BasisRefs or explicitly records that no
+// new information was used (for example operator_decision).
+type Decision struct {
+	ID              string              `json:"id,omitempty"`
+	Action          string              `json:"action"`
+	Actor           string              `json:"actor,omitempty"`
+	At              time.Time           `json:"at,omitempty"`
+	IntentID        string              `json:"intent_id,omitempty"`
+	HypothesisID    string              `json:"hypothesis_id,omitempty"`
+	BasisRefs       []string            `json:"basis_refs,omitempty"`
+	Candidates      []DecisionCandidate `json:"candidates,omitempty"`
+	HardConstraints []string            `json:"hard_constraints,omitempty"`
+	Selected        string              `json:"selected,omitempty"`
+	Reason          string              `json:"reason,omitempty"`
+	InfoUse         string              `json:"info_use,omitempty"`
+	NoInfoReason    string              `json:"no_info_reason,omitempty"`
+	SnapshotDigest  string              `json:"snapshot_digest,omitempty"`
+}
+
 // Record is one durable domain event. Sequence is per scan and assigned by the
 // Journal writer; callers must not invent cross-scan ordering.
 type Record struct {
@@ -217,6 +274,7 @@ type Record struct {
 	HypothesisID string              `json:"hypothesis_id,omitempty"`
 	EvidenceID   string              `json:"evidence_id,omitempty"`
 	Summary      string              `json:"summary,omitempty"`
+	Decision     *Decision           `json:"decision,omitempty"`
 	Before       *State              `json:"before,omitempty"`
 	After        *State              `json:"after,omitempty"`
 	InfoItem     *infoitem.Item      `json:"info_item,omitempty"`
@@ -244,6 +302,17 @@ func (r Record) Validate() error {
 	}
 	if !r.Operation.Valid() {
 		return fmt.Errorf("domainjournal: invalid operation %q", r.Operation)
+	}
+	if r.Operation == OpDecision && r.Decision == nil {
+		return errors.New("domainjournal: decision operation requires a decision payload")
+	}
+	if r.Decision != nil {
+		if r.Operation != OpDecision {
+			return errors.New("domainjournal: decision payload requires the decision operation")
+		}
+		if strings.TrimSpace(r.Decision.Action) == "" {
+			return errors.New("domainjournal: decision action is required")
+		}
 	}
 	if r.InfoItem != nil {
 		if err := r.InfoItem.Validate(); err != nil {

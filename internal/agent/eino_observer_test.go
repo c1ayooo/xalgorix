@@ -39,6 +39,54 @@ func TestEngineObserverMatchesLegacyHookResults(t *testing.T) {
 	}
 }
 
+func TestCompleteWorkIsReservedForDelegatedWorkers(t *testing.T) {
+	a, state := newGateTestAgent(t, "complete-root")
+	observer := a.EngineObserver()
+	verdict := observer.BeforeTool(context.Background(), "complete_work", map[string]string{"summary": "done"})
+	if verdict.Allowed {
+		t.Fatal("root scan must not call complete_work")
+	}
+	if !strings.Contains(verdict.Output, "DELEGATED") {
+		t.Fatalf("root rejection = %q", verdict.Output)
+	}
+	_ = state
+}
+
+func TestCompleteWorkEndsDelegatedLane(t *testing.T) {
+	a, state := newGateTestAgent(t, "complete-worker")
+	state.DelegatedAgent = true
+	observer := a.EngineObserver()
+	observer.AfterTool(context.Background(), "complete_work",
+		map[string]string{"summary": "lane done"},
+		"lane done\nUnfinished: none",
+		map[string]any{"work_completed": true}, nil)
+
+	if !a.scanFinished.Load() {
+		t.Fatal("complete_work did not mark the lane finished")
+	}
+	var finishedEvent *Event
+	for {
+		select {
+		case evt := <-a.events:
+			if evt.Type == "finished" {
+				finishedEvent = &evt
+			}
+			continue
+		default:
+		}
+		break
+	}
+	if finishedEvent == nil {
+		t.Fatal("complete_work did not emit a finished event")
+	}
+	if !strings.Contains(finishedEvent.Content, "lane done") {
+		t.Fatalf("finished content = %q", finishedEvent.Content)
+	}
+	if finishedEvent.Aborted {
+		t.Fatal("complete_work must emit a normal completion, not an abort")
+	}
+}
+
 func TestEngineObserverBlocksFinishThroughLegacyGate(t *testing.T) {
 	sctx, state := newTestCtxState(t)
 	plan := NewPlan()

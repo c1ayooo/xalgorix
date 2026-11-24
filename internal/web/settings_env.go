@@ -213,6 +213,10 @@ func allEnvSettingDefinitions() []envSettingDefinition {
 		{Key: "XALGORIX_RATE_LIMIT_WINDOW", Label: "Rate-limit window", Category: "Rate limits", Description: "Rate-limit window in seconds.", DefaultValue: "60", InputType: "number"},
 		{Key: "XALGORIX_RATE_RPS", Label: "Outbound RPS", Category: "Rate limits", Description: "Sustained per-domain outbound request rate.", DefaultValue: "10", InputType: "number"},
 		{Key: "XALGORIX_RATE_BURST", Label: "Outbound burst", Category: "Rate limits", Description: "Per-domain outbound burst size.", DefaultValue: "20", InputType: "number"},
+		{Key: "XALGORIX_EGRESS_MAX_CONCURRENCY", Label: "Egress concurrency", Category: "Rate limits", Description: "Engagement-wide concurrent target-facing actions shared by HTTP, browser, terminal, python, port scans and every worker.", DefaultValue: "8", InputType: "number", RequiresRestart: true},
+		{Key: "XALGORIX_EGRESS_PER_HOST_CONCURRENCY", Label: "Per-host concurrency", Category: "Rate limits", Description: "Concurrent target-facing actions allowed per origin.", DefaultValue: "4", InputType: "number", RequiresRestart: true},
+		{Key: "XALGORIX_EGRESS_PER_HOST_RPS", Label: "Per-host RPS", Category: "Rate limits", Description: "Per-origin egress rate. 0 = inherit the scan's request-rate policy.", DefaultValue: "0", InputType: "number", RequiresRestart: true},
+		{Key: "XALGORIX_EGRESS_TOTAL_BUDGET", Label: "Total request budget", Category: "Rate limits", Description: "Maximum target-facing requests for the whole run/engagement. 0 = unlimited.", DefaultValue: "0", InputType: "number", RequiresRestart: true},
 
 		{Key: "XALGORIX_TRAFFICPROXY", Label: "Traffic recording (MITM)", Category: "Traffic recording", Description: "Intercept and record scan HTTP into each run's audit journal (traffic evidence, live HTTP view, approval wire gate). Off disables recording; how traffic still reaches the egress proxy is governed by XALGORIX_EGRESS_ROUTER in the Egress proxy group. Applies immediately; running containers reconnect on their next command.", DefaultValue: "true", InputType: "boolean"},
 		{Key: "XALGORIX_CA_DIR", Label: "Traffic recording CA directory", Category: "Traffic recording", Description: "Directory holding the interception CA (ca.pem / ca.key.pem) used while recording is on. Takes effect after restart.", Placeholder: "~/.xalgorix/ca", InputType: "path", RequiresRestart: true},
@@ -243,7 +247,8 @@ func allEnvSettingDefinitions() []envSettingDefinition {
 		{Key: "XALGORIX_ALLOW_LOCAL_TARGETS", Label: "Allow local targets", Category: "Security", Description: "Permit scanning locally-hosted apps (localhost / 127.0.0.1 / private IPs) — for self-hosted demo/staging on the same box. The dashboard's own listener is always protected. Leave OFF on shared/hosted deployments.", DefaultValue: "false", InputType: "boolean"},
 		{Key: "XALGORIX_DISABLE_AUTO_DELEGATE", Label: "Disable specialist wave", Category: "LLM", Description: "Skip the automatic specialist delegation wave entirely. The root agent does all testing itself — deeper but slower (pre-v4.6.93 behavior). Enable if specialist-parallel scans are producing shallower results.", DefaultValue: "false", InputType: "boolean"},
 		{Key: "XALGORIX_DISABLED_SPECIALISTS", Label: "Disabled specialist lanes", Category: "LLM", Description: "Comma-separated specialist lane names to skip. Available lanes: recon-discovery, authz-logic, injection-serverside, client-source. Example: recon-discovery disables the early discovery specialist only. Use XALGORIX_DISABLE_AUTO_DELEGATE=true to disable ALL specialists.", Placeholder: "recon-discovery", InputType: "text", RequiresRestart: true},
-		{Key: "XALGORIX_CHECKLIST", Label: "Scan checklist", Category: "LLM", Description: "Methodology depth: full = comprehensive 22-phase playbook (default, deepest scans); professional = compact focused workflow.", DefaultValue: "full", InputType: "select", Options: []string{"full", "professional"}},
+		{Key: "XALGORIX_CHECKLIST", Label: "Scan checklist", Category: "LLM", Description: "Methodology depth: lean = mission loop only (default; the engine tracks 22 phases for reporting but does not hand the agent an answer sheet); professional = compact focused workflow; full = comprehensive 22-phase playbook.", DefaultValue: "lean", InputType: "select", Options: []string{"lean", "professional", "full"}},
+		{Key: "XALGORIX_NOISE_PROFILE", Label: "Noise profile", Category: "LLM", Description: "Traffic posture for DISCOVERY. quiet = evidence-led only (JS/crawl/API artifacts + targeted probes; no wordlist, no port sweep); balanced = no automatic discovery — the model may propose ONE bounded wordlist pass only while the inventory is thin and no API description is known; loud = bounded wordlist obligation. Port discovery additionally needs a host:port/CIDR target, deep mode and a request budget. An explicit operator instruction can always override.", DefaultValue: "balanced", InputType: "select", Options: []string{"quiet", "balanced", "loud"}},
 
 		{Key: "CAIDO_PORT", Label: "Caido port", Category: "Integrations", Description: "Caido proxy port. 0 means auto-detect.", DefaultValue: "0", InputType: "number"},
 		{Key: "CAIDO_API_TOKEN", Label: "Caido API token", Category: "Integrations", Description: "Caido API token for proxy integration.", InputType: "secret", Sensitive: true},
@@ -321,6 +326,7 @@ var environmentHiddenKeys = map[string]bool{
 	"XALGORIX_DISABLE_AUTO_DELEGATE":      true,
 	"XALGORIX_DISABLED_SPECIALISTS":       true,
 	"XALGORIX_CHECKLIST":                  true,
+	"XALGORIX_NOISE_PROFILE":              true,
 	// Internal convergence / iteration tuning.
 	"XALGORIX_EPOCH_COVERAGE":              true,
 	"XALGORIX_MIN_ITERATIONS":              true,

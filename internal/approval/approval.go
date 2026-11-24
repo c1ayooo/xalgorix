@@ -309,29 +309,48 @@ var authMutationFeatures = []string{
 // string that happens to contain the word stays on the audit trail instead
 // of the approval queue.
 
-// AssessHTTP decides whether an HTTP request needs operator approval. Read
-// methods always pass (recorded in the tool-call audit, never as approval
-// rows); write methods pass unless they hit a high-risk feature. Rule names
-// double as the approval payload reason.
+// AssessHTTP decides whether an HTTP request needs operator approval. Ordinary
+// reads pass (recorded in the tool-call audit, never as approval rows), but a
+// read whose query carries a destructive primitive is still a destructive
+// operation: risk is not decided by the method alone (XALG013). Write methods
+// pass unless they hit a high-risk feature. Rule names double as the approval
+// payload reason.
 func AssessHTTP(method, rawURL string, headers map[string]string, body string) Verdict {
 	m := strings.ToUpper(strings.TrimSpace(method))
 	if m == "" {
 		m = "GET"
 	}
-	switch m {
-	case "GET", "HEAD", "OPTIONS":
-		return Verdict{Decision: Allow, Kind: KindHTTP, Method: m, URL: rawURL}
-	}
-	v := Verdict{Decision: Allow, Kind: KindHTTP, Method: m, URL: rawURL, Headers: headers, Body: body}
-
 	path, query := splitURLPathQuery(rawURL)
 	host := splitURLHost(rawURL)
 	lowerBody := strings.ToLower(body)
 	lowerQuery := strings.ToLower(query)
+	// The same operation must get the same verdict regardless of serialization
+	// (percent-encoded query, form '+' encoding, JSON escapes). Normalize a
+	// bounded copy for matching only; the request bytes are never changed
+	// (XALG014).
+	normQuery := normalizeForMatching(query)
+	normBody := normalizeForMatching(body)
+
+	switch m {
+	case "GET", "HEAD", "OPTIONS":
+		v := Verdict{Decision: Allow, Kind: KindHTTP, Method: m, URL: rawURL}
+		readHaystack := lowerQuery + "\n" + normQuery
+		for _, feature := range destructivePayloadFeatures {
+			if strings.Contains(readHaystack, feature) {
+				v.Decision = Require
+				v.Reason = "destructive payload feature: " + feature
+				return v
+			}
+		}
+		return v
+	}
+	v := Verdict{Decision: Allow, Kind: KindHTTP, Method: m, URL: rawURL, Headers: headers, Body: body}
+
+	payloadHaystack := lowerBody + "\n" + normBody + "\n" + lowerQuery + "\n" + normQuery
 
 	// 1. Destructive payload — highest risk first.
 	for _, feature := range destructivePayloadFeatures {
-		if strings.Contains(lowerBody, feature) || strings.Contains(lowerQuery, feature) {
+		if strings.Contains(payloadHaystack, feature) {
 			v.Decision = Require
 			v.Reason = "destructive payload feature: " + feature
 			return v
@@ -344,13 +363,43 @@ func AssessHTTP(method, rawURL string, headers map[string]string, body string) V
 		return v
 	}
 	// 3. Auth-mutation endpoint or payload.
-	if containsAny(strings.ToLower(path)+" "+lowerQuery, authMutationFeatures) ||
-		matchAuthField(lowerBody) {
+	if containsAny(strings.ToLower(path)+" "+lowerQuery+" "+normQuery, authMutationFeatures) ||
+		matchAuthField(normBody) {
 		v.Decision = Require
 		v.Reason = "auth mutation endpoint or payload"
 		return v
 	}
 	return v
+}
+
+// normalizeForMatching returns a bounded, lower-cased copy of a query/body with
+// one layer of percent/form decoding and JSON string unescaping. It is a
+// matching aid only: the sent request keeps its original bytes. Invalid or
+// oversized input falls back to the raw text rather than failing open.
+func normalizeForMatching(s string) string {
+	const maxNormalizeBytes = 256 << 10
+	if s == "" {
+		return ""
+	}
+	if len(s) > maxNormalizeBytes {
+		s = s[:maxNormalizeBytes]
+	}
+	out := s
+	if decoded, err := url.QueryUnescape(s); err == nil {
+		out = decoded
+	}
+	trimmed := strings.TrimSpace(out)
+	if strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
+		var v any
+		dec := json.NewDecoder(strings.NewReader(trimmed))
+		dec.UseNumber()
+		if err := dec.Decode(&v); err == nil {
+			if b, err := json.Marshal(v); err == nil {
+				out = string(b)
+			}
+		}
+	}
+	return strings.ToLower(out)
 }
 
 func splitURLPathQuery(rawURL string) (string, string) {

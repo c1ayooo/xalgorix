@@ -322,6 +322,7 @@ func addNoteForContext(contextID string, args map[string]string) (tools.Result, 
 	// (they lock the map, not the file).
 	s.mu.Lock()
 	prev, existed := s.store[key]
+	changed := !existed || prev != value
 	s.store[key] = value
 	s.writeSeq++
 	data, _ := s.marshalSnapshot()
@@ -339,9 +340,15 @@ func addNoteForContext(contextID string, args map[string]string) (tools.Result, 
 	s.mu.Unlock()
 
 	if writeErr != nil {
-		return tools.Result{Error: fmt.Sprintf("add_note: durable write failed (%v) — the note was NOT saved. Retry the add_note call, or include the information in your report instead of relying on it persisting.", writeErr)}, nil
+		return tools.Result{
+			Error:    fmt.Sprintf("add_note: durable write failed (%v) — the note was NOT saved. Retry the add_note call, or include the information in your report instead of relying on it persisting.", writeErr),
+			Metadata: map[string]any{"state_changed": false},
+		}, nil
 	}
-	return tools.Result{Output: fmt.Sprintf("Note saved: %s", key)}, nil
+	return tools.Result{
+		Output:   fmt.Sprintf("Note saved: %s", key),
+		Metadata: map[string]any{"state_changed": changed},
+	}, nil
 }
 
 //lint:ignore U1000 kept as a package-level compatibility wrapper for callers in this package.

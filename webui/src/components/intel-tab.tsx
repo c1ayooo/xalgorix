@@ -4,18 +4,33 @@ import {
   ChevronRight,
   Compass,
   Database,
+  DoorOpen,
   KeyRound,
 } from "lucide-react";
+import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { EmptyState, ErrorState } from "@/components/states";
 import { IntelInfoSummary } from "@/components/intel-info-summary";
 import { useIntelTriage, useTaskIntelligence } from "@/api/queries";
 import { useI18n } from "@/i18n";
 import { cn } from "@/lib/utils";
-import type { IntelItem, IntelKind, IntelTriageStatus } from "@/types/api";
+import type {
+  IntelAccess,
+  IntelItem,
+  IntelKind,
+  IntelTriageStatus,
+} from "@/types/api";
 
 /**
  * 任务情报（契约 §3.7）——上半区是冷路径信息项切片（InfoItem 区域/关联
@@ -45,6 +60,17 @@ const KIND_META: Record<
   },
 };
 
+const ACCESS_VARIANT: Record<
+  IntelAccess["state"],
+  "default" | "success" | "muted" | "warning" | "destructive"
+> = {
+  proposed: "muted",
+  confirmed: "success",
+  active: "success",
+  expired: "warning",
+  revoked: "destructive",
+};
+
 const TRIAGE_VARIANT: Record<
   IntelTriageStatus,
   "default" | "success" | "muted"
@@ -63,6 +89,10 @@ function IntelRow({
 }) {
   const { t } = useI18n();
   const [open, setOpen] = useState(false);
+  const [grantsOpen, setGrantsOpen] = useState(false);
+  const [grantsValue, setGrantsValue] = useState(
+    (item.access?.grants ?? []).join(", "),
+  );
   const triage = useIntelTriage(taskId);
   const meta = KIND_META[item.kind];
   const Icon = meta.icon;
@@ -113,6 +143,30 @@ function IntelRow({
         <Badge variant={TRIAGE_VARIANT[status]} className="shrink-0">
           {t(`intel.status.${status}`)}
         </Badge>
+        {item.access && (
+          <Badge
+            variant={ACCESS_VARIANT[item.access.state]}
+            className="shrink-0"
+            title={item.access.grants?.join(", ")}
+          >
+            {t(`intelAccess.state.${item.access.state}`)}
+          </Badge>
+        )}
+        {item.kind !== "sensitive_data" && (
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-7 shrink-0 px-1.5 text-muted-foreground"
+            title={t("intel.grants.edit")}
+            aria-label={t("intel.grants.edit")}
+            onClick={() => {
+              setGrantsValue((item.access?.grants ?? []).join(", "));
+              setGrantsOpen(true);
+            }}
+          >
+            <DoorOpen className="h-3.5 w-3.5" aria-hidden />
+          </Button>
+        )}
         {/* 分诊动作：未决给 确认/驳回，已决给 重开。 */}
         {!decided ? (
           <span className="flex shrink-0 items-center gap-1">
@@ -158,6 +212,14 @@ function IntelRow({
           <p className="whitespace-pre-wrap text-xs leading-relaxed text-foreground">
             {item.content}
           </p>
+          {item.access && (
+            <p className="font-mono text-[10px] text-muted-foreground">
+              {t("intel.grants.current")}:{" "}
+              {item.access.grants && item.access.grants.length > 0
+                ? item.access.grants.join(", ")
+                : t("intel.grants.none")}
+            </p>
+          )}
           {item.triage && (
             <p className="font-mono text-[10px] text-muted-foreground">
               {t("intel.triage.by")} {item.triage.decided_by} ·{" "}
@@ -166,6 +228,62 @@ function IntelRow({
           )}
         </div>
       )}
+      <Dialog open={grantsOpen} onOpenChange={setGrantsOpen}>
+        <DialogContent className="max-w-lg">
+          <DialogHeader>
+            <DialogTitle>{t("intel.grants.title")}</DialogTitle>
+            <DialogDescription>{t("intel.grants.description")}</DialogDescription>
+          </DialogHeader>
+          <Input
+            value={grantsValue}
+            onChange={(e) => setGrantsValue(e.target.value)}
+            placeholder={t("intel.grants.placeholder")}
+            className="font-mono text-xs"
+          />
+          <div className="flex justify-end gap-2">
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => setGrantsOpen(false)}
+              disabled={triage.isPending}
+            >
+              {t("decisions.action.cancel")}
+            </Button>
+            <Button
+              size="sm"
+              disabled={triage.isPending}
+              onClick={() => {
+                const grants = grantsValue
+                  .split(/[,\s]+/)
+                  .map((v) => v.trim())
+                  .filter(Boolean);
+                triage.mutate(
+                  {
+                    fingerprint: item.fingerprint,
+                    status,
+                    grants: grants.length > 0 ? grants : undefined,
+                  },
+                  {
+                    onSuccess: () => {
+                      toast.success(t("intel.grants.saved"));
+                      setGrantsOpen(false);
+                    },
+                    onError: (err) => {
+                      toast.error(
+                        `${t("intel.grants.savedFailed")}: ${
+                          err instanceof Error ? err.message : String(err)
+                        }`,
+                      );
+                    },
+                  },
+                );
+              }}
+            >
+              {t("intel.grants.save")}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
     </li>
   );
 }

@@ -14,8 +14,10 @@ import (
 	"github.com/c1ayooo/xalgorix/v4/internal/domainjournal"
 	"github.com/c1ayooo/xalgorix/v4/internal/graph"
 	"github.com/c1ayooo/xalgorix/v4/internal/infoitem"
+	"github.com/c1ayooo/xalgorix/v4/internal/intelaccess"
 	"github.com/c1ayooo/xalgorix/v4/internal/llm"
 	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools/intelligence"
 	"github.com/c1ayooo/xalgorix/v4/internal/tools/reporting"
 )
 
@@ -337,5 +339,117 @@ func TestCompactMessagesProjectsSnapshotAndDigestNode(t *testing.T) {
 	}
 	if len(digests) != 1 || digests[0].State != graph.StateActive {
 		t.Fatalf("digest nodes = %+v, want one active", digests)
+	}
+}
+
+// The worker seed lists endorsed intel only: proposed items are observations,
+// not doors, and the seed is auto-injected so no content may travel with it
+// (INTEL_HANDOFF_SPEC v1.1 D4/D5 + M2). Once the operator confirms, the row
+// appears with its grants and a detail-fetch hint.
+func TestWorkerSeedListsConfirmedIntelOnly(t *testing.T) {
+	a, store, sctx, _ := newSnapshotTestAgent(t)
+	seedSnapshotState(t, a, store, sctx)
+	intelligence.ResetForContext(sctx.ID)
+	access := intelaccess.NewMemoryStore()
+	intelaccess.SetStore(access)
+	t.Cleanup(func() {
+		intelaccess.SetStore(nil)
+		intelligence.CleanupContext(sctx.ID)
+	})
+
+	if _, err := intelligence.RecordForContext(sctx.ID, map[string]string{
+		"kind":     "credential",
+		"title":    "SSH password on app-01",
+		"content":  "root uses Passw0rd! on 10.0.177.5:22",
+		"endpoint": "10.0.177.5:22",
+	}); err != nil {
+		t.Fatalf("record intel: %v", err)
+	}
+	items := intelligence.ItemsForContext(sctx.ID)
+	if len(items) != 1 {
+		t.Fatalf("intel items = %d, want 1", len(items))
+	}
+	fp := items[0].Fingerprint
+
+	// Access rows are keyed by the graph run id, not the intel store's context
+	// id — the production shape this section must work in.
+	graphScanID := a.planGraphScanID()
+	if graphScanID == "" {
+		graphScanID = sctx.ID
+	}
+	if _, err := access.DeriveScan(context.Background(), graphScanID, items); err != nil {
+		t.Fatalf("derive: %v", err)
+	}
+	seed := a.workerSeedContext("t-1")
+	if strings.Contains(seed, fp) {
+		t.Fatalf("proposed intel must not appear in the seed:\n%s", seed)
+	}
+
+	if _, err := access.Confirm(context.Background(), intelaccess.ConfirmInput{
+		ScanID: graphScanID, Fingerprint: fp, Kind: intelaccess.KindCredential,
+		Subject: "10.0.177.5", Targets: []string{"10.0.177.5:22"}, By: "operator",
+	}); err != nil {
+		t.Fatalf("confirm: %v", err)
+	}
+	seed = a.workerSeedContext("t-1")
+	if strings.Contains(seed, "Passw0rd!") {
+		t.Fatalf("worker seed leaked intel content:\n%s", seed)
+	}
+	for _, want := range []string{
+		"Available intel", "fp=" + fp, "state=confirmed", "grants=10.0.177.5:22",
+		"read_intelligence(fingerprint=" + fp + ")",
+	} {
+		if !strings.Contains(seed, want) {
+			t.Fatalf("worker seed missing %q:\n%s", want, seed)
+		}
+	}
+}
+
+// The intel section is capped and deterministically ordered, so a run with
+// many confirmed items cannot crowd out the rest of the seed.
+func TestWorkerSeedIntelIsCapped(t *testing.T) {
+	a, store, sctx, _ := newSnapshotTestAgent(t)
+	seedSnapshotState(t, a, store, sctx)
+	intelligence.ResetForContext(sctx.ID)
+	access := intelaccess.NewMemoryStore()
+	intelaccess.SetStore(access)
+	t.Cleanup(func() {
+		intelaccess.SetStore(nil)
+		intelligence.CleanupContext(sctx.ID)
+	})
+
+	for i := 0; i < snapIntelMax+3; i++ {
+		res, err := intelligence.RecordForContext(sctx.ID, map[string]string{
+			"kind":    "lead",
+			"title":   fmt.Sprintf("lead %d", i),
+			"content": fmt.Sprintf("distinct observation %d", i),
+		})
+		if err != nil || res.Error != "" {
+			t.Fatalf("record intel %d: err=%v res=%+v", i, err, res)
+		}
+	}
+	items := intelligence.ItemsForContext(sctx.ID)
+	if len(items) != snapIntelMax+3 {
+		t.Fatalf("intel items = %d, want %d", len(items), snapIntelMax+3)
+	}
+	// Access rows are keyed by the graph run id, not the intel store's context
+	// id — the production shape this section must work in.
+	graphScanID := a.planGraphScanID()
+	if graphScanID == "" {
+		graphScanID = sctx.ID
+	}
+	if _, err := access.DeriveScan(context.Background(), graphScanID, items); err != nil {
+		t.Fatalf("derive: %v", err)
+	}
+	for _, item := range items {
+		if _, err := access.Confirm(context.Background(), intelaccess.ConfirmInput{
+			ScanID: graphScanID, Fingerprint: item.Fingerprint, Kind: intelaccess.KindPath, By: "operator",
+		}); err != nil {
+			t.Fatalf("confirm: %v", err)
+		}
+	}
+	seed := a.workerSeedContext("t-2")
+	if got := strings.Count(seed, "- [intel] "); got != snapIntelMax {
+		t.Fatalf("intel lines in seed = %d, want %d:\n%s", got, snapIntelMax, seed)
 	}
 }

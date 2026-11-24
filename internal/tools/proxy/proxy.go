@@ -230,6 +230,32 @@ func sendRequestGuardedCtx(parent context.Context, scanCtxID string, guard tools
 	targetURL := args["url"]
 	method := strings.ToUpper(args["method"])
 
+	// R1: honor the target's Retry-After before any send.
+	if sc := scanctx.Get(scanCtxID); sc != nil {
+		if msg := sc.TargetBackoffMessage(); msg != "" {
+			return tools.Result{Output: msg}, nil
+		}
+	}
+	// R4: shared Engagement budget.
+	var ticket *scanctx.Ticket
+	status, retryAfter := 0, time.Duration(0)
+	if sc := scanctx.Get(scanCtxID); sc != nil {
+		if budget := sc.Egress(); budget != nil {
+			base := parent
+			if base == nil {
+				base = context.Background()
+			}
+			acqCtx, cancel := context.WithTimeout(base, 30*time.Second)
+			t, aerr := budget.Acquire(acqCtx, targetURL)
+			cancel()
+			if aerr != nil {
+				return tools.Result{Output: scanctx.EgressSoftMessage(aerr)}, nil
+			}
+			ticket = t
+			defer func() { ticket.Done(status, retryAfter) }()
+		}
+	}
+
 	// Rate-limit before sending — blocks until a token is available for
 	// this domain. No-op when XALGORIX_RATE_RPS=0.
 	globalLimiter.Wait(targetURL)
@@ -277,6 +303,8 @@ func sendRequestGuardedCtx(parent context.Context, scanCtxID string, guard tools
 		return tools.Result{}, fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
+	status = resp.StatusCode
+	retryAfter = scanctx.ParseRetryAfter(resp.Header.Get("Retry-After"))
 
 	// Bound the in-memory read so a hostile/huge response cannot exhaust the
 	// worker. The preview file still gets the full (bounded) body.

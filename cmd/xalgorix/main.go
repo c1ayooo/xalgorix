@@ -26,6 +26,7 @@ import (
 	"github.com/c1ayooo/xalgorix/v4/internal/evidence"
 	"github.com/c1ayooo/xalgorix/v4/internal/graph"
 	"github.com/c1ayooo/xalgorix/v4/internal/imhub"
+	"github.com/c1ayooo/xalgorix/v4/internal/intelaccess"
 	"github.com/c1ayooo/xalgorix/v4/internal/jobs"
 	"github.com/c1ayooo/xalgorix/v4/internal/platform"
 	"github.com/c1ayooo/xalgorix/v4/internal/proxy"
@@ -421,6 +422,35 @@ func main() {
 		}
 		graph.SetBackend(graphStore)
 		defer graphStore.Close()
+
+		// Intel reachability projection (INTEL_HANDOFF_SPEC M2): derived on the
+		// intent-conclusion transaction, read by dispatch and the worker seed
+		// through the process store. Own pool + the shared migrator, like the
+		// other PG authorities.
+		intelAccessStore, intelAccessErr := intelaccess.Open(context.Background(), cfg.DatabaseURL)
+		if intelAccessErr != nil {
+			fmt.Fprintf(os.Stderr, "❌ intel access projection failed to start (M2): %v\n", intelAccessErr)
+			fmt.Fprintln(os.Stderr, "   Fix the DSN / database, then start again — the projection has no file fallback.")
+			os.Exit(1)
+		}
+		intelaccess.SetStore(intelAccessStore)
+		graph.SetConcludeHook(intelAccessStore.ConcludeHook())
+		// Explicit detail fetches are the one place intel content reaches the
+		// model; record them on the audit projection of the run (the intel
+		// store's context id maps to the graph run id through the scan context).
+		intelligence.SetDetailObserver(func(contextID, fingerprint string) {
+			scanID := contextID
+			if sc := scanctx.Get(contextID); sc != nil && sc.InstanceID != "" {
+				scanID = sc.InstanceID
+			}
+			_ = intelAccessStore.RecordUse(context.Background(), intelaccess.UseRecord{
+				ScanID:      scanID,
+				Fingerprint: fingerprint,
+				Decision:    intelaccess.DecisionDetailFetch,
+				Reason:      "detail_fetch",
+			})
+		})
+		defer func() { _ = intelAccessStore.Close() }()
 
 		// Asset graph authority (R7/M1): project-scoped identity/dedup is the
 		// authority; InfoItem keeps the observed/inferred provenance.

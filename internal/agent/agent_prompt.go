@@ -71,14 +71,25 @@ func (a *Agent) buildSystemPrompt(targets []string, instruction string, ratePoli
 		return a.buildOrchestratorSystemPrompt(targets, instruction, rateInt, rateDelay)
 	}
 
-	// XALGORIX_CHECKLIST: full (22-phase, default) or professional (compact)
+	// XALGORIX_CHECKLIST: lean (default: mission loop, no answer sheet) |
+	// professional | full. The 22-phase registry stays the reporting/plan
+	// vocabulary either way; only the prompt text changes.
 	checklistMode := ""
 	if a.cfg != nil {
 		checklistMode = strings.ToLower(strings.TrimSpace(a.cfg.Checklist))
 	}
-	baseChecklist := defaultChecklist
-	if checklistMode == "professional" {
+	baseChecklist := leanMissionBrief
+	switch checklistMode {
+	case "professional":
 		baseChecklist = professionalChecklist
+	case "full":
+		baseChecklist = defaultChecklist
+	default:
+		// Explicit CTF missions keep the specialized flag-hunting playbook:
+		// that is a different contract from the general engagement loop.
+		if isExplicitCTFMission(instruction) {
+			baseChecklist = defaultChecklist
+		}
 	}
 	checklist := rateLimitedChecklist(baseChecklist, ratePolicy)
 	if instruction != "" {
@@ -491,6 +502,21 @@ You have access to **expert-level vulnerability skills** via the read_skill and 
 	}
 	if a.delegatedAgentID != "" {
 		prompt = applyDelegatedSpecialistPrompt(prompt, a.delegatedAgentID)
+		// A worker owns one intent; give it the hypothesis protocol it would
+		// otherwise never see (delegated prompts skip the root checklist).
+		prompt = prompt + "\n\n" + workerHypothesisProtocol
+	}
+	// Engagement noise posture: a hard constraint on unprompted active
+	// discovery, appended after the mode rewrites so it is never replaced.
+	noiseProfile := ""
+	if a.cfg != nil {
+		noiseProfile = a.cfg.NoiseProfile
+	}
+	prompt = prompt + "\n\n" + noisePromptBlock(noiseProfile)
+	// Bounded skill index. Skill schemas alone are almost never called; the
+	// index makes the corpus visible enough to be used.
+	if block := skillIndexPromptBlock(a.userSkills); block != "" {
+		prompt = prompt + "\n\n" + block
 	}
 	if a.benchmarkIsolated {
 		prompt = `## BENCHMARK ISOLATION — NETWORK EVIDENCE ONLY
@@ -583,7 +609,9 @@ func applyDelegatedSpecialistPrompt(prompt, agentID string) string {
 	replacement := fmt.Sprintf(`## Delegated Specialist — bounded lane
 You are already specialist %s. Do not call spawn_agent or create nested delegations. Work only the endpoints, classes, roles, and hypotheses in your assigned task.
 
-Use the shared ledger as the completion source of truth: claim one assigned hypothesis atomically, establish a control, execute the class-specific probe, save evidence, close it as proven or rejected, report and link every distinct proven issue, then claim the next assigned hypothesis. The stopping condition is lane exhaustion, never the first finding or an iteration count.`, strings.TrimSpace(agentID))
+Use the shared ledger as the completion source of truth: claim one assigned hypothesis atomically, establish a control, execute the class-specific probe, save evidence, close it as proven or rejected, report and link every distinct proven issue, then claim the next assigned hypothesis. The stopping condition is lane exhaustion, never the first finding or an iteration count.
+
+When the assigned lane is exhausted (or you cannot make further productive progress), call complete_work with a short result summary and any unfinished/partial items. Do not call finish: complete_work releases only this intent, not the root scan.`, strings.TrimSpace(agentID))
 	endMarker := "## 🧠 Deep Knowledge Skills (CRITICAL — USE THESE!)"
 	if strings.Contains(prompt, "## Knowledge skills — load selectively") {
 		endMarker = "## Knowledge skills — load selectively"
@@ -657,7 +685,7 @@ func buildDelegatedTaskInstruction(task, agentID string, ctfMission, delegateUnl
 		}
 		contract := fmt.Sprintf(`MANDATORY DELEGATED-LANE CONTRACT (benchmark mission, owner %s):
 - This is a bounded specialist assignment. Do not spawn or delegate additional agents.
-- Do not stop after the first flag. Repeatedly claim_next_hypothesis for every vulnerability class assigned in the task until that assigned lane has no queued hypothesis left.
+- Do not stop after the first flag. For each assigned class, record the formal hypotheses your evidence actually supports (claim + preconditions + baseline/falsification), then repeatedly claim_next_hypothesis(vuln_class=…) for every assigned class until that lane has no queued hypothesis left.
 - Close every hypothesis you claim: save control and exploit evidence, and submit every distinct captured flag through report_vulnerability immediately (link it with kind=finding_ref), then continue to the next claim. A captured flag is a result, never a lane-completion signal.
 - Before finish, read_ledger again and confirm no hypothesis you own remains testing or proven without a linked finding. Finish only after the full assigned lane is exhausted.`, owner)
 		if chain := chains.SkeletonForIntent(task); chain != "" {
@@ -674,7 +702,7 @@ func buildDelegatedTaskInstruction(task, agentID string, ctfMission, delegateUnl
 	}
 	contract := fmt.Sprintf(`MANDATORY DELEGATED-LANE CONTRACT (owner %s):
 - This is a bounded specialist assignment. Do not spawn or delegate additional agents.
-- Do not stop after the first finding. Repeatedly claim_next_hypothesis for every vulnerability class assigned in the task until that assigned lane has no queued hypothesis left.
+- Do not stop after the first finding. For each assigned class, record the formal hypotheses your evidence actually supports (record_hypothesis), then repeatedly claim_next_hypothesis(vuln_class=…) for every assigned class until that lane has no queued hypothesis left. A class with no concrete claim is a coverage note, not a hypothesis.
 - If the operator supplied no account/session, do not guess or spray passwords, create accounts, or crack leaked hashes. Set role-dependent work aside as blocked by missing prerequisites. Public JavaScript and source maps are route/sink discovery material, not a vulnerability unless they expose an actual secret value.
 - Close every hypothesis you claim: save control and exploit evidence, report every distinct proven vulnerability, link its finding_ref, then continue to the next claim. A finding is a result, never a lane-completion signal.
 - Before finish, read_ledger again and confirm no hypothesis owned by %s remains testing or proven without a linked finding. Finish only after the full assigned lane is exhausted.`, owner, owner)

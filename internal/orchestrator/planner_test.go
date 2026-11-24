@@ -2,11 +2,13 @@ package orchestrator
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/c1ayooo/xalgorix/v4/internal/graph"
+	"github.com/c1ayooo/xalgorix/v4/internal/llm"
 	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
 )
 
@@ -277,37 +279,50 @@ func TestPlannerOverviewExtractsReadyContainerTargets(t *testing.T) {
 	}
 }
 
-func TestPlannerRoundWaitsForWorkerCapacity(t *testing.T) {
-	release := make(chan struct{})
-	gateEntered := make(chan struct{})
-	done := make(chan struct{})
+// TestPlannerApplyCapsAtAvailableSlots pins the replacement for the old
+// blocking capacity gate: a round may still read/steer/kill while the pool is
+// full, but it may only add intents the pool can claim.
+func TestPlannerApplyCapsAtAvailableSlots(t *testing.T) {
+	store := graph.NewMemoryStore()
+	addIntent(t, store, "cap", "existing")
 	p := NewPlanner(context.Background(), PlannerConfig{
-		ScanID: "gate",
-		WaitForCapacity: func(context.Context) error {
-			close(gateEntered)
-			<-release
-			return context.Canceled // stop the round before it needs an LLM client
-		},
+		ScanID: "cap", Repo: store, MaxIntents: 2,
+		AvailableSlots: func() int { return 1 }, // one free slot, already taken by the open intent
 	})
-	go func() {
-		p.round()
-		close(done)
-	}()
-	select {
-	case <-gateEntered:
-	case <-time.After(time.Second):
-		t.Fatal("planner did not consult worker capacity")
+	added, _ := p.apply(plannerOutput{Intents: []plannerIntent{
+		{TaskID: "a", Title: "A", Target: "https://a.example", TargetKind: "web"},
+		{TaskID: "b", Title: "B", Target: "https://b.example", TargetKind: "web"},
+	}})
+	if added != 0 {
+		t.Fatalf("added = %d, want 0: the only free slot is already open", added)
 	}
-	select {
-	case <-done:
-		t.Fatal("planner round proceeded while capacity was blocked")
-	case <-time.After(40 * time.Millisecond):
+
+	p.cfg.AvailableSlots = func() int { return 2 }
+	added, _ = p.apply(plannerOutput{Intents: []plannerIntent{
+		{TaskID: "a", Title: "A", Target: "https://a.example", TargetKind: "web"},
+		{TaskID: "b", Title: "B", Target: "https://b.example", TargetKind: "web"},
+	}})
+	if added != 1 {
+		t.Fatalf("added = %d, want 1 (one free claim slot)", added)
 	}
-	close(release)
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("planner round did not unblock")
+}
+
+// TestPlannerSkipsFullPoolTimerRound pins the cheap gate: when every slot is
+// executing, a timer round must not call the model or wait for capacity.
+func TestPlannerSkipsFullPoolTimerRound(t *testing.T) {
+	store := graph.NewMemoryStore()
+	addIntent(t, store, "fullpool", "a")
+	addIntent(t, store, "fullpool", "b")
+	ctx := context.Background()
+	for i := 0; i < 2; i++ {
+		if n, err := store.ClaimNextIntent(ctx, "fullpool", fmt.Sprintf("work#%d", i+1), time.Minute); err != nil || n == nil {
+			t.Fatalf("claim %d: %v %v", i, n, err)
+		}
+	}
+	p := NewPlanner(ctx, PlannerConfig{ScanID: "fullpool", Repo: store, MaxIntents: 2})
+	p.initialDone.Store(true)
+	if p.shouldPlan(false, false) {
+		t.Fatal("a full pool with no trigger must not plan")
 	}
 }
 
@@ -333,6 +348,34 @@ func TestPlannerRelabelsTaskWithConcreteTarget(t *testing.T) {
 	}
 	if kinds["analysis"] != "task" {
 		t.Fatalf("symbolic task kind = %q, want task", kinds["analysis"])
+	}
+}
+
+// TestPlannerRetriesAfterInvalidFirstPlan pins XALG003: a model answer is not
+// a valid plan. Only a parsed empty plan (or a plan that actually added/retired
+// work) may drain an empty frontier; malformed/all-rejected plans keep retrying
+// on the backoff ladder.
+func TestPlannerRetriesAfterInvalidFirstPlan(t *testing.T) {
+	store := graph.NewMemoryStore()
+	p := NewPlanner(context.Background(), PlannerConfig{
+		ScanID: "planner-invalid", Repo: store, MaxIntents: 2,
+		Client: &llm.Client{},
+	})
+	p.initialDone.Store(true)
+	p.modelRounds.Store(1) // the model answered, but the plan was invalid
+	if !p.shouldPlan(false, false) {
+		t.Fatal("an invalid first plan must not drain the frontier")
+	}
+	if p.drained.Load() {
+		t.Fatal("invalid plan marked the planner drained")
+	}
+
+	p.planRounds.Store(1) // a legal empty plan is a real decision
+	if p.shouldPlan(false, false) {
+		t.Fatal("a valid empty plan on an empty frontier should drain")
+	}
+	if !p.drained.Load() {
+		t.Fatal("valid empty plan did not enter the drained state")
 	}
 }
 
@@ -371,17 +414,11 @@ func TestPlannerSkipsFullFrontier(t *testing.T) {
 }
 
 // TestPlannerSettleWakesDrainedFrontier pins that a worker settle (Notify) is a
-// real trigger: it un-drains the planner and lets the round proceed to the
-// capacity gate.
+// real trigger: it un-drains the planner and lets the round proceed.
 func TestPlannerSettleWakesDrainedFrontier(t *testing.T) {
 	store := graph.NewMemoryStore()
-	gateCalls := 0
 	p := NewPlanner(context.Background(), PlannerConfig{
 		ScanID: "planner-wake", Repo: store, MaxIntents: 2,
-		WaitForCapacity: func(context.Context) error {
-			gateCalls++
-			return context.Canceled // stop before the round needs an LLM client
-		},
 	})
 	p.initialDone.Store(true)
 	if p.round() {
@@ -395,8 +432,8 @@ func TestPlannerSettleWakesDrainedFrontier(t *testing.T) {
 	if p.drained.Load() {
 		t.Fatal("settle did not un-drain the planner")
 	}
-	if gateCalls != 1 {
-		t.Fatalf("capacity gate calls = %d, want 1", gateCalls)
+	if !p.shouldPlan(true, false) {
+		t.Fatal("settle trigger did not pass the cheap gate")
 	}
 }
 
@@ -529,5 +566,23 @@ func TestPlannerStallGuardSteersAfterTwoMissedRounds(t *testing.T) {
 	p.applyStallGuard(stalls)
 	if len(steered) != 1 {
 		t.Fatalf("guard steered after the model corrected it: %v", steered)
+	}
+}
+
+// TestPlannerSetScopeAppliesToNextPlan pins XALG019 on the planner layer: a
+// live scope replacement is used by the next apply.
+func TestPlannerSetScopeAppliesToNextPlan(t *testing.T) {
+	store := graph.NewMemoryStore()
+	p := NewPlanner(context.Background(), PlannerConfig{ScanID: "live-scope", Repo: store, MaxIntents: 2})
+	out := plannerOutput{Intents: []plannerIntent{{
+		TaskID: "scoped-1", Title: "Scope work", Target: "10.20.30.4",
+		TargetKind: "scope", VulnClass: "manual",
+	}}}
+	if added, _ := p.apply(out); added != 0 {
+		t.Fatal("scope intent accepted before the scope was installed")
+	}
+	p.SetScope([]string{"10.20.30.0/24"}, nil, nil)
+	if added, _ := p.apply(out); added != 1 {
+		t.Fatal("scope intent rejected after the live scope update")
 	}
 }

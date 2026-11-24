@@ -72,8 +72,32 @@ func executePythonForContext(contextID string, args map[string]string) (tools.Re
 }
 
 func executePythonForContextCtx(parent context.Context, contextID string, args map[string]string) (tools.Result, error) {
+	// R1: the target's Retry-After cooldown applies to scripted requests too.
+	if sc := scanctx.Get(contextID); sc != nil {
+		if msg := sc.TargetBackoffMessage(); msg != "" {
+			return tools.Result{Output: msg}, nil
+		}
+	}
 	if strings.TrimSpace(contextID) == "" {
 		contextID = scanctx.Default().ID
+	}
+	// R4: shared Engagement budget (global slot; script commands may fan out).
+	var ticket *scanctx.Ticket
+	if sc := scanctx.Get(contextID); sc != nil {
+		if budget := sc.Egress(); budget != nil {
+			base := parent
+			if base == nil {
+				base = context.Background()
+			}
+			acqCtx, cancel := context.WithTimeout(base, 30*time.Second)
+			t, aerr := budget.Acquire(acqCtx, "")
+			cancel()
+			if aerr != nil {
+				return tools.Result{Output: scanctx.EgressSoftMessage(aerr)}, nil
+			}
+			ticket = t
+			defer func() { ticket.Done(0, 0) }()
+		}
 	}
 
 	code := args["code"]

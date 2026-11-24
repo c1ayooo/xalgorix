@@ -21,6 +21,7 @@ package agent
 // re-fetch with read_ledger / read_info_item / read_tool_output / read_notes.
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -31,6 +32,7 @@ import (
 
 	"github.com/c1ayooo/xalgorix/v4/internal/graph"
 	"github.com/c1ayooo/xalgorix/v4/internal/infoitem"
+	"github.com/c1ayooo/xalgorix/v4/internal/intelaccess"
 	"github.com/c1ayooo/xalgorix/v4/internal/llm"
 	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
 	"github.com/c1ayooo/xalgorix/v4/internal/tools/notes"
@@ -50,6 +52,7 @@ const (
 	snapFindingsMax = 12
 	snapObsMax      = 10
 	snapGapsMax     = 10
+	snapIntelMax    = 6
 	snapActionsMax  = 10
 )
 
@@ -259,8 +262,10 @@ func (a *Agent) buildContextSnapshotLabeled(region string, dropped []llm.Message
 	b := newSnapshotBuilder(a, region, budget, label)
 	a.snapshotHints(b)
 	a.snapshotIntents(b)
+	a.snapshotRecentResults(b)
 	a.snapshotBeliefs(b)
 	a.snapshotFindings(b)
+	a.snapshotIntel(b)
 	a.snapshotObservations(b)
 	a.snapshotCoverage(b)
 	a.snapshotNotes(b)
@@ -269,6 +274,7 @@ func (a *Agent) buildContextSnapshotLabeled(region string, dropped []llm.Message
 		"- [engine] ledger: read_ledger (hypotheses, evidence, schedulable pool)",
 		"- [engine] information space: search_info / read_info_item; archives: read_tool_output",
 		"- [engine] notes: read_notes(key=...); coverage: read the plan and gap report",
+		"- [engine] intel: the seed lists identities only — read_intelligence(fingerprint=…) for one item's content",
 		"- [engine] do not treat this snapshot as proof and do not retest a rejected/exhausted direction without new evidence.",
 	})
 	snap := b.finish()
@@ -356,6 +362,57 @@ func (a *Agent) snapshotIntents(b *snapshotBuilder) {
 	b.add("Plan intents (authoritative plan graph)", lines)
 }
 
+// snapshotRecentResults lists recently concluded parent stages by reference
+// only. It is the seed half of the P0 handoff: a next-stage worker can see the
+// parent's artifact ID and fetch it explicitly, without the parent's prose
+// being copied into the prompt.
+func (a *Agent) snapshotRecentResults(b *snapshotBuilder) {
+	repo := graph.Backend()
+	scanID := a.planGraphScanID()
+	if repo == nil || scanID == "" {
+		return
+	}
+	ctx, cancel := planGraphContext()
+	defer cancel()
+	nodes, err := repo.ListNodes(ctx, scanID, graph.KindFact)
+	if err != nil {
+		log.Printf("[agent] snapshot: intent results unavailable: %v", err)
+		return
+	}
+	type result struct {
+		parent string
+		ref    string
+		at     time.Time
+		nodeID int64
+	}
+	results := make([]result, 0, 6)
+	for i := range nodes {
+		payload := nodes[i].PayloadJSON()
+		parent := strings.TrimSpace(stringField(payload, "result_of"))
+		ref := strings.TrimSpace(stringField(payload, "result_artifact_id"))
+		if parent == "" || ref == "" {
+			continue
+		}
+		results = append(results, result{parent: parent, ref: ref, at: nodes[i].CreatedAt, nodeID: nodes[i].ID})
+	}
+	sort.SliceStable(results, func(i, j int) bool {
+		if !results[i].at.Equal(results[j].at) {
+			return results[i].at.After(results[j].at)
+		}
+		return results[i].parent < results[j].parent
+	})
+	if len(results) > 6 {
+		results = results[:6]
+	}
+	lines := make([]string, 0, len(results))
+	for _, r := range results {
+		lines = append(lines, fmt.Sprintf("- [graph] intent-result %s: result_ref=%s (read_tool_output)", r.parent, r.ref))
+		b.ref(r.ref)
+		b.nodeIDs = append(b.nodeIDs, r.nodeID)
+	}
+	b.add("Recent intent results (references only)", lines)
+}
+
 func (a *Agent) snapshotBeliefs(b *snapshotBuilder) {
 	l := a.ledger()
 	if l == nil {
@@ -413,6 +470,60 @@ func (a *Agent) snapshotFindings(b *snapshotBuilder) {
 		b.ref(f.ID)
 	}
 	b.add("Confirmed findings (report gate — acceptance decided here)", lines)
+}
+
+// snapshotIntel renders the "Available intel" section: identity + reachability
+// for intel a human/engine has blessed in THIS scan, so a fresh lane can act on
+// what the run already holds without any plaintext entering the seed.
+// Content is fetched on demand through read_intelligence(fingerprint=…) — the
+// seed is auto-injected, so it must stay identity-only (INTEL_HANDOFF_SPEC
+// v1.1 D5 / M2).
+//
+// Source of truth is the intel_access projection (ListUsable: confirmed/active,
+// unexpired). proposed items are observations, not doors, so they stay out of
+// the seed and remain discoverable through read_intelligence's identity
+// listing. Without a registered projection store (unit tests, memory harness)
+// the section is absent rather than falling back to "everything is usable".
+func (a *Agent) snapshotIntel(b *snapshotBuilder) {
+	if a == nil || a.scanCtx == nil {
+		return
+	}
+	store := intelaccess.StoreOrNil()
+	if store == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	// Access rows are keyed by the graph run id; the scan-session context id is
+	// only the intel store's key (they differ in production).
+	scanID := a.planGraphScanID()
+	if scanID == "" {
+		scanID = a.scanCtx.ID
+	}
+	usable, err := store.ListUsable(ctx, scanID, "", snapIntelMax)
+	if err != nil {
+		log.Printf("[agent] snapshot: usable intel unavailable: %v", err)
+		return
+	}
+	if len(usable) == 0 {
+		return
+	}
+	lines := make([]string, 0, len(usable))
+	for _, access := range usable {
+		grants := "-"
+		if len(access.Targets) > 0 {
+			grants = strings.Join(access.Targets, ",")
+		}
+		subject := access.Subject
+		if subject == "" {
+			subject = "-"
+		}
+		lines = append(lines, fmt.Sprintf("- [intel] fp=%s kind=%s state=%s subject=%s grants=%s (content: read_intelligence(fingerprint=%s))",
+			access.Fingerprint, access.Kind, access.State,
+			clipSnapshotText(subject, 60), clipSnapshotText(grants, 120), access.Fingerprint))
+		b.ref(access.Fingerprint)
+	}
+	b.add("Available intel (confirmed doors; read_intelligence(fingerprint=…) for content)", lines)
 }
 
 func (a *Agent) snapshotObservations(b *snapshotBuilder) {

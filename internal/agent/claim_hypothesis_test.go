@@ -14,11 +14,13 @@ func newClaimAgent(t *testing.T) *Agent {
 // seedQueued adds a queued hypothesis and returns its stored id.
 func seedQueued(l *scanctx.LedgerStore, class, endpoint string, conf float64) string {
 	h := l.Upsert(scanctx.Hypothesis{
-		VulnClass:  class,
-		Endpoint:   endpoint,
-		Confidence: conf,
-		Status:     scanctx.HypothesisQueued,
-		NextAction: "probe " + endpoint,
+		Title:         "Verify " + class + " on " + endpoint,
+		VulnClass:     class,
+		Endpoint:      endpoint,
+		Preconditions: []string{"unknown"},
+		Confidence:    conf,
+		Status:        scanctx.HypothesisQueued,
+		NextAction:    "probe " + endpoint,
 	})
 	return h.ID
 }

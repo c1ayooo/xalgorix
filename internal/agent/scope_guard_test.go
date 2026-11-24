@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/c1ayooo/xalgorix/v4/internal/config"
 	"github.com/c1ayooo/xalgorix/v4/internal/scopeguard"
 )
 
@@ -136,5 +137,128 @@ func TestDelegatedOptionsPropagateEngagementScope(t *testing.T) {
 	}
 	if plain.engagementScope != nil {
 		t.Fatal("no scope should not install one")
+	}
+}
+
+// TestSetEngagementScopePropagatesToChildren pins XALG019 on the agent layer:
+// a live scope replacement reaches already-registered delegated workers.
+func TestSetEngagementScopePropagatesToChildren(t *testing.T) {
+	root := NewAgent(&config.Config{}, "scope-root", make(chan Event, 8), scopeguard.Config{})
+	child := NewAgent(&config.Config{}, "scope-child", make(chan Event, 8), scopeguard.Config{})
+	t.Cleanup(root.Stop)
+	t.Cleanup(child.Stop)
+	root.registerChildAgent(child)
+	t.Cleanup(func() { root.unregisterChildAgent(child) })
+
+	root.SetEngagementScope([]string{"10.20.30.0/24"}, []string{"10.20.30.9"}, []int{443})
+	for name, ag := range map[string]*Agent{"root": root, "child": child} {
+		scope := ag.EngagementScope()
+		if scope == nil || len(scope.Targets) != 1 || scope.Targets[0] != "10.20.30.0/24" ||
+			len(scope.Deny) != 1 || len(scope.AllowPorts) != 1 {
+			t.Fatalf("%s scope = %+v", name, scope)
+		}
+	}
+
+	root.SetEngagementScope(nil, nil, nil)
+	if child.EngagementScope() != nil {
+		t.Fatal("cleared scope was not propagated to the child")
+	}
+}
+
+// TestCheckHTTPHopEnforcesEngagementScope pins XALG018's redirect leg: a hop
+// outside the enforced project scope is refused.
+func TestCheckHTTPHopEnforcesEngagementScope(t *testing.T) {
+	a := NewAgent(&config.Config{}, "hop-scope", make(chan Event, 8), scopeguard.Config{})
+	t.Cleanup(a.Stop)
+	a.SetEngagementScope([]string{"example.com"}, []string{"deny.example.com"}, nil)
+
+	if err := a.checkHTTPHop("https://example.com/api"); err != nil {
+		t.Fatalf("in-scope hop refused: %v", err)
+	}
+	if err := a.checkHTTPHop("https://evil.test/api"); err == nil {
+		t.Fatal("out-of-scope redirect hop accepted")
+	}
+	if err := a.checkHTTPHop("https://deny.example.com/api"); err == nil {
+		t.Fatal("denied host accepted")
+	}
+}
+
+// TestScopeFenceOnlyChecksPlatformInitiatedOperations pins the decided XALG018
+// boundary: the fence applies to actions the platform directs at a destination
+// (HTTP, commands, explicit browser navigation), not to a target page's own
+// third-party subresources (which never arrive as tool destinations).
+func TestScopeFenceOnlyChecksPlatformInitiatedOperations(t *testing.T) {
+	a := NewAgent(&config.Config{}, "scope-boundary", make(chan Event, 8), scopeguard.Config{})
+	t.Cleanup(a.Stop)
+	a.SetEngagementScope([]string{"target.example.com"}, nil, nil)
+
+	// Not a platform network operation: a note may mention any URL.
+	if blocked, _ := a.shouldBlockForOutOfScope("add_note", map[string]string{
+		"key": "cdn", "value": "the page loads https://cdn.thirdparty.example.com/app.js",
+	}); blocked {
+		t.Fatal("note mentioning a third-party CDN URL was fenced")
+	}
+
+	// Platform-directed HTTP and explicit browser navigation are fenced.
+	if blocked, _ := a.shouldBlockForOutOfScope("http_request", map[string]string{
+		"url": "https://cdn.thirdparty.example.com/api",
+	}); !blocked {
+		t.Fatal("explicit out-of-scope HTTP request was not fenced")
+	}
+	if blocked, _ := a.shouldBlockForOutOfScope("browser_action", map[string]string{
+		"url": "https://cdn.thirdparty.example.com/page",
+	}); !blocked {
+		t.Fatal("explicit out-of-scope browser navigation was not fenced")
+	}
+	if blocked, _ := a.shouldBlockForOutOfScope("browser_action", map[string]string{
+		"url": "https://target.example.com/page",
+	}); blocked {
+		t.Fatal("in-scope browser navigation was fenced")
+	}
+}
+
+// A CIDR destination is authorized only when the whole range is allowed:
+// checking just the base address would widen the scope.
+func TestCIDRDestinationRequiresWholeRange(t *testing.T) {
+	wide := &EngagementScope{Targets: []string{"10.0.0.0/8"}}
+	if ok, why := wide.DestinationAllowed("10.20.30.0/24"); !ok {
+		t.Fatalf("range inside the allow entry rejected: %s", why)
+	}
+	if ok, _ := wide.DestinationAllowed("10.0.0.0/8"); !ok {
+		t.Fatal("exact range rejected")
+	}
+	if ok, _ := wide.DestinationAllowed("11.0.0.0/24"); ok {
+		t.Fatal("range outside the allow entry accepted")
+	}
+
+	partiallyDenied := &EngagementScope{
+		Targets: []string{"10.0.0.0/8"},
+		Deny:    []string{"10.1.0.0/16"},
+	}
+	if ok, _ := partiallyDenied.DestinationAllowed("10.0.0.0/8"); ok {
+		t.Fatal("range overlapping a deny entry accepted")
+	}
+	if ok, _ := partiallyDenied.DestinationAllowed("10.2.0.0/16"); !ok {
+		t.Fatal("range clear of the deny entry rejected")
+	}
+
+	// A host entry can never authorize a range.
+	hostOnly := &EngagementScope{Targets: []string{"10.20.30.4"}}
+	if ok, _ := hostOnly.DestinationAllowed("10.20.30.0/24"); ok {
+		t.Fatal("host allow entry authorized a range")
+	}
+}
+
+// Bare IPv6 literals are judged as themselves (no URL parsing involved).
+func TestDestinationAllowedIPv6Literal(t *testing.T) {
+	scope := &EngagementScope{Targets: []string{"2001:db8::/32"}}
+	if ok, why := scope.DestinationAllowed("2001:db8::5"); !ok {
+		t.Fatalf("IPv6 literal rejected: %s", why)
+	}
+	if ok, _ := scope.DestinationAllowed("2001:db9::5"); ok {
+		t.Fatal("IPv6 literal outside the entry accepted")
+	}
+	if ok, _ := scope.DestinationAllowed("[2001:db8::5]:443"); !ok {
+		t.Fatal("bracketed IPv6 host:port rejected")
 	}
 }

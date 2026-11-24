@@ -27,6 +27,13 @@ import (
 // the root agent only (workers share the ledger; the root's next turn folds
 // their results). A PG failure is logged through the agent's error event by
 // the caller path and never blocks the loop.
+// mustJSON encodes a map for a graph payload; graph payloads are small and
+// internal, so an encoding failure is not a runtime path.
+func mustJSON(v any) string {
+	b, _ := json.Marshal(v)
+	return string(b)
+}
+
 func (a *Agent) syncExplorationGraph() {
 	if a == nil || a.scanCtx == nil || a.state == nil || a.delegatedAgentID != "" {
 		return
@@ -95,8 +102,68 @@ func (a *Agent) syncExplorationGraph() {
 	// Goals from the deterministic objective evaluator.
 	goalNodes := map[string]int64{}
 	findingProofs := map[string][]int64{}
+	// Root Goal: one stable node per run. It is the parent of every criterion
+	// goal and the fallback target for intents that only name "GOAL". Its met
+	// state is derived from the same deterministic evaluator as the finish gate:
+	// partial criterion completion never closes the root.
+	rootState := graph.StateOpen
+	rootReason := "no structured objective; root goal stays open until the operator finish"
+	rootLabel := "Engagement root goal"
+	if a.state.Objective != nil && strings.TrimSpace(a.state.Objective.Statement) != "" {
+		rootLabel = a.state.Objective.Statement
+	}
+	rootNode, rootErr := repo.UpsertNode(ctx, graph.NodeInput{
+		ScanID: runID, Kind: graph.KindGoal, UnitKey: "GOAL",
+		State: rootState, Priority: 100, Origin: "objective",
+		Payload: mustJSON(map[string]any{
+			"criterion_id": "GOAL",
+			"label":        rootLabel,
+			"kind":         "root",
+			"required":     true,
+			"state":        string(rootState),
+			"reason":       rootReason,
+		}),
+	})
+	if rootErr == nil && rootNode != nil {
+		goalNodes["GOAL"] = rootNode.ID
+	}
 	if a.state.Objective != nil && len(a.state.Objective.Criteria) > 0 {
 		report := objective.Evaluate(objectiveSpecFromAgent(a.state.Objective), objectiveSignalForState(a.state))
+		requiredDecidable := false
+		for _, c := range a.state.Objective.Criteria {
+			if c.Required && c.VerifyBy != objective.VerifyManual {
+				requiredDecidable = true
+				break
+			}
+		}
+		rootReason = "no required engine-decidable criterion"
+		if requiredDecidable {
+			if open := goalGateOpenCriteria(a.state); len(open) == 0 {
+				rootState = graph.StateMet
+				rootReason = "all required engine-decidable criteria are met"
+			} else {
+				rootReason = strings.Join(open, "; ")
+			}
+		}
+		if rootNode != nil {
+			// Re-upsert the root state once the evaluator has run.
+			updated, uerr := repo.UpsertNode(ctx, graph.NodeInput{
+				ScanID: runID, Kind: graph.KindGoal, UnitKey: "GOAL",
+				State: rootState, Priority: 100, Origin: "objective",
+				Payload: mustJSON(map[string]any{
+					"criterion_id": "GOAL",
+					"label":        rootLabel,
+					"kind":         "root",
+					"required":     true,
+					"state":        string(rootState),
+					"reason":       rootReason,
+				}),
+			})
+			if uerr == nil && updated != nil {
+				goalNodes["GOAL"] = updated.ID
+				rootNode = updated
+			}
+		}
 		for i, c := range a.state.Objective.Criteria {
 			id := strings.TrimSpace(c.ID)
 			if id == "" {
@@ -114,6 +181,7 @@ func (a *Agent) syncExplorationGraph() {
 			}
 			payload, _ := json.Marshal(map[string]any{
 				"criterion_id":        id,
+				"parent_goal":         "GOAL",
 				"label":               criterionLabel(c),
 				"kind":                criterionKindDetail(c),
 				"vuln_class":          c.VulnClass,
@@ -134,6 +202,16 @@ func (a *Agent) syncExplorationGraph() {
 				continue
 			}
 			goalNodes[id] = node.ID
+			if rootID := goalNodes["GOAL"]; rootID != 0 {
+				_ = repo.AddEdge(ctx, graph.EdgeInput{
+					ScanID: runID, SrcID: rootID, DstID: node.ID, Rel: graph.RelSpawns,
+				})
+				if rootState == graph.StateMet && state == graph.StateMet {
+					_ = repo.AddEdge(ctx, graph.EdgeInput{
+						ScanID: runID, SrcID: node.ID, DstID: rootID, Rel: graph.RelProves,
+					})
+				}
+			}
 			if findingID != "" {
 				findingProofs[findingID] = append(findingProofs[findingID], node.ID)
 			}
@@ -181,6 +259,12 @@ func (a *Agent) syncExplorationGraph() {
 				goalID := strings.TrimSpace(t.ObjectiveRef)
 				goalNode, ok := goalNodes[goalID]
 				if !ok {
+					// Older/engine-created intents carry the sentinel "GOAL";
+					// attach them to the root goal instead of leaving the intent
+					// without lineage.
+					goalNode = goalNodes["GOAL"]
+				}
+				if goalNode == 0 {
 					continue
 				}
 				_ = repo.AddEdge(ctx, graph.EdgeInput{
@@ -238,6 +322,9 @@ func (a *Agent) checkProjectionConformance(ctx context.Context, repo graph.Repos
 			expected[graph.KindFinding] = append(expected[graph.KindFinding], id)
 		}
 	}
+	// The root goal node is created even without a structured objective, so it
+	// is always part of the expected set.
+	expected[graph.KindGoal] = append(expected[graph.KindGoal], "GOAL")
 	if a.state.Objective != nil {
 		for i, c := range a.state.Objective.Criteria {
 			id := strings.TrimSpace(c.ID)

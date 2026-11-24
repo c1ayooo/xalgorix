@@ -33,6 +33,7 @@ var (
 	ErrConfirmationRequired = errors.New("graph: intent confirmation required")
 	ErrPreconditionUnmet    = errors.New("graph: intent precondition unmet")
 	ErrNoProduct            = errors.New("graph: done intent requires a produced node")
+	ErrYieldUnmet           = errors.New("graph: intent declared a yield kind it did not produce")
 )
 
 // Kind is one exploration node type.
@@ -292,8 +293,17 @@ type Repository interface {
 	// confirmation, precondition, receipt and yields rules without requiring a
 	// lease. Only plan_graph may call it.
 	ConcludePlanned(ctx context.Context, scanID string, id int64, to State, produced []NodeInput) (*Node, error)
+	// SettleIntent moves a worker-owned running intent to a terminal state
+	// (blocked/exhausted/stopped) or back to open (worker missing) in one
+	// statement, writing the reason atomically and fencing the update on the
+	// current owner. False means the caller no longer owns a running intent
+	// (another worker reclaimed the expired lease); the caller MUST NOT retry
+	// with a plain Transition. done is refused: only ConcludeIntent can produce
+	// a done intent.
+	SettleIntent(ctx context.Context, scanID string, id int64, owner string, to State, reason string) (bool, error)
 	// SetBlockedReason records why an intent is blocked (operator/debug
-	// visibility). It only touches rows already in state=blocked.
+	// visibility). It only touches rows already in state=blocked. Worker
+	// settlement uses SettleIntent so the reason and state can never diverge.
 	SetBlockedReason(ctx context.Context, scanID string, id int64, reason string) error
 	Counts(ctx context.Context, scanID string) (Counts, error)
 	PlanTasks(ctx context.Context, scanID string) ([]PlanTask, error)

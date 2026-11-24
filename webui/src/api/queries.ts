@@ -105,6 +105,7 @@ export const qk = {
   scanExploration: (scanId: string) => ["info", "exploration", scanId] as const,
   // 决策收件箱：与探索投影同前缀（同一 run 的决策/@投影视图一起刷新）。
   scanDecisions: (scanId: string) => ["info", "decisions", scanId] as const,
+  intelAccess: (scanId: string) => ["info", "intel-access", scanId] as const,
   // 集成模块（MCP / Skills / Agents）：定义 + 调用记录。配置类无轮询，
   // mutation 失效刷新；调用记录 15s 轻轮询。
   mcpServers: ["mcp", "servers"] as const,
@@ -1202,10 +1203,13 @@ export function useIntelTriage(taskId: string) {
     mutationFn: ({
       fingerprint,
       status,
-    }: { fingerprint: string; status: IntelTriageStatus }) =>
-      api.triageIntelligence(taskId, fingerprint, status),
+      grants,
+    }: { fingerprint: string; status: IntelTriageStatus; grants?: string[] }) =>
+      api.triageIntelligence(taskId, fingerprint, status, grants),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: qk.taskIntelligence(taskId) });
+      // 确认/驳回/补门槛会改写运行级的可达性投影与见识审计。
+      qc.invalidateQueries({ queryKey: ["info", "intel-access"] });
     },
   });
 }
@@ -1484,7 +1488,19 @@ export function useApplyScanDecision(scanId: string) {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: qk.scanDecisions(scanId) });
       qc.invalidateQueries({ queryKey: qk.scanExploration(scanId) });
+      qc.invalidateQueries({ queryKey: qk.intelAccess(scanId) });
     },
+  });
+}
+
+/** 运行级情报可达性投影（access / 通行证 / 审计），运行中 15s 轮询。 */
+export function useScanIntelAccess(scanId: string, enabled = true) {
+  return useQuery({
+    queryKey: qk.intelAccess(scanId),
+    queryFn: () => api.scanIntelAccess(scanId),
+    enabled: enabled && !!scanId,
+    refetchInterval: enabled ? 15000 : false,
+    placeholderData: keepPreviousData,
   });
 }
 

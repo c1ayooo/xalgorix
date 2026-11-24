@@ -337,6 +337,14 @@ func (s *Server) runRegisteredMultiScan(run *multiScanRun, scanCfg *config.Confi
 	instance := run.instance
 	defer run.ownership.release()
 
+	// Project isolation: XALGORIX_CONTROL_PLANE_HOSTS is operator-global, but
+	// its entries belong to one engagement. Narrow them to the hosts THIS
+	// dispatch names before they reach any prompt (planner, worker, root
+	// agent) or the benchmark doctrine; a run that does not name them must
+	// never see a foreign project's hosts. This is the common choke point for
+	// both runMultiScan and the paused-instance resume path.
+	scanCfg = scopedScanConfig(scanCfg, req)
+
 	// Persist the queue state immediately, BEFORE the admission wait loop.
 	// Previously the first saveQueueState ran only after admission (well past
 	// the wait loop), so an instance parked at "pending" left ZERO disk trace.

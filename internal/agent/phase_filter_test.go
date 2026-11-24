@@ -9,6 +9,10 @@ import (
 // surface used across the phase-orchestration tests.
 func richTestState() *ScanState {
 	state := NewScanState()
+	// These fixtures exercise the full-methodology plan shape (phase filtering,
+	// dispositions). R1 evidence gating is covered by discovery/noise tests; an
+	// explicit discovery request keeps this fixture's original contract.
+	state.OperatorRequestedDiscovery = true
 	state.ScanTargets = []string{"https://app.example.com"}
 	state.DiscoveredEndpoints = []string{
 		"https://app.example.com/checkout",

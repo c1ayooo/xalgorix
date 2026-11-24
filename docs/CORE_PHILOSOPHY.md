@@ -208,7 +208,7 @@ Evidence 继续保留每假设 40 条、单字段 4096 字符及现有内存上�
 - `claim_next_hypothesis` 的可调度池；
 - `taskCoverageComplete` 与 coverage epoch 的缺口计算；
 - `read_ledger(filter=schedulable)`；
-- M3 之后的跨扫描同主体候选检索。
+- 跨扫描同主体候选检索（范围限本项目任务之间；项目是隔离边界）。
 
 **实现**：内存索引或 SQL 属性查询，不要求语义向量空间。
 
@@ -221,7 +221,7 @@ Evidence 继续保留每假设 40 条、单字段 4096 字符及现有内存上�
 - Verifier 的 baseline/控制组装（**部分**：Verifier 独立复测自带负向/基线对照；引擎尚未从关系边装配 baseline 注入 `VerificationRequest`）；
 - `report_vulnerability` 的同类同端点去重与证据引用（已接线）；
 - `verify_*` 复用既有 baseline（已接线，按类各自实现）；
-- 跨扫描同主体历史证据查询（已接线：`read_ledger(filter=schedulable)` / `claim_next_hypothesis` 的 same-subject 提示，`internal/agent/ledger_cross_scan.go`）。
+- 跨扫描同主体历史证据查询（已接线：`read_ledger(filter=schedulable)` / `claim_next_hypothesis` 的 same-subject 提示，`internal/agent/ledger_cross_scan.go`；范围限本项目任务之间）。
 
 **实现**：扫描内关系索引或 PostgreSQL 递归 CTE。返回结果必须保留路径、深度和截断标志，不能把无界遍历交给调用方。生产端现写四类确定性边：`supports`（ledger 证据）、`references`（冷路径词法召回）、`same_subject`/`same_session`（字段精确比较）、`contradicts`（同一 subject+purpose+hypothesis 下 control/baseline 对 probe/exploit/finding_ref）；矛盾边来自证据角色，不来自文本猜测。
 
@@ -413,7 +413,7 @@ Obligation 不得被 InfoItem 置信度或 VOI 绕过。删掉 Obligation 就无
 | M1 | Hypothesis 前置条件 | 缺少 preconditions 时 `record_hypothesis` 返回可纠正提示；历史/未知值不伪装成已满足；Obligation 与收工门回归通过 |
 | M2 | 完整审计记录与只读投影 | 自动和模型认领均有持久化记录；重复/乱序/缺口可识别；可从记录还原认领历史；投影不参与判定，缺口显示为 incomplete |
 | M3 | InfoItem 冷路径落 PG | 无 DSN 全核心测试通过；幂等重投通过；杀死进程模拟“JSON 已写未入队”后 reconciler 能追平；pending/applied/gap/failed 可查询 |
-| M4 | 激活入口接真实消费者 | 区域、关联、语境分别至少一个消费者有契约测试；关联跳数/预算有上限；结果携带来源和截断标志；无 PG 时热路径不依赖这些跨扫描查询 |
+| M4 | 激活入口接真实消费者 | 区域、关联、语境分别至少一个消费者有契约测试；关联跳数/预算有上限；结果携带来源和截断标志；无 PG 时热路径不依赖冷路径查询 |
 | M5 | 确定性 VOI 加权 | 不可变快照金样本排序稳定；`w=0` 完全保持旧排序；边界值和缺失值有测试；ClaimNext 并发认领不重复 |
 
 ### 10.1 M3 参考性能验收

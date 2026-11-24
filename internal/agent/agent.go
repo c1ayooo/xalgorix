@@ -20,6 +20,7 @@ import (
 
 	"github.com/c1ayooo/xalgorix/v4/internal/attacksurface"
 	"github.com/c1ayooo/xalgorix/v4/internal/config"
+	"github.com/c1ayooo/xalgorix/v4/internal/discovery"
 	"github.com/c1ayooo/xalgorix/v4/internal/domainjournal"
 	"github.com/c1ayooo/xalgorix/v4/internal/engine"
 	"github.com/c1ayooo/xalgorix/v4/internal/llm"
@@ -245,8 +246,9 @@ type Agent struct {
 	scanCtx               *scanctx.ScanContext               // per-session state (vulns, notes, terminal, browser)
 	conformanceMu         sync.Mutex                         // guards lastConformanceCheck (projection conformance throttle)
 	lastConformanceCheck  time.Time                          // last read-only projection reconciliation
-	crossScanMu           sync.RWMutex                       // guards crossScanAllowed
+	crossScanMu           sync.RWMutex                       // guards crossScanAllowed/crossScanScanIDs
 	crossScanAllowed      func(scanID string) bool           // optional project-scope guard for read_info_item scan_id
+	crossScanScanIDs      func() []string                    // optional project scan whitelist for cross-scan history (M4)
 	userSkills            []skillstool.UserSkill             // operator-authored skills injected for THIS scan only
 	userProfiles          []specialistProfile                // operator-authored delegation profiles injected for THIS scan only
 	mcpServers            []mcptool.ServerSpec               // operator-registered MCP servers for THIS scan only
@@ -290,8 +292,10 @@ type Agent struct {
 	// engagementScope is the project's enforced authorization boundary. It is
 	// nil unless the project fence is enforced, so runs without an explicit
 	// fence keep the pre-scope behavior. Delegated workers inherit the same
-	// scope (see delegatedAgentOptions).
+	// scope (see delegatedAgentOptions); a live project-scope update replaces it
+	// under scopeMu and propagates to existing children.
 	engagementScope *EngagementScope
+	scopeMu         sync.RWMutex
 
 	// Per-scan whitebox/auth config. Default to the global cfg values but can
 	// be overridden PER SCAN via SetTargetAuth/SetSourceRepo before Run() so a
@@ -433,14 +437,62 @@ func WithBenchmarkIsolation() AgentOption {
 // benchmark and ad-hoc runs. Every delegated worker inherits the same scope.
 func WithEngagementScope(targets, deny []string, allowPorts []int) AgentOption {
 	return func(a *Agent) {
-		if len(targets) == 0 {
-			return
-		}
-		a.engagementScope = &EngagementScope{
+		a.SetEngagementScope(targets, deny, allowPorts)
+	}
+}
+
+// SetEngagementScope installs (or clears, when targets is empty) the project's
+// enforced authorization boundary. Existing delegated workers receive the same
+// replacement so a running project-scope tightening applies to their next
+// guard check (XALG019). The scope object is immutable after publication.
+func (a *Agent) SetEngagementScope(targets, deny []string, allowPorts []int) {
+	if a == nil {
+		return
+	}
+	var scope *EngagementScope
+	if len(targets) > 0 {
+		scope = &EngagementScope{
 			Targets:    append([]string(nil), targets...),
 			Deny:       append([]string(nil), deny...),
 			AllowPorts: append([]int(nil), allowPorts...),
 		}
+	}
+	a.scopeMu.Lock()
+	a.engagementScope = scope
+	a.scopeMu.Unlock()
+
+	a.childrenMu.Lock()
+	children := make([]*Agent, 0, len(a.children))
+	for child := range a.children {
+		children = append(children, child)
+	}
+	a.childrenMu.Unlock()
+	for _, child := range children {
+		child.SetEngagementScope(targets, deny, allowPorts)
+	}
+}
+
+// engagementScopeSnapshot returns the current immutable scope under the lock.
+func (a *Agent) engagementScopeSnapshot() *EngagementScope {
+	if a == nil {
+		return nil
+	}
+	a.scopeMu.RLock()
+	defer a.scopeMu.RUnlock()
+	return a.engagementScope
+}
+
+// EngagementScope returns a copy of the current enforced scope for diagnostics
+// and tests. nil means the run has no project fence.
+func (a *Agent) EngagementScope() *EngagementScope {
+	scope := a.engagementScopeSnapshot()
+	if scope == nil {
+		return nil
+	}
+	return &EngagementScope{
+		Targets:    append([]string(nil), scope.Targets...),
+		Deny:       append([]string(nil), scope.Deny...),
+		AllowPorts: append([]int(nil), scope.AllowPorts...),
 	}
 }
 
@@ -957,7 +1009,7 @@ func NewAgent(cfg *config.Config, name string, events chan Event, localGuard sco
 			// context. Creating a child therefore cannot overwrite another scan's
 			// runner or leave an uncancellable worker behind.
 			subArgs := []any{sctx}
-			for _, opt := range delegatedAgentOptions(ctx, a.agentGraph, a.scanBudget, agentID, a.benchmarkIsolated, a.engagementScope) {
+			for _, opt := range delegatedAgentOptions(ctx, a.agentGraph, a.scanBudget, agentID, a.benchmarkIsolated, a.engagementScopeSnapshot()) {
 				subArgs = append(subArgs, opt)
 			}
 			if a.workerSurface != SurfaceLegacyRoot {
@@ -1323,7 +1375,7 @@ func (a *Agent) maybeAutoDelegate(targets []string) string {
 	// plan's endpoint set every iteration. Skipped when the model already
 	// spawned anything itself (manual delegation disables engine launches).
 	if !a.state.ReconLaneLaunched && a.state.Plan != nil && a.state.PlanBuilt &&
-		a.state.LedgerSeeded && a.state.EndpointInventorySaved && a.state.Iteration >= 5 &&
+		a.state.EndpointInventorySaved && a.state.Iteration >= 5 &&
 		a.agentGraph.DelegationCount() == 0 {
 		for _, profile := range defaultSpecialistProfiles {
 			if profile.Role != "recon-discovery" || a.specialistDisabled(profile.Role) {
@@ -1347,11 +1399,19 @@ func (a *Agent) maybeAutoDelegate(targets []string) string {
 	if a.state.ReconLaneLaunched {
 		engineLaunched++
 	}
+	formal := a.formalSchedulableHypotheses()
 	if a.state.WaveLaunched || !a.reconPhaseComplete() || a.state.Iteration < 5 || a.state.Plan == nil ||
-		!a.state.PlanBuilt || !a.state.LedgerSeeded || a.agentGraph.DelegationCount() > engineLaunched {
+		!a.state.PlanBuilt || a.agentGraph.DelegationCount() > engineLaunched {
 		if a.state.Iteration >= 5 && !a.state.WaveLaunched {
 			a.noteDelegationDefer("comprehensive recon not complete (missing: " + strings.Join(a.reconIncompleteReasons(), ", ") + ")")
 		}
+		return ""
+	}
+	// R5: delegation is driven by distinguishable formal hypotheses, not by a
+	// coverage matrix. No formal belief = no testing wave; coverage gaps are
+	// prompts, not work for a specialist.
+	if len(formal) == 0 {
+		a.noteDelegationDefer("no formal hypotheses yet — record a falsifiable claim (record_hypothesis) before delegating; coverage gaps are prompts, not hypotheses")
 		return ""
 	}
 
@@ -1362,10 +1422,14 @@ func (a *Agent) maybeAutoDelegate(targets []string) string {
 	// surface. Delegation code no longer rebuilds plans — disabling every
 	// specialist leaves plan completeness byte-identical.
 
-	profiles := a.eligibleSpecialistProfiles()
+	profiles := a.hypothesisDrivenProfiles(formal)
 	spawned := make([]string, 0, len(profiles))
 	for _, profile := range profiles {
 		if a.specialistDisabled(profile.Role) {
+			continue
+		}
+		if ready, missing := a.profileReadiness(profile); !ready {
+			a.noteDelegationDefer(fmt.Sprintf("lane %s blocked: required tool(s) unavailable: %s", profile.Role, strings.Join(missing, ", ")))
 			continue
 		}
 		if id := a.spawnSpecialistProfile(profile, targets); id != "" {
@@ -1373,6 +1437,7 @@ func (a *Agent) maybeAutoDelegate(targets []string) string {
 		}
 	}
 	if len(spawned) == 0 {
+		a.noteDelegationDefer("no specialist lane matches a formal hypothesis (or its required tools are unavailable)")
 		return ""
 	}
 	a.state.DelegationAttempted = true
@@ -1466,6 +1531,80 @@ func (a *Agent) maybeRescheduleWave(targets []string) string {
 	return ""
 }
 
+// formalSchedulableHypotheses returns the claim-eligible, unowned beliefs the
+// scheduler would hand out. R2's ClaimEligible gate excludes coverage seeds, so
+// this list cannot be satisfied by an uncovered-class matrix.
+func (a *Agent) formalSchedulableHypotheses() []scanctx.Hypothesis {
+	l := a.ledger()
+	if l == nil {
+		return nil
+	}
+	var out []scanctx.Hypothesis
+	for _, h := range l.All() {
+		if !h.ClaimEligible() {
+			continue
+		}
+		if h.Status != scanctx.HypothesisQueued && h.Status != scanctx.HypothesisBlocked {
+			continue
+		}
+		if strings.TrimSpace(h.AssignedTo) != "" {
+			continue
+		}
+		out = append(out, h)
+	}
+	return out
+}
+
+// hypothesisDrivenProfiles keeps only the lanes that have at least one formal
+// hypothesis in their assigned classes. Built-in lanes with no matching belief
+// do not launch; an operator-authored lane with no class list keeps its
+// operator contract.
+func (a *Agent) hypothesisDrivenProfiles(hyps []scanctx.Hypothesis) []specialistProfile {
+	profiles := a.eligibleSpecialistProfiles()
+	out := make([]specialistProfile, 0, len(profiles))
+	for _, profile := range profiles {
+		if len(profile.VulnClasses) == 0 {
+			out = append(out, profile)
+			continue
+		}
+		matched := false
+		for _, h := range hyps {
+			for _, class := range profile.VulnClasses {
+				if vulnClassMatches(h.VulnClass, class) {
+					matched = true
+					break
+				}
+			}
+			if matched {
+				break
+			}
+		}
+		if matched {
+			out = append(out, profile)
+		}
+	}
+	return out
+}
+
+// profileReadiness checks the lane's declared tool requirements. Missing tools
+// are a capability block with a name, never an endless lane with nothing to run.
+func (a *Agent) profileReadiness(profile specialistProfile) (bool, []string) {
+	if len(profile.RequiredTools) == 0 || a.registry == nil {
+		return true, nil
+	}
+	var missing []string
+	for _, name := range profile.RequiredTools {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if _, ok := a.registry.Get(name); !ok {
+			missing = append(missing, name)
+		}
+	}
+	return len(missing) == 0, missing
+}
+
 func (a *Agent) eligibleSpecialistProfiles() []specialistProfile {
 	profiles := make([]specialistProfile, 0, len(defaultSpecialistProfiles)+len(a.userProfiles))
 	for _, profile := range defaultSpecialistProfiles {
@@ -1547,6 +1686,30 @@ Stopping rule: %s.%s`, profile.Role, target, strings.Join(profile.VulnClasses, "
 // everywhere" becomes "H-18 business-logic POST /api/checkout", and the class
 // knowledge loads deterministically instead of hoping the child remembers the
 // catalog.
+// truncatePromptLine bounds one lane-brief field.
+func truncatePromptLine(s string, max int) string {
+	r := []rune(strings.TrimSpace(s))
+	if len(r) <= max {
+		return string(r)
+	}
+	return string(r[:max]) + "…"
+}
+
+// evidenceRefList renders up to n evidence IDs for a lane brief.
+func evidenceRefList(evs []scanctx.Evidence, n int) string {
+	out := make([]string, 0, n)
+	for _, ev := range evs {
+		if ev.ID == "" {
+			continue
+		}
+		out = append(out, ev.ID)
+		if len(out) >= n {
+			break
+		}
+	}
+	return strings.Join(out, ", ")
+}
+
 func (a *Agent) specialistLaneBrief(profile specialistProfile) (string, []string) {
 	var b strings.Builder
 	l := a.ledger()
@@ -1564,6 +1727,9 @@ func (a *Agent) specialistLaneBrief(profile specialistProfile) (string, []string
 				if h.Status != scanctx.HypothesisQueued && h.Status != scanctx.HypothesisBlocked {
 					continue
 				}
+				if !h.ClaimEligible() {
+					continue // R2/R5: coverage seeds are prompts, not lane work
+				}
 				if !vulnClassMatches(h.VulnClass, class) {
 					continue
 				}
@@ -1574,7 +1740,23 @@ func (a *Agent) specialistLaneBrief(profile specialistProfile) (string, []string
 				if h.Parameter != "" {
 					loc += " [" + h.Parameter + "]"
 				}
-				lines = append(lines, fmt.Sprintf("  • %s: %s", h.ID, loc))
+				detail := loc
+				if claim := strings.TrimSpace(h.Title); claim != "" {
+					detail += " — claim: " + truncatePromptLine(claim, 160)
+				}
+				if len(h.Preconditions) > 0 {
+					detail += " | pre: " + truncatePromptLine(strings.Join(h.Preconditions, "; "), 120)
+				}
+				if h.Baseline != "" {
+					detail += " | baseline: " + truncatePromptLine(h.Baseline, 100)
+				}
+				if h.Falsification != "" {
+					detail += " | falsify: " + truncatePromptLine(h.Falsification, 120)
+				}
+				if refs := evidenceRefList(h.Evidence, 3); refs != "" {
+					detail += " | evidence: " + refs
+				}
+				lines = append(lines, fmt.Sprintf("  • %s: %s", h.ID, detail))
 				ids = append(ids, h.ID)
 				count++
 			}
@@ -1582,8 +1764,9 @@ func (a *Agent) specialistLaneBrief(profile specialistProfile) (string, []string
 	}
 	if len(lines) > 0 {
 		sort.Strings(lines)
-		b.WriteString("\nAssigned concrete hypotheses (claim these FIRST, one per class, until the lane is exhausted):\n")
+		b.WriteString("\nAssigned formal hypotheses (claim these FIRST, one per class, until the lane is exhausted):\n")
 		b.WriteString(strings.Join(lines, "\n"))
+		b.WriteString("\nWrite-back contract: claim with claim_next_hypothesis, record every observation with add_hypothesis_evidence (link info_item_id/intent_id when known), and close the hypothesis (proven only after report_vulnerability + finding_ref; rejected only with a refuting baseline/control; blocked with a reason). Results return to the shared ledger — do not copy findings into a second store.")
 	}
 
 	// Resolved lane methodology (1-3 skills).
@@ -2157,6 +2340,20 @@ func (a *Agent) Run(targets []string, instruction string) {
 	ratePolicy := EffectiveRequestRatePolicy(a.cfg, instruction)
 	if a.scanCtx != nil {
 		a.scanCtx.SetRequestRatePolicy(ratePolicy)
+		// R4: one Engagement-wide budget per scan, installed by the root. A
+		// delegated worker must not replace it (workers share the ScanContext
+		// and would reset the counters).
+		if a.delegatedAgentID == "" && a.cfg != nil {
+			a.scanCtx.SetEgressPolicy(scanctx.EgressPolicy{
+				GlobalRPS:          ratePolicy.MaxRPS,
+				Burst:              a.cfg.RateLimitBurst,
+				PerHostRPS:         a.cfg.EgressPerHostRPS,
+				MaxConcurrency:     a.cfg.EgressMaxConcurrency,
+				PerHostConcurrency: a.cfg.EgressPerHostConcurrency,
+				TotalBudget:        a.cfg.EgressTotalBudget,
+				Source:             ratePolicy.Source,
+			})
+		}
 	}
 
 	// Start watchdog
@@ -2247,6 +2444,24 @@ func (a *Agent) Run(targets []string, instruction string) {
 	// never of specialist availability. Single-agent scans owe the same
 	// deep reconnaissance as wave-enabled scans.
 	a.state.DeepReconRequired = a.isDeepMode() && a.scanIntensity == activityModeActive
+	// Noise posture scopes only the engine's DEMANDED discovery. An explicit
+	// operator instruction or an observed signal still moves work forward at
+	// any profile; quiet simply stops the engine from demanding wordlist
+	// content discovery or port sweeps that the target never asked for.
+	noiseProfile := ""
+	if a.cfg != nil {
+		noiseProfile = a.cfg.NoiseProfile
+	}
+	a.state.NoiseProfile = config.NormalizeNoiseProfile(noiseProfile)
+	// R1 progressive recon: active discovery is authorized by the operator's
+	// instruction and the engagement's concrete grants, not by the mere fact
+	// that the methodology includes it. These inputs are read by
+	// internal/discovery via the recon predicate, the engine plan and the
+	// finish gate, so every path makes the same decision.
+	a.state.OperatorRequestedDiscovery = discovery.OperatorRequestedContentDiscovery(instruction)
+	a.state.OperatorRequestedPortScan = discovery.OperatorRequestedPortDiscovery(instruction)
+	a.state.PortDiscoveryAuthorized = discovery.AuthorizedHostTarget(targets)
+	a.state.RequestBudgetConfigured = ratePolicy.Enabled()
 	// Epoch-based coverage convergence is derived once from config so the
 	// coverage predicates read a single ScanState flag (never the global cfg).
 	a.state.EpochCoverage = a.cfg != nil && a.cfg.EpochCoverage
@@ -2333,6 +2548,13 @@ func (a *Agent) completeWithFinish(output string, tokenCount func() int) {
 // Stop signals the agent to stop and kills all running processes.
 func (a *Agent) Stop() {
 	a.stopped.Store(true)
+	// R4: an operator stop ends all further target traffic for the run, not
+	// only this agent's own loop. Workers share the budget and see it.
+	if a.delegatedAgentID == "" && a.scanCtx != nil {
+		if b := a.scanCtx.Egress(); b != nil {
+			b.Stop("run stopped")
+		}
+	}
 
 	if a.cancel != nil {
 		a.cancel()

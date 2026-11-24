@@ -48,8 +48,14 @@ type subAgentState struct {
 	Error       string
 	Observed    bool
 	Partial     []string
-	done        chan struct{}
-	doneOnce    sync.Once
+	// KilledAt/KillReason/KilledBy record who ended this worker and why. They
+	// are audit projection: the graph state remains the intent authority, but a
+	// cancelled worker must not surface as an anonymous "parent scan stopped".
+	KilledAt   time.Time
+	KillReason string
+	KilledBy   string
+	done       chan struct{}
+	doneOnce   sync.Once
 	// ctx is the per-worker cancellation context (pool dispatches). nil means
 	// the graph's root context.
 	ctx    context.Context
@@ -634,8 +640,11 @@ func (g *Graph) SteerUnit(unitID, msg string) error {
 	return fmt.Errorf("no active worker for unit %s", unitID)
 }
 
-// KillUnit cancels the active worker for one authoritative intent. The
-// scheduler settles the intent as blocked when the run returns.
+// KillUnit cancels the active worker for one authoritative intent. A running
+// worker is cancelled (its runner returns and complete closes done); a queued
+// worker is terminal immediately, because it never started and waiting for a
+// freed slot would make exit confirmation unbounded. The scheduler settles the
+// intent when the run returns.
 func (g *Graph) KillUnit(unitID, reason string) error {
 	unitID = strings.TrimSpace(unitID)
 	if g == nil || unitID == "" {
@@ -645,17 +654,78 @@ func (g *Graph) KillUnit(unitID, reason string) error {
 		reason = "killed by planner"
 	}
 	g.mu.Lock()
-	defer g.mu.Unlock()
+	var queued *subAgentState
 	for _, state := range g.agents {
 		if state.UnitID != unitID || (state.Status != "running" && state.Status != "queued") {
 			continue
 		}
+		state.KilledAt = time.Now().UTC()
+		state.KillReason = reason
+		state.KilledBy = "engine"
+		if i := strings.IndexByte(reason, ':'); i > 0 {
+			// KillWorkerWithReason prefixes the typed cause; this is the closest
+			// stable actor label (human / stagnant / budget_exhausted / ...).
+			state.KilledBy = strings.TrimSpace(reason[:i])
+		}
+		if state.Status == "queued" {
+			queued = state
+			continue
+		}
 		if state.cancel != nil {
 			state.cancel(fmt.Errorf("killed: %s", reason))
+			g.mu.Unlock()
 			return nil
 		}
 	}
+	if queued != nil {
+		for i, q := range g.queue {
+			if q == queued {
+				g.queue = append(g.queue[:i], g.queue[i+1:]...)
+				break
+			}
+		}
+		queued.Status = "failed"
+		queued.Error = "killed before start: " + reason
+		queued.CompletedAt = time.Now().UTC()
+		queued.doneOnce.Do(func() { close(queued.done) })
+		if queued.cancel != nil {
+			queued.cancel(nil)
+		}
+		_ = g.persistLocked()
+		id, name, unit, task, target := queued.ID, queued.Name, queued.UnitID, queued.Task, strings.Join(queued.Targets, ",")
+		g.mu.Unlock()
+		g.notify("agent_failed", id, name, unit, "failed", task, target)
+		return nil
+	}
+	g.mu.Unlock()
 	return fmt.Errorf("no active worker for unit %s", unitID)
+}
+
+// WaitUnitExit blocks until the worker currently (or most recently) bound to
+// unitID has closed its done channel. A unit with no record is already exited.
+// It is the exit-confirmation half of a kill: the pool must not write a terminal
+// intent state while the worker is still winding down.
+func (g *Graph) WaitUnitExit(ctx context.Context, unitID string) error {
+	g.mu.Lock()
+	var state *subAgentState
+	for _, candidate := range g.agents {
+		if candidate.UnitID != unitID {
+			continue
+		}
+		if state == nil || candidate.StartedAt.After(state.StartedAt) {
+			state = candidate
+		}
+	}
+	g.mu.Unlock()
+	if state == nil {
+		return nil
+	}
+	select {
+	case <-state.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // SurfaceFor returns the role surface registered for a dispatched worker.
@@ -708,7 +778,11 @@ func (g *Graph) complete(agentID, summary string, runErr error) {
 	state.CompletedAt = time.Now()
 	if errors.Is(runErr, context.Canceled) {
 		state.Status = "failed"
-		state.Error = "parent scan stopped"
+		if state.KillReason != "" {
+			state.Error = "killed: " + state.KillReason
+		} else {
+			state.Error = "parent scan stopped"
+		}
 		state.Result = summary
 	} else if runErr != nil {
 		state.Status = "failed"

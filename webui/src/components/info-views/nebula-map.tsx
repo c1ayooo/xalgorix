@@ -2,8 +2,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { RotateCcw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useI18n } from "@/i18n";
+import { useTheme } from "@/store/theme";
 import {
   edgeBowSign,
+  edgePhaseOffset,
+  heatRGB,
   layoutNebula,
   sortForPaint,
   subjectKey,
@@ -37,15 +40,47 @@ type DragState =
 
 const CHAIN_STROKE = "rgb(205, 90, 70)";
 const INFO_STROKE = "rgb(138, 143, 153)";
+const GLOW_BUCKETS = 12;
+const ROTATION_PER_MS = 0.00003; // ~1.7°/s, one revolution every ~3.5 min
+const FRAME_MS = 33; // ambient loop at ~30fps
+const glowCache = new Map<number, HTMLCanvasElement>();
+
+function glowSprite(bucket: number): HTMLCanvasElement | null {
+  if (typeof document === "undefined") return null;
+  const cached = glowCache.get(bucket);
+  if (cached) return cached;
+  const size = 64;
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return null;
+  const [r, g, b] = heatRGB(bucket / (GLOW_BUCKETS - 1));
+  const gradient = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+  gradient.addColorStop(0, `rgba(${r}, ${g}, ${b}, 0.85)`);
+  gradient.addColorStop(0.35, `rgba(${r}, ${g}, ${b}, 0.28)`);
+  gradient.addColorStop(1, `rgba(${r}, ${g}, ${b}, 0)`);
+  ctx.fillStyle = gradient;
+  ctx.fillRect(0, 0, size, size);
+  glowCache.set(bucket, canvas);
+  return canvas;
+}
+
+function prefersReducedMotion(): boolean {
+  return (
+    typeof window !== "undefined" &&
+    !!window.matchMedia?.("(prefers-reduced-motion: reduce)").matches
+  );
+}
 
 /**
  * Project information nebula (CORE cold/hot, volume heat) + subject graph.
  *
- * One subject = one point. Distance from the centre, size and colour encode
- * information volume; edges are real relations from the unified space. Nodes
- * are draggable, the canvas pans on empty space and the wheel zooms. The canvas
- * repaints from refs during gestures (no React state per pointer move); hover
- * only moves a DOM tooltip.
+ * Hot is the core: distance to the centre, size and colour all encode
+ * information volume, and higher volume sits closer in. Nodes are draggable;
+ * the canvas pans, zooms and rotates very slowly. Action/evidence edges carry
+ * travelling light (direction without arrows), hot points glow in the dark
+ * theme, and the first snapshot blooms out of the core.
  */
 export function NebulaMap({
   rows,
@@ -62,6 +97,10 @@ export function NebulaMap({
   onSelect: (row: InfoHeatmapRow) => void;
 }) {
   const { t } = useI18n();
+  const { resolved } = useTheme();
+  const dark = resolved === "dark";
+  const reduceMotionRef = useRef(prefersReducedMotion());
+
   const wrapRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [size, setSize] = useState({ w: 0, h: 0 });
@@ -74,18 +113,19 @@ export function NebulaMap({
 
   const overridesRef = useRef<Map<string, { x: number; y: number }>>(new Map());
   const viewRef = useRef<View>({ x: 0, y: 0, k: 1 });
+  const rotationRef = useRef(0);
   const dragRef = useRef<DragState>(null);
   const hoveredRef = useRef<NebulaPoint | null>(null);
   const hoverFrameRef = useRef<number | null>(null);
   const hoverPointRef = useRef<{ x: number; y: number } | null>(null);
   const drawFrameRef = useRef<number | null>(null);
-  const drawRef = useRef<() => void>(() => {});
+  const drawRef = useRef<(now?: number) => void>(() => {});
   const entranceRef = useRef<{ start: number; active: boolean }>({
     start: 0,
     active: false,
   });
   const enteredRef = useRef(false);
-  const animFrameRef = useRef<number | null>(null);
+  const rippleRef = useRef<{ start: number; key: string } | null>(null);
 
   useEffect(() => {
     const el = wrapRef.current;
@@ -131,15 +171,32 @@ export function NebulaMap({
     });
   }, []);
 
-  function hitAt(screenX: number, screenY: number): NebulaPoint | null {
+  /** Screen → logical world, undoing pan/zoom and the slow rotation. */
+  function logicalPoint(screenX: number, screenY: number) {
     const view = viewRef.current;
-    const wx = (screenX - view.x) / view.k;
-    const wy = (screenY - view.y) / view.k;
+    let x = (screenX - view.x) / view.k;
+    let y = (screenY - view.y) / view.k;
+    const rotation = rotationRef.current;
+    if (rotation) {
+      const cx = size.w / 2;
+      const cy = size.h / 2;
+      const dx = x - cx;
+      const dy = y - cy;
+      const cos = Math.cos(-rotation);
+      const sin = Math.sin(-rotation);
+      x = cx + dx * cos - dy * sin;
+      y = cy + dx * sin + dy * cos;
+    }
+    return { x, y };
+  }
+
+  function hitAt(screenX: number, screenY: number): NebulaPoint | null {
+    const pointer = logicalPoint(screenX, screenY);
     let best: NebulaPoint | null = null;
     let bestDistance = Number.POSITIVE_INFINITY;
     for (const point of basePoints) {
       const pos = positionOf(point);
-      const distance = Math.hypot(wx - pos.x, wy - pos.y);
+      const distance = Math.hypot(pointer.x - pos.x, pointer.y - pos.y);
       const limit = Math.max(12, point.r + 7);
       if (distance <= limit && distance < bestDistance) {
         best = point;
@@ -149,8 +206,7 @@ export function NebulaMap({
     return best;
   }
 
-  // Draw reads positions/view/selection from refs so gestures never re-render.
-  const draw = () => {
+  const draw = (now = performance.now()) => {
     const canvas = canvasRef.current;
     if (!canvas || size.w <= 0 || size.h <= 0) return;
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -165,20 +221,26 @@ export function NebulaMap({
 
     const view = viewRef.current;
     ctx.setTransform(dpr * view.k, 0, 0, dpr * view.k, dpr * view.x, dpr * view.y);
+    const centerX = size.w / 2;
+    const centerY = size.h / 2;
+    if (rotationRef.current) {
+      ctx.translate(centerX, centerY);
+      ctx.rotate(rotationRef.current);
+      ctx.translate(-centerX, -centerY);
+    }
     ctx.lineCap = "round";
 
     const selectedKey = selected
       ? subjectKey(selected.subject, selected.subjectKind)
       : null;
+    const reduce = reduceMotionRef.current;
 
-    // Entrance: points bloom out of the centre (cold core first, hot spikes
-    // last). After the first snapshot it never replays on a refresh.
+    // Entrance: points bloom out of the centre (cold rim first, hot core last).
     const entrance = entranceRef.current;
+    if (entrance.active && now - entrance.start >= 620) entrance.active = false;
     const progress = entrance.active
-      ? Math.min(1, (performance.now() - entrance.start) / 520)
+      ? Math.min(1, (now - entrance.start) / 520)
       : 1;
-    const centerX = size.w / 2;
-    const centerY = size.h / 2;
     const rendered = new Map<NebulaPoint, { x: number; y: number; t: number }>();
     const reveal = (point: NebulaPoint) => {
       const cached = rendered.get(point);
@@ -186,7 +248,7 @@ export function NebulaMap({
       const pos = positionOf(point);
       let t = 1;
       if (entrance.active) {
-        const raw = Math.min(1, Math.max(0, (progress - 0.15 * point.norm) / 0.85));
+        const raw = Math.min(1, Math.max(0, (progress - 0.15 * (1 - point.norm)) / 0.85));
         t = 1 - (1 - raw) * (1 - raw);
       }
       const out = {
@@ -197,6 +259,13 @@ export function NebulaMap({
       rendered.set(point, out);
       return out;
     };
+
+    const chainTotal = edges.reduce(
+      (count, edge) => count + (edge.category === "chain" ? 1 : 0),
+      0,
+    );
+    const particleStride = Math.max(1, Math.ceil(chainTotal / 80));
+    let chainSeen = 0;
 
     for (const edge of edges) {
       const srcKey = subjectKey(edge.src_subject, edge.src_kind ?? "");
@@ -210,6 +279,7 @@ export function NebulaMap({
       if (revealAlpha <= 0.02) continue;
       const incident = !!selectedKey && (srcKey === selectedKey || dstKey === selectedKey);
       const chain = edge.category === "chain";
+      if (chain) chainSeen += 1;
 
       // Start/end at the node boundary, bow slightly, and fade long chords so
       // the nebula reads as clusters instead of wires across the whole circle.
@@ -244,8 +314,51 @@ export function NebulaMap({
       ctx.quadraticCurveTo(controlX, controlY, endX, endY);
       ctx.stroke();
       ctx.setLineDash([]);
+
+      // Travelling light: direction without arrows, chain edges only.
+      if (
+        chain &&
+        !reduce &&
+        revealAlpha > 0.35 &&
+        (!selectedKey || incident) &&
+        chainSeen % particleStride === 0
+      ) {
+        const phase = (now * 0.00045 + edgePhaseOffset(srcKey, dstKey)) % 1;
+        const mt = 1 - phase;
+        const px = mt * mt * startX + 2 * mt * phase * controlX + phase * phase * endX;
+        const py = mt * mt * startY + 2 * mt * phase * controlY + phase * phase * endY;
+        const sprite = glowSprite(GLOW_BUCKETS - 1);
+        if (sprite) {
+          ctx.globalCompositeOperation = "lighter";
+          ctx.globalAlpha = 0.55 * revealAlpha;
+          ctx.drawImage(sprite, px - 5, py - 5, 10, 10);
+          ctx.globalCompositeOperation = "source-over";
+        }
+        ctx.globalAlpha = revealAlpha;
+        ctx.fillStyle = "rgba(255, 236, 225, 0.95)";
+        ctx.beginPath();
+        ctx.arc(px, py, 1.5, 0, Math.PI * 2);
+        ctx.fill();
+      }
     }
     ctx.setLineDash([]);
+
+    // Hot core glows in the dark theme; light theme stays flat and readable.
+    if (dark) {
+      ctx.globalCompositeOperation = "lighter";
+      for (const point of basePoints) {
+        if (point.norm < 0.3) continue;
+        const pos = reveal(point);
+        if (pos.t <= 0.05) continue;
+        const sprite = glowSprite(Math.round(point.norm * (GLOW_BUCKETS - 1)));
+        if (!sprite) continue;
+        const radius = point.r * (0.55 + 0.45 * pos.t) * 4.2;
+        ctx.globalAlpha = (0.1 + 0.28 * point.norm) * pos.t;
+        ctx.drawImage(sprite, pos.x - radius, pos.y - radius, radius * 2, radius * 2);
+      }
+      ctx.globalCompositeOperation = "source-over";
+    }
+    ctx.globalAlpha = 1;
 
     for (const point of sortForPaint(basePoints)) {
       const pos = reveal(point);
@@ -275,40 +388,80 @@ export function NebulaMap({
         ctx.stroke();
         ctx.globalAlpha = 1;
       }
+
+      const ripple = rippleRef.current;
+      if (!reduce && ripple && ripple.key === selectedKey) {
+        const elapsed = now - ripple.start;
+        if (elapsed >= 0 && elapsed < 700) {
+          const point = pointByKey.get(selectedKey);
+          if (point) {
+            const pos = reveal(point);
+            const p = elapsed / 700;
+            ctx.globalAlpha = (1 - p) * 0.45;
+            ctx.strokeStyle = "rgba(255, 255, 255, 0.9)";
+            ctx.lineWidth = 1.5;
+            ctx.beginPath();
+            ctx.arc(pos.x, pos.y, point.r + 4 + p * 34, 0, Math.PI * 2);
+            ctx.stroke();
+            ctx.globalAlpha = 1;
+          }
+        }
+      }
     }
   };
   drawRef.current = draw;
 
-  // First non-empty snapshot: bloom from the core for ~520ms.
+  // First non-empty snapshot: mark the entrance; the ambient loop draws it.
   useEffect(() => {
     if (enteredRef.current || basePoints.length === 0) return;
     enteredRef.current = true;
-    const reduce =
-      typeof window !== "undefined" &&
-      window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
-    if (reduce) {
+    if (reduceMotionRef.current) {
       entranceRef.current = { start: 0, active: false };
       drawRef.current();
       return;
     }
     entranceRef.current = { start: performance.now(), active: true };
-    const tick = () => {
-      if (!entranceRef.current.active) return;
-      drawRef.current();
-      if (performance.now() - entranceRef.current.start >= 620) {
-        entranceRef.current.active = false;
-        animFrameRef.current = null;
-        drawRef.current();
-        return;
-      }
-      animFrameRef.current = window.requestAnimationFrame(tick);
-    };
-    animFrameRef.current = window.requestAnimationFrame(tick);
   }, [basePoints.length]);
 
   useEffect(() => {
     drawRef.current();
-  }, [basePoints, edges, size.w, size.h, selected]);
+  }, [basePoints, edges, size.w, size.h, selected, resolved]);
+
+  // Selection ripple (one-shot; skipped under reduced motion).
+  useEffect(() => {
+    if (!selected) {
+      rippleRef.current = null;
+      return;
+    }
+    rippleRef.current = {
+      start: performance.now(),
+      key: subjectKey(selected.subject, selected.subjectKind),
+    };
+  }, [selected?.subject, selected?.subjectKind]);
+
+  // Ambient loop: slow rotation + travelling light + ripple. ~30fps, paused
+  // while the tab is hidden or a node is being dragged; absent under reduced
+  // motion.
+  useEffect(() => {
+    if (prefersReducedMotion()) return;
+    let raf = 0;
+    let last = performance.now();
+    let lastDraw = 0;
+    const tick = (now: number) => {
+      raf = window.requestAnimationFrame(tick);
+      const dt = Math.min(64, Math.max(0, now - last));
+      last = now;
+      if (document.hidden) return;
+      if (!dragRef.current) {
+        rotationRef.current = (rotationRef.current + dt * ROTATION_PER_MS) % (Math.PI * 2);
+      }
+      if (now - lastDraw < FRAME_MS) return;
+      lastDraw = now;
+      drawRef.current(now);
+    };
+    raf = window.requestAnimationFrame(tick);
+    return () => window.cancelAnimationFrame(raf);
+  }, []);
 
   // Drop drag overrides for subjects that left the snapshot.
   useEffect(() => {
@@ -322,10 +475,6 @@ export function NebulaMap({
     () => () => {
       if (drawFrameRef.current !== null) window.cancelAnimationFrame(drawFrameRef.current);
       if (hoverFrameRef.current !== null) window.cancelAnimationFrame(hoverFrameRef.current);
-      if (animFrameRef.current !== null) {
-        window.cancelAnimationFrame(animFrameRef.current);
-        animFrameRef.current = null;
-      }
     },
     [],
   );
@@ -380,14 +529,12 @@ export function NebulaMap({
     if (hit) {
       const key = subjectKey(hit.row.subject, hit.row.subject_kind ?? "");
       const pos = positionOf(hit);
-      const view = viewRef.current;
-      const wx = (x - view.x) / view.k;
-      const wy = (y - view.y) / view.k;
+      const world = logicalPoint(x, y);
       dragRef.current = {
         type: "node",
         key,
-        offsetX: wx - pos.x,
-        offsetY: wy - pos.y,
+        offsetX: world.x - pos.x,
+        offsetY: world.y - pos.y,
         startX: x,
         startY: y,
         moved: false,
@@ -415,12 +562,10 @@ export function NebulaMap({
     }
     if (Math.hypot(x - drag.startX, y - drag.startY) > 3) drag.moved = true;
     if (drag.type === "node") {
-      const view = viewRef.current;
-      const wx = (x - view.x) / view.k;
-      const wy = (y - view.y) / view.k;
+      const world = logicalPoint(x, y);
       overridesRef.current.set(drag.key, {
-        x: wx - drag.offsetX,
-        y: wy - drag.offsetY,
+        x: world.x - drag.offsetX,
+        y: world.y - drag.offsetY,
       });
     } else {
       const view = viewRef.current;
@@ -461,6 +606,7 @@ export function NebulaMap({
   function resetView() {
     overridesRef.current.clear();
     viewRef.current = { x: 0, y: 0, k: 1 };
+    rotationRef.current = 0;
     scheduleDraw();
   }
 

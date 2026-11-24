@@ -47,10 +47,10 @@ const (
 )
 
 // observeScope adjudicates one Require verdict for the instance's project.
+// The caller has already resolved the RUN's effective audit mode (a task may
+// enforce while the process default is off); re-checking the process-global
+// policy here silently skipped the task's project rules (XALG025).
 func (s *ApprovalService) observeScope(instanceID string, verdict approval.Verdict) scopeObservation {
-	if s.policy.Mode != approval.ModeEnforce {
-		return scopeObservation{Decision: scopeDefer}
-	}
 	if verdict.Kind != approval.KindCommand && verdict.Kind != approval.KindHTTP {
 		return scopeObservation{Decision: scopeDefer}
 	}

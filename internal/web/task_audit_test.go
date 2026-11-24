@@ -98,10 +98,31 @@ func TestTaskAuditEnforceCreatesCommandApprovalWithGlobalOff(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The same task switched to off must not create a broker at all.
+	// The same task switched to off must keep the adapter installed (so a later
+	// enforce switch reaches existing workers) but must not gate the call.
 	sctx.AuditMode = platform.TaskAuditOff
-	if b := s.einoApprovalBroker("task-audit-inst", sctx); b != nil {
-		t.Fatal("task audit=off still created the approval broker")
+	b := s.einoApprovalBroker("task-audit-inst", sctx)
+	if b == nil {
+		t.Fatal("task audit=off dropped the approval adapter; off→enforce could not apply to running workers")
+	}
+	if id, err := b.RequestApproval(ctx, engine.ApprovalRequest{
+		ToolName: "terminal_execute",
+		Args:     map[string]string{"command": "touch hot-switch-off"},
+	}); err != nil || id != "" {
+		t.Fatalf("off run gated a call: id=%q err=%v", id, err)
+	}
+
+	// Flipping back to enforce applies to the SAME adapter on the next call.
+	sctx.AuditMode = platform.TaskAuditEnforce
+	id2, err := b.RequestApproval(ctx, engine.ApprovalRequest{
+		ToolName: "terminal_execute",
+		Args:     map[string]string{"command": "touch hot-switch-on"},
+	})
+	if err != nil || id2 == "" {
+		t.Fatalf("enforce switch did not gate the next call: id=%q err=%v", id2, err)
+	}
+	if _, err := s.approvalService().Decide(ctx, id2, platform.ApprovalRejected, "tester", "cleanup"); err != nil {
+		t.Fatal(err)
 	}
 }
 

@@ -123,6 +123,9 @@ func (s *Server) putProjectScope(w http.ResponseWriter, r *http.Request, store p
 	if n := s.seedScopeApprovalRules(r.Context(), store, project.ID); n > 0 {
 		log.Printf("[scope-observer] seeded %d baseline rule(s) after scope update of %s", n, project.ID)
 	}
+	// Live runs hold a scope snapshot at start. Replace it now so every
+	// subsequent guard/dispatch/plan check uses the new boundary (XALG019).
+	s.applyProjectScopeToLiveRuns(project.ID, project.Scope)
 	view := s.buildProjectScopeView(r.Context(), store, project, scopeProblems(project.Scope), "")
 	if view.Fence.Enforce && view.ActiveRuns > 0 {
 		view.Warning = "the fence applies immediately to every subsequent approval of this project's running scans; calls already waiting for a decision keep their existing row"
@@ -245,3 +248,49 @@ func (s *Server) approvalModeLabel() string {
 }
 
 func (s *Server) approvalModeEnforced() bool { return s.approvalModeLabel() == "enforce" }
+
+// applyProjectScopeToLiveRuns replaces the enforced scope snapshot of every
+// live run mounted on the project. A project fence that was just turned off
+// clears the snapshot; turning it on installs it. The operator's PUT is the
+// explicit authorization for either direction.
+func (s *Server) applyProjectScopeToLiveRuns(projectID string, scope platform.Scope) {
+	if s == nil || strings.TrimSpace(projectID) == "" {
+		return
+	}
+	var targets, deny []string
+	var ports []int
+	if scope.Fence != nil && scope.Fence.Enforce {
+		targets = append([]string(nil), scope.Targets...)
+		deny = append([]string(nil), scope.Fence.DenyTargets...)
+		ports = append([]int(nil), scope.AllowPorts...)
+	}
+
+	s.liveRunsMu.RLock()
+	handles := make([]*liveRunHandles, 0, len(s.liveRuns))
+	for _, h := range s.liveRuns {
+		if h != nil && h.scanCtx != nil && strings.TrimSpace(h.scanCtx.ProjectID) == projectID {
+			handles = append(handles, h)
+		}
+	}
+	s.liveRunsMu.RUnlock()
+
+	for _, h := range handles {
+		if h.agent != nil {
+			h.agent.SetEngagementScope(targets, deny, ports)
+		}
+		if h.planner != nil {
+			h.planner.SetScope(targets, deny, ports)
+		}
+		if h.pool != nil {
+			h.pool.SetScope(targets, deny, ports)
+		}
+		if h.agent != nil {
+			msg := "PROJECT SCOPE UPDATED — the authorized boundary changed. Re-read it before proposing new work: every subsequent guard/dispatch/plan check uses the new scope. In-flight requests are not retroactively cancelled."
+			if len(targets) == 0 {
+				msg = "PROJECT SCOPE UPDATED — the enforced fence was removed. The project scope may have expanded; new work must still follow the operator's instruction and the six-ring guards."
+			}
+			h.agent.NotifyMainSystem(msg)
+		}
+		log.Printf("[scope] run %s: live scope replaced (%d target(s), %d denied, %d port(s))", h.instanceID, len(targets), len(deny), len(ports))
+	}
+}

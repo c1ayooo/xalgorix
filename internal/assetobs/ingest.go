@@ -108,6 +108,20 @@ func ingestURLBatch(sc *scanctx.ScanContext, repo assets.Repository, inputs []as
 		}); err != nil {
 			log.Printf("[assetobs] link %s to %s failed: %v", in.Key, scanID, err)
 		}
+		if in.Locator != "" {
+			loc := assets.LocatorInput{
+				ProjectID:        sc.ProjectID,
+				AssetID:          asset.ID,
+				Locator:          in.Locator,
+				InstanceID:       scanID,
+				SourceInfoItemID: strings.TrimSpace(in.InfoItemID),
+			}
+			if _, lerr := repo.RecordLocator(ctx, loc); lerr != nil {
+				// Identity is already written; a locator-history failure is
+				// logged instead of failing the observation.
+				log.Printf("[assetobs] record locator %s for asset %d failed: %v", in.Locator, asset.ID, lerr)
+			}
+		}
 		switch in.Kind {
 		case assets.KindRootDomain, assets.KindSubdomain, assets.KindIP, assets.KindService, assets.KindApp:
 			hosts = append(hosts, asset)

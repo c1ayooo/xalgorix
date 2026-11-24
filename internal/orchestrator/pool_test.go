@@ -9,8 +9,10 @@ import (
 	"time"
 
 	"github.com/c1ayooo/xalgorix/v4/internal/graph"
+	"github.com/c1ayooo/xalgorix/v4/internal/intelaccess"
 	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
 	"github.com/c1ayooo/xalgorix/v4/internal/tools"
+	"github.com/c1ayooo/xalgorix/v4/internal/tools/intelligence"
 	"github.com/c1ayooo/xalgorix/v4/internal/tools/notes"
 )
 
@@ -192,6 +194,21 @@ func TestWorkerTaskTextMatchesLaneSurface(t *testing.T) {
 	}
 }
 
+func TestWorkerTaskTextHidesForeignControlPlaneHosts(t *testing.T) {
+	// Project isolation: the worker prompt only carries the control-plane list
+	// the dispatch scoped to this run. An empty (scoped-out) list must emit no
+	// host section at all, so a foreign project's hosts never reach a worker.
+	node := &graph.Node{Payload: `{"title":"recon","target":"59.110.104.110","target_kind":"web"}`}
+	if text := workerTaskText(node, "", "", nil, nil); strings.Contains(text, "CONTROL-PLANE HOSTS") {
+		t.Fatalf("worker prompt advertised an empty control-plane list:\n%s", text)
+	}
+	text := workerTaskText(node, "", "", []string{"tsecbench.zc.tencent.com", "10.0.100.58"}, nil)
+	want := "CONTROL-PLANE HOSTS: tsecbench.zc.tencent.com, 10.0.100.58"
+	if !strings.Contains(text, want) {
+		t.Fatalf("worker prompt lost its declared control-plane hosts:\n%s", text)
+	}
+}
+
 func TestWorkerTaskText_HardensNotesAndPriorWork(t *testing.T) {
 	sctx := scanctx.New("worker-ctx", t.TempDir())
 	sctx.Ledger.Upsert(scanctx.Hypothesis{ID: "H-1", VulnClass: "sqli", Endpoint: "/login", Status: scanctx.HypothesisQueued})
@@ -319,6 +336,53 @@ func TestMaterializeContainerIntentsFromNotes(t *testing.T) {
 	nodes, _ = store.ListNodes(context.Background(), "mat", graph.KindIntent)
 	if len(nodes) != 3 {
 		t.Fatalf("materialized with cap = %d, want 3", len(nodes))
+	}
+}
+
+// TestMaterializeContainerIntentsReusesTerminalAddress pins XALG023: a
+// historical (terminal) attack lane must not suppress a new container instance
+// that reuses the same address; the new lane gets a generation-suffixed
+// identity, while a live lane still dedupes.
+func TestMaterializeContainerIntentsReusesTerminalAddress(t *testing.T) {
+	store := graph.NewMemoryStore()
+	sctx := scanctx.New("mat-reuse", t.TempDir())
+	if err := sctx.Notes.Set("handoff_c07", "unique_code=c-07 container_addr=10.0.177.176:23"); err != nil {
+		t.Fatal(err)
+	}
+	p, err := New(context.Background(), Config{
+		ScanID: "mat-reuse", Workers: 2, Repo: store, Root: &fakeRoot{}, ScanCtx: sctx,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	addContainerAttack(t, store, "mat-reuse", "c-07", "10.0.177.176:23", graph.StateBlocked)
+	p.materializeContainerIntents()
+
+	nodes, _ := store.ListNodes(context.Background(), "mat-reuse", graph.KindIntent)
+	if len(nodes) != 2 {
+		t.Fatalf("nodes = %d, want the old terminal lane plus a new one", len(nodes))
+	}
+	var reused *graph.Node
+	for i := range nodes {
+		if nodes[i].UnitKey == "container-attack:c-07:g2" {
+			reused = &nodes[i]
+		}
+	}
+	if reused == nil {
+		t.Fatalf("missing generation-suffixed reuse lane: %+v", nodes)
+	}
+	if reused.State != graph.StateOpen {
+		t.Fatalf("reused lane state = %s, want open", reused.State)
+	}
+	if got := str(reused.PayloadJSON()["unique_code"]); got != "c-07" {
+		t.Fatalf("reused lane unique_code = %q", got)
+	}
+
+	// Idempotent after the new lane is active.
+	p.materializeContainerIntents()
+	nodes, _ = store.ListNodes(context.Background(), "mat-reuse", graph.KindIntent)
+	if len(nodes) != 2 {
+		t.Fatalf("duplicate reuse materialization: %d", len(nodes))
 	}
 }
 
@@ -532,6 +596,12 @@ func TestWorkerBudgetKeepsAttackLanesLong(t *testing.T) {
 	if got := p.workerBudget(api); got != 2*time.Minute {
 		t.Fatalf("api budget = %s, want 2m", got)
 	}
+	// An analysis layer has no container slot to defend; an explicit short
+	// contract must not be silently extended to the execution floor.
+	analysis := &graph.Node{Payload: `{"target":"task:reconcile","target_kind":"task","contract":{"version":1,"timebox_s":300}}`}
+	if got := p.workerBudget(analysis); got != 5*time.Minute {
+		t.Fatalf("analysis budget = %s, want its declared 5m", got)
+	}
 }
 
 func TestPoolKillsWorkerWhenBudgetExpires(t *testing.T) {
@@ -555,37 +625,6 @@ func TestPoolKillsWorkerWhenBudgetExpires(t *testing.T) {
 	}
 	if got := root.killed(); len(got) != 1 || got[0] != "slow" {
 		t.Fatalf("killed = %v, want [slow]", got)
-	}
-}
-
-func TestWaitForSlotBlocksAtWorkerCap(t *testing.T) {
-	store := graph.NewMemoryStore()
-	root := &fakeRoot{delay: 400 * time.Millisecond}
-	pool, err := New(context.Background(), Config{
-		ScanID: "pool-gate", Workers: 1, Repo: store, Root: root,
-		WorkerTimeout: 5 * time.Second,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	id := addIntent(t, store, "pool-gate", "one")
-	pool.Start()
-	t.Cleanup(pool.Stop)
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) && pool.running.Load() == 0 {
-		time.Sleep(5 * time.Millisecond)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
-	if err := pool.WaitForSlot(ctx); err == nil {
-		cancel()
-		t.Fatal("WaitForSlot returned while the only worker was busy")
-	}
-	cancel()
-	waitState(t, store, "pool-gate", id, graph.StateDone)
-	ctx, cancel = context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	if err := pool.WaitForSlot(ctx); err != nil {
-		t.Fatalf("WaitForSlot after settle: %v", err)
 	}
 }
 
@@ -784,5 +823,195 @@ func TestStallReportUsesProgressLedger(t *testing.T) {
 	sctx.Progress.MarkProgress("agent-old")
 	if got := pool.StallReport(); len(got) != 0 {
 		t.Fatalf("stall report after progress = %+v, want empty", got)
+	}
+}
+
+// TestPoolSetScopeAppliesToNextDispatch pins XALG019 on the dispatch layer.
+func TestPoolSetScopeAppliesToNextDispatch(t *testing.T) {
+	p := &Pool{cfg: Config{ScopeTargets: []string{"10.0.0.0/24"}}}
+	node := &graph.Node{Payload: `{"target":"10.0.1.5","target_kind":"scope"}`}
+	if got := p.targetsForIntent(node); len(got) != 0 {
+		t.Fatalf("target accepted before scope update: %v", got)
+	}
+	p.SetScope([]string{"10.0.1.0/24"}, nil, nil)
+	if got := p.targetsForIntent(node); len(got) != 1 || got[0] != "10.0.1.5" {
+		t.Fatalf("targets after scope update = %v", got)
+	}
+}
+
+// stubJudge returns one fixed decision so the pool's authorization handling can
+// be pinned without a projection store.
+type stubJudge struct {
+	decision intelaccess.Decision
+	err      error
+}
+
+func (s stubJudge) Decide(context.Context, intelaccess.DecisionInput) (intelaccess.Decision, error) {
+	return s.decision, s.err
+}
+
+// An out-of-scope intent with a usable intel grant is PARKED, not blocked and
+// not dispatched: the slot is released and the decision inbox owns the next
+// move (INTEL_HANDOFF_SPEC M3).
+func TestPoolParksIntentAwaitingCapability(t *testing.T) {
+	store := graph.NewMemoryStore()
+	root := &fakeRoot{}
+	pool, err := New(context.Background(), Config{
+		ScanID: "pool-cap", Workers: 1, Repo: store, Root: root,
+		WorkerTimeout: 2 * time.Second,
+		Judge: stubJudge{decision: intelaccess.Decision{
+			Reason: intelaccess.ReasonNeedsCapability, ViaAccess: "fp1",
+			Detail: "a capability is required for 10.0.1.5:8080",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("new pool: %v", err)
+	}
+	id := addIntent(t, store, "pool-cap", "a")
+	pool.Start()
+	waitState(t, store, "pool-cap", id, graph.StatePaused)
+	pool.Stop()
+
+	if root.count() != 0 {
+		t.Fatalf("dispatched = %d, want 0 (parked)", root.count())
+	}
+	node, err := store.GetNode(context.Background(), "pool-cap", id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(node.BlockedReason, "capability required") || !strings.Contains(node.BlockedReason, "fp1") {
+		t.Fatalf("paused reason = %q", node.BlockedReason)
+	}
+	if node.Owner != "" || node.LeaseUntil != nil {
+		t.Fatalf("paused intent still holds the slot: owner=%q lease=%v", node.Owner, node.LeaseUntil)
+	}
+
+	// Resuming (what issue_capability does) makes it claimable again; the
+	// stubbed judge still asks, so it parks again rather than running — the
+	// point here is that paused is not a dead end.
+	if moved, err := store.Transition(context.Background(), "pool-cap", id, graph.KindIntent, graph.StatePaused, graph.StateOpen); err != nil || !moved {
+		t.Fatalf("resume = %v, %v", moved, err)
+	}
+}
+
+// A final refusal blocks the intent and dispatches nothing.
+func TestPoolBlocksDeniedIntent(t *testing.T) {
+	store := graph.NewMemoryStore()
+	root := &fakeRoot{}
+	pool, err := New(context.Background(), Config{
+		ScanID: "pool-deny", Workers: 1, Repo: store, Root: root,
+		WorkerTimeout: 2 * time.Second,
+		Judge: stubJudge{decision: intelaccess.Decision{
+			Reason: intelaccess.ReasonDenyTarget, Detail: "denied by the fence",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("new pool: %v", err)
+	}
+	id := addIntent(t, store, "pool-deny", "a")
+	pool.Start()
+	waitState(t, store, "pool-deny", id, graph.StateBlocked)
+	pool.Stop()
+	if root.count() != 0 {
+		t.Fatalf("dispatched = %d, want 0", root.count())
+	}
+}
+
+// The conclusion gate (INTEL_HANDOFF_SPEC D6 / M4): a completed lane without a
+// declaration cannot reach done, exit=none needs a reason, and an access claim
+// must name a row attributed to this intent.
+func TestValidateExitGate(t *testing.T) {
+	store := graph.NewMemoryStore()
+	sctx := scanctx.New("exit-gate", t.TempDir())
+	pool, err := New(context.Background(), Config{
+		ScanID: "exit-gate", Workers: 1, Repo: store, Root: &fakeRoot{}, ScanCtx: sctx,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	node := &graph.Node{ID: 7}
+
+	if reason, ok := pool.validateExit(node, scanctx.ExitDeclaration{}, false); ok || !strings.Contains(reason, "without an exit declaration") {
+		t.Fatalf("undeclared exit = %q, %v", reason, ok)
+	}
+	if reason, ok := pool.validateExit(node, scanctx.ExitDeclaration{Exit: "none"}, true); ok || !strings.Contains(reason, "blocked_reason") {
+		t.Fatalf("reasonless none = %q, %v", reason, ok)
+	}
+	if _, ok := pool.validateExit(node, scanctx.ExitDeclaration{Exit: "none", Reason: "no route"}, true); !ok {
+		t.Fatal("exit=none with reason must pass")
+	}
+
+	access := intelaccess.NewMemoryStore()
+	intelaccess.SetStore(access)
+	t.Cleanup(func() { intelaccess.SetStore(nil) })
+	if _, err := access.DeriveScanForIntent(context.Background(), "exit-gate", 9, []intelligence.Item{{
+		Fingerprint: "fp-x", Kind: intelligence.KindCredential, Endpoint: "10.0.0.1:22",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if reason, ok := pool.validateExit(node, scanctx.ExitDeclaration{Exit: "access:fp-x"}, true); ok {
+		t.Fatalf("access attributed to intent 9 passed for intent 7 (%q)", reason)
+	}
+	if _, ok := pool.validateExit(node, scanctx.ExitDeclaration{Exit: "access:fp-x"}, true); ok {
+		t.Fatal("misattributed access must fail")
+	}
+	node9 := &graph.Node{ID: 9}
+	if _, ok := pool.validateExit(node9, scanctx.ExitDeclaration{Exit: "access:fp-x"}, true); !ok {
+		t.Fatal("the producing intent must be able to claim its access")
+	}
+	if reason, ok := pool.validateExit(node, scanctx.ExitDeclaration{Exit: "access:missing"}, true); ok || !strings.Contains(reason, "names no intel access row") {
+		t.Fatalf("unknown access = %q, %v", reason, ok)
+	}
+}
+
+// A completed worker with no declaration is blocked, not done, and the reason
+// says what was missing.
+func TestPoolBlocksUndeclaredCompletion(t *testing.T) {
+	store := graph.NewMemoryStore()
+	sctx := scanctx.New("pool-exit", t.TempDir())
+	root := &fakeRoot{}
+	pool, err := New(context.Background(), Config{
+		ScanID: "pool-exit", Workers: 1, Repo: store, Root: root,
+		WorkerTimeout: 2 * time.Second, ScanCtx: sctx,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := addIntent(t, store, "pool-exit", "a")
+	pool.Start()
+	waitState(t, store, "pool-exit", id, graph.StateBlocked)
+	pool.Stop()
+	node, _ := store.GetNode(context.Background(), "pool-exit", id)
+	if !strings.Contains(node.BlockedReason, "exit declaration") {
+		t.Fatalf("blocked reason = %q", node.BlockedReason)
+	}
+}
+
+// With a declaration the lane settles done and the receipt fact carries the
+// declared exit.
+func TestPoolConcludesDeclaredExit(t *testing.T) {
+	store := graph.NewMemoryStore()
+	sctx := scanctx.New("pool-exit-ok", t.TempDir())
+	root := &fakeRoot{}
+	pool, err := New(context.Background(), Config{
+		ScanID: "pool-exit-ok", Workers: 1, Repo: store, Root: root,
+		WorkerTimeout: 2 * time.Second, ScanCtx: sctx,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := addIntent(t, store, "pool-exit-ok", "a")
+	// The declaration is keyed by the delegated agent id the root returns.
+	sctx.Progress.RecordExit("worker-1", "none", "no reachable route in the timebox")
+	pool.Start()
+	waitState(t, store, "pool-exit-ok", id, graph.StateDone)
+	pool.Stop()
+	nodes, err := store.ListNodes(context.Background(), "pool-exit-ok", graph.KindFact)
+	if err != nil || len(nodes) != 1 {
+		t.Fatalf("receipt facts = %d err=%v", len(nodes), err)
+	}
+	payload := nodes[0].PayloadJSON()
+	if payload["exit"] != "none" || payload["blocked_reason"] != "no reachable route in the timebox" {
+		t.Fatalf("receipt payload = %+v", payload)
 	}
 }

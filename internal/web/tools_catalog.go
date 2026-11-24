@@ -159,8 +159,8 @@ func builtinToolCatalog() []ToolCatalogEntry {
 		},
 		{
 			Name: "read_intelligence", Category: "intelligence",
-			Description: "List intelligence already recorded for this task (avoid duplicate recording).",
-			Parameters:  []ToolCatalogParameter{},
+			Description: "Identity-only listing by default; pass a fingerprint (or I-N id) to read one item's full content.",
+			Parameters:  []ToolCatalogParameter{param("fingerprint", false, "fp= value or I-N item id")},
 		},
 		{
 			Name: "search_info", Category: "intelligence",

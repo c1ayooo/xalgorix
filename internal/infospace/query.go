@@ -287,7 +287,7 @@ func (t InfoType) Valid() bool {
 
 // DefaultInfoTypes is the deterministic loop order of the map: observation →
 // inference → belief → action (intent) → evidence (fact) → verdict (finding).
-// The dashboard colours a subject by the furthest stage it reached.
+// The dashboard colors a subject by the furthest stage it reached.
 func DefaultInfoTypes() []InfoType {
 	return []InfoType{
 		InfoTypeObservation,
@@ -485,6 +485,37 @@ type RelationsResult struct {
 // it answers "relations unavailable" instead of pretending the graph is empty.
 type RelationsReader interface {
 	Relations(ctx context.Context, q RelationsQuery) (RelationsResult, error)
+}
+
+// ItemQuery looks up one projected item by its info id. Layer is optional;
+// empty searches both layers (aggregate first, then atom). The lookup exists
+// because the planner renders aggregate items by graph node id, while the
+// ledger-only detail path could not resolve those ids.
+type ItemQuery struct {
+	RunID  string
+	InfoID string
+	Layer  Layer
+}
+
+// Validate rejects an unbounded or ambiguous lookup.
+func (q ItemQuery) Validate() error {
+	if strings.TrimSpace(q.RunID) == "" {
+		return errors.New("infospace: item query requires a run_id")
+	}
+	if strings.TrimSpace(q.InfoID) == "" {
+		return errors.New("infospace: item query requires an info_id")
+	}
+	if !q.Layer.Valid() {
+		return fmt.Errorf("infospace: invalid layer %q", q.Layer)
+	}
+	return nil
+}
+
+// ItemReader is the by-id detail read used by the planner's read_info_item.
+// It is separate from Reader so existing read-model fakes do not need to grow a
+// method they never use.
+type ItemReader interface {
+	Item(ctx context.Context, q ItemQuery) (Item, bool, error)
 }
 
 // Reader is implemented by the graph authority's PG store. A nil or

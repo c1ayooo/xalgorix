@@ -91,9 +91,15 @@ func scanCompletionAssessment(state *ScanState) (string, []string) {
 	if state == nil {
 		return CompletionStatusCompleted, nil
 	}
+	goalReasons := goalGateOpenCriteria(state)
 	// R7 planner_worker: the graph frontier is the completion contract; the
-	// main agent's ScanState never holds the plan.
+	// main agent's ScanState never holds the plan. The objective is NOT the
+	// graph frontier: an empty/blocked frontier with an unmet required
+	// criterion is incomplete, not completed.
 	if state.PlannerWorkerMode {
+		if len(goalReasons) > 0 {
+			return CompletionStatusIncomplete, goalReasons
+		}
 		if repo := graph.Backend(); repo != nil {
 			if scanID := planGraphID(state); scanID != "" {
 				ctx, cancel := planGraphContext()
@@ -108,7 +114,7 @@ func scanCompletionAssessment(state *ScanState) (string, []string) {
 			}
 		}
 	}
-	var reasons []string
+	reasons := append([]string(nil), goalReasons...)
 
 	// Plan: pending/active tasks are unfinished work. (Phase 20/22 are no
 	// longer plan tasks — verification and reporting are derived states.)

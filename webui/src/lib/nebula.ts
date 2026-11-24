@@ -49,7 +49,7 @@ export function volumeNorm(total: number): number {
   return Math.min(1, Math.max(0.06, Math.pow(ratio, 1.6)));
 }
 
-export function heatColor(norm: number): string {
+export function heatRGB(norm: number): [number, number, number] {
   const value = Math.min(1, Math.max(0, norm));
   for (let i = 1; i < RAMP.length; i += 1) {
     const upper = RAMP[i];
@@ -57,10 +57,15 @@ export function heatColor(norm: number): string {
       const lower = RAMP[i - 1];
       const f = (value - lower.stop) / (upper.stop - lower.stop || 1);
       const rgb = lower.rgb.map((v, k) => Math.round(v + (upper.rgb[k] - v) * f));
-      return `rgb(${rgb[0]}, ${rgb[1]}, ${rgb[2]})`;
+      return [rgb[0], rgb[1], rgb[2]];
     }
   }
-  return "rgb(205, 38, 48)";
+  return [205, 38, 48];
+}
+
+export function heatColor(norm: number): string {
+  const [r, g, b] = heatRGB(norm);
+  return `rgb(${r}, ${g}, ${b})`;
 }
 
 function fnv1a(input: string): number {
@@ -75,6 +80,11 @@ function fnv1a(input: string): number {
 /** Deterministic side for an edge's slight bow, so curves do not all lean one way. */
 export function edgeBowSign(srcKey: string, dstKey: string): number {
   return (fnv1a(`${srcKey}|${dstKey}`) & 1) === 0 ? 1 : -1;
+}
+
+/** Deterministic phase offset for the travelling light on an edge. */
+export function edgePhaseOffset(srcKey: string, dstKey: string): number {
+  return (fnv1a(`${srcKey}->${dstKey}`) % 1000) / 1000;
 }
 
 export function layoutNebula(
@@ -95,9 +105,11 @@ export function layoutNebula(
     // Angle grid: deterministic spread around the circle.
     const angle = ((hash % 3600) / 3600) * Math.PI * 2;
     const norm = volumeNorm(row.total);
-    // Radius follows volume; the hash jitter avoids clean concentric rings.
+    // Hot is the core: higher information volume sits closer to the centre,
+    // cold/low-volume subjects form the outer rim. Jitter keeps it organic.
+    const coldness = 1 - norm;
     const jitter = ((hash >>> 12) % 1000) / 1000;
-    const radial = Math.min(0.98, norm * (0.86 + jitter * 0.2));
+    const radial = Math.min(0.98, 0.07 + coldness * (0.8 + jitter * 0.16));
     const angleJitter = (((hash >>> 22) % 1000) / 1000 - 0.5) * 0.5;
     const theta = angle + angleJitter;
     return {

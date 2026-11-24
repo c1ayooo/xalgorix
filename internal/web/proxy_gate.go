@@ -61,9 +61,15 @@ func (g *proxyHighRiskGate) Adjudicate(attr trafficproxy.Attribution, verdict ap
 	sctx := scanctx.Get(attr.ScanCtxID)
 	if sctx == nil {
 		// The scan context is gone (finished/teared down between the proxy's
-		// attribution and the verdict) — nothing to attach the row to, and
-		// submit needs the context's cancellation channel. Fail open.
-		log.Printf("[approval] proxy gate: scan context %s gone — failing open", attr.ScanCtxID)
+		// attribution and the verdict). Under a process-wide enforce posture this
+		// is fail-closed because no approval row can be attached (XALG017). A
+		// process-wide off/observe posture keeps forwarding, which is the mode's
+		// documented behavior.
+		if g.svc.srv.runAuditMode(nil) == approval.ModeEnforce {
+			log.Printf("[approval] proxy gate: scan context %s gone — blocking the subprocess request (enforce)", attr.ScanCtxID)
+			return false, "⛔ APPROVAL CONTEXT UNAVAILABLE — the run's approval context is gone; the request was NOT sent.", nil
+		}
+		log.Printf("[approval] proxy gate: scan context %s gone — observe/off mode, forwarding", attr.ScanCtxID)
 		return true, "", nil
 	}
 	// Per-run posture: the task's audit switch (snapshotted on the context)

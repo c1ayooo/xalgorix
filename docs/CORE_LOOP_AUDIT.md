@@ -49,7 +49,7 @@
 | M1 Hypothesis 前置条件 | `record_hypothesis` preconditions REQUIRED（未知须显式写 `unknown`，ledger_tools.go:75）| ❌ 运行零 record_hypothesis 观测——CTF 形态无此纪律（缺口①）|
 | M2 审计记录与只读投影 | journal seq/缺口/乱序投影 + `/api/scans/{id}/audit` | ✅ 21493 行审计投影，缺口/乱序可识别 |
 | M3 InfoItem 冷路径落 PG | 幂等重投 + reconciler 追平 + 四态水位 | ✅ 6702 行高流转，实时入队 |
-| M4 激活入口接真实消费者 | ledger 五件套对所有 agent 注册（agent.go:662）+ `read_ledger(filter=schedulable)` + claim 跨扫描注记（ledger_cross_scan.go，契约测试钉住）+ objective 面板可调度池 | ❌ 零消费：claim 0 次——消费向量被 CTF 单代理模式结构性关闭（缺口①）|
+| M4 激活入口接真实消费者 | ledger 五件套对所有 agent 注册（agent.go:662）+ `read_ledger(filter=schedulable)` + claim 跨扫描注记（ledger_cross_scan.go，限本项目任务之间，契约测试钉住）+ objective 面板可调度池 | ❌ 零消费：claim 0 次——消费向量被 CTF 单代理模式结构性关闭（缺口①）|
 | M5 确定性 VOI 加权 | `TestGoldenSchedulingParity`：加权排序 + tie-break + 不可变快照（w∈[0,0.30]）| ❌ 未激活：w 默认 0、模型未传 voi、零 claim（缺口③）|
 
 ---

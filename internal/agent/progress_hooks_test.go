@@ -2,6 +2,7 @@ package agent
 
 import (
 	"testing"
+	"time"
 
 	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
 )
@@ -81,4 +82,84 @@ func TestHookProgressLedgerRootFallbackAndMissingContext(t *testing.T) {
 	hookProgressLedger(&ScanState{ScanContextID: "does-not-exist"}, map[string]string{"tool_name": "add_note"})
 	hookProgressLedger(nil, map[string]string{"tool_name": "add_note"})
 	hookProgressLedger(&ScanState{}, nil)
+}
+
+// TestHookProgressIgnoresUnchangedNoteWrite pins the round-5 false-progress
+// fix: a successful add_note that stored the same value is not an
+// information-layer increment.
+func TestHookProgressIgnoresUnchangedNoteWrite(t *testing.T) {
+	sctx := progressTestContext(t, "progress-notes")
+	state := &ScanState{ScanContextID: "progress-notes", DelegatedAgentID: "worker-1"}
+	hookProgressLedger(state, map[string]string{"tool_name": "add_note", "state_changed": "false"})
+	if entry := sctx.Progress.Snapshot()["worker-1"]; entry.ProgressCount != 0 {
+		t.Fatalf("identical note write counted as progress: %+v", entry)
+	}
+	hookProgressLedger(state, map[string]string{"tool_name": "add_note", "state_changed": "true"})
+	if entry := sctx.Progress.Snapshot()["worker-1"]; entry.ProgressCount != 1 {
+		t.Fatalf("changed note write did not count: %+v", entry)
+	}
+}
+
+// TestHookProgressActiveTool pins the long-tool protection: the tool is marked
+// active before execution and cleared on the result.
+func TestHookProgressActiveTool(t *testing.T) {
+	sctx := progressTestContext(t, "progress-tool")
+	state := &ScanState{ScanContextID: "progress-tool", DelegatedAgentID: "worker-1"}
+	hookProgressToolStart(state, map[string]string{"tool_name": "terminal_execute"})
+	name, started, ok := sctx.Progress.ActiveTool("worker-1")
+	if !ok || name != "terminal_execute" || started.IsZero() {
+		t.Fatalf("active tool = %q %v %v", name, started, ok)
+	}
+	hookProgressLedger(state, map[string]string{"tool_name": "terminal_execute", "output": "ok"})
+	if _, _, ok := sctx.Progress.ActiveTool("worker-1"); ok {
+		t.Fatal("tool result did not clear the active marker")
+	}
+}
+
+// TestVerifierBridgeMarksWorkerProgress pins XALG004's engine-derived leg: a
+// deterministic verifier that actually executed is a progress increment even
+// before the model writes a ledger entry.
+func TestVerifierBridgeMarksWorkerProgress(t *testing.T) {
+	sctx := progressTestContext(t, "progress-verifier")
+	state := &ScanState{ScanContextID: "progress-verifier", DelegatedAgentID: "worker-v"}
+	hookVerifierEvidenceBridge(state, map[string]string{
+		"tool_name": "verify_sqli",
+		"endpoint":  "https://example.com/login",
+		"output":    "confirmed boolean-based injection",
+	})
+	entry := sctx.Progress.Snapshot()["worker-v"]
+	if entry.ProgressCount != 1 {
+		t.Fatalf("verifier execution did not mark progress: %+v", entry)
+	}
+}
+
+// TestToolActiveBudget pins the per-tool deadline classes (XALG005).
+func TestToolActiveBudget(t *testing.T) {
+	cases := map[string]time.Duration{
+		"terminal_execute":  60 * time.Minute,
+		"python_action":     30 * time.Minute,
+		"browser_action":    10 * time.Minute,
+		"http_request":      5 * time.Minute,
+		"some_unknown_tool": 15 * time.Minute,
+	}
+	for name, want := range cases {
+		if got := toolActiveBudget(name); got != want {
+			t.Fatalf("toolActiveBudget(%q) = %s, want %s", name, got, want)
+		}
+	}
+}
+
+// TestReconCompletionMarksWorkerProgress pins XALG004's recon leg: completing a
+// new recon dimension is a progress increment for the worker that produced it.
+func TestReconCompletionMarksWorkerProgress(t *testing.T) {
+	sctx := progressTestContext(t, "progress-recon")
+	state := &ScanState{ScanContextID: "progress-recon", DelegatedAgentID: "worker-r"}
+	hookReconResultTracker(state, map[string]string{
+		"tool_name": "discover_client_routes",
+		"output":    "Discovered 3 client routes",
+	})
+	entry := sctx.Progress.Snapshot()["worker-r"]
+	if entry.ProgressCount == 0 {
+		t.Fatalf("recon dimension completion did not mark progress: %+v", entry)
+	}
 }

@@ -109,6 +109,18 @@ func buildGoldenLedgerFixture(t *testing.T) []byte {
 		VOI: 0.5, VOIEstimated: true,
 		Preconditions: []string{"unknown"},
 	})
+	// R2: rejecting a hypothesis requires a refuting observation. H2/H3 are
+	// rejected by the golden script, so the fixture carries the control that
+	// refutes them (a different user receives 403/empty on the same request).
+	for _, id := range []string{h2.ID, h3.ID} {
+		if !ls.AddEvidence(id, scanctx.Evidence{
+			Kind: "baseline", Nature: scanctx.EvidenceObserved,
+			Summary: "control request as another user returned no protected data",
+			Request: "GET same route as user B HTTP/1.1", Response: "HTTP/1.1 403 Forbidden",
+		}) {
+			t.Fatalf("fixture: refuting baseline for %s was not stored", id)
+		}
+	}
 	h4 := ls.Upsert(scanctx.Hypothesis{
 		VulnClass: "ssrf", Endpoint: "/fetch", Parameter: "url",
 		Title: "SSRF via fetch proxy", Confidence: 0.7,

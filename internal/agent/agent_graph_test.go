@@ -133,12 +133,19 @@ func TestMaybeAutoDelegateLaunchesOneDeterministicWave(t *testing.T) {
 	state.Plan = AutoPlan([]string{"/api/users"}, nil) // stale: built from the seeded surface only
 	state.DiscoveredEndpoints = []string{"/api/users", "/admin/export", "/search"}
 	state.PlanBuilt = true
-	state.LedgerSeeded = true
+	state.CoverageOpportunitiesSent = true
+
+	// R5: the testing wave is hypothesis-driven. Give the test a live ledger
+	// (the wave reads formal, claim-eligible beliefs from the ScanContext).
+	sctx := scanctx.New("wave-test", t.TempDir())
+	scanctx.Activate(sctx)
+	t.Cleanup(func() { scanctx.Deactivate(sctx.ID); sctx.Close() })
 
 	a := &Agent{
 		registry:   registry,
 		agentGraph: graph,
 		state:      state,
+		scanCtx:    sctx,
 		events:     make(chan Event, 16),
 		targetAuth: "Authorization: Bearer operator-test-token",
 	}
@@ -188,14 +195,29 @@ func TestMaybeAutoDelegateLaunchesOneDeterministicWave(t *testing.T) {
 		state.PlanSurfaceRevision = rev
 	}
 
-	// ── Stage W: the testing wave launches the non-overlapping lanes
-	// (authz-logic included: operator token supplies both identities).
+	// ── Stage W: the testing wave launches only lanes with a formal belief.
+	// Seed one claim per eligible lane so the wave covers every lane under test.
+	for _, profile := range a.eligibleSpecialistProfiles() {
+		if len(profile.VulnClasses) == 0 {
+			continue
+		}
+		class := profile.VulnClasses[0]
+		sctx.Ledger.Upsert(scanctx.Hypothesis{
+			Title:         "Confirm " + class + " on the discovered surface",
+			VulnClass:     class,
+			Endpoint:      "/api/users",
+			Preconditions: []string{"a reachable endpoint"},
+			Origin:        "coordinator",
+			Status:        scanctx.HypothesisQueued,
+		})
+	}
+	expectedProfiles := a.hypothesisDrivenProfiles(a.formalSchedulableHypotheses())
 	message := a.maybeAutoDelegate([]string{"https://example.test"})
-	if graph.DelegationCount() != len(defaultSpecialistProfiles) {
-		t.Fatalf("delegated %d agents total, want %d (1 discovery + testing lanes)", graph.DelegationCount(), len(defaultSpecialistProfiles))
+	if graph.DelegationCount() != 1+len(expectedProfiles) {
+		t.Fatalf("delegated %d agents total, want %d (1 discovery + %d testing lanes)", graph.DelegationCount(), 1+len(expectedProfiles), len(expectedProfiles))
 	}
 	waveNames := map[string]bool{}
-	for range a.eligibleSpecialistProfiles() {
+	for range expectedProfiles {
 		select {
 		case got := <-tasks:
 			if got.name == "recon-discovery" {

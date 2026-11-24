@@ -443,6 +443,41 @@ func (s *PGStore) Transition(ctx context.Context, scanID string, id int64, kind 
 	return ct.RowsAffected() == 1, nil
 }
 
+// SettleIntent is the worker-owned terminal transition. Unlike Transition it
+// fences on the owner, so an old worker whose expired lease was reclaimed by a
+// new claimant cannot rewrite the new worker's running row. The state change
+// and the audit reason are one statement: a terminal row never exists without
+// its engine reason.
+func (s *PGStore) SettleIntent(ctx context.Context, scanID string, id int64, owner string, to State, reason string) (bool, error) {
+	owner = strings.TrimSpace(owner)
+	if owner == "" {
+		return false, fmt.Errorf("graph: settle intent %d: owner is required", id)
+	}
+	// StatePaused parks the intent for an operator decision (INTEL_HANDOFF_SPEC
+	// M3: a capability request); it is the one non-terminal settlement.
+	if to != StateBlocked && to != StateExhausted && to != StateStopped && to != StateOpen && to != StatePaused {
+		return false, fmt.Errorf("graph: settle intent %d: %q is not a worker settlement target", id, to)
+	}
+	terminal := TerminalState(KindIntent, to)
+	parked := to == StatePaused
+	ct, err := s.pool.Exec(ctx, `
+		UPDATE exploration_nodes
+		SET state = $4,
+		    owner = '',
+		    lease_until = NULL,
+		    completed_at = CASE WHEN $5 THEN now() ELSE NULL END,
+		    blocked_reason = CASE WHEN ($5 OR $7) AND $6 <> '' THEN $6 ELSE blocked_reason END,
+		    updated_at = now()
+		WHERE scan_id = $1 AND id = $2 AND kind = 'intent'
+		  AND state = 'running' AND owner = $3`,
+		scanID, id, owner, string(to), terminal, strings.TrimSpace(reason), parked,
+	)
+	if err != nil {
+		return false, err
+	}
+	return ct.RowsAffected() == 1, nil
+}
+
 // ConcludeIntent settles one claimed intent and its produced nodes in a
 // single transaction. done requires at least one produced node and writes a
 // yields edge for each; blocked/exhausted/stopped must not produce nodes.
@@ -514,6 +549,11 @@ func (s *PGStore) conclude(ctx context.Context, scanID string, id int64, to Stat
 	}
 	if to == StateDone && contract.NeedsConfirmation() {
 		return nil, fmt.Errorf("%w: intent %d", ErrConfirmationRequired, n.ID)
+	}
+	if to == StateDone {
+		if err := ValidateProducedYields(contract, produced); err != nil {
+			return nil, fmt.Errorf("graph: conclude intent %d: %w", n.ID, err)
+		}
 	}
 	for i := range produced {
 		in := &produced[i]
@@ -590,6 +630,9 @@ func (s *PGStore) conclude(ctx context.Context, scanID string, id int64, to Stat
 	if err != nil {
 		return nil, err
 	}
+	// Derived projections (M2: intel reachability) settle on the same
+	// transaction, under a savepoint that the hook's own failure rolls back.
+	runConcludeHookPG(ctx, tx, scanID, id)
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("graph: commit conclude: %w", err)
 	}

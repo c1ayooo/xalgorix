@@ -44,6 +44,14 @@ func (m *MemoryStore) AddNode(_ context.Context, in NodeInput) (*Node, error) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	cp := *m.addNodeLocked(in)
+	return &cp, nil
+}
+
+// addNodeLocked allocates and stores a node. The caller holds m.mu; keeping
+// allocation under the same lock as the update path is what makes
+// UpsertNode's find-or-insert atomic for concurrent projections.
+func (m *MemoryStore) addNodeLocked(in NodeInput) *Node {
 	m.nextID++
 	now := time.Now().UTC()
 	n := &Node{
@@ -63,11 +71,12 @@ func (m *MemoryStore) AddNode(_ context.Context, in NodeInput) (*Node, error) {
 		UpdatedAt:      now,
 	}
 	m.nodes[n.ID] = n
-	cp := *n
-	return &cp, nil
+	return n
 }
 
 // UpsertNode updates the node with the same (scan, kind, unit_key) or inserts.
+// Find-or-insert happens under one lock: two concurrent projections of the
+// same unit must converge on one node, never create duplicate lineage.
 func (m *MemoryStore) UpsertNode(ctx context.Context, in NodeInput) (*Node, error) {
 	if err := in.Normalize(); err != nil {
 		return nil, err
@@ -76,6 +85,7 @@ func (m *MemoryStore) UpsertNode(ctx context.Context, in NodeInput) (*Node, erro
 		return m.AddNode(ctx, in)
 	}
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	for _, n := range m.nodes {
 		if n.ScanID != in.ScanID || n.Kind != in.Kind || n.UnitKey != in.UnitKey {
 			continue
@@ -92,11 +102,10 @@ func (m *MemoryStore) UpsertNode(ctx context.Context, in NodeInput) (*Node, erro
 		n.Payload = in.Payload
 		n.UpdatedAt = time.Now().UTC()
 		cp := *n
-		m.mu.Unlock()
 		return &cp, nil
 	}
-	m.mu.Unlock()
-	return m.AddNode(ctx, in)
+	cp := *m.addNodeLocked(in)
+	return &cp, nil
 }
 
 // AddEdge inserts one idempotent lineage edge.
@@ -284,16 +293,16 @@ func (m *MemoryStore) preconditionSatisfiedLocked(scanID string, pre Preconditio
 
 // ConcludeIntent settles one claimed intent and its produced nodes under one
 // lock, mirroring the PG transaction.
-func (m *MemoryStore) ConcludeIntent(_ context.Context, scanID string, id int64, owner string, to State, produced []NodeInput) (*Node, error) {
-	return m.conclude(scanID, id, to, produced, concludeMode{owner: owner, requireClaim: true})
+func (m *MemoryStore) ConcludeIntent(ctx context.Context, scanID string, id int64, owner string, to State, produced []NodeInput) (*Node, error) {
+	return m.conclude(ctx, scanID, id, to, produced, concludeMode{owner: owner, requireClaim: true})
 }
 
 // ConcludePlanned settles an intent from the plan surface without a claim.
-func (m *MemoryStore) ConcludePlanned(_ context.Context, scanID string, id int64, to State, produced []NodeInput) (*Node, error) {
-	return m.conclude(scanID, id, to, produced, concludeMode{})
+func (m *MemoryStore) ConcludePlanned(ctx context.Context, scanID string, id int64, to State, produced []NodeInput) (*Node, error) {
+	return m.conclude(ctx, scanID, id, to, produced, concludeMode{})
 }
 
-func (m *MemoryStore) conclude(scanID string, id int64, to State, produced []NodeInput, mode concludeMode) (*Node, error) {
+func (m *MemoryStore) conclude(ctx context.Context, scanID string, id int64, to State, produced []NodeInput, mode concludeMode) (*Node, error) {
 	if !ValidState(KindIntent, to) || !TerminalState(KindIntent, to) {
 		return nil, fmt.Errorf("graph: conclude intent: %q is not a terminal intent state", to)
 	}
@@ -332,6 +341,9 @@ func (m *MemoryStore) conclude(scanID string, id int64, to State, produced []Nod
 		return nil, fmt.Errorf("%w: intent %d", ErrConfirmationRequired, n.ID)
 	}
 	if to == StateDone {
+		if err := ValidateProducedYields(contract, produced); err != nil {
+			return nil, fmt.Errorf("graph: conclude intent %d: %w", n.ID, err)
+		}
 		for _, pre := range contract.Preconditions {
 			if !m.preconditionSatisfiedLocked(scanID, pre) {
 				return nil, fmt.Errorf("%w: %s/%s is not %s", ErrPreconditionUnmet, pre.RefKind, pre.Ref, pre.NeedState)
@@ -410,6 +422,9 @@ func (m *MemoryStore) conclude(scanID string, id int64, to State, produced []Nod
 	n.CompletedAt = &now
 	n.ContentVersion++
 	n.UpdatedAt = now
+	// Same seam as the PG transaction: derived projections settle with the
+	// conclusion and a hook failure never fails it.
+	runConcludeHookMemory(ctx, scanID, n.ID)
 	cp := *n
 	return &cp, nil
 }
@@ -492,6 +507,48 @@ func (m *MemoryStore) Transition(_ context.Context, scanID string, id int64, kin
 	if TerminalState(kind, to) {
 		now := time.Now().UTC()
 		n.CompletedAt = &now
+	}
+	n.ContentVersion++
+	n.UpdatedAt = time.Now().UTC()
+	return true, nil
+}
+
+// SettleIntent is the owner-fenced worker settlement path (see the Repository
+// contract). It mirrors PGStore: state, lease release and reason are one
+// atomic update, and a stale owner can never rewrite a reclaimed row.
+func (m *MemoryStore) SettleIntent(_ context.Context, scanID string, id int64, owner string, to State, reason string) (bool, error) {
+	owner = strings.TrimSpace(owner)
+	if owner == "" {
+		return false, fmt.Errorf("graph: settle intent %d: owner is required", id)
+	}
+	// StatePaused parks the intent for an operator decision (INTEL_HANDOFF_SPEC
+	// M3: a capability request); it is the one non-terminal settlement.
+	if to != StateBlocked && to != StateExhausted && to != StateStopped && to != StateOpen && to != StatePaused {
+		return false, fmt.Errorf("graph: settle intent %d: %q is not a worker settlement target", id, to)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n, ok := m.nodes[id]
+	if !ok || n.ScanID != scanID || n.Kind != KindIntent ||
+		n.State != StateRunning || n.Owner != owner {
+		return false, nil
+	}
+	n.State = to
+	n.Owner = ""
+	n.LeaseUntil = nil
+	if TerminalState(KindIntent, to) {
+		now := time.Now().UTC()
+		n.CompletedAt = &now
+		if r := strings.TrimSpace(reason); r != "" {
+			n.BlockedReason = r
+		}
+	} else {
+		n.CompletedAt = nil
+		if to == StatePaused {
+			if r := strings.TrimSpace(reason); r != "" {
+				n.BlockedReason = r
+			}
+		}
 	}
 	n.ContentVersion++
 	n.UpdatedAt = time.Now().UTC()

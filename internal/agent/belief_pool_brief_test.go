@@ -72,13 +72,20 @@ func TestBeliefPoolBriefSkipsDelegationPaths(t *testing.T) {
 		"delegation root": func(s *ScanState) { s.DelegationEnabled = true },
 		"discovery mode":  func(s *ScanState) { s.DiscoveryMode = true },
 		"recon-only mode": func(s *ScanState) { s.ReconOnlyMode = true },
-		"plan mid-flight": func(s *ScanState) { s.CTFMission = false },
 	} {
 		state := &ScanState{ScanContextID: ctxID, CTFMission: true}
 		mutate(state)
 		if res := hookBeliefPoolBrief(state, nil); len(res.Directives) != 0 {
 			t.Fatalf("%s must stay quiet, got %d directives", name, len(res.Directives))
 		}
+	}
+
+	// R2: a single-agent professional run with a busy structural plan must
+	// still see its formal pool, or created hypotheses have no consumer.
+	single := &ScanState{ScanContextID: ctxID, Plan: NewPlan(), PlanBuilt: true}
+	single.Plan.add(&Task{ID: "t1", Title: "probe", Status: TaskPending})
+	if res := hookBeliefPoolBrief(single, nil); len(res.Directives) != 1 {
+		t.Fatalf("single-agent mid-plan must brief, got %d directives", len(res.Directives))
 	}
 }
 
@@ -118,11 +125,13 @@ func TestBeliefPoolBriefPlanIdleProfessional(t *testing.T) {
 		}
 	}
 
-	// Structural plan still has open work: the planner owns the loop.
+	// R2: a single-agent professional run consumes the pool even while the
+	// structural plan is busy (previously it waited for plan idle, which left
+	// formal hypotheses with no consumer).
 	open := NewPlan()
 	open.add(&Task{ID: "t1", Title: "probe", Status: TaskPending})
-	if res := hookBeliefPoolBrief(mkState(open), nil); len(res.Directives) != 0 {
-		t.Fatalf("mid-plan professional scan must stay quiet, got %d directives", len(res.Directives))
+	if res := hookBeliefPoolBrief(mkState(open), nil); len(res.Directives) != 1 {
+		t.Fatalf("single-agent mid-plan must brief, got %d directives", len(res.Directives))
 	}
 
 	// Exhausted structural plan (idle tail): the belief pool takes over.

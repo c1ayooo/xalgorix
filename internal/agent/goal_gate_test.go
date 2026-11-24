@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"github.com/c1ayooo/xalgorix/v4/internal/config"
+	"github.com/c1ayooo/xalgorix/v4/internal/graph"
+	"github.com/c1ayooo/xalgorix/v4/internal/llm"
 	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
 	"github.com/c1ayooo/xalgorix/v4/internal/scopeguard"
 	"github.com/c1ayooo/xalgorix/v4/internal/tools/reporting"
@@ -229,5 +231,41 @@ func TestGoalAchievedAutoStopWithoutObjective(t *testing.T) {
 	a.state = state
 	if a.goalAchievedAutoStop() {
 		t.Fatal("auto-stop fired without a structured objective")
+	}
+}
+
+// TestMainChatFinishRechecksRequiredObjective pins XALG012: an empty frontier
+// is not goal achievement. A model/completion finish must pass the same
+// deterministic required-objective gate, while an explicit operator stop remains
+// immediate.
+func TestMainChatFinishRechecksRequiredObjective(t *testing.T) {
+	store := graph.NewMemoryStore()
+	graph.SetBackend(store)
+	t.Cleanup(func() { graph.SetBackend(nil) })
+
+	sctx, state := goalGateState(t, []ObjectiveCriterion{
+		{ID: "C1", Kind: "finding_class", VulnClass: "sql injection", VerifyBy: "verifier", Required: true},
+	})
+	sctx.SetInstanceID("run-goal-finish")
+	state.PlannerWorkerMode = true
+	a := NewAgent(&config.Config{}, "finish-gate-chat", make(chan Event, 32), scopeguard.Config{}, sctx)
+	t.Cleanup(a.Stop)
+	a.state = state
+
+	call := llm.ToolCall{Name: "finish", Args: map[string]string{"reason": "frontier drained"}}
+	out, finished := a.mainChatToolResult(call, "please finish the scan")
+	if finished {
+		t.Fatal("finish marked the run complete with an unmet required objective")
+	}
+	if !strings.Contains(out, "C1") {
+		t.Fatalf("finish refusal = %q, want the unmet criterion", out)
+	}
+
+	// An explicit operator stop is still immediate.
+	if out, finished := a.mainChatToolResult(call, "停止扫描"); !finished {
+		t.Fatalf("explicit stop was blocked: %q", out)
+	}
+	if !a.scanFinished.Load() {
+		t.Fatal("explicit stop did not finish the run")
 	}
 }

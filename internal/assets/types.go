@@ -60,6 +60,35 @@ type AssetInput struct {
 	Key         string
 	DisplayName string
 	InfoItemID  string
+	// Locator is the concrete way this observation reached the identity
+	// (host, host:port, URL or path). It is not part of the asset identity; it
+	// is recorded as a time-bound locator row when non-empty.
+	Locator string
+}
+
+// Locator is one time-bound way to reach an asset identity. Old locators stay
+// queryable; ValidUntil nil means "still current as of the latest observation".
+type Locator struct {
+	ID               int64      `json:"id"`
+	ProjectID        string     `json:"project_id"`
+	AssetID          int64      `json:"asset_id"`
+	Locator          string     `json:"locator"`
+	InstanceID       string     `json:"instance_id,omitempty"`
+	ObservedAt       time.Time  `json:"observed_at"`
+	ValidFrom        time.Time  `json:"valid_from"`
+	ValidUntil       *time.Time `json:"valid_until,omitempty"`
+	SourceInfoItemID string     `json:"source_info_item_id,omitempty"`
+}
+
+// LocatorInput records one observed locator for an asset.
+type LocatorInput struct {
+	ProjectID        string
+	AssetID          int64
+	Locator          string
+	InstanceID       string
+	ObservedAt       time.Time
+	ValidUntil       *time.Time
+	SourceInfoItemID string
 }
 
 // Edge is one deterministic structural relation.
@@ -123,6 +152,11 @@ type Repository interface {
 	ListProjectAssets(ctx context.Context, filter AssetFilter) ([]Asset, error)
 	// GetAssetDetail returns one asset with provenance links and incident edges.
 	GetAssetDetail(ctx context.Context, projectID string, id int64) (AssetDetail, error)
+	// RecordLocator appends one observed locator for an existing asset. It is
+	// idempotent for the same (asset, locator, observed_at) tuple.
+	RecordLocator(ctx context.Context, in LocatorInput) (*Locator, error)
+	// ListAssetLocators returns the locator history, newest observation first.
+	ListAssetLocators(ctx context.Context, projectID string, assetID int64) ([]Locator, error)
 	// MergeAssets moves source links/edges to target and archives the source as
 	// a tombstone. Both must belong to projectID.
 	MergeAssets(ctx context.Context, projectID string, sourceID, targetID int64, actor string) error

@@ -77,8 +77,8 @@ func crossScanCleanup(t *testing.T, pool *pgxpool.Pool, scanIDs ...string) {
 }
 
 // fetchCrossScanHistory must produce a real result through the real store:
-// the AllScans region query reaches another scan's items, and the current
-// scan's same-subject item IDs come back as association roots.
+// the project-scoped region query reaches another scan of the SAME project,
+// and the current scan's same-subject item IDs come back as association roots.
 func TestCrossScanHistoryAgainstRealStore(t *testing.T) {
 	pool := crossScanPGPool(t)
 	ctx := context.Background()
@@ -93,7 +93,7 @@ func TestCrossScanHistoryAgainstRealStore(t *testing.T) {
 	cancel := infoitem.RegisterReader(store)
 	defer cancel()
 
-	hist, err := fetchCrossScanHistory(ctx, store, curScan, "/orders", crossScanRegionLimit)
+	hist, err := fetchCrossScanHistory(ctx, store, []string{oldScan, curScan}, curScan, "/orders", crossScanRegionLimit)
 	if err != nil {
 		t.Fatalf("fetchCrossScanHistory: %v", err)
 	}
@@ -105,6 +105,37 @@ func TestCrossScanHistoryAgainstRealStore(t *testing.T) {
 	}
 	if len(hist.currentIDs) != 1 || hist.currentIDs[0] != current.ID {
 		t.Fatalf("current-scan roots = %v, want [%s]", hist.currentIDs, current.ID)
+	}
+}
+
+// A scan outside the project whitelist is invisible even when its items share
+// the subject: the real SQL predicate (scan_id = ANY) must exclude it.
+func TestCrossScanHistoryExcludesForeignProject(t *testing.T) {
+	pool := crossScanPGPool(t)
+	ctx := context.Background()
+	store := postgres.New(pool)
+	oldScan := fmt.Sprintf("cs-old-%d", time.Now().UnixNano())
+	curScan := fmt.Sprintf("cs-cur-%d", time.Now().UnixNano())
+	foreignScan := fmt.Sprintf("cs-foreign-%d", time.Now().UnixNano())
+	crossScanCleanup(t, pool, oldScan, curScan, foreignScan)
+
+	crossScanApplyItem(t, store, oldScan, "EV-old-1", "/orders", 1)
+	crossScanApplyItem(t, store, foreignScan, "EV-foreign-1", "/orders", 1)
+
+	cancel := infoitem.RegisterReader(store)
+	defer cancel()
+
+	hist, err := fetchCrossScanHistory(ctx, store, []string{oldScan, curScan}, curScan, "/orders", crossScanRegionLimit)
+	if err != nil {
+		t.Fatalf("fetchCrossScanHistory: %v", err)
+	}
+	if hist.total != 1 || len(hist.scans) != 1 || hist.scans[0] != oldScan {
+		t.Fatalf("history = %+v, want only the project's scan %s", hist, oldScan)
+	}
+	for _, id := range hist.ids {
+		if id == "EV-foreign-1" {
+			t.Fatalf("foreign project item leaked into history: %+v", hist)
+		}
 	}
 }
 
@@ -142,7 +173,7 @@ func TestClaimCrossScanNoteAgainstRealStore(t *testing.T) {
 	cancel := infoitem.RegisterReader(store)
 	defer cancel()
 
-	a := newCrossScanAgent(t, curScan)
+	a := newCrossScanAgentWithProject(t, curScan, []string{oldScan, curScan})
 	seedSchedulableHypothesis(a.scanCtx, "idor", "/orders", 0.9)
 	res, err := a.claimNextHypothesisTool(map[string]string{})
 	if err != nil || res.Error != "" {
@@ -174,7 +205,7 @@ func TestReadLedgerCrossScanNoteAgainstRealStore(t *testing.T) {
 	cancel := infoitem.RegisterReader(store)
 	defer cancel()
 
-	a := newCrossScanAgent(t, curScan)
+	a := newCrossScanAgentWithProject(t, curScan, []string{oldScan, curScan})
 	seedSchedulableHypothesis(a.scanCtx, "idor", "/orders", 0.9)
 	res, err := a.readLedgerTool(map[string]string{"filter": "schedulable"})
 	if err != nil || res.Error != "" {

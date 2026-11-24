@@ -25,6 +25,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/c1ayooo/xalgorix/v4/internal/promptrender"
 	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
 	"github.com/c1ayooo/xalgorix/v4/internal/tools/reporting"
 )
@@ -74,6 +75,10 @@ type specialistProfile struct {
 	// roleToolScope default for the resolved agent type). Operator-authored
 	// profiles set it; builtins leave it empty and fall through to the map.
 	ToolScopeHidden []string
+	// RequiredTools names tools the lane cannot work without. A lane whose
+	// required tool is absent is a typed capability block, not an endless
+	// worker that cannot make progress (R5).
+	RequiredTools []string
 	// Builtin marks the code-defined specialists — the API surface treats
 	// them as read-only and the reserved role names cannot be reused.
 	Builtin bool
@@ -260,20 +265,58 @@ Do not delegate three generic scans or duplicate your own work.`)
 	return b.String()
 }
 
-// ── hookLedgerSeed ───────────────────────────────────────────────────────────
-// Once a plan exists, seed the shared ledger with one hypothesis per planned
-// vuln class so the graph is populated deterministically. This is a side effect
-// only (no nudge) and runs once per agent; the ledger dedups, so the coordinator
-// and any specialist that also seeds cannot create duplicates.
+// ── hookCoverageOpportunity (formerly hookLedgerSeed) ────────────────────────
+// R2: coverage is a PROMPT, not a belief. This hook used to write one
+// hypothesis per planned vuln class (and per class × endpoint) into the shared
+// ledger, which turned the Belief store into a coverage matrix. It now delivers
+// a one-shot advisory listing the planned classes that have no formal
+// hypothesis yet. Whether any of them deserves a falsifiable claim is the
+// model's decision, recorded through record_hypothesis.
+//
+// seedLedgerFromPlan is kept below as the legacy rollback path; it is no longer
+// called by the hook.
 func hookLedgerSeed(state *ScanState, args map[string]string) HookResult {
-	if state == nil || state.ReconOnlyMode || state.LedgerSeeded || state.Plan == nil {
+	if state == nil || state.ReconOnlyMode || state.CoverageOpportunitiesSent || state.Plan == nil {
 		return HookResult{}
 	}
+	state.CoverageOpportunitiesSent = true
+	covered := map[string]bool{}
 	if l := ledgerForState(state); l != nil {
-		seedLedgerFromPlan(state, l)
-		state.LedgerSeeded = true
+		for _, h := range l.All() {
+			if h.ClaimEligible() && strings.TrimSpace(h.VulnClass) != "" {
+				covered[strings.ToLower(strings.TrimSpace(h.VulnClass))] = true
+			}
+		}
 	}
-	return HookResult{}
+	var b strings.Builder
+	n := 0
+	for _, t := range state.Plan.Tasks {
+		class := strings.ToLower(strings.TrimSpace(t.VulnClass))
+		if class == "" || covered[class] {
+			continue
+		}
+		if n >= 8 {
+			break
+		}
+		covered[class] = true
+		loc := strings.TrimSpace(t.Endpoint)
+		if loc == "" {
+			loc = "whole target"
+		}
+		fmt.Fprintf(&b, "- %s on %s (no formal hypothesis yet)\n", class, promptrender.Cell(loc, 120))
+		n++
+	}
+	if n == 0 {
+		return HookResult{}
+	}
+	head := "COVERAGE OPPORTUNITIES (advisory only — these are NOT hypotheses and must not be claimed):\n" + b.String() +
+		"If target evidence supports a concrete, falsifiable claim, record it with record_hypothesis (claim + preconditions + baseline/falsification) and then claim it. Otherwise ignore the gap: an uncovered class is not a reason to test."
+	return HookResult{Directives: []Directive{{
+		Priority:  DirectivePriorityPlanner,
+		Category:  "coverage-opportunity",
+		DedupeKey: "coverage-opportunities",
+		Content:   head,
+	}}}
 }
 
 // seedLedgerFromPlan creates a class-level hypothesis for every planned task
@@ -445,8 +488,21 @@ func hookBeliefPoolBrief(state *ScanState, _ map[string]string) HookResult {
 		pending, active, _, _ := state.Plan.Counts()
 		return pending == 0 && active == 0
 	}()
-	if !state.CTFMission && !planIdle {
-		return HookResult{}
+	// R2: a single-agent run (delegation disabled) must have a consumption
+	// path even while its structural plan is still busy; otherwise formal
+	// hypotheses are created but never worked. Delegation-enabled roots keep
+	// the old plan-idle/CTF trigger because their specialists own claim
+	// discipline.
+	if !state.CTFMission {
+		// A single-agent run needs the pool once it has a plan; a delegation
+		// root keeps the old plan-idle trigger because its specialists own claim
+		// discipline. Before any plan/recon there is nothing to schedule.
+		if state.Plan == nil {
+			return HookResult{}
+		}
+		if state.DelegationEnabled && !planIdle {
+			return HookResult{}
+		}
 	}
 	l := ledgerForState(state)
 	if l == nil {

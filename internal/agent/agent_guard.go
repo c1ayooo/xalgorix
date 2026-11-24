@@ -278,6 +278,11 @@ func (a *Agent) shouldBlockForPhaseRestriction(toolName string, toolArgs map[str
 	// Recon/report-only scans keep their stricter historical contract.
 	if isReconReportOnlyPhaseSelection(a.allowedPhases) {
 		lowerTool := strings.ToLower(toolName)
+		if lowerTool == "complete_work" || lowerTool == "finish" {
+			// The summary may name tools or payloads used earlier; it is
+			// bookkeeping, not a new target operation.
+			return false, ""
+		}
 		if lowerTool == "report_vulnerability" {
 			return true, "report_vulnerability is out of scope for a reconnaissance/report-only scan. Record recon findings in notes and finish with a recon-focused summary instead."
 		}
@@ -347,7 +352,7 @@ func (a *Agent) shouldBlockForActivityPolicy(toolName string, toolArgs map[strin
 		return false, ""
 	}
 	switch lowerTool {
-	case "add_note", "read_notes", "finish", "list_skills", "read_skill", "report_vulnerability":
+	case "add_note", "read_notes", "finish", "complete_work", "list_skills", "read_skill", "report_vulnerability":
 		return false, ""
 	case "browser_action", "page_agent":
 		if passiveReconGuard {
@@ -523,9 +528,14 @@ func (a *Agent) shouldBlockForOutOfScope(toolName string, toolArgs map[string]st
 	// host the command names must be in scope and not denied. Bare host tokens
 	// carry no port; explicit URL references are checked as well so allow_ports
 	// is honoured when the command names one.
-	if a.engagementScope != nil && (lowerTool == "terminal_execute" || lowerTool == "python_action") {
+	// Engagement scope (opt-in project fence) for platform-directed network
+	// tools: every host the call names must be in scope and not denied. This
+	// includes explicit browser navigation; page-initiated third-party
+	// subresources never arrive here, so the fence does not break CDN/analytics
+	// loading (XALG018 boundary).
+	if scope := a.engagementScopeSnapshot(); scope != nil && toolEngagementScopeGated(lowerTool) {
 		for _, h := range hosts {
-			if !scopeHostNeedsCheck(a.engagementScope, h) {
+			if !scopeHostNeedsCheck(scope, h) {
 				continue
 			}
 			if blocked, reason := a.engagementScopeBlocked(h); blocked {
@@ -568,6 +578,19 @@ func (a *Agent) shouldBlockForOutOfScope(toolName string, toolArgs map[string]st
 	return false, ""
 }
 
+// toolEngagementScopeGated reports whether a tool is a platform-directed
+// network operation whose named destinations must sit inside the project fence.
+// Notes, reads and finding reporting are not network operations.
+func toolEngagementScopeGated(lowerTool string) bool {
+	switch lowerTool {
+	case "terminal_execute", "python_action", "browser_action", "page_agent", "pageagent",
+		"port_scan", "authz_matrix", "probe_hypothesis":
+		return true
+	default:
+		return false
+	}
+}
+
 // httpToolDestinations returns the forms of an http_request / send_request
 // url argument to classify: the value as given and, when it has no http(s)://
 // prefix, the https:// form http_request actually sends ("localhost/x" is a
@@ -593,6 +616,11 @@ func httpToolDestinations(raw string) []string {
 func (a *Agent) checkHTTPHop(rawURL string) error {
 	if scopeguard.IsLocalOrListener(a.localGuard, rawURL) {
 		return fmt.Errorf("it points at the operator's machine or the dashboard's listener")
+	}
+	// Project engagement scope applies to every hop, not only the first request:
+	// an in-scope URL that redirects outside must be refused (XALG018).
+	if blocked, reason := a.engagementScopeBlocked(rawURL); blocked {
+		return fmt.Errorf("%s", reason)
 	}
 	// Lane separation: the control-plane/orchestrator lane may only call the
 	// configured control-plane hosts. Container attacks must be separate

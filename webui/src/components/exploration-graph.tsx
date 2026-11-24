@@ -20,6 +20,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { EmptyState, ErrorState } from "@/components/states";
+import { IntelAccessPanel } from "@/components/intel-access-panel";
 import {
   useApplyScanDecision,
   useScanDecisions,
@@ -87,6 +88,7 @@ export function ExplorationTab({
   return (
     <div className="space-y-3">
       <DecisionInbox scanId={scanId} running={running} />
+      <IntelAccessPanel scanId={scanId} running={running} />
       {data.incomplete && (
         <p className="rounded-sm border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-600 dark:text-amber-400">
           {data.note || t("explore.incomplete")}
@@ -134,13 +136,20 @@ function DecisionInbox({ scanId, running }: { scanId: string; running?: boolean 
   const [reasonCode, setReasonCode] = useState<string>("human");
   const [reason, setReason] = useState("");
   const [priority, setPriority] = useState("");
+  // issue_capability 的表单：目标、可用次数、有效期（秒）。
+  const [targets, setTargets] = useState("");
+  const [usesLeft, setUsesLeft] = useState("1");
+  const [ttlSeconds, setTtlSeconds] = useState("600");
 
-  function openForm(action: DecisionAction, unitId: string) {
+  function openForm(action: DecisionAction, unitId: string, target?: string) {
     setForm({ action, unitId });
     setMessage("");
     setReason("");
     setReasonCode("human");
     setPriority("");
+    setTargets(target ?? "");
+    setUsesLeft("1");
+    setTtlSeconds("600");
   }
 
   function closeForm() {
@@ -157,6 +166,14 @@ function DecisionInbox({ scanId, running }: { scanId: string; running?: boolean 
     }
     if (form.action === "retire_intent") req.reason = reason.trim();
     if (form.action === "reprioritize_intent") req.priority = Number(priority);
+    if (form.action === "issue_capability") {
+      req.targets = targets
+        .split(/[,\s]+/)
+        .map((v) => v.trim())
+        .filter(Boolean);
+      req.uses_left = Number(usesLeft);
+      req.ttl_s = Number(ttlSeconds);
+    }
     apply.mutate(req, {
       onSuccess: (res) => {
         toast.success(res.message || t("decisions.applied"));
@@ -191,6 +208,7 @@ function DecisionInbox({ scanId, running }: { scanId: string; running?: boolean 
   const total =
     data.stalled.length +
     data.blocked.length +
+    data.paused.length +
     data.open_intents.length +
     data.deviations.length;
 
@@ -204,7 +222,15 @@ function DecisionInbox({ scanId, running }: { scanId: string; running?: boolean 
             Number.isFinite(Number(priority)) &&
             Number(priority) >= 0 &&
             Number(priority) <= 100000
-          : form?.action === "kill_work";
+          : form?.action === "issue_capability"
+            ? targets.trim() !== "" &&
+              Number.isFinite(Number(usesLeft)) &&
+              Number(usesLeft) >= 1 &&
+              Number(usesLeft) <= 10 &&
+              Number.isFinite(Number(ttlSeconds)) &&
+              Number(ttlSeconds) >= 60 &&
+              Number(ttlSeconds) <= 7200
+            : form?.action === "kill_work";
 
   return (
     <section className="rounded-md border border-border bg-background/40">
@@ -246,6 +272,12 @@ function DecisionInbox({ scanId, running }: { scanId: string; running?: boolean 
                 setReason={setReason}
                 priority={priority}
                 setPriority={setPriority}
+                targets={targets}
+                setTargets={setTargets}
+                usesLeft={usesLeft}
+                setUsesLeft={setUsesLeft}
+                ttlSeconds={ttlSeconds}
+                setTtlSeconds={setTtlSeconds}
                 valid={!!formValid}
                 pending={apply.isPending}
                 onSubmit={submit}
@@ -277,6 +309,49 @@ function DecisionInbox({ scanId, running }: { scanId: string; running?: boolean 
                 setReason={setReason}
                 priority={priority}
                 setPriority={setPriority}
+                targets={targets}
+                setTargets={setTargets}
+                usesLeft={usesLeft}
+                setUsesLeft={setUsesLeft}
+                ttlSeconds={ttlSeconds}
+                setTtlSeconds={setTtlSeconds}
+                valid={!!formValid}
+                pending={apply.isPending}
+                onSubmit={submit}
+                onCancel={closeForm}
+              />
+            </DecisionRow>
+          ))}
+
+          {data.paused.map((row) => (
+            <DecisionRow
+              key={`paused-${row.unit_id}`}
+              bucket={t("decisions.bucket.paused")}
+              unitId={row.unit_id}
+              title={row.title || row.unit_id}
+              meta={row.reason || t("decisions.noReason")}
+              actions={["issue_capability", "retire_intent"]}
+              form={form}
+              onOpen={(action, unitId) => openForm(action, unitId, row.target)}
+              onClose={closeForm}
+              pending={apply.isPending}
+            >
+              <DecisionFormFields
+                action={form?.unitId === row.unit_id ? form.action : null}
+                message={message}
+                setMessage={setMessage}
+                reasonCode={reasonCode}
+                setReasonCode={setReasonCode}
+                reason={reason}
+                setReason={setReason}
+                priority={priority}
+                setPriority={setPriority}
+                targets={targets}
+                setTargets={setTargets}
+                usesLeft={usesLeft}
+                setUsesLeft={setUsesLeft}
+                ttlSeconds={ttlSeconds}
+                setTtlSeconds={setTtlSeconds}
                 valid={!!formValid}
                 pending={apply.isPending}
                 onSubmit={submit}
@@ -310,6 +385,12 @@ function DecisionInbox({ scanId, running }: { scanId: string; running?: boolean 
                 setReason={setReason}
                 priority={priority}
                 setPriority={setPriority}
+                targets={targets}
+                setTargets={setTargets}
+                usesLeft={usesLeft}
+                setUsesLeft={setUsesLeft}
+                ttlSeconds={ttlSeconds}
+                setTtlSeconds={setTtlSeconds}
                 valid={!!formValid}
                 pending={apply.isPending}
                 onSubmit={submit}
@@ -411,6 +492,12 @@ function DecisionFormFields({
   setReason,
   priority,
   setPriority,
+  targets,
+  setTargets,
+  usesLeft,
+  setUsesLeft,
+  ttlSeconds,
+  setTtlSeconds,
   valid,
   pending,
   onSubmit,
@@ -425,6 +512,12 @@ function DecisionFormFields({
   setReason: (v: string) => void;
   priority: string;
   setPriority: (v: string) => void;
+  targets: string;
+  setTargets: (v: string) => void;
+  usesLeft: string;
+  setUsesLeft: (v: string) => void;
+  ttlSeconds: string;
+  setTtlSeconds: (v: string) => void;
   valid: boolean;
   pending: boolean;
   onSubmit: () => void;
@@ -500,6 +593,45 @@ function DecisionFormFields({
             className="h-8 flex-1 text-xs"
             disabled={pending}
           />
+        </div>
+      )}
+      {action === "issue_capability" && (
+        <div className="space-y-1.5">
+          <Input
+            value={targets}
+            onChange={(e) => setTargets(e.target.value)}
+            placeholder={t("decisions.placeholder.targets")}
+            className="h-8 font-mono text-xs"
+            disabled={pending}
+            aria-label={t("decisions.placeholder.targets")}
+          />
+          <div className="flex flex-wrap items-end gap-1.5">
+            <label className="flex flex-col gap-0.5 text-[10px] uppercase tracking-wide text-muted-foreground">
+              {t("decisions.capability.uses")}
+              <Input
+                type="number"
+                min={1}
+                max={10}
+                value={usesLeft}
+                onChange={(e) => setUsesLeft(e.target.value)}
+                className="h-8 w-20 font-mono text-xs tabular-nums"
+                disabled={pending}
+              />
+            </label>
+            <label className="flex flex-col gap-0.5 text-[10px] uppercase tracking-wide text-muted-foreground">
+              {t("decisions.capability.ttl")}
+              <Input
+                type="number"
+                min={60}
+                max={7200}
+                step={60}
+                value={ttlSeconds}
+                onChange={(e) => setTtlSeconds(e.target.value)}
+                className="h-8 w-24 font-mono text-xs tabular-nums"
+                disabled={pending}
+              />
+            </label>
+          </div>
         </div>
       )}
       <div className="flex gap-1.5">

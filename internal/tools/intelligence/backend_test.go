@@ -130,8 +130,14 @@ func TestIntelBackendSavesRoundTrip(t *testing.T) {
 	if err != nil || n != 1 {
 		t.Fatalf("restore = %d items err=%v, want 1 nil", n, err)
 	}
-	if !containsIntel(ReadForContext(ctxID), "admin:admin accepted") {
-		t.Fatal("restored item not readable")
+	// The listing carries identity only; the content is one explicit fetch away.
+	listing := ReadForContext(ctxID)
+	if !containsIntel(listing, "credential") || containsIntel(listing, "admin:admin accepted") {
+		t.Fatalf("restored listing must be identity-only:\n%s", listing)
+	}
+	item, ok := ReadItemForContext(ctxID, "I-1")
+	if !ok || !containsIntel(item.Content, "admin:admin accepted") {
+		t.Fatalf("restored item not readable by id: ok=%v item=%+v", ok, item)
 	}
 }
 
@@ -155,8 +161,8 @@ func TestIntelBackendInstanceContinuityAcrossRedispatch(t *testing.T) {
 	if err != nil || n != 1 {
 		t.Fatalf("continuity restore = %d err=%v, want 1 nil", n, err)
 	}
-	if !containsIntel(ReadForContext(second), "admin:admin accepted") {
-		t.Fatal("continuity item not readable in re-dispatched session")
+	if items := ItemsForContext(second); len(items) != 1 || !containsIntel(items[0].Content, "admin:admin accepted") {
+		t.Fatalf("continuity item not readable in re-dispatched session: %+v", items)
 	}
 
 	// Recording in the resumed session does not collide with the carried
@@ -188,8 +194,8 @@ func TestIntelBackendSaveFailureIsHonest(t *testing.T) {
 	if res.Error == "" {
 		t.Fatalf("record succeeded despite backend save failure: %+v", res)
 	}
-	if containsIntel(ReadForContext(ctxID), "invoice ids") {
-		t.Fatal("rolled-back item still readable — receipt and durable state disagree")
+	if items := ItemsForContext(ctxID); len(items) != 0 {
+		t.Fatalf("rolled-back item still stored — receipt and durable state disagree: %+v", items)
 	}
 }
 

@@ -24,6 +24,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/c1ayooo/xalgorix/v4/internal/assets"
+	"github.com/c1ayooo/xalgorix/v4/internal/discovery"
 	"github.com/c1ayooo/xalgorix/v4/internal/gaps"
 	"github.com/c1ayooo/xalgorix/v4/internal/graph"
 	"github.com/c1ayooo/xalgorix/v4/internal/infoitem"
@@ -50,12 +52,14 @@ type PlannerCriterion struct {
 // stalled: no information-layer progress inside the lane's threshold. It is a
 // projection for the planner prompt, not a state authority.
 type StalledWorker struct {
-	UnitID       string
-	AgentID      string
-	Lane         string
-	IdleFor      time.Duration
-	ActiveTool   bool
-	LastProgress time.Time
+	UnitID         string
+	AgentID        string
+	Lane           string
+	IdleFor        time.Duration
+	ActiveTool     bool
+	ActiveToolName string
+	ActiveFor      time.Duration
+	LastProgress   time.Time
 }
 
 // PlannerConfig assembles one run's planning loop.
@@ -94,6 +98,16 @@ type PlannerConfig struct {
 	ScopeTargets    []string
 	ScopeDeny       []string
 	ScopeAllowPorts []int
+	// NoiseProfile is the engagement's traffic posture (quiet|balanced|loud).
+	// It constrains what the planner may PLAN (empty = balanced), never what a
+	// worker may do in response to an explicit operator instruction.
+	NoiseProfile string
+	// Deep reports the engagement depth (full methodology / deep phase
+	// selection). Port discovery is a deep-mode capability.
+	Deep bool
+	// RequestBudgetConfigured reports whether a per-scan request-rate policy is
+	// in force. Port discovery is refused without an independent budget.
+	RequestBudgetConfigured bool
 	// Emit publishes planner activity to the run's event stream (nil-safe).
 	Emit func(kind, content string, meta map[string]any)
 	// Interval between heartbeat rounds (default 60s).
@@ -102,10 +116,11 @@ type PlannerConfig struct {
 	// round leaves the frontier empty. This prevents a just-settled recon
 	// intent from finishing the run before the planner gets a chance to plan.
 	OnDrained func()
-	// WaitForCapacity blocks a round until a worker slot is free. This is the
-	// producer-side backpressure: the planner never stockpiles open intents
-	// beyond the configured worker count; a settling worker wakes it.
-	WaitForCapacity func(context.Context) error
+	// AvailableSlots reports the pool's free worker slots (desired - running).
+	// apply() uses it as the admission cap so supervision never blocks on a full
+	// pool: a round may read the graph and steer/kill even when every worker is
+	// busy, but it may only add intents the pool can actually claim.
+	AvailableSlots func() int
 	// MaxIntents bounds how many intents one round may add (default 4; the
 	// server sets it to the configured worker count so the pool can fill).
 	MaxIntents int
@@ -126,6 +141,9 @@ type Planner struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	notify chan struct{}
+	// scopeMu guards the live engagement-scope projection. A project-scope
+	// update replaces it; each round/apply reads a snapshot (XALG019).
+	scopeMu sync.RWMutex
 
 	// Cheap-gate state. settlePending/stallPending are real planning triggers;
 	// drained means the frontier is empty and only a trigger may wake it.
@@ -140,6 +158,11 @@ type Planner struct {
 	// first round may have failed (provider timeout), and the planner must
 	// retry with backoff instead of sleeping forever.
 	modelRounds atomic.Int64
+	// planRounds counts rounds that produced a valid plan: a parsed empty plan
+	// or a plan that actually added/retired something. A malformed JSON or a
+	// plan whose intents were all rejected is NOT effective; an empty frontier
+	// must keep retrying (with the backoff ladder) instead of draining.
+	planRounds atomic.Int64
 	// roundActions counts steer/kill writes issued in the current round; the
 	// final JSON path's added/retired counts are tracked separately.
 	roundActions atomic.Int64
@@ -227,11 +250,37 @@ func (p *Planner) maxIntents() int {
 	return n
 }
 
-// SetWaitForCapacity binds producer backpressure after the pool exists.
-func (p *Planner) SetWaitForCapacity(fn func(context.Context) error) {
+// SetAvailableSlots binds the pool's admission cap. It must be called before
+// Start (the planner reads it from each apply).
+func (p *Planner) SetAvailableSlots(fn func() int) {
 	if p != nil {
-		p.cfg.WaitForCapacity = fn
+		p.cfg.AvailableSlots = fn
 	}
+}
+
+// SetScope replaces the live engagement scope. The planner reads a snapshot
+// per round and per apply, so the next planning decision uses the new boundary
+// without restarting the run (XALG019).
+func (p *Planner) SetScope(targets, deny []string, allowPorts []int) {
+	if p == nil {
+		return
+	}
+	p.scopeMu.Lock()
+	p.cfg.ScopeTargets = append([]string(nil), targets...)
+	p.cfg.ScopeDeny = append([]string(nil), deny...)
+	p.cfg.ScopeAllowPorts = append([]int(nil), allowPorts...)
+	p.scopeMu.Unlock()
+}
+
+func (p *Planner) scopeSnapshot() (targets, deny []string, allowPorts []int) {
+	if p == nil {
+		return nil, nil, nil
+	}
+	p.scopeMu.RLock()
+	defer p.scopeMu.RUnlock()
+	return append([]string(nil), p.cfg.ScopeTargets...),
+		append([]string(nil), p.cfg.ScopeDeny...),
+		append([]int(nil), p.cfg.ScopeAllowPorts...)
 }
 
 // SetStallReport binds the engine's live stall projection. It must be called
@@ -366,17 +415,19 @@ func (p *Planner) coalesce() bool {
 }
 
 type plannerIntent struct {
-	TaskID       string         `json:"task_id"`
-	Title        string         `json:"title"`
-	Phase        plannerInt     `json:"phase"`
-	VulnClass    string         `json:"vuln_class"`
-	Endpoint     string         `json:"endpoint"`
-	Target       string         `json:"target"`
-	TargetKind   string         `json:"target_kind"`
-	DependsOn    plannerStrings `json:"depends_on"`
-	Notes        string         `json:"notes"`
-	ObjectiveRef string         `json:"objective_ref"`
-	TimeboxS     plannerInt     `json:"timebox_s"`
+	TaskID        string         `json:"task_id"`
+	Title         string         `json:"title"`
+	Phase         plannerInt     `json:"phase"`
+	VulnClass     string         `json:"vuln_class"`
+	Endpoint      string         `json:"endpoint"`
+	Target        string         `json:"target"`
+	TargetKind    string         `json:"target_kind"`
+	DependsOn     plannerStrings `json:"depends_on"`
+	Notes         string         `json:"notes"`
+	ObjectiveRef  string         `json:"objective_ref"`
+	AssetRef      string         `json:"asset_ref"`
+	DecisionBasis plannerStrings `json:"decision_basis_refs"`
+	TimeboxS      plannerInt     `json:"timebox_s"`
 }
 
 // plannerInt accepts a JSON number or a string ("6", "phase 6") and extracts
@@ -476,20 +527,16 @@ func (p *Planner) round() (acted bool) {
 	if !first && !p.shouldPlan(settle, stall) {
 		return false
 	}
-	// Producer backpressure: while every configured worker is executing, wait
-	// for one to settle instead of queueing more open intents. This keeps the
-	// frontier at the configured worker count instead of growing without bound.
-	if p.cfg.WaitForCapacity != nil {
-		if err := p.cfg.WaitForCapacity(p.ctx); err != nil {
-			return false
-		}
-	}
+	// No capacity wait here. Blocking the whole round on a free slot delayed
+	// stall supervision behind a busy pool (round-5 review). apply() enforces the
+	// same frontier bound at admission time, so reads/steer/kill stay immediate.
 	if p.cfg.Client == nil {
 		return false
 	}
 	overview := p.overview()
+	scopeTargets, _, _ := p.scopeSnapshot()
 	msgs := []llm.Message{
-		{Role: "system", Content: plannerPromptFor(p.cfg.ControlPlaneHosts, len(p.cfg.ScopeTargets) > 0)},
+		{Role: "system", Content: plannerPromptFor(p.cfg.ControlPlaneHosts, len(scopeTargets) > 0) + plannerNoiseRules(p.cfg.NoiseProfile)},
 		{Role: "user", Content: overview},
 	}
 	// Bounded tool loop (R7 M3 follow-up): the planner may inspect the graph
@@ -514,6 +561,13 @@ func (p *Planner) round() (acted bool) {
 			a, r := p.apply(parsed)
 			added += a
 			retired += r
+			if len(parsed.Intents) == 0 && len(parsed.Retire) == 0 {
+				// A legal empty plan is a valid decision; a plan whose intents
+				// were all rejected is not. Only the former may drain the
+				// frontier. Non-empty plans are counted after the loop when they
+				// actually added/retired something.
+				p.planRounds.Add(1)
+			}
 			break
 		}
 		calls = llm.EnsureToolCallIDs(calls, fmt.Sprintf("plan%d", attempt))
@@ -526,6 +580,7 @@ func (p *Planner) round() (acted bool) {
 		}
 	}
 	if added > 0 || retired > 0 {
+		p.planRounds.Add(1)
 		if p.cfg.Emit != nil {
 			p.cfg.Emit("plan_updated", fmt.Sprintf("planner: +%d intents, -%d retired", added, retired), map[string]any{
 				"source": "llm", "added": added, "retired": retired,
@@ -574,16 +629,17 @@ func (p *Planner) shouldPlan(settle, stall bool) bool {
 	if p.drained.Load() {
 		return false
 	}
-	if counts.OpenIntents >= p.maxIntents() {
-		// The frontier already fills every worker slot: plan again when one
-		// settles instead of stockpiling intents.
+	if counts.OpenIntents+counts.RunningIntents >= p.maxIntents() {
+		// Every claimable slot is already filled (or executing). A timer round
+		// would add nothing the pool can claim; wait for a settle or a stall
+		// trigger instead of burning a model call or blocking on capacity.
 		return false
 	}
 	if counts.OpenIntents+counts.RunningIntents+counts.PausedIntents == 0 {
 		// Nothing running and nothing to claim, with no trigger: the frontier is
 		// drained — but only after the model has actually produced a round.
 		// Before that, a failed first round must retry instead of sleeping.
-		if p.modelRounds.Load() == 0 && p.cfg.Client != nil {
+		if p.planRounds.Load() == 0 && p.cfg.Client != nil {
 			return true
 		}
 		p.drained.Store(true)
@@ -663,8 +719,19 @@ func (p *Planner) overview() string {
 			states[t.TaskID] = t.GraphState
 		}
 		for _, t := range tasks {
+			// Print the GRAPH state (done/exhausted/blocked/...) and the typed
+			// disposition when present: "completed" alone hides whether a
+			// direction was mined out or merely ran out of budget, and the
+			// planner's continuation decision depends on that difference.
+			state := t.GraphState
+			if state == "" {
+				state = t.Status
+			}
+			if t.Disposition != "" {
+				state += "/" + t.Disposition
+			}
 			line := fmt.Sprintf("- %s [phase %d, %s, %s] %s", promptrender.Cell(t.TaskID, 80), t.Phase,
-				promptrender.Cell(t.Status, 20), promptrender.Cell(t.VulnClass, 40), promptrender.Cell(t.Title, 120))
+				promptrender.Cell(state, 40), promptrender.Cell(t.VulnClass, 40), promptrender.Cell(t.Title, 120))
 			if len(t.DependsOn) > 0 {
 				var waiting []string
 				for _, dep := range t.DependsOn {
@@ -742,11 +809,15 @@ func (p *Planner) overview() string {
 			}
 		}
 	}
-	if block := p.infoSpaceBlock(); block != "" {
+	if block := p.assetsBlock(); block != "" {
+		b.WriteString(block)
+	}
+	if block, ok := p.infoSpaceBlock(); ok {
 		b.WriteString(block)
 	} else if prior := p.priorWorkBlock(); prior != "" {
-		// Lexical fallback: unchanged whenever the unified space is
-		// unavailable (no reader, PG down, views not migrated).
+		// Lexical fallback only when the unified space is unavailable (no
+		// reader, PG down, views not migrated). A successful empty read means
+		// the space is genuinely empty, not a reason to substitute the ledger.
 		b.WriteString(prior)
 	}
 	snap := p.readCoverageSnapshot()
@@ -760,6 +831,38 @@ func (p *Planner) overview() string {
 	return b.String()
 }
 
+// assetsBlock renders the run's linked asset identities. It is bounded and
+// read-only: the planner uses the asset id as a stage reference, not as an
+// authorization decision.
+func (p *Planner) assetsBlock() string {
+	repo := assets.Backend()
+	if repo == nil || strings.TrimSpace(p.cfg.ScanID) == "" {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(p.ctx, 3*time.Second)
+	defer cancel()
+	list, err := repo.ListTaskAssets(ctx, p.cfg.ScanID)
+	if err != nil || len(list) == 0 {
+		return ""
+	}
+	sort.SliceStable(list, func(i, j int) bool {
+		if list[i].Kind != list[j].Kind {
+			return list[i].Kind < list[j].Kind
+		}
+		return list[i].Key < list[j].Key
+	})
+	var b strings.Builder
+	b.WriteString("\nKnown assets (project-scoped; use asset_ref=<id> when an intent continues one):\n")
+	for i, a := range list {
+		if i >= 12 {
+			b.WriteString("- … (truncated)\n")
+			break
+		}
+		fmt.Fprintf(&b, "- asset=%d kind=%s key=%s\n", a.ID, a.Kind, promptrender.Cell(a.Key, 120))
+	}
+	return b.String()
+}
+
 // authorizedScopeLimit bounds the scope section. The project scope is operator
 // configuration, but the prompt must stay bounded even for a very large list.
 const authorizedScopeLimit = 40
@@ -768,13 +871,14 @@ const authorizedScopeLimit = 40
 // ScopeTargets (every benchmark/control-plane run) produces no section, so the
 // overview stays byte-identical there.
 func (p *Planner) authorizedScopeBlock() string {
-	if len(p.cfg.ScopeTargets) == 0 {
+	targets, deny, allowPorts := p.scopeSnapshot()
+	if len(targets) == 0 {
 		return ""
 	}
 	var b strings.Builder
 	b.WriteString("\nAUTHORIZED SCOPE (enforced by the project; intents outside it are refused):\n")
 	b.WriteString("Allowed targets: ")
-	for i, t := range p.cfg.ScopeTargets {
+	for i, t := range targets {
 		if i >= authorizedScopeLimit {
 			b.WriteString(", …")
 			break
@@ -785,9 +889,9 @@ func (p *Planner) authorizedScopeBlock() string {
 		b.WriteString(promptrender.Cell(t, 120))
 	}
 	b.WriteString("\n")
-	if len(p.cfg.ScopeDeny) > 0 {
+	if len(deny) > 0 {
 		b.WriteString("Denied targets (override the allow list): ")
-		for i, t := range p.cfg.ScopeDeny {
+		for i, t := range deny {
 			if i >= authorizedScopeLimit {
 				b.WriteString(", …")
 				break
@@ -799,9 +903,9 @@ func (p *Planner) authorizedScopeBlock() string {
 		}
 		b.WriteString("\n")
 	}
-	if len(p.cfg.ScopeAllowPorts) > 0 {
-		ports := make([]string, 0, len(p.cfg.ScopeAllowPorts))
-		for _, port := range p.cfg.ScopeAllowPorts {
+	if len(allowPorts) > 0 {
+		ports := make([]string, 0, len(allowPorts))
+		for _, port := range allowPorts {
 			ports = append(ports, strconv.Itoa(port))
 		}
 		fmt.Fprintf(&b, "Allowed ports: %s\n", strings.Join(ports, ", "))
@@ -856,6 +960,12 @@ func (p *Planner) applyStallGuard(stalls []StalledWorker) {
 			continue
 		}
 		present[unitID] = true
+		if worker.ActiveTool {
+			// A legitimate long tool is executing; it is not a stall just
+			// because no result has arrived yet.
+			delete(p.stallMisses, unitID)
+			continue
+		}
 		if p.roundCorrected[unitID] {
 			delete(p.stallMisses, unitID)
 			continue
@@ -904,6 +1014,12 @@ func (p *Planner) stalledWorkersBlock() string {
 		state := "idle"
 		if w.ActiveTool {
 			state = "tool-running"
+			if w.ActiveToolName != "" {
+				state = "tool-running:" + w.ActiveToolName
+				if w.ActiveFor > 0 {
+					state += "(" + w.ActiveFor.Round(time.Second).String() + ")"
+				}
+			}
 		}
 		fmt.Fprintf(&b, "- unit=%s agent=%s lane=%s idle=%s %s",
 			promptrender.Cell(w.UnitID, 80), promptrender.Cell(w.AgentID, 60),
@@ -1061,14 +1177,15 @@ func (p *Planner) infoSpacePurpose() string {
 	return ""
 }
 
-// infoSpaceBlock renders the bounded region/context lighting. It returns ""
-// when no reader is available, when the read fails (PG down or views not
-// migrated) or when the space holds nothing for this run, so the caller keeps
-// the lexical prior-work block byte-for-byte.
-func (p *Planner) infoSpaceBlock() string {
+// infoSpaceBlock renders the bounded region/context lighting. ok=false means
+// the unified space is unavailable (no reader, PG down, views not migrated) and
+// the caller may fall back to the lexical prior-work block. ok=true means the
+// read succeeded: an empty space is authoritative and a cold-path gap is always
+// rendered, even when it produced zero items.
+func (p *Planner) infoSpaceBlock() (string, bool) {
 	reader := p.infoSpaceReader()
 	if reader == nil || strings.TrimSpace(p.cfg.ScanID) == "" {
-		return ""
+		return "", false
 	}
 	ctx, cancel := context.WithTimeout(p.ctx, 5*time.Second)
 	defer cancel()
@@ -1083,7 +1200,7 @@ func (p *Planner) infoSpaceBlock() string {
 		Limit:   infoSpaceRegionLimit,
 	})
 	if err != nil {
-		return ""
+		return "", false
 	}
 	regionItems := boundedInfoSpaceItems(region.Items, infoSpaceRegionLimit)
 
@@ -1099,8 +1216,8 @@ func (p *Planner) infoSpaceBlock() string {
 			contextItems = boundedInfoSpaceItems(res.Items, infoSpaceContextLimit)
 		}
 	}
-	if len(regionItems) == 0 && len(contextItems) == 0 {
-		return ""
+	if len(regionItems) == 0 && len(contextItems) == 0 && !region.Incomplete {
+		return "", true
 	}
 
 	var b strings.Builder
@@ -1110,6 +1227,8 @@ func (p *Planner) infoSpaceBlock() string {
 		for _, item := range regionItems {
 			b.WriteString(infoSpaceItemLine(item))
 		}
+	} else if region.Incomplete {
+		b.WriteString("Region: no items returned, but this read is incomplete (see gap below).\n")
 	}
 	if region.Incomplete && region.GapReason != "" {
 		fmt.Fprintf(&b, "Region incomplete: %s (treat as partial, not empty)\n", promptrender.Cell(region.GapReason, 120))
@@ -1120,7 +1239,7 @@ func (p *Planner) infoSpaceBlock() string {
 			b.WriteString(infoSpaceItemLine(item))
 		}
 	}
-	return b.String()
+	return b.String(), true
 }
 
 // plannerInfoSpaceKinds keeps the region block on the information layer that
@@ -1347,7 +1466,11 @@ func unsettledDependency(deps []string, byID map[string]graph.PlanTask, created 
 			continue
 		}
 		state := graph.State(strings.TrimSpace(prev.GraphState))
-		if state == "" || !graph.TerminalState(graph.KindIntent, state) {
+		// A dependency is satisfied only by a successful conclusion. blocked /
+		// exhausted / deleted parents are terminal but they did NOT produce the
+		// stage output the child assumes; emitting the child would break mission
+		// continuity silently.
+		if state != graph.StateDone {
 			return dep
 		}
 	}
@@ -1449,6 +1572,76 @@ func intentVOI(hypotheses []scanctx.Hypothesis, target, endpoint, vulnClass stri
 	return best
 }
 
+// normalizeObjectiveRef maps a model-authored reference onto a goal node that
+// the projector guarantees: either the root "GOAL" or a known criterion ID.
+// Unknown/empty values fall back to the root instead of leaving a dangling
+// lineage string.
+func (p *Planner) normalizeObjectiveRef(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || strings.EqualFold(raw, "GOAL") {
+		return "GOAL"
+	}
+	for _, c := range p.cfg.ObjectiveCriteria {
+		if strings.EqualFold(strings.TrimSpace(c.ID), raw) {
+			return strings.TrimSpace(c.ID)
+		}
+	}
+	return "GOAL"
+}
+
+// normalizeAssetRef validates an optional asset reference against the
+// project-scoped asset graph. An invalid/unknown id is dropped instead of
+// failing the whole intent: the ref is lineage, not authorization.
+func (p *Planner) normalizeAssetRef(ctx context.Context, raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	id, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || id <= 0 {
+		return ""
+	}
+	if p.cfg.ScanCtx == nil {
+		return raw
+	}
+	repo := assets.Backend()
+	if repo == nil {
+		return raw
+	}
+	if _, err := repo.GetAssetDetail(ctx, strings.TrimSpace(p.cfg.ScanCtx.ProjectID), id); err != nil {
+		return ""
+	}
+	return strconv.FormatInt(id, 10)
+}
+
+// plannerContract writes the executable part of an intent contract. Explicit
+// dependencies become "parent intent must be done" preconditions, so a blocked
+// parent cannot silently unlock the next stage. The claim path also enforces
+// the depends_on edge; this makes the success condition explicit and visible.
+func (p *Planner) plannerContract(deps []string, timebox int) map[string]any {
+	contract := map[string]any{
+		"version":               1,
+		"timebox_s":             clampTimebox(timebox),
+		"requires_confirmation": false,
+	}
+	preconditions := make([]map[string]string, 0, len(deps))
+	for _, dep := range deps {
+		dep = strings.TrimSpace(dep)
+		if dep == "" {
+			continue
+		}
+		preconditions = append(preconditions, map[string]string{
+			"ref_kind":   "intent",
+			"ref":        dep,
+			"need_state": "done",
+		})
+	}
+	if len(preconditions) > 0 {
+		contract["preconditions"] = preconditions
+	}
+	return contract
+}
+
 func (p *Planner) apply(out plannerOutput) (added, retired int) {
 	ctx, cancel := context.WithTimeout(p.ctx, 10*time.Second)
 	defer cancel()
@@ -1460,8 +1653,12 @@ func (p *Planner) apply(out plannerOutput) (added, retired int) {
 	seen := make(map[string]bool, len(existing))
 	activeEndpoints := make(map[string]bool, len(existing))
 	recentEndpoints := make(map[string]time.Time, len(existing))
+	openIntents := 0
 	for _, t := range existing {
 		byID[t.TaskID] = t
+		if t.Status == "pending" {
+			openIntents++
+		}
 		dedupeTarget := strings.TrimSpace(t.Target)
 		if dedupeTarget == "" {
 			dedupeTarget = t.Endpoint
@@ -1488,6 +1685,9 @@ func (p *Planner) apply(out plannerOutput) (added, retired int) {
 	// half of the control-plane lane, so read/state/close orchestration (and
 	// every execution lane) keeps working.
 	platformDone := p.platformFinished()
+	// One live scope snapshot per apply: a concurrent project-scope update
+	// applies atomically to the next round, not halfway through this one.
+	scopeTargets, scopeDeny, scopePorts := p.scopeSnapshot()
 	// IG4: the VOI term is read once per round from the ledger snapshot. When
 	// the weight is 0 (the default and the only value legacy scans carry) no
 	// hypothesis is read and the priority is the pure phase baseline.
@@ -1499,8 +1699,27 @@ func (p *Planner) apply(out plannerOutput) (added, retired int) {
 			voiHyps = p.cfg.ScanCtx.Ledger.All()
 		}
 	}
+	// Admission cap: a round may add only intents the pool can actually claim.
+	// This replaces the old blocking capacity gate. Retiring an open intent in
+	// the same output frees one slot.
+	newCap := p.maxIntents()
+	if p.cfg.AvailableSlots != nil {
+		retiringOpen := 0
+		for _, id := range out.Retire {
+			if t, ok := byID[strings.TrimSpace(id)]; ok && t.GraphState == string(graph.StateOpen) {
+				retiringOpen++
+			}
+		}
+		avail := p.cfg.AvailableSlots() - openIntents + retiringOpen
+		if avail < 0 {
+			avail = 0
+		}
+		if avail < newCap {
+			newCap = avail
+		}
+	}
 	for i, in := range out.Intents {
-		if added >= p.maxIntents() {
+		if added >= newCap {
 			break
 		}
 		title := strings.TrimSpace(in.Title)
@@ -1535,7 +1754,7 @@ func (p *Planner) apply(out plannerOutput) (added, retired int) {
 		// authorized project scope entries (or inside one). Without an enforced
 		// scope this kind is never accepted, so benchmark behavior is unchanged.
 		if kind == "scope" &&
-			!scopeTargetAuthorized(target, p.cfg.ScopeTargets, p.cfg.ScopeDeny, p.cfg.ScopeAllowPorts) {
+			!scopeTargetAuthorized(target, scopeTargets, scopeDeny, scopePorts) {
 			continue
 		}
 		controlLaneKey := ""
@@ -1577,6 +1796,21 @@ func (p *Planner) apply(out plannerOutput) (added, retired int) {
 		if intentNamesControlPlaneForScan(in, p.cfg.ControlPlaneHosts) {
 			continue
 		}
+		// R1 progressive recon: a discovery proposal is admitted only when the
+		// shared policy authorizes it against the live surface. The planner may
+		// always propose; silent drops are not allowed, so the rejection is
+		// surfaced to the run events.
+		if ok, reason := p.admitDiscovery(in, target, existing); !ok {
+			p.rejectDiscovery(title, reason)
+			continue
+		}
+		// R3: decision basis refs must resolve to an authoritative ledger
+		// object (or the GOAL). A model-invented reference is not a decision
+		// trace; it is rejected rather than stored as if it were evidence.
+		if bad := p.invalidDecisionBasis(in.DecisionBasis); bad != "" {
+			p.rejectDecisionBasis(title, bad)
+			continue
+		}
 		// Do not emit work that cannot be claimed yet. An intent whose
 		// dependency is still running (or was created earlier in this same
 		// round) would sit open-but-parked: it occupies a worker row, produces
@@ -1608,24 +1842,20 @@ func (p *Planner) apply(out plannerOutput) (added, retired int) {
 			phase = 22
 		}
 		payload, _ := json.Marshal(map[string]any{
-			"task_id":       taskID,
-			"title":         title,
-			"phase":         phase,
-			"vuln_class":    strings.ToLower(strings.TrimSpace(in.VulnClass)),
-			"endpoint":      strings.TrimSpace(in.Endpoint),
-			"target":        target,
-			"target_kind":   kind,
-			"origin":        "llm",
-			"depends_on":    in.DependsOn,
-			"notes":         strings.TrimSpace(in.Notes),
-			"objective_ref": strings.TrimSpace(in.ObjectiveRef),
-			"contract": map[string]any{
-				"version":   1,
-				"timebox_s": clampTimebox(int(in.TimeboxS)),
-				// A planner-created intent is not operator-confirmed work; the
-				// confirmation gate stays for the main-chat proposal path.
-				"requires_confirmation": false,
-			},
+			"task_id":             taskID,
+			"title":               title,
+			"phase":               phase,
+			"vuln_class":          strings.ToLower(strings.TrimSpace(in.VulnClass)),
+			"endpoint":            strings.TrimSpace(in.Endpoint),
+			"target":              target,
+			"target_kind":         kind,
+			"origin":              "llm",
+			"depends_on":          in.DependsOn,
+			"notes":               strings.TrimSpace(in.Notes),
+			"objective_ref":       p.normalizeObjectiveRef(in.ObjectiveRef),
+			"asset_ref":           p.normalizeAssetRef(ctx, in.AssetRef),
+			"decision_basis_refs": in.DecisionBasis,
+			"contract":            p.plannerContract(in.DependsOn, int(in.TimeboxS)),
 		})
 		voi := 0.0
 		if voiWeight > 0 {
@@ -1732,15 +1962,19 @@ func plannerToolDefinitions() []llm.ToolDefinition {
 	return []llm.ToolDefinition{
 		{Name: "graph_overview", Description: "Read the current counters and existing intents."},
 		{Name: "read_plan", Description: "List the existing plan intents."},
-		{Name: "read_info_item", Description: "Read one belief/evidence summary by ID.", Parameters: []llm.ToolParameter{
-			{Name: "id", Description: "Hypothesis or evidence ID", Required: true},
+		{Name: "read_info_item", Description: "Read one information-space item, belief or evidence summary by ID (the ID printed in the Information space / Prior work blocks).", Parameters: []llm.ToolParameter{
+			{Name: "id", Description: "Info item, hypothesis or evidence ID", Required: true},
+		}},
+		{Name: "read_ledger", Description: "Read the shared belief ledger. filter=schedulable lists FORMAL hypotheses the engine may schedule (highest confidence/VOI first); filter=all includes coverage seeds, which are prompts and are not claimable.", Parameters: []llm.ToolParameter{
+			{Name: "filter", Description: "schedulable (default) or all", Required: false},
+			{Name: "limit", Description: "Max rows (default 10)", Required: false},
 		}},
 		{Name: "add_intent", Description: "Add one concrete intent (subject to the same caps/dedupe as the final JSON).", Parameters: []llm.ToolParameter{
 			{Name: "title", Required: true}, {Name: "target", Required: true},
 			{Name: "target_kind", Description: "control_plane_api|container|web|task"},
 			{Name: "vuln_class"}, {Name: "phase"}, {Name: "endpoint"},
 			{Name: "task_id"}, {Name: "depends_on", Description: "Comma-separated task ids"},
-			{Name: "notes"}, {Name: "objective_ref"}, {Name: "timebox_s"},
+			{Name: "notes"}, {Name: "objective_ref"}, {Name: "asset_ref"}, {Name: "timebox_s"}, {Name: "decision_basis_refs", Description: "Comma-separated ledger IDs (Hypothesis/Evidence) this intent is based on; omission means low-impact necessary work."},
 		}},
 		{Name: "retire_intent", Description: "Retire one OPEN intent by task id.", Parameters: []llm.ToolParameter{
 			{Name: "task_id", Required: true},
@@ -1765,6 +1999,8 @@ func (p *Planner) execPlannerTool(call llm.ToolCall, addedSoFar int) (string, in
 		return p.planList(), 0, 0
 	case "read_info_item":
 		return p.readInfoItem(call.Args["id"]), 0, 0
+	case "read_ledger":
+		return p.ledgerList(call.Args["filter"], call.Args["limit"]), 0, 0
 	case "add_intent":
 		if addedSoFar >= p.maxIntents() {
 			return fmt.Sprintf("add_intent rejected: this round already added the maximum of %d intents", p.maxIntents()), 0, 0
@@ -1778,6 +2014,11 @@ func (p *Planner) execPlannerTool(call llm.ToolCall, addedSoFar int) (string, in
 			TargetKind:   strings.TrimSpace(call.Args["target_kind"]),
 			Notes:        strings.TrimSpace(call.Args["notes"]),
 			ObjectiveRef: strings.TrimSpace(call.Args["objective_ref"]),
+		}
+		for _, ref := range strings.Split(call.Args["decision_basis_refs"], ",") {
+			if ref = strings.TrimSpace(ref); ref != "" {
+				in.DecisionBasis = append(in.DecisionBasis, ref)
+			}
 		}
 		if n, err := strconv.Atoi(strings.TrimSpace(call.Args["phase"])); err == nil {
 			in.Phase = plannerInt(n)
@@ -1872,29 +2113,133 @@ func (p *Planner) planList() string {
 	return b.String()
 }
 
+// ledgerList renders the shared belief ledger for the planner. schedulable
+// is the same formal-hypothesis pool claim_next_hypothesis draws from; seeds are
+// shown in "all" only and are explicitly marked as not claimable.
+func (p *Planner) ledgerList(filter, rawLimit string) string {
+	if p.cfg.ScanCtx == nil || p.cfg.ScanCtx.Ledger == nil {
+		return "read_ledger: ledger unavailable"
+	}
+	limit := 10
+	if n, err := strconv.Atoi(strings.TrimSpace(rawLimit)); err == nil && n > 0 && n <= 50 {
+		limit = n
+	}
+	var rows []scanctx.Hypothesis
+	switch strings.ToLower(strings.TrimSpace(filter)) {
+	case "all":
+		rows = p.cfg.ScanCtx.Ledger.All()
+		if len(rows) > limit {
+			rows = rows[:limit]
+		}
+	default:
+		rows = p.cfg.ScanCtx.Ledger.Schedulable(limit)
+	}
+	if len(rows) == 0 {
+		return "read_ledger: no formal hypotheses yet — record one with concrete evidence before planning around it"
+	}
+	var b strings.Builder
+	b.WriteString("Belief ledger (formal hypotheses the scheduler may use):\n")
+	for _, h := range rows {
+		loc := h.Endpoint
+		if loc == "" {
+			loc = h.Target
+		}
+		fmt.Fprintf(&b, "- %s [%s] %s %s conf=%.2f", h.ID, h.Status, h.VulnClass, promptrender.Cell(loc, 120), h.Confidence)
+		if h.VOIEstimated {
+			fmt.Fprintf(&b, " voi=%.2f", h.VOI)
+		}
+		if !h.ClaimEligible() {
+			b.WriteString(" (coverage seed — NOT claimable; record a formal hypothesis to promote it)")
+		}
+		b.WriteString("\n")
+		if claim := strings.TrimSpace(h.Title); claim != "" {
+			fmt.Fprintf(&b, "    claim: %s\n", promptrender.Cell(claim, 200))
+		}
+		if len(h.Preconditions) > 0 {
+			fmt.Fprintf(&b, "    pre: %s\n", promptrender.Cell(strings.Join(h.Preconditions, "; "), 160))
+		}
+	}
+	return b.String()
+}
+
 func (p *Planner) readInfoItem(id string) string {
 	id = strings.TrimSpace(id)
 	if id == "" {
 		return "read_info_item: id is required"
 	}
-	if p.cfg.ScanCtx == nil || p.cfg.ScanCtx.Ledger == nil {
-		return "read_info_item: ledger unavailable"
-	}
-	for _, h := range p.cfg.ScanCtx.Ledger.All() {
-		if h.ID == id {
-			return fmt.Sprintf("belief %s [%s] %s @ %s conf=%.2f\nnext: %s", h.ID, h.Status,
-				h.VulnClass, h.Endpoint, h.Confidence, truncateText(h.NextAction, 600))
-		}
-		for _, ev := range h.Evidence {
-			if ev.ID != id {
-				continue
+	if p.cfg.ScanCtx != nil && p.cfg.ScanCtx.Ledger != nil {
+		for _, h := range p.cfg.ScanCtx.Ledger.All() {
+			if h.ID == id {
+				return fmt.Sprintf("belief %s [%s] %s @ %s conf=%.2f\nnext: %s", h.ID, h.Status,
+					h.VulnClass, h.Endpoint, h.Confidence, truncateText(h.NextAction, 600))
 			}
-			return fmt.Sprintf("evidence %s (hypothesis %s, kind=%s, nature=%s)\n%s\nrequest: %s\nresponse: %s",
-				ev.ID, h.ID, ev.Kind, ev.Nature, truncateText(ev.Summary, 1200),
-				truncateText(ev.Request, 1200), truncateText(ev.Response, 1200))
+			for _, ev := range h.Evidence {
+				if ev.ID != id {
+					continue
+				}
+				return fmt.Sprintf("evidence %s (hypothesis %s, kind=%s, nature=%s)\n%s\nrequest: %s\nresponse: %s",
+					ev.ID, h.ID, ev.Kind, ev.Nature, truncateText(ev.Summary, 1200),
+					truncateText(ev.Request, 1200), truncateText(ev.Response, 1200))
+			}
 		}
 	}
-	return "read_info_item: not found in this run's ledger"
+	// Archived raw tool outputs are valid references in the information space;
+	// resolve them before the read-model lookup (XALG010).
+	if strings.HasPrefix(id, "to_") && p.cfg.ScanCtx != nil && p.cfg.ScanCtx.ToolOutputs != nil {
+		if content, ok := p.cfg.ScanCtx.ToolOutputs.Get(id); ok {
+			return "tool_output " + id + " (archived raw output)\n" + truncateText(content, 4000)
+		}
+	}
+	// The planner's Information space block renders aggregate items by graph
+	// node id. That id is not a ledger id, so the ledger-only lookup above
+	// could show an item and then report "not found". Resolve it through the
+	// same read model that rendered it.
+	if block := p.readInfoSpaceItem(id); block != "" {
+		return block
+	}
+	return "read_info_item: not found in this run's ledger or information space"
+}
+
+// readInfoSpaceItem resolves one item id through the unified read model. It
+// returns "" when the reader is unavailable, does not implement ItemReader, or
+// has no such id, so the caller keeps the ledger-only error path.
+func (p *Planner) readInfoSpaceItem(id string) string {
+	reader := p.infoSpaceReader()
+	itemReader, ok := reader.(infospace.ItemReader)
+	if !ok {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(p.ctx, 5*time.Second)
+	defer cancel()
+	item, found, err := itemReader.Item(ctx, infospace.ItemQuery{RunID: p.cfg.ScanID, InfoID: id})
+	if err != nil || !found {
+		return ""
+	}
+	layer := string(item.Layer)
+	if layer == "" {
+		layer = string(infospace.LayerAggregate)
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "info_item %s [%s/%s/%s]", item.InfoID, layer, item.Kind, item.State)
+	if item.UnitKey != "" {
+		fmt.Fprintf(&b, " unit=%s", promptrender.Cell(item.UnitKey, 80))
+	}
+	if item.Subject != "" {
+		fmt.Fprintf(&b, " subject=%s", promptrender.Cell(item.Subject, 160))
+	}
+	if item.Purpose != "" {
+		fmt.Fprintf(&b, " purpose=%s", promptrender.Cell(item.Purpose, 60))
+	}
+	if item.Nature != "" {
+		fmt.Fprintf(&b, " nature=%s", item.Nature)
+	}
+	if !item.ObservedAt.IsZero() {
+		fmt.Fprintf(&b, " observed=%s", item.ObservedAt.UTC().Format(time.RFC3339))
+	}
+	b.WriteString("\npayload: ")
+	b.WriteString(promptrender.Cell(truncateText(string(item.Payload), 4000), 4000))
+	b.WriteString("\n")
+	return b.String()
 }
 
 const plannerSystemPrompt = `You are the planning agent for an authorized task. Read the situation's three layers in this authority order:
@@ -1918,6 +2263,8 @@ Rules:
 - For every intent set objective_ref to the GOAL or an OBJECTIVE criterion id it serves (for example "GOAL" or "C1"). If no criterion exists, use "GOAL".
 - timebox_s is an optional per-intent execution budget in seconds (60-86400). Use a short box only for cheap checks; for exploitation lanes omit it or use a generous value — execution lanes get a floor regardless.
 - steer_work(unit_id,message) corrects one running worker; kill_work(unit_id,reason_code,reason) ends one. reason_code must be one of stagnant|repeated_failure|lane_violation|scope_violation|duplicate|superseded. Prefer steer over kill, and never kill a worker that is still producing information-layer progress.
+- When an intent follows from an observed belief/evidence, set decision_basis_refs to those ledger IDs (Hypothesis/Evidence); low-impact necessary recon may cite GOAL. Unknown refs are rejected by the engine.
+- read_ledger(filter=schedulable) shows the FORMAL hypotheses the scheduler may use. When one matches the goal, base the next intent on it (its claim, preconditions and falsification condition) instead of inventing a direction; coverage seeds are prompts, not claimable work.
 - Never claim a goal is met; never report a finding.
 - Return STRICT JSON only, no markdown fences:
 {"intents":[{"task_id":"optional-stable-id","title":"...","phase":6,"vuln_class":"sqli","endpoint":"/api/users","target":"https://app.example","target_kind":"web","depends_on":[],"notes":"why","objective_ref":"GOAL","timebox_s":1800}],"retire":["task-id"]}`
@@ -1951,12 +2298,190 @@ Engagement scope rules (this task has an ENFORCED project scope):
 
 func plannerPromptFor(controlPlane []string, hasScope ...bool) string {
 	if len(controlPlane) > 0 {
-		return plannerSystemPrompt + plannerBenchmarkRules
+		return plannerSystemPrompt + plannerReasoningRules + plannerBenchmarkRules
 	}
 	if len(hasScope) > 0 && hasScope[0] {
-		return plannerSystemPrompt + plannerEngagementScopeRules
+		return plannerSystemPrompt + plannerReasoningRules + plannerEngagementScopeRules
 	}
-	return plannerSystemPrompt
+	return plannerSystemPrompt + plannerReasoningRules
+}
+
+// plannerReasoningRules is the decision discipline that turns the planner from
+// an intent dispenser into the run's reasoning layer. It is scenario-independent
+// (benchmark, engagement, internal) and therefore always appended after the
+// base prompt: the base says WHAT the planner is, this says HOW it must decide.
+//
+// Derived from 4zreco's planner doctrine (the same author's earlier engine):
+// graph-state reasoning, done-vs-exhausted semantics, bounded continuation with
+// an incremental commitment, anomaly-as-clue, variant hunting, and explicit
+// failure/repetition discipline. It is deliberately prose, not a phase table —
+// the engine's obligations live in coverage/evidence state, never here.
+const plannerReasoningRules = `
+
+Decision discipline (read before answering; it outranks "be conservative"):
+- FRONTIER FLOOR: if the GOAL is unmet and no intent is open/running/paused, this round MUST emit at least one intent that advances the goal. Zero intents is only valid when (a) every direction you can think of is already covered by open/running work, or (b) the next step depends on an in-flight intent whose output does not exist yet. "Fewer intents is safer" is not a reason.
+- DONE vs EXHAUSTED vs BLOCKED, by the settled state and its recorded reason, never by existence alone: a done intent with no fact/finding yields is a dead end — do not re-emit it. exhausted with "no increment / output rate zero" means the direction is mined out — change direction. exhausted with "step/time budget" means a concrete next step exists — you may continue it. blocked is an external failure — re-dispatching the same direction is correct. If a reason is not shown in the overview, read the intent's notes/evidence before deciding.
+- CONTINUATION DISCIPLINE: a direction may be continued at most 3 times. A continuation must state the increment ("last time reached X, this time obtain Y; stop if Y is unobtainable") and carries depends_on when the engine exposes the upstream id. If you cannot name Y, do not continue — pick a different direction.
+- NEGATIVE OBSERVATIONS ARE WORKER CLAIMS, NOT VERDICTS: before accepting "port closed / not injectable / no login", read the evidence. Thin evidence, a single probe, or an inferred nature means the direction is still open — emit one bounded re-check (at most once per negated direction). After a solid re-check, respect the negative and stop re-probing it.
+- ANOMALY IS A CLUE, NOT A MECHANISM: an odd response, a suspicious parameter, or a version difference earns at most ONE bounded verification intent with an explicit success signal ("only verify X; seeing Y counts"). Until that hypothesis is settled, do not spawn one intent per suspicious point; at most add two discriminators (different parameter position, identity, or method). No difference → record the observation and move on.
+- AFTER A CONFIRMED FINDING, HUNT THE VARIANT: ask whether the same product/version/framework/asset family has the same mechanism elsewhere. Emit 1–2 variant intents on in-scope assets; put the proven path/parameter in the notes as a reusable lead.
+- DEPTH vs BREADTH ARBITRATION: coverage is a floor, not the goal. After a high-value entry appears, allow up to two intents deepening that one path (main line + bypass). If those two rounds produce no new fact/finding, resume breadth. Use the two-round signal, not mood.
+- KNOWN SURFACE vs UNKNOWN SURFACE: known = advisory/CVE lookup on a fingerprinted product (fast, certain). Unknown = authorization, logic, race, state-machine and resource-assumption flaws mined from the target's behavior (slow, often the only high-value path). When known-surface returns nothing and the goal is still unmet, emit one unknown-surface intent; do not keep re-querying advisories.
+- FAILURE IS NOT RE-EMITTED IDENTICALLY: two consecutive blocked results with the same error signature (same 403/timeout/WAF reject) mean the third attempt must change the path (tool, protocol, entry point, identity), and the notes must state that difference. If you cannot state a difference, do not emit it.
+- DIVERSITY: while the goal is unmet, keep 2–3 mechanically different routes alive (different entry surfaces / asset families / exploit chains) instead of synonyms of one route. Diversity never outranks hard constraints: an excluded entry surface, port, host or action is never planned, however different it is.
+- SERIAL CHAINS ARE STEPWISE: for A→B→C where B needs A's actual output, emit only the step whose inputs already exist. Never front-load downstream steps behind depends_on to "reserve" them.
+- PLAN BELIEFS, NOT AN ENDPOINT×CLASS MATRIX: one intent per distinguishable claim or professional question, never one per endpoint × vulnerability class. If a formal hypothesis exists, name its ID in decision_basis_refs; a coverage gap alone is not an intent.
+- BAD INTENT EXAMPLES (do not emit these): "dig deeper into the admin surface" (no address, no evidence, no success signal); "re-check #14 SQL injection" (same wording as a done intent, zero increment); "test all endpoints for all bugs" (a checklist, not a direction). A good intent names a concrete target, the evidence it derives from, and what outcome settles it.
+- You are not a scanner operator: never turn the plan into a phase-by-phase checklist. If a direction has no evidence and no goal link, it does not belong in the plan.`
+
+// plannerNoiseRules states the engagement's traffic posture for THIS run. It is
+// appended per-round because the posture is configuration, not methodology.
+//
+// R1: active discovery is never a default. The model may PROPOSE it; apply()
+// admits the proposal only when internal/discovery says yes (inventory thin, no
+// API description, and — for ports — host/IP authorization + budget + deep).
+func plannerNoiseRules(profile string) string {
+	switch strings.ToLower(strings.TrimSpace(profile)) {
+	case "quiet":
+		return `
+
+NOISE POSTURE — QUIET (hard constraint on what you may plan):
+- Plan evidence-led reconnaissance only: crawl/robots/sitemap, first-party JavaScript and source-map analysis, OpenAPI/Swagger/GraphQL artifacts, and targeted probes of routes the surface actually exposed.
+- NEVER plan a wordlist content-discovery pass, a port sweep, parameter brute force (arjun/x8), or archival-URL harvesting unless the operator instruction explicitly asks for that action. Those are exactly the traffic this engagement declined.
+- A quiet run may finish without "content discovery" coverage. Do not invent noisy work to satisfy a checklist.`
+	case "loud":
+		return `
+
+NOISE POSTURE — LOUD (the operator accepted broad discovery):
+- A bounded wordlist content-discovery pass is admissible, but aim it at hidden NON-API paths and keep it to ONE pass per application host with -maxtime.
+- Port discovery still requires a concrete host:port/CIDR target, deep mode and a configured request budget; never -p- under a rate limit.`
+	default:
+		return `
+
+NOISE POSTURE — BALANCED (evidence-led; discovery is proposed, not granted):
+- Default to evidence-led work: crawl, first-party JavaScript, API artifacts, and observed routes. There is NO automatic wordlist pass in this posture.
+- You MAY propose ONE bounded content-discovery intent, but it will be admitted only while the concrete route inventory is thin and no API description (OpenAPI/Swagger/GraphQL/api-docs) is known. With a mature inventory or a known API, analyze the documented/observed interface instead of enumerating generic paths.
+- You MAY propose port/service discovery only when the intent target is a concrete host:port or CIDR (not a Web URL), the engagement is deep, and a request budget is configured. Otherwise the proposal is rejected by the engine.
+- Evidence beats coverage: when a lead is observed, go deep on it rather than adding discovery to fill a checklist.`
+	}
+}
+
+// discoveryInput projects the planner's live situation onto the R1 policy.
+func (p *Planner) discoveryInput(existing []graph.PlanTask) discovery.Input {
+	routes := map[string]struct{}{}
+	add := func(raw string) {
+		raw = strings.TrimSpace(raw)
+		if raw != "" {
+			routes[strings.ToLower(raw)] = struct{}{}
+		}
+	}
+	if p.cfg.ScanCtx != nil && p.cfg.ScanCtx.Ledger != nil {
+		for _, h := range p.cfg.ScanCtx.Ledger.All() {
+			add(h.Endpoint)
+			add(h.Target)
+		}
+	}
+	for _, t := range existing {
+		add(t.Endpoint)
+		add(t.Target)
+	}
+	apiSpec := false
+	for route := range routes {
+		if strings.Contains(route, "swagger") || strings.Contains(route, "openapi") ||
+			strings.Contains(route, "api-docs") || strings.Contains(route, "graphql") {
+			apiSpec = true
+			break
+		}
+	}
+	instr := strings.TrimSpace(p.cfg.UserInstruction)
+	if instr == "" {
+		instr = strings.TrimSpace(p.cfg.Instruction)
+	}
+	return discovery.Input{
+		Posture:               p.cfg.NoiseProfile,
+		OperatorRequested:     discovery.OperatorRequestedContentDiscovery(instr),
+		OperatorRequestedPort: discovery.OperatorRequestedPortDiscovery(instr),
+		Deep:                  p.cfg.Deep,
+		AuthorizedHostTarget:  discovery.AuthorizedHostTarget(append([]string{p.cfg.Target}, p.cfg.ScopeTargets...)),
+		RequestBudget:         p.cfg.RequestBudgetConfigured,
+		InventoryRoutes:       len(routes),
+		APISpec:               apiSpec,
+	}
+}
+
+// admitDiscovery applies the R1 gate to a proposed intent. Non-discovery
+// intents always pass. A rejected discovery proposal is logged and surfaced to
+// the run events instead of being silently dropped.
+func (p *Planner) admitDiscovery(in plannerIntent, target string, existing []graph.PlanTask) (bool, string) {
+	base := p.discoveryInput(existing)
+	if discovery.LooksLikePortDiscoveryIntent(in.Title, in.VulnClass, in.Notes) {
+		// The intent's own target must authorize the sweep; a URL elsewhere in
+		// the run never grants it.
+		if !discovery.AuthorizedHostTarget([]string{target}) {
+			return false, "port discovery target is not a concrete host:port or CIDR (a Web URL does not authorize a sweep)"
+		}
+		d := discovery.PortProposalAllowed(base)
+		return d.Owed, d.Reason
+	}
+	if discovery.LooksLikeContentDiscoveryIntent(in.Title, in.VulnClass, in.Notes) {
+		d := discovery.ContentDiscoveryProposalAllowed(base)
+		return d.Owed, d.Reason
+	}
+	return true, ""
+}
+
+// invalidDecisionBasis returns the first reference that does not resolve to a
+// ledger hypothesis/evidence ID (or the semantic GOAL id). Empty refs are
+// allowed: low-impact necessary work is justified by the goal/policy.
+func (p *Planner) invalidDecisionBasis(refs []string) string {
+	if len(refs) == 0 || p.cfg.ScanCtx == nil || p.cfg.ScanCtx.Ledger == nil {
+		return ""
+	}
+	l := p.cfg.ScanCtx.Ledger
+	for _, raw := range refs {
+		ref := strings.TrimSpace(raw)
+		if ref == "" || strings.EqualFold(ref, "GOAL") {
+			continue
+		}
+		if _, ok := l.Get(ref); ok {
+			continue
+		}
+		found := false
+		for _, h := range l.All() {
+			for _, ev := range h.Evidence {
+				if strings.EqualFold(ev.ID, ref) || strings.EqualFold(ev.InfoItemID, ref) {
+					found = true
+					break
+				}
+			}
+			if found {
+				break
+			}
+		}
+		if !found {
+			return ref
+		}
+	}
+	return ""
+}
+
+func (p *Planner) rejectDecisionBasis(title, ref string) {
+	if p.cfg.Emit != nil {
+		p.cfg.Emit("plan_rejected", fmt.Sprintf("planner rejected %q: decision_basis_refs %q is not an authoritative ledger ID", title, ref), map[string]any{
+			"source": "decision-basis", "ref": ref,
+		})
+	}
+	log.Printf("[planner] %s: rejected %q — unknown decision basis %q", p.cfg.ScanID, title, ref)
+}
+
+// rejectDiscovery records one gated proposal for the event stream.
+func (p *Planner) rejectDiscovery(title, reason string) {
+	log.Printf("[planner] %s: rejected discovery intent %q: %s", p.cfg.ScanID, title, reason)
+	if p.cfg.Emit != nil {
+		p.cfg.Emit("plan_rejected", fmt.Sprintf("planner rejected %q: %s", title, reason), map[string]any{
+			"source": "discovery-gate", "reason": reason,
+		})
+	}
 }
 
 func parsePlannerOutput(raw string) (plannerOutput, error) {

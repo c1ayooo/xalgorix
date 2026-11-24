@@ -292,10 +292,10 @@ func TestProxyGateTimeoutIs403Rejection(t *testing.T) {
 	t.Fatal("row never landed as timeout")
 }
 
-// TestProxyGateFailsOpenWithoutStore pins the no-DSN red line: enforce mode
-// but no platform store → submit approves without a row, the request
-// forwards, nothing is parked.
-func TestProxyGateFailsOpenWithoutStore(t *testing.T) {
+// TestProxyGateFailsClosedWithoutStoreUnderEnforce pins the decided XALG017
+// posture: enforce mode with no platform store refuses the regulated request
+// instead of forwarding it without an approval row.
+func TestProxyGateFailsClosedWithoutStoreUnderEnforce(t *testing.T) {
 	cfg := &config.Config{ApprovalMode: "enforce", ApprovalTimeoutSeconds: 10, ApprovalMaxPending: 1}
 	s := newTestServer(t, cfg) // no SetPlatformStore — store stays nil
 	t.Cleanup(func() { trafficproxy.SetHighRiskGate(nil) })
@@ -344,8 +344,11 @@ func TestProxyGateFailsOpenWithoutStore(t *testing.T) {
 	}
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK || string(body) != "failopen-ok" || hits.Load() != 1 {
-		t.Fatalf("fail-open did not forward: status=%d body=%q hits=%d", resp.StatusCode, body, hits.Load())
+	if resp.StatusCode != http.StatusForbidden || hits.Load() != 0 {
+		t.Fatalf("enforce without a store did not fail closed: status=%d body=%q hits=%d", resp.StatusCode, body, hits.Load())
+	}
+	if !strings.Contains(string(body), "APPROVAL") {
+		t.Fatalf("missing approval-unavailable denial: %q", body)
 	}
 }
 

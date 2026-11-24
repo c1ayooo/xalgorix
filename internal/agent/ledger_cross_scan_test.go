@@ -106,7 +106,30 @@ func seedSchedulableHypothesis(sc *scanctx.ScanContext, class, endpoint string, 
 	})
 }
 
+// crossScanTestWhitelist is the simulated project scan set for the contract
+// tests: the current scan plus the older scans the stubs report. Cross-scan
+// history is project-scoped (D7): tasks inside one project share history,
+// projects never do, so the agent must carry an explicit project whitelist;
+// there is no AllScans fallback.
+var crossScanTestWhitelist = []string{"scan-cur", "scan-old-1", "scan-old-2", "scan-old-3", "scan-old-4"}
+
 func newCrossScanAgent(t *testing.T, scanID string) *Agent {
+	t.Helper()
+	return newCrossScanAgentWithProject(t, scanID, crossScanTestWhitelist)
+}
+
+func newCrossScanAgentWithProject(t *testing.T, scanID string, scanIDs []string) *Agent {
+	t.Helper()
+	a := newCrossScanAgentNoProject(t, scanID)
+	ids := append([]string(nil), scanIDs...)
+	a.SetCrossScanScanIDsResolver(func() []string { return ids })
+	return a
+}
+
+// newCrossScanAgentNoProject builds an agent with a reader but no project
+// scope, mirroring a project-less run: cross-scan annotations must be
+// suppressed instead of widening to every scan.
+func newCrossScanAgentNoProject(t *testing.T, scanID string) *Agent {
 	t.Helper()
 	sc := scanctx.New(scanID, "")
 	t.Cleanup(sc.Close)
@@ -150,15 +173,18 @@ func TestReadLedgerSchedulableCrossScanRegionNote(t *testing.T) {
 		t.Fatalf("current-scan item leaked into cross-scan history:\n%s", res.Output)
 	}
 
-	// Cross-scan query shape: AllScans (the §4.1 cross-scan form), no ScanIDs,
+	// Cross-scan query shape: the project whitelist (D7 — never AllScans),
 	// subject = endpoint, small limit. The stub's Validate already rejects a
 	// malformed query; these assertions pin the exact shape.
 	if len(stub.regionQueries) != 1 {
 		t.Fatalf("expected exactly 1 region query, got %d", len(stub.regionQueries))
 	}
 	q := stub.regionQueries[0]
-	if q.Subject != "/orders" || q.Limit != crossScanRegionLimit || len(q.ScanIDs) != 0 || !q.AllScans {
+	if q.Subject != "/orders" || q.Limit != crossScanRegionLimit || q.AllScans {
 		t.Fatalf("unexpected region query shape: %+v", q)
+	}
+	if strings.Join(q.ScanIDs, ",") != strings.Join(crossScanTestWhitelist, ",") {
+		t.Fatalf("region query scan ids = %v, want project whitelist %v", q.ScanIDs, crossScanTestWhitelist)
 	}
 
 	// A second schedulable hypothesis on the same endpoint reuses the cached
@@ -176,6 +202,72 @@ func TestReadLedgerSchedulableCrossScanRegionNote(t *testing.T) {
 	// 3 total).
 	if len(stub.regionQueries) != 2 {
 		t.Fatalf("expected one region query per call (endpoint dedup within a call), got %d total", len(stub.regionQueries))
+	}
+}
+
+func TestCrossScanHistoryIgnoresForeignProjectItems(t *testing.T) {
+	// The project is the isolation fence. Even if the store returns an item
+	// from another project's scan (buggy store, stale index), the consumer
+	// must drop it — no count, no scan label, no ID handed to the model.
+	a := newCrossScanAgentWithProject(t, "scan-cur", []string{"scan-cur", "scan-old-1"})
+	seedSchedulableHypothesis(a.scanCtx, "idor", "/orders", 0.9)
+
+	stub := &crossScanStubReader{region: infoitem.RegionResult{
+		Items: []infoitem.Item{
+			crossScanItem("ii-own", "scan-old-1", infoitem.NatureObserved),
+			crossScanItem("ii-foreign", "scan-foreign-project", infoitem.NatureObserved),
+			crossScanItem("ii-cur", "scan-cur", infoitem.NatureObserved),
+		},
+	}}
+	cancel := infoitem.RegisterReader(stub)
+	defer cancel()
+
+	res, err := a.readLedgerTool(map[string]string{"filter": "schedulable"})
+	if err != nil || res.Error != "" {
+		t.Fatalf("read_ledger failed: result=%+v err=%v", res, err)
+	}
+	want := "同端点跨扫描历史: 1 条既往观察 (observed=1 inferred=0), 扫描: scan-old-1"
+	if !strings.Contains(res.Output, want) {
+		t.Fatalf("cross-scan note missing or counts foreign items:\n%s\nwant: %s", res.Output, want)
+	}
+	if strings.Contains(res.Output, "scan-foreign-project") {
+		t.Fatalf("foreign project's scan id leaked into the note:\n%s", res.Output)
+	}
+}
+
+func TestCrossScanHistoryRequiresProjectWhitelist(t *testing.T) {
+	// A project-less agent (no resolver) must not fall back to AllScans: the
+	// annotation is suppressed and nothing is queried.
+	a := newCrossScanAgentNoProject(t, "scan-cur")
+	seedSchedulableHypothesis(a.scanCtx, "idor", "/orders", 0.9)
+
+	stub := &crossScanStubReader{region: infoitem.RegionResult{
+		Items: []infoitem.Item{crossScanItem("ii-1", "scan-old-1", infoitem.NatureObserved)},
+	}}
+	cancel := infoitem.RegisterReader(stub)
+	defer cancel()
+
+	res, err := a.readLedgerTool(map[string]string{"filter": "schedulable"})
+	if err != nil || res.Error != "" {
+		t.Fatalf("read_ledger failed: result=%+v err=%v", res, err)
+	}
+	if strings.Contains(res.Output, crossScanRegionMarker) {
+		t.Fatalf("cross-scan note rendered without a project whitelist:\n%s", res.Output)
+	}
+	if len(stub.regionQueries) != 0 {
+		t.Fatalf("project-less agent issued %d cross-scan queries, want 0", len(stub.regionQueries))
+	}
+
+	// The claim path must suppress its section the same way.
+	claimRes, err := a.claimNextHypothesisTool(map[string]string{})
+	if err != nil || claimRes.Error != "" {
+		t.Fatalf("claim failed: result=%+v err=%v", claimRes, err)
+	}
+	if strings.Contains(claimRes.Output, crossScanAssocMarker) {
+		t.Fatalf("cross-scan association note rendered without a project whitelist:\n%s", claimRes.Output)
+	}
+	if len(stub.regionQueries) != 0 {
+		t.Fatalf("project-less claim issued %d cross-scan queries, want 0", len(stub.regionQueries))
 	}
 }
 
@@ -305,15 +397,18 @@ func TestLedgerClaimCrossScanAssociationNote(t *testing.T) {
 		t.Fatalf("cross-scan section must follow the guidance line:\n%s", res.Output)
 	}
 
-	// Query shapes: region is the AllScans cross-scan form and subject-filtered;
+	// Query shapes: region is project-whitelisted and subject-filtered;
 	// association is rooted at THIS scan's same-subject item IDs only, with
 	// bounded depth and budget, unrestricted edge types.
 	if len(stub.regionQueries) != 1 {
 		t.Fatalf("expected 1 region query, got %d", len(stub.regionQueries))
 	}
 	rq := stub.regionQueries[0]
-	if rq.Subject != "/orders" || rq.Limit != crossScanRegionLimit || len(rq.ScanIDs) != 0 || !rq.AllScans {
+	if rq.Subject != "/orders" || rq.Limit != crossScanRegionLimit || rq.AllScans {
 		t.Fatalf("unexpected region query shape: %+v", rq)
+	}
+	if strings.Join(rq.ScanIDs, ",") != strings.Join(crossScanTestWhitelist, ",") {
+		t.Fatalf("region query scan ids = %v, want project whitelist %v", rq.ScanIDs, crossScanTestWhitelist)
 	}
 	if len(stub.assocQueries) != 1 {
 		t.Fatalf("expected 1 association query, got %d", len(stub.assocQueries))

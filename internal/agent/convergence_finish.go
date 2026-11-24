@@ -113,6 +113,12 @@ func taskBlocksPrincipledFinish(state *ScanState, t *Task) bool {
 		// forever. ReconDone is the engine's authoritative "surface is mapped" flag.
 		return state == nil || !state.ReconDone
 	case "dirbust":
+		// The noise posture decides whether a wordlist pass is owed at all:
+		// quiet never blocks on it, balanced only while the evidence-led
+		// inventory is thin, loud always does.
+		if !contentDiscoveryOwed(state) {
+			return false
+		}
 		return state == nil || (!state.DirBustingDone && !state.VulnClassesTested["dirbusting"])
 	}
 	return false

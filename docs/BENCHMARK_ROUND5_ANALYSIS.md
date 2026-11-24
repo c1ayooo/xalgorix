@@ -258,7 +258,7 @@ Token 分布同样指向空转：10:00–13:59 四小时消耗 **122M / 160M（7
 - scope 按“任务/题”而不是“单容器地址”，避免 IP 回收后合法目标被自身 scope guard 挡住。
 - 代码落点：`internal/graph`、`internal/infoitem`、`internal/scopeguard` / `agent_guard`。
 
-### P1-3 worker 取消语义（部分落地：终止原因已写入 blocked/exhausted/stopped，见 §11.3；budget/lease/parent-cancel 的类型区分仍未落地）
+### P1-3 worker 取消语义（已落地：终止原因与状态同事务写入，见 §11.3；budget/stagnant/human 类型码、owner 围栏与退出确认均已实现；parent-cancel 仍写 `parent scan stopped`）
 
 - 区分 budget / lease / parent-cancel / platform-finish，写入 `blocked_reason`；
 - 禁止成批 `context canceled` 记为 failed 且 error 为空；
@@ -373,7 +373,8 @@ where instance_id='5e132b0566b6c116ad13312f744fd430'
 | 机制 | 实现 | 直接对应的第五轮事实 |
 |---|---|---|
 | 无进展即回收 | `internal/orchestrator/reclaim.go` `watchProgress`：execution lane 连续 `WorkerProgressTimeout`（默认 20m，`XALGORIX_WORKER_PROGRESS_TIMEOUT` 可调，`0/off` 关闭）无信息层增量 → steer 保存 → 以 `stagnant` 类型 kill → settle **exhausted** | a-03 4.6h、a-18 3.1h、c-02 92min、e3-04 41min（596 slot-min 换 0 分） |
-| 回收原因入审计 | `settle` 对 `blocked/exhausted/stopped` 全部写终止原因（`SetBlockedReason` 覆盖面扩展，内存/PG 两实现同步） | §4.4 的 79 条 `context canceled` 无原因 |
+| 回收原因入审计 | `Repository.SettleIntent`：owner 围栏 + state/owner/lease/`blocked_reason` 单条 UPDATE，原因与终态同事务落库（内存/PG 两实现同步）；旧 worker 的过期租约被重新领取后无法改写新 owner 的 running 行 | §4.4 的 79 条 `context canceled` 无原因；控制审查的高 5/中 7 |
+| 取消类型与退出确认 | `budget_exhausted` 成为引擎类型码（不再伪装成 `human`）；typed kill 被进度守卫拒绝时**不回落**普通 kill；`KillUnit` 记录 `KilledBy/KillReason`，worker 表写 `killed: …`；预算超时后 `WaitWorkerExit` 等 `done` 关闭才结算，原因带 `exit=confirmed/unconfirmed` | 控制审查的高 3/高 4 |
 | 释放平台槽位 | `enqueueContainerClose`：容器 intent 无 flag 结束时发放**一条**幂等 close intent（priority 4000、180s timebox、`target_kind=control_plane_api`、endpoint 取指令中的 `/…/challenges` 前缀）；同容器还有 live sibling 时不发放 | a-18 容器持续 open 3.1h |
 | 轮转前置 | close intent 优先级高于攻击 lane，materializer 下一 tick 即可补位 | §4.1 无“抢占/轮转”机制 |
 
@@ -387,8 +388,8 @@ where instance_id='5e132b0566b6c116ad13312f744fd430'
 |---|---|---|---|
 | 提交守卫 | 证据 → 判定（提交层） | `scanctx.SubmitGuard`（per-scan scratch）+ 工具 gate | 不改 Verifier/报告门；guard 只拒调用，不产生 finding |
 | lane 收口 | 行动（Operation）合法性 | `ToolSurface` + `checkHTTPHop` | 六环安全链不放宽，只收窄目的地址 |
-| 进展闸门 | 义务（Obligation）执行 | `orchestrator` 进度投影 + `ProgressStore` | 合同 timebox 下限不变；超时仍先 `KillWorker` 再结算 |
-| 终止原因 | 审计投影 | `exploration_nodes.blocked_reason` | 只加原因，不改状态机；`done` 仍只能经 `ConcludeIntent` |
+| 进展闸门 | 义务（Obligation）执行 | `orchestrator` 进度投影 + `ProgressStore` | 合同 timebox 下限不变；超时先 typed kill → 确认退出 → 结算 |
+| 终止原因 | 审计投影 | `exploration_nodes.blocked_reason`（与状态同一 `SettleIntent` UPDATE） | 只加原因，不改状态机；`done` 仍只能经 `ConcludeIntent` |
 | close intent | 行动（Operation） | 探索图 `intent` 节点（`origin=engine`） | 平台生命周期仍由 control-plane lane 执行 |
 
 ### 11.5 仍未落地（不在本次提交内）
@@ -404,3 +405,6 @@ where instance_id='5e132b0566b6c116ad13312f744fd430'
 
 §8 的指标表继续有效；其中**假 flag 提交、不存在题号的提交、控制面 lane 打容器、cancel 无原因**四项
 本轮已具备代码级保障，第六轮实测应直接观察是否为 0，而不是看 prompt 是否被遵守。
+2026-11-24 控制审查整改后，终结路径还额外记录 `exit=confirmed/unconfirmed`、typed kill 来源
+（`stagnant`/`budget_exhausted`/`human`）与 owner 围栏结果；复盘应按 run、unit、派发 agent 对齐这三个字段，
+不再把“有终态”当成“已退出/原因正确”。

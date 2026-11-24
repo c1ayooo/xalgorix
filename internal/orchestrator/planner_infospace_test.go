@@ -22,8 +22,13 @@ type fakeInfoSpaceReader struct {
 	regionErr  error
 	contextErr error
 
+	item      infospace.Item
+	itemFound bool
+	itemErr   error
+
 	regionCalls  []infospace.RegionQuery
 	contextCalls []infospace.ContextQuery
+	itemCalls    []infospace.ItemQuery
 }
 
 func (f *fakeInfoSpaceReader) Region(_ context.Context, q infospace.RegionQuery) (infospace.RegionResult, error) {
@@ -38,6 +43,11 @@ func (f *fakeInfoSpaceReader) Associate(context.Context, infospace.AssociationQu
 func (f *fakeInfoSpaceReader) ContextSlice(_ context.Context, q infospace.ContextQuery) (infospace.ContextResult, error) {
 	f.contextCalls = append(f.contextCalls, q)
 	return f.contextRes, f.contextErr
+}
+
+func (f *fakeInfoSpaceReader) Item(_ context.Context, q infospace.ItemQuery) (infospace.Item, bool, error) {
+	f.itemCalls = append(f.itemCalls, q)
+	return f.item, f.itemFound, f.itemErr
 }
 
 // fakeItems builds n items with descending observed_at and shuffled-ish IDs so
@@ -220,14 +230,84 @@ func TestPlannerOverviewInfoSpaceFallback(t *testing.T) {
 	}
 }
 
-func TestPlannerOverviewInfoSpaceEmptyResultFallsBack(t *testing.T) {
-	reader := &fakeInfoSpaceReader{} // no items
+func TestPlannerOverviewInfoSpaceEmptyResultIsAuthoritative(t *testing.T) {
+	// A successful empty read means the space is empty; the planner must not
+	// silently substitute the lexical ledger view.
+	sctx := scanctx.New("run-empty", "")
+	sctx.Ledger.Upsert(scanctx.Hypothesis{ID: "H-1", VulnClass: "sqli", Endpoint: "/login", Status: scanctx.HypothesisQueued})
+	reader := &fakeInfoSpaceReader{} // no items, no error
 	p := &Planner{cfg: PlannerConfig{
 		ScanID: "run-empty", Repo: graph.NewMemoryStore(), InfoSpace: reader,
-		Target: "10.0.1.5:8080",
+		ScanCtx: sctx, Target: "10.0.1.5:8080",
 	}, ctx: context.Background()}
 	out := p.overview()
 	if strings.Contains(out, "Information space") {
 		t.Fatalf("empty information space rendered an empty header:\n%s", out)
+	}
+	if strings.Contains(out, "Prior work") {
+		t.Fatalf("a successful empty read must not fall back to the lexical ledger:\n%s", out)
+	}
+}
+
+// TestPlannerOverviewInfoSpaceIncompleteGapIsVisible pins the gap contract: a
+// zero-item incomplete read must still render the cold-path reason.
+func TestPlannerOverviewInfoSpaceIncompleteGapIsVisible(t *testing.T) {
+	reader := &fakeInfoSpaceReader{region: infospace.RegionResult{
+		Incomplete: true, GapReason: "atom sync watermark behind at seq 42",
+	}}
+	p := &Planner{cfg: PlannerConfig{
+		ScanID: "run-gap", Repo: graph.NewMemoryStore(), InfoSpace: reader,
+		Target: "10.0.1.5:8080",
+	}, ctx: context.Background()}
+	out := p.overview()
+	for _, want := range []string{"Information space", "Region incomplete", "sync watermark"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("overview missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestReadInfoItemResolvesInformationSpaceID pins the detail lookup for the
+// aggregate graph-node ids the Information space block renders.
+func TestReadInfoItemResolvesInformationSpaceID(t *testing.T) {
+	reader := &fakeInfoSpaceReader{
+		item: infospace.Item{
+			ScanID: "run-detail", RunID: "run-detail", InfoID: "42",
+			Layer: infospace.LayerAggregate, Kind: "belief", State: "queued",
+			UnitKey: "H-1", Subject: "10.0.1.5:8080", Purpose: "sqli",
+			Nature:  "inferred",
+			Payload: []byte(`{"hypothesis_id":"H-1","confidence":0.7}`),
+		},
+		itemFound: true,
+	}
+	sctx := scanctx.New("run-detail", "")
+	p := &Planner{cfg: PlannerConfig{
+		ScanID: "run-detail", Repo: graph.NewMemoryStore(), ScanCtx: sctx, InfoSpace: reader,
+	}, ctx: context.Background()}
+	out := p.readInfoItem("42")
+	for _, want := range []string{"info_item 42", "aggregate/belief", "unit=H-1", "sqli", `"confidence":0.7`} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("detail missing %q:\n%s", want, out)
+		}
+	}
+	if len(reader.itemCalls) != 1 || reader.itemCalls[0].InfoID != "42" || reader.itemCalls[0].RunID != "run-detail" {
+		t.Fatalf("item lookup query = %+v", reader.itemCalls)
+	}
+}
+
+// TestReadInfoItemResolvesArchivedToolOutput pins XALG010's archive reference
+// leg: a to_<seq> id resolves to the archived raw output.
+func TestReadInfoItemResolvesArchivedToolOutput(t *testing.T) {
+	sctx := scanctx.New("planner-archive", t.TempDir())
+	id := sctx.ToolOutputs.Archive("curl", "ARCHIVED-PLANNER-OUTPUT", 1)
+	if id == "" {
+		t.Fatal("archive returned no id")
+	}
+	p := &Planner{cfg: PlannerConfig{
+		ScanID: "planner-archive", Repo: graph.NewMemoryStore(), ScanCtx: sctx,
+	}, ctx: context.Background()}
+	out := p.readInfoItem(id)
+	if !strings.Contains(out, "ARCHIVED-PLANNER-OUTPUT") || !strings.Contains(out, "tool_output "+id) {
+		t.Fatalf("archive detail = %q", out)
 	}
 }

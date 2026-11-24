@@ -9,6 +9,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -25,12 +26,27 @@ const (
 	KillReasonScopeViolation  = "scope_violation"
 	KillReasonDuplicate       = "duplicate"
 	KillReasonSuperseded      = "superseded"
+	// KillReasonBudgetExhausted is an engine cause (worker timebox), never a
+	// planner/human decision. It exists so a budget kill is not mislabeled as
+	// "human" in the worker table.
+	KillReasonBudgetExhausted = "budget_exhausted"
+	// KillReasonLeaseLost is an engine cause: the intent lease expired or was
+	// reclaimed. The old worker must stop before it produces side effects a new
+	// owner cannot see.
+	KillReasonLeaseLost = "lease_lost"
 )
 
-// killProgressWindow is the information-layer recency window a stagnant kill
+// ErrStagnantKillRefused is returned when the engine rejects a stagnant kill
+// because the worker produced information-layer progress inside the guard
+// window. Callers must treat this as "do not kill", not as a generic failure:
+// falling back to a plain (human-labeled) cancel is the round-5 bug.
+var ErrStagnantKillRefused = errors.New("stagnant kill refused: recent information-layer progress")
+
+// KillProgressWindow is the information-layer recency window a stagnant kill
 // must respect: a worker that produced an increment inside it may not be
-// killed as stagnant.
-const killProgressWindow = 2 * time.Minute
+// killed as stagnant. The orchestrator reuses it as the retry cooldown after a
+// refusal so the two guards cannot drift.
+const KillProgressWindow = 2 * time.Minute
 
 var validKillReasonCodes = map[string]bool{
 	KillReasonHuman:           true,
@@ -40,6 +56,8 @@ var validKillReasonCodes = map[string]bool{
 	KillReasonScopeViolation:  true,
 	KillReasonDuplicate:       true,
 	KillReasonSuperseded:      true,
+	KillReasonBudgetExhausted: true,
+	KillReasonLeaseLost:       true,
 }
 
 func normalizeKillReasonCode(code string) (string, error) {
@@ -136,6 +154,16 @@ func (a *Agent) KillWorker(unitID, reason string) error {
 	return a.KillWorkerWithReason(unitID, KillReasonHuman, reason)
 }
 
+// WaitWorkerExit blocks until the worker bound to unitID has actually exited
+// (its done channel closed). It is the exit-confirmation half of a kill: the
+// orchestrator may not settle the intent while the worker is still winding down.
+func (a *Agent) WaitWorkerExit(ctx context.Context, unitID string) error {
+	if a == nil || a.agentGraph == nil {
+		return fmt.Errorf("worker pool graph unavailable")
+	}
+	return a.agentGraph.WaitUnitExit(ctx, strings.TrimSpace(unitID))
+}
+
 // KillWorkerWithReason cancels the active worker for one unit after validating
 // the typed reason code. An empty code defaults to human.
 //
@@ -156,10 +184,18 @@ func (a *Agent) KillWorkerWithReason(unitID, reasonCode, reason string) error {
 		return fmt.Errorf("unit_id is required")
 	}
 	if code == KillReasonStagnant {
+		if agentID, ok := a.workerAgentID(unitID); ok {
+			if name, _, active := a.scanCtx.Progress.ActiveTool(agentID); active {
+				deadline, _ := a.scanCtx.Progress.ActiveToolDeadline(agentID)
+				if deadline.IsZero() || time.Now().Before(deadline) {
+					return fmt.Errorf("%w: tool %s is still running; wait for its result", ErrStagnantKillRefused, name)
+				}
+			}
+		}
 		_, lastProgress, ok := a.workerProgress(unitID)
 		if ok && !lastProgress.IsZero() {
-			if ago := time.Since(lastProgress); ago < killProgressWindow {
-				return fmt.Errorf("refusing stagnant kill for %s: the worker produced information-layer progress %s ago (window %s); steer it and wait for a real stall", unitID, ago.Round(time.Second), killProgressWindow)
+			if ago := time.Since(lastProgress); ago < KillProgressWindow {
+				return fmt.Errorf("%w: %s produced progress %s ago (window %s); steer it and wait for a real stall", ErrStagnantKillRefused, unitID, ago.Round(time.Second), KillProgressWindow)
 			}
 		}
 	}
@@ -170,6 +206,23 @@ func (a *Agent) KillWorkerWithReason(unitID, reasonCode, reason string) error {
 		reason = code + ": " + reason
 	}
 	return a.agentGraph.KillUnit(unitID, reason)
+}
+
+// workerAgentID resolves the delegated agent id for a unit without requiring a
+// progress timestamp. It is used by the active-tool guard, which must refuse a
+// stagnant kill even when the tool has not returned a result yet.
+func (a *Agent) workerAgentID(unitID string) (string, bool) {
+	if a == nil || a.scanCtx == nil || a.scanCtx.Progress == nil {
+		return "", false
+	}
+	unitID = strings.TrimSpace(unitID)
+	if unitID == "" {
+		return "", false
+	}
+	if agentID, ok := a.scanCtx.Progress.UnitAgent(unitID); ok && agentID != "" {
+		return agentID, true
+	}
+	return unitID, true
 }
 
 // workerProgress resolves the progress projection for a unit. The dispatch path
