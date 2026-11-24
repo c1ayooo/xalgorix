@@ -16,12 +16,24 @@ export function ObligationModule({
   plan,
   agents,
   running,
+  loading = false,
 }: {
   plan?: ScanPlanView;
   agents?: InstanceAgentsView;
   running: boolean;
+  /** plan/agents 首次取数中：给骨架而不是"暂无义务"的假空态。 */
+  loading?: boolean;
 }) {
   const { t } = useI18n();
+
+  if (loading && !plan && !agents) {
+    return (
+      <div className="min-h-0 flex-1 space-y-2 p-4" aria-busy="true">
+        <div className="h-3 w-1/3 animate-pulse rounded bg-muted" />
+        <div className="h-3 w-1/2 animate-pulse rounded bg-muted" />
+      </div>
+    );
+  }
 
   const unfinished = (plan?.tasks ?? []).filter(
     (task) => task.status === "pending" || task.status === "active",

@@ -70,7 +70,24 @@ export function dedupFindings(findings: FlatFinding[]): FlatFinding[] {
   out.sort((a, b) => {
     const sevDiff = severityRank(b.severity) - severityRank(a.severity);
     if (sevDiff !== 0) return sevDiff;
-    return (b.scan_started_at ?? "").localeCompare(a.scan_started_at ?? "");
+    // Same severity → newest REPORTED first. scan_started_at is the run's
+    // start (hours old on a long assessment) and must not decide recency.
+    return findingTimeMs(b) - findingTimeMs(a);
   });
   return out;
+}
+
+/**
+ * When the finding itself was reported, falling back to the owning run's start
+ * for rows persisted before `found_at` existed. Display and ordering both use
+ * this so a finding reported moments ago never reads as "4h ago".
+ */
+export function findingTimeMs(f: FlatFinding): number {
+  const t = Date.parse(f.found_at || f.scan_started_at || "");
+  return Number.isNaN(t) ? 0 : t;
+}
+
+/** Label helper: the finding's report time, else the run start. */
+export function findingTime(f: FlatFinding): string {
+  return f.found_at || f.scan_started_at || "";
 }

@@ -9,6 +9,7 @@ import { EmptyState } from "./states";
 import type { StreamingMessage } from "@/store/events";
 import { useI18n } from "@/i18n";
 import { ApprovalInlineBar } from "@/components/approval-inline-bar";
+import { Markdown } from "@/components/markdown";
 
 export type FeedFilter =
   | "all"
@@ -195,7 +196,9 @@ export function LiveEventRow({ event }: { event: FeedEvent }) {
             <div className="mb-1 text-[10px] uppercase tracking-wider text-muted-foreground">
               {event.agent_id && <span className="mono">{event.agent_id}</span>}
             </div>
-            <div className="whitespace-pre-wrap text-foreground">{event.content}</div>
+            <div className="text-foreground">
+              <Markdown source={event.content} />
+            </div>
           </div>
         </div>
       )}
@@ -273,6 +276,8 @@ export function LiveFeed({
   // 整块替换内容。事件流里的 vulns 快照受广播门/活跃状态/缓冲窗口三重裁剪，
   // 拿它当发现列表必然与任务详情对不上。
   findingsPanel,
+  // LLM 视图：进程级 key 池状态与自动切换流水（/api/pool 轮询，非事件流）。
+  llmPanel,
 }: {
   events: FeedEvent[];
   filter: FeedFilter;
@@ -289,6 +294,7 @@ export function LiveFeed({
   streaming?: StreamingMessage[];
   httpPanel?: ReactNode;
   findingsPanel?: ReactNode;
+  llmPanel?: ReactNode;
 }) {
   const { t } = useI18n();
   const paused = useEventsStore((s) => s.paused);
@@ -307,7 +313,13 @@ export function LiveFeed({
   // 事件有意义的控件（导出/暂停/清空）。未传面板时回退到事件行，保持其他页
   // 复用本组件时的既有行为。
   const activePanel =
-    filter === "http" ? httpPanel : filter === "findings" ? findingsPanel : undefined;
+    filter === "http"
+      ? httpPanel
+      : filter === "findings"
+        ? findingsPanel
+        : filter === "llm"
+          ? llmPanel
+          : undefined;
 
   function handleExport(format: FeedExportFormat) {
     exportFeedEvents({

@@ -114,7 +114,8 @@ import {
 } from "lucide-react";
 import { LiveFeed, type FeedFilter } from "@/components/live-feed";
 import { Pagination, DEFAULT_PAGE_SIZE } from "@/components/Pagination";
-import type { SubScanSummary, VulnSummary, WSEvent } from "@/types/api";
+import { extractRawHttpBlocks, isHttpFinding } from "@/lib/http-poc";
+import type { HttpExchange, SubScanSummary, VulnSummary, WSEvent } from "@/types/api";
 
 export default function ScanDetailPage() {
   const { t } = useI18n();
@@ -315,9 +316,15 @@ export default function ScanDetailPage() {
               义务未清=amber、自由文本原样 mono——词表照引擎枚举，不造新状态。 */}
           <StopReasonBadge reason={scan.stop_reason} />
           <Button variant="outline" size="sm" asChild>
-            <a href={api.reportUrl(scan.id)} target="_blank" rel="noreferrer">
-              <Download className="mr-1 h-4 w-4" /> {t("nav.reports")}
-            </a>
+            {scan.task_id ? (
+              <Link to={`/tasks/${scan.task_id}?tab=reports`}>
+                <Download className="mr-1 h-4 w-4" /> {t("nav.reports")}
+              </Link>
+            ) : (
+              <a href={api.reportUrl(scan.id)} target="_blank" rel="noreferrer">
+                <Download className="mr-1 h-4 w-4" /> {t("nav.reports")}
+              </a>
+            )}
           </Button>
           {canStart && scan.task_id && (
             <Button
@@ -1251,12 +1258,14 @@ function FindingRowMenu({
   );
 }
 
-function FindingDetailsDialog({
+export function FindingDetailsDialog({
   scanId,
+  sourceScanId,
   finding,
   onOpenChange,
 }: {
   scanId: string;
+  sourceScanId?: string;
   finding: VulnSummary | null;
   onOpenChange: (open: boolean) => void;
 }) {
@@ -1305,6 +1314,25 @@ function FindingDetailsDialog({
               </DialogDescription>
             </DialogHeader>
 
+            <div className="flex flex-wrap items-center gap-2 rounded-md border border-border bg-muted/20 px-3 py-2">
+              <span className="text-[10px] uppercase tracking-wider text-muted-foreground">
+                {t("findings.export", "导出")}
+              </span>
+              {(["md", "html", "json"] as const).map((format) => (
+                <a
+                  key={format}
+                  href={api.findingExportUrl(
+                    sourceScanId || scanId,
+                    finding.id,
+                    format,
+                  )}
+                  className="rounded border border-border px-2 py-0.5 text-[11px] uppercase text-muted-foreground hover:bg-muted hover:text-foreground"
+                >
+                  {format}
+                </a>
+              ))}
+            </div>
+
             <div className="grid min-w-0 max-w-full gap-3 rounded-md border border-border bg-muted/20 p-3 text-sm sm:grid-cols-2">
               <DetailRow label={t("scans.col.target")} value={finding.target} mono />
               <DetailRow label={t("findings.field.endpoint")} value={finding.endpoint} mono />
@@ -1317,6 +1345,13 @@ function FindingDetailsDialog({
                 label={t("findings.field.verification")}
                 value={finding.verification_method}
               />
+              {sourceScanId && sourceScanId !== scanId && (
+                <DetailRow
+                  label={t("findings.field.sourceScan", "来源扫描")}
+                  value={sourceScanId}
+                  mono
+                />
+              )}
             </div>
 
             <Separator />
@@ -1328,25 +1363,9 @@ function FindingDetailsDialog({
                 title={t("findings.section.analysis")}
                 value={finding.technical_analysis}
               />
-              <DetailSection
-                title={t("findings.section.poc")}
-                value={finding.poc_description}
-              />
-              {finding.poc_script && (
-                <DetailSection
-                  title={t("findings.section.pocScript")}
-                  value={finding.poc_script}
-                  code
-                />
-              )}
-              {finding.exploitation_proof && (
-                <DetailSection
-                  title={t("findings.section.exploitProof")}
-                  value={finding.exploitation_proof}
-                  code
-                />
-              )}
-              <FindingHttpExchanges scanId={scanId} finding={finding} />
+              {/* PoC：HTTP 类发现以原始请求/响应为准（归档 > 模型记录的报文 >
+                  脚本），非 HTTP 类保持原有脚本/证明段落。 */}
+              <FindingPoc scanId={scanId} finding={finding} />
               <DetailSection title={t("findings.section.remediation")} value={finding.remediation} />
               {finding.fix && (
                 <DetailSection title={t("findings.section.suggestedFix")} value={finding.fix} code />
@@ -1412,87 +1431,173 @@ function DetailSection({
 }
 
 // 流量代理为该 finding 记录的原始 HTTP 交互（wire 包，未脱敏）。懒加载：
-// 打开详情弹窗才拉取；扫描没有流量归档（代理关闭或旧扫描）或无匹配时整段
-// 不渲染——不堆空态文案。
+// 打开详情弹窗才拉取；扫描没有流量归档（代理关闭或旧扫描）或无匹配时返回空，
+// 由调用方决定回退（HTTP 类发现退回"模型记录的原始报文"或脚本）。
 //
 // 证据绑定：endpoint 子串 + 资产 host 双条件。只按路径匹配会让 A 资产上的
 // 同名路径流量冒充 B 资产的证据；host 来自 finding.target（发现项所属资产），
 // 解析不出 host 时退回纯 endpoint 匹配。
-function FindingHttpExchanges({
-  scanId,
-  finding,
-}: {
-  scanId: string;
-  finding: VulnSummary;
-}) {
-  const { t } = useI18n();
+function useFindingHttpExchanges(
+  scanId: string,
+  finding: VulnSummary,
+  enabled: boolean,
+) {
   const assetHost = hostFromAsset(finding.target ?? finding.endpoint);
-  const { data } = useScanTrafficQuery(findingSourceScanId(scanId, finding), {
+  const sourceScanId = findingSourceScanId(scanId, finding);
+  // 优先按 finding 落库时绑定的 (session, seq) 精确取包——这是确认漏洞那一刻的
+  // wire 证据；只有旧 finding（无 refs）或归档被清理时才退回 endpoint/host 匹配。
+  const refsParam = (finding.traffic_refs ?? [])
+    .map((ref) => `${ref.session ?? ""}:${ref.seq}`)
+    .join(",");
+  const refsQuery = useScanTrafficQuery(sourceScanId, {
+    refs: refsParam,
+    enabled: enabled && !!refsParam,
+  });
+  const refsEmpty =
+    !!refsParam && refsQuery.isFetched && (refsQuery.data?.exchanges?.length ?? 0) === 0;
+  const fallbackQuery = useScanTrafficQuery(sourceScanId, {
     endpoint: finding.endpoint,
     method: finding.method,
     host: assetHost || undefined,
+    enabled: enabled && (!refsParam || refsEmpty),
   });
-  const exchanges = data?.exchanges ?? [];
-  if (exchanges.length === 0) return null;
+  const data =
+    (refsQuery.data?.exchanges?.length ?? 0) > 0 ? refsQuery.data : fallbackQuery.data;
+  return {
+    exchanges: data?.exchanges ?? [],
+    truncated: !!data?.truncated,
+    totalMatched: data?.total_matched ?? 0,
+  };
+}
+
+const RAW_BLOCK_CLASS =
+  "max-h-64 min-w-0 max-w-full overflow-auto whitespace-pre-wrap rounded-md border border-border bg-muted p-3 text-xs leading-relaxed text-foreground [overflow-wrap:anywhere]";
+
+/** 一条归档交互：方法/URL/状态摘要 + 原始请求与响应报文。 */
+function WireExchangeCard({ exchange }: { exchange: HttpExchange }) {
+  const { t } = useI18n();
   return (
-    <section className="min-w-0 max-w-full space-y-2">
-      <h4 className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
-        {t("findings.section.httpExchanges")}
-      </h4>
-      <div className="min-w-0 max-w-full space-y-3">
-        {exchanges.map((ex) => (
-          <div
-            key={ex.seq}
-            className="min-w-0 max-w-full space-y-2 rounded-md border border-border p-2"
+    <div className="min-w-0 max-w-full space-y-2 rounded-md border border-border p-2">
+      <div className="flex min-w-0 flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
+        <span className="mono font-medium text-foreground">{exchange.method}</span>
+        <span className="mono min-w-0 truncate">{exchange.url}</span>
+        {typeof exchange.status === "number" && (
+          <span
+            className={cn(
+              "mono",
+              exchange.denied
+                ? "text-destructive"
+                : exchange.status < 400
+                  ? "text-emerald-600 dark:text-emerald-400"
+                  : "text-amber-600 dark:text-amber-400",
+            )}
           >
-            <div className="flex min-w-0 flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
-              <span className="mono font-medium text-foreground">{ex.method}</span>
-              <span className="mono min-w-0 truncate">{ex.url}</span>
-              {typeof ex.status === "number" && (
-                <span
-                  className={cn(
-                    "mono",
-                    ex.denied
-                      ? "text-destructive"
-                      : ex.status < 400
-                        ? "text-emerald-600 dark:text-emerald-400"
-                        : "text-amber-600 dark:text-amber-400",
-                  )}
-                >
-                  {ex.status}
-                </span>
-              )}
-              {ex.high_risk && (
-                <span className="mono min-w-0 truncate text-amber-600 dark:text-amber-400">
-                  {ex.high_risk}
-                </span>
-              )}
-            </div>
-            {ex.request_raw && (
-              <pre className="max-h-64 min-w-0 max-w-full overflow-auto whitespace-pre-wrap rounded-md border border-border bg-muted p-3 text-xs leading-relaxed text-foreground [overflow-wrap:anywhere]">
-                <code>
-                  {ex.request_raw}
-                  {ex.request_truncated ? `\n${t("findings.http.truncated")}` : ""}
-                </code>
-              </pre>
-            )}
-            {ex.response_raw && (
-              <pre className="max-h-64 min-w-0 max-w-full overflow-auto whitespace-pre-wrap rounded-md border border-border bg-muted p-3 text-xs leading-relaxed text-foreground [overflow-wrap:anywhere]">
-                <code>
-                  {ex.response_raw}
-                  {ex.response_truncated ? `\n${t("findings.http.truncated")}` : ""}
-                </code>
-              </pre>
-            )}
-          </div>
-        ))}
+            {exchange.status}
+          </span>
+        )}
+        {exchange.high_risk && (
+          <span className="mono min-w-0 truncate text-amber-600 dark:text-amber-400">
+            {exchange.high_risk}
+          </span>
+        )}
       </div>
-      {data?.truncated && (
-        <p className="mono text-[11px] text-muted-foreground">
-          {t("findings.http.moreHidden").replace("%d", String(data.total_matched))}
-        </p>
+      {exchange.request_raw && (
+        <pre className={RAW_BLOCK_CLASS}>
+          <code>
+            {exchange.request_raw}
+            {exchange.request_truncated ? `\n${t("findings.http.truncated")}` : ""}
+          </code>
+        </pre>
       )}
-    </section>
+      {exchange.response_raw && (
+        <pre className={RAW_BLOCK_CLASS}>
+          <code>
+            {exchange.response_raw}
+            {exchange.response_truncated ? `\n${t("findings.http.truncated")}` : ""}
+          </code>
+        </pre>
+      )}
+    </div>
+  );
+}
+
+/**
+ * PoC 区（HTTP 类发现显示原始 HTTP，而不是只给一段 curl 脚本）：
+ *
+ *   1) 有流量归档 → 逐字报文（权威证据）；
+ *   2) 无归档但利用证明里有可解析的请求/响应 → 逐行照录，并注明来源是模型记录
+ *      （不做任何补全/合成，避免把"看起来像 wire"的内容冒充证据）；
+ *   3) 都没有 → 保持原有脚本/证明段落，不伪造 raw。
+ *
+ * 非 HTTP 类发现（TCP/TELNET/代码审计等）不进入 1/2，行为与之前一致。
+ */
+function FindingPoc({ scanId, finding }: { scanId: string; finding: VulnSummary }) {
+  const { t } = useI18n();
+  const httpFinding = useMemo(() => isHttpFinding(finding), [finding]);
+  const http = useFindingHttpExchanges(scanId, finding, httpFinding);
+  const hasWire = http.exchanges.length > 0;
+  // 归档已覆盖时不再从证明里再抄一份：两份"报文"并列会让读者分不清哪份是证据。
+  const modelBlocks = useMemo(
+    () =>
+      httpFinding && !hasWire
+        ? extractRawHttpBlocks(finding.exploitation_proof ?? "")
+        : [],
+    [httpFinding, hasWire, finding.exploitation_proof],
+  );
+  const hasModel = modelBlocks.length > 0;
+
+  return (
+    <div className="min-w-0 max-w-full space-y-4">
+      {(hasWire || hasModel) && (
+        <section className="min-w-0 max-w-full space-y-2">
+          <h4 className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
+            {hasWire
+              ? t("findings.section.pocHttp")
+              : t("findings.section.pocHttpModel")}
+          </h4>
+          {!hasWire && (
+            <p className="text-[11px] text-muted-foreground">
+              {t("findings.poc.modelSource")}
+            </p>
+          )}
+          {hasWire
+            ? http.exchanges.map((exchange) => (
+                <WireExchangeCard
+                  key={`${exchange.session ?? ""}:${exchange.seq}`}
+                  exchange={exchange}
+                />
+              ))
+            : modelBlocks.map((block, index) => (
+                <div key={`${block.kind}:${index}`} className="min-w-0 space-y-1">
+                  <span className="mono text-[10px] uppercase tracking-wider text-muted-foreground">
+                    {block.kind === "request"
+                      ? t("findings.http.request")
+                      : t("findings.http.response")}
+                  </span>
+                  <pre className={RAW_BLOCK_CLASS}>
+                    <code>{block.raw}</code>
+                  </pre>
+                </div>
+              ))}
+          {hasWire && http.truncated && (
+            <p className="mono text-[11px] text-muted-foreground">
+              {t("findings.http.moreHidden").replace("%d", String(http.totalMatched))}
+            </p>
+          )}
+        </section>
+      )}
+      <DetailSection title={t("findings.section.poc")} value={finding.poc_description} />
+      {finding.poc_script && (
+        <DetailSection title={t("findings.section.pocScript")} value={finding.poc_script} code />
+      )}
+      {finding.exploitation_proof && (
+        <DetailSection
+          title={t("findings.section.exploitProof")}
+          value={finding.exploitation_proof}
+          code
+        />
+      )}
+    </div>
   );
 }
 

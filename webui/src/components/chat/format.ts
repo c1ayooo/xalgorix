@@ -73,7 +73,16 @@ export function agentLane(instanceId: string | undefined, agentId: string | unde
 export function isMainAgentLane(instanceId: string | undefined, agentId: string | undefined): boolean {
   if (!agentId) return true; // 无 agent_id 的行（人工/系统）归主会话
   const lane = agentLane(instanceId, agentId);
-  return lane === "coordinator" || (!!instanceId && agentId === instanceId);
+  if (lane === "coordinator" || (!!instanceId && agentId === instanceId)) return true;
+  // 引擎侧的非 worker 角色不属于主 Agent：planner 的计划活动挂左栏 Planner
+  // 模块，operator_chat 是旁路问答已有自己的 role="chat" 行。它们若落进
+  // 主栏就会把 Planner/问答内容混进主 Agent 对话。
+  if (lane === "planner" || lane === "operator_chat") return false;
+  // 根 agent 的真实 id 是 `agent_<ts>`（agent.NewAgent），续跑/重派还会在同
+  // 一 instance 下出现多个不同 id。只有 agentsgraph 的委派子 agent 才用
+  // `sub_`/`sync_` 前缀（nextIDLocked），其余一律属于主会话。判据必须与后端
+  // isRootAgentEvent 一致，否则主会话转录会被过滤成空。
+  return !lane.startsWith("sub_") && !lane.startsWith("sync_");
 }
 
 /**

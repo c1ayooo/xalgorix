@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
 import { Loader2, Pause, Play } from "lucide-react";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { api } from "@/api/client";
 import {
@@ -9,30 +10,81 @@ import {
   useStartTaskRun,
 } from "@/api/queries";
 import { useI18n } from "@/i18n";
+import { cn } from "@/lib/utils";
 import type { Run, Task } from "@/types/api";
 
 /** 活跃 run 判定：pending（入队等待 admission）也算占用任务。 */
 const ACTIVE_STATUSES = new Set(["running", "pending", "paused"]);
 
 /**
- * 任务运行状态机（用户裁决：任务一次性，点击运行后按钮变暂停）：
+ * 任务运行态（用户裁决：一个任务只有一个 run，内容跑过就不再裸跑）。
  *
- *   idle（无活跃 Run）       → 运行（Play，发起 Run；ack 成功即乐观翻转为排队）
- *   pending（排队等待槽位）   → 排队中（禁用，避免误认为可再发起）
- *   running                  → 暂停（Pause，pause 活跃 Run 的实例）
- *   paused                   → 恢复（Resume，resume 实例）
+ *   runnable  → 从未跑 / 已编辑（内容与上次派发不同）→ 「运行」
+ *   pending   → 排队等槽位（禁用）
+ *   running   → 「暂停」
+ *   paused    → 「恢复」
+ *   completed → 运行已把双图走完（completion=full），且内容未变 → 不显示运行
+ *   unmet     → 运行停下但意图未达成（completion=partial），且内容未变 → 不显示运行
  *
- * 状态源：优先 runs 投影（详情页传 `runs`），否则 task.last_run_status
- * （列表轮询投影）。状态变化经 WS 生命周期桥 + 既有轮询收敛（UI_DESIGN §9）。
+ * 「内容未变」的权威是后端投影 `content_changed_since_run`：它比较的是任务
+ * 可运行内容的修订值（目标/指令/结构化目标/阶段策略/上下文文件/模型链），
+ * 不是时间戳——改名、改定时、改审批模式都不解锁重跑。终态判定也不看
+ * failed：任务只有「已完成」和「未达成意图」两种读法。
  */
-export function taskRunState(task: Task, runs?: Run[]): string {
+export type TaskRunState =
+  | "runnable"
+  | "completed"
+  | "unmet"
+  | "pending"
+  | "running"
+  | "paused";
+
+export function taskRunIsActive(state: TaskRunState): boolean {
+  return state === "running" || state === "pending" || state === "paused";
+}
+
+export function taskRunState(task: Task, runs?: Run[]): TaskRunState {
   if (runs) {
     const active = runs.find((r) => ACTIVE_STATUSES.has(r.status));
-    if (active) return active.status;
-    return "idle";
+    if (active) return active.status as TaskRunState;
+  } else {
+    const status = (task.last_run_status ?? "").toLowerCase();
+    if (ACTIVE_STATUSES.has(status)) return status as TaskRunState;
   }
-  const status = task.last_run_status ?? "";
-  return ACTIVE_STATUSES.has(status) ? status : "idle";
+  // Settled (or never run): a plain run exists only while the runnable
+  // content has not been consumed by a dispatch.
+  if (task.content_changed_since_run === false) {
+    return task.last_run_completion === "full" ? "completed" : "unmet";
+  }
+  return "runnable";
+}
+
+/** 运行态章：详情页头部与任务列表共用同一派生来源。 */
+export function TaskRunStateBadge({
+  task,
+  runs,
+  className,
+}: {
+  task: Task;
+  runs?: Run[];
+  className?: string;
+}) {
+  const { t } = useI18n();
+  const state = taskRunState(task, runs);
+  const variant =
+    state === "running"
+      ? "success"
+      : state === "pending" || state === "paused" || state === "unmet"
+        ? "warning"
+        : "muted";
+  return (
+    <Badge variant={variant} className={cn("shrink-0 gap-1", className)}>
+      {state === "running" && (
+        <span className="size-1 rounded-full bg-emerald-500 pulse-dot" aria-hidden />
+      )}
+      {t(`taskDetail.state.${state}`)}
+    </Badge>
+  );
 }
 
 export function TaskRunButton({ task, runs }: { task: Task; runs?: Run[] }) {
@@ -48,11 +100,12 @@ export function TaskRunButton({ task, runs }: { task: Task; runs?: Run[] }) {
 
   const derived = taskRunState(task, runs);
   // 乐观态只在真实投影尚未显示活跃 run 时兜底（轮询/WS 桥会很快收敛）。
+  // 旧投影此刻可能仍读作 completed/unmet，同样要盖成排队中。
   const state =
-    optimisticStart && derived === "idle" ? "pending" : derived;
+    optimisticStart && !taskRunIsActive(derived) ? "pending" : derived;
 
   useEffect(() => {
-    if (derived !== "idle") setOptimisticStart(false);
+    if (taskRunIsActive(derived)) setOptimisticStart(false);
   }, [derived]);
 
   const busy =
@@ -139,6 +192,11 @@ export function TaskRunButton({ task, runs }: { task: Task; runs?: Run[] }) {
       </Button>
     );
   }
+
+  // completed / unmet: this content already ran. No plain run button — the
+  // operator continues by editing the task (「新目标」/「编辑」), which flips
+  // content_changed_since_run back to true.
+  if (state !== "runnable") return null;
 
   return (
     <Button size={runs ? "default" : "sm"} disabled={busy} onClick={start}>

@@ -25,6 +25,7 @@ export function Composer({
   disabled,
   placeholder,
   leftSlot,
+  seed,
   onSend,
   onStop,
   stopping,
@@ -36,6 +37,8 @@ export function Composer({
   placeholder?: string;
   /** Draft picker etc. — full width on tiny screens (reference leftSlot). */
   leftSlot?: ReactNode;
+  /** Editing a sent turn: replace the draft text when nonce changes. */
+  seed?: { text: string; nonce: number };
   onSend: (message: string, attachments: ChatAttachment[]) => Promise<void> | void;
   onStop?: () => void;
   stopping?: boolean;
@@ -48,6 +51,12 @@ export function Composer({
   const [sending, setSending] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (!seed || !seed.text) return;
+    setDraft(seed.text);
+    requestAnimationFrame(() => textareaRef.current?.focus());
+  }, [seed?.nonce]);
 
   useEffect(() => {
     setAttachments([]);

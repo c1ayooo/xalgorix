@@ -31,8 +31,10 @@ import {
 } from "@/components/ui/select";
 import { SeverityBadge } from "@/components/severity-badge";
 import { VerificationBadge } from "@/components/verification-badge";
-import { EmptyState } from "@/components/states";
+import { EmptyState, ErrorState } from "@/components/states";
 import { Skeleton } from "@/components/ui/skeleton";
+import { api } from "@/api/client";
+import { FindingDetailsDialog } from "@/pages/scan-detail";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -56,7 +58,7 @@ import {
 } from "@/api/queries";
 import { useActiveProjectId } from "@/lib/use-active-project";
 import type { FindingsSummaryResponse } from "@/types/api";
-import { dedupFindings, type FlatFinding } from "@/lib/findings";
+import { dedupFindings, findingTime, type FlatFinding } from "@/lib/findings";
 import {
   cn,
   normalizeSeverity,
@@ -78,6 +80,7 @@ export default function FindingsPage() {
   const qc = useQueryClient();
   const del = useDeleteVuln();
   const [pendingDelete, setPendingDelete] = useState<string[] | null>(null);
+  const [details, setDetails] = useState<FlatFinding | null>(null);
   const { data: projectsData } = useProjects();
   const projects = projectsData?.projects ?? [];
 
@@ -352,6 +355,29 @@ export default function FindingsPage() {
               <Skeleton key={i} className="h-12 w-full" />
             ))}
           </div>
+        ) : findingsQuery.error ? (
+          // A failed read must never render as "no findings": that is how an
+          // empty scope or a backend hiccup gets mistaken for a clean scan.
+          <ErrorState
+            className="m-3"
+            title={t("findings.loadFailed")}
+            description={
+              findingsQuery.error instanceof Error
+                ? findingsQuery.error.message
+                : String(findingsQuery.error)
+            }
+            action={
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                onClick={refreshAll}
+                disabled={findingsQuery.isFetching}
+              >
+                {t("common.retry")}
+              </Button>
+            }
+          />
         ) : filtered.length === 0 ? (
           <EmptyState
             icon={<ShieldAlert className="h-6 w-6" />}
@@ -385,7 +411,7 @@ export default function FindingsPage() {
                           {f.title}
                         </p>
                         <span className="mono text-[11px] text-muted-foreground">
-                          {timeAgo(f.scan_started_at)}
+                          {timeAgo(findingTime(f))}
                         </span>
                       </div>
                       <div className="mt-1 flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
@@ -412,9 +438,18 @@ export default function FindingsPage() {
                         <span className="ml-auto truncate">→ {f.scan_target}</span>
                       </div>
                     </Link>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="shrink-0"
+                      onClick={() => setDetails(f)}
+                    >
+                      详情
+                    </Button>
                     <RowActionMenu
                       finding={f}
                       deleting={del.isPending}
+                      onDetails={() => setDetails(f)}
                       onDelete={() => setPendingDelete([key])}
                     />
                   </li>
@@ -465,6 +500,13 @@ export default function FindingsPage() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      <FindingDetailsDialog
+        scanId={details?.scan_id ?? ""}
+        sourceScanId={details?.scan_id}
+        finding={details}
+        onOpenChange={(open) => !open && setDetails(null)}
+      />
     </div>
   );
 }
@@ -513,10 +555,12 @@ function BulkActionMenu({
 function RowActionMenu({
   finding,
   deleting,
+  onDetails,
   onDelete,
 }: {
   finding: FlatFinding;
   deleting: boolean;
+  onDetails: () => void;
   onDelete: () => void;
 }) {
   return (
@@ -533,12 +577,30 @@ function RowActionMenu({
       </DropdownMenu.Trigger>
       <DropdownMenu.Portal>
         <DropdownMenu.Content align="end" className={menuContentClass}>
+          <DropdownMenu.Item
+            className={menuItemClass}
+            onSelect={() => onDetails()}
+          >
+            <ShieldAlert className="h-3.5 w-3.5" />
+            详情
+          </DropdownMenu.Item>
           <DropdownMenu.Item asChild className={menuItemClass}>
             <Link to={`/scans/${finding.scan_id}`}>
               <ExternalLink className="h-3.5 w-3.5" />
               Open scan
             </Link>
           </DropdownMenu.Item>
+          <DropdownMenu.Separator className="-mx-1 my-1 h-px bg-border" />
+          {(["md", "html", "json"] as const).map((format) => (
+            <DropdownMenu.Item key={format} asChild className={menuItemClass}>
+              <a
+                href={api.findingExportUrl(finding.scan_id, finding.id, format)}
+                download
+              >
+                导出 {format.toUpperCase()}
+              </a>
+            </DropdownMenu.Item>
+          ))}
           <DropdownMenu.Separator className="-mx-1 my-1 h-px bg-border" />
           <DropdownMenu.Item
             disabled={deleting}

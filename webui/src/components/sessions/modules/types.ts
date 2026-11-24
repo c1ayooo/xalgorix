@@ -22,7 +22,7 @@ export interface ModuleData {
   run?: Run;
   instanceId?: string;
   running: boolean;
-  /** 当前 ?agent= 值：undefined=主会话；模块 id 或 worker agent_id。 */
+  /** 当前 ?agent= 值：undefined=主会话；模块 id；worker 泳道 unit:<unit_id> 或 legacy agent_id。 */
   lane?: string;
   plan?: ScanPlanView;
   planLoading: boolean;
@@ -35,14 +35,14 @@ export interface ModuleData {
   onSelectLane: (lane?: string) => void;
 }
 
-/** 左栏子行：worker 组按「一个 worker 一行」展开，点击直达该 agent 的转录。 */
+/** 左栏子行：worker 组按「一个工作单元一行」展开，点击直达该 unit 的转录。 */
 export interface RailChild {
-  /** ?agent= 深链值（worker 的 agent_id）。 */
+  /** ?agent= 深链值（unit:<unit_id>；legacy spawn 为 agent_id）。 */
   id: string;
   label: string;
-  /** 行尾的稳定标识（agent_id），等宽小字。 */
+  /** 行尾的稳定标识（unit_id / agent_id），等宽小字。 */
   meta?: string;
-  /** queued | running | completed | failed —— 决定状态点。 */
+  /** queued | running | paused | completed | failed —— 决定状态点。 */
   status?: string;
   active?: boolean;
 }

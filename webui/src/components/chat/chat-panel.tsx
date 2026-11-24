@@ -74,6 +74,9 @@ export function ChatPanel({
   // undefined = 投影还在加载（或刚切换会话），保持底部布局，等上报后落位，
   // 避免"先居中再跳底"或沿用上一个会话的空态。
   const [empty, setEmpty] = useState<boolean | undefined>(undefined);
+  // Editing a sent turn: the text is loaded back into the composer and sent as
+  // a new turn (history is append-only; the original row is never rewritten).
+  const [editSeed, setEditSeed] = useState<{ text: string; nonce: number } | undefined>(undefined);
   // 发送语义按投影分开（4zreco 对话页）：人工页默认「提问」走旁路应答（保证
   // 有回应、不消耗扫描轮次），指令通过同一个小选择按钮切换、注入主循环（HITL
   // guidance）；转录页默认「指令」，因为它就是执行过程的下发口。
@@ -255,8 +258,10 @@ export function ChatPanel({
         <div className="min-h-0 flex-1 overflow-hidden">
           <UserConversation
             instanceId={instanceId}
+            taskId={run.task_id}
             pending={questionPending}
             onEmptyChange={setEmpty}
+            onEditMessage={(text) => setEditSeed({ text, nonce: Date.now() })}
             className="h-full bg-muted/10"
           />
         </div>
@@ -264,6 +269,7 @@ export function ChatPanel({
 
       <Composer
         instanceId={instanceId}
+        seed={editSeed}
         // 提问模式下发送键保持发送（停止控制在次行头部已有）；指令模式沿用
         // 「运行中发送键变停止键」的参照语义。
         running={running && sendMode === "directive"}

@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { EmptyState } from "@/components/states";
 import { SessionRail } from "@/components/sessions/session-rail";
 import { SessionWorkspace } from "@/components/sessions/session-workspace";
@@ -8,9 +8,10 @@ import { findModule } from "@/components/sessions/modules/registry";
 import { useProjectionInvalidation } from "@/components/sessions/modules/use-projection-invalidation";
 import type { ModuleData } from "@/components/sessions/modules/types";
 import { useLiveSessionKeys } from "@/components/session-item";
-import { useInstanceAgents, useRunEvents, useScanPlan, useTaskWorkers } from "@/api/queries";
+import { useInstanceAgents, useRunEvents, useScanPlan } from "@/api/queries";
 import { cn } from "@/lib/utils";
 import { useI18n } from "@/i18n";
+import { pickLatestRun } from "@/hooks/use-run-selection";
 import type { Run } from "@/types/api";
 
 /**
@@ -49,7 +50,6 @@ export function SessionsTab({
   const liveKeys = useLiveSessionKeys();
   const selectedRun = runs.find((run) => run.instance_id === selectedInstanceId);
   const running = selectedRun?.status === "running";
-  const anyRunActive = runs.some((run) => run.status === "running" || run.status === "pending");
 
   useProjectionInvalidation(selectedInstanceId, taskId);
 
@@ -59,11 +59,37 @@ export function SessionsTab({
 
   const plan = useScanPlan(selectedInstanceId, running);
   const agents = useInstanceAgents(selectedInstanceId, running);
-  // Task-scoped worker history: every delegating run's workers, terminal
-  // workers included, so the rail keeps the full history after output stops.
-  const taskWorkers = useTaskWorkers(taskId, anyRunActive);
 
-  const lane = agentLaneName;
+  // Clicking a rail group before choosing a Run must still show that group's
+  // data. The sessions page deliberately does not auto-select a Run on open
+  // (R7: no implicit main-agent session), so the first group click binds the
+  // latest Run and the lane in ONE URL write — two writes in the same tick
+  // would overwrite each other.
+  const latestRun = useMemo(() => pickLatestRun(runs), [runs]);
+  // Default-load: bind the latest run on open so the workspace is not empty
+  // until the operator clicks something. Layout is unchanged; this only removes
+  // the "click Planner first" step.
+  useEffect(() => {
+    if (!selectedInstanceId && latestRun?.instance_id) {
+      onSelectRun(latestRun.instance_id);
+    }
+  }, [selectedInstanceId, latestRun?.instance_id, onSelectRun]);
+
+  const selectLane = useCallback(
+    (next?: string) => {
+      if (next && !selectedInstanceId && latestRun?.instance_id) {
+        onOpenWorker(latestRun.instance_id, next);
+        return;
+      }
+      onSelectAgentLane(next);
+    },
+    [selectedInstanceId, latestRun, onOpenWorker, onSelectAgentLane],
+  );
+
+  // No explicit lane: open the plan projection by default (the module was
+  // always loaded; only its rendering was gated behind a click). The main
+  // conversation is addressed explicitly as lane "main".
+  const lane = agentLaneName ?? (selectedInstanceId ? "plan" : undefined);
   const moduleData: ModuleData = useMemo(
     () => ({
       run: selectedRun,
@@ -77,11 +103,12 @@ export function SessionsTab({
       agentsLoading: agents.isLoading,
       agentsError: !!agents.error,
       feedEvents,
-      onSelectLane: onSelectAgentLane,
+      onSelectLane: selectLane,
     }),
     [
       selectedRun,
       selectedInstanceId,
+      runs.length,
       running,
       lane,
       plan.data,
@@ -91,7 +118,7 @@ export function SessionsTab({
       agents.isLoading,
       agents.error,
       feedEvents,
-      onSelectAgentLane,
+      selectLane,
     ],
   );
 
@@ -100,7 +127,7 @@ export function SessionsTab({
   const activeTitle = useMemo(() => {
     const module = findModule(lane);
     if (module) return t(module.titleKey ?? module.labelKey);
-    if (lane) return lane;
+    if (lane && lane !== "main") return lane;
     return selectedRun?.title || selectedRun?.id || t("session.emptyRuns");
   }, [lane, selectedRun, t]);
 
@@ -115,19 +142,19 @@ export function SessionsTab({
       )}
     >
       <SessionRail
+        key={taskId}
+        taskId={taskId}
         runs={runs}
         selectedInstanceId={selectedInstanceId}
         onSelectRun={onSelectRun}
         lane={lane}
-        onLaneChange={onSelectAgentLane}
+        onLaneChange={selectLane}
         groups={groups}
         liveKeys={liveKeys}
         totalTokens={runs.reduce((sum, run) => sum + (run.total_tokens ?? 0), 0)}
         listOpen={listOpen}
         onToggleList={() => setListOpen((open) => !open)}
         activeTitle={activeTitle}
-        workerRuns={taskWorkers.data?.items}
-        onOpenWorker={onOpenWorker}
       />
 
       {selectedInstanceId ? (

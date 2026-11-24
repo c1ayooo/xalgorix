@@ -1,6 +1,7 @@
 import { NavLink } from "react-router-dom";
 import {
   BadgeCheck,
+  Boxes,
   Clock,
   FolderKanban,
   Database,
@@ -48,6 +49,16 @@ const NAV_GROUPS: {
       { to: "/chat", labelKey: "nav.chat", icon: MessagesSquare },
       { to: "/approvals", labelKey: "nav.approvals", icon: BadgeCheck },
       { to: "/findings", labelKey: "nav.findings", icon: ShieldAlert },
+    ],
+  },
+  {
+    // 信息组 = 同一信息空间的两个正交轴（CORE v3.3 / INFO_AS §3.1）：
+    // 资产 = 跨 run 的主体身份目录（`assets` 身份权威，项目级）；
+    // 信息空间 = 运行内观测/聚合查询（探索图 + InfoItem，规范键 run_id）。
+    // 两者数据权威不同，不合并页面，只合并入口语义；互链见各页。
+    labelKey: "nav.groupInfo",
+    items: [
+      { to: "/assets", labelKey: "nav.assets", icon: Boxes },
       { to: "/info", labelKey: "nav.info", icon: Database },
     ],
   },

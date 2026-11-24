@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
-import { ArrowLeft, ChevronRight, FileText, Pencil, Target } from "lucide-react";
+import { ArrowLeft, Boxes, ChevronRight, FileText, Pencil, Plus, Target } from "lucide-react";
 import { toast } from "sonner";
 import { Textarea } from "@/components/ui/textarea";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -21,24 +21,35 @@ import { TokenUsageTab } from "@/components/token-usage";
 import { ScanFilesBrowser } from "@/components/scan-files-browser";
 import { ApprovalInlineBar } from "@/components/approval-inline-bar";
 import { TaskObjectivePanel } from "@/components/task-objective-panel";
-import { TaskRunButton, taskRunState } from "@/components/task-run-button";
+import {
+  TaskRunButton,
+  TaskRunStateBadge,
+  taskRunIsActive,
+  taskRunState,
+} from "@/components/task-run-button";
 import { TaskGoalDialog } from "@/components/task-goal-dialog";
+import { TaskFormDialog } from "@/components/task-form-dialog";
+import { TaskLLMChain } from "@/components/task-llm-chain";
+import { TaskProxySelect } from "@/components/task-proxy-select";
 import {
   useApprovals,
   useColdPathSync,
+  useProjectAssets,
   useProjects,
   useTask,
   useTaskFindings,
+  useTaskReports,
   useTaskRuns,
   useUpdateTask,
 } from "@/api/queries";
-import { api } from "@/api/client";
 import { severityRank, timeAgo, cn } from "@/lib/utils";
 import { useI18n } from "@/i18n";
 import { useRunSelection } from "@/hooks/use-run-selection";
 import { RunTraffic } from "@/components/run-traffic";
 import type { Approval, Run, Task } from "@/types/api";
 import { dedupFindings, type FlatFinding } from "@/lib/findings";
+import { GenerateReportDialog } from "@/pages/reports";
+import { FindingDetailsDialog } from "@/pages/scan-detail";
 
 /** 本页的 tab 词汇（4zreco 交互骨架 × REDESIGN §7.2 内容处方：会话默认 + 消耗）。 */
 type TaskDetailTab =
@@ -89,9 +100,13 @@ export default function TaskDetailPage() {
   const { taskId } = useParams<{ taskId: string }>();
   const { t } = useI18n();
   const [searchParams, setSearchParams] = useSearchParams();
+  const tab = normalizeTab(searchParams.get("tab"));
   const { data: task, isLoading, error, refetch } = useTask(taskId);
   const { data: runsData, isLoading: runsLoading } = useTaskRuns(taskId);
-  const { data: taskFindings } = useTaskFindings(taskId);
+  // 首屏（会话 tab）不需要 findings 明细；它只在「概览 / 发现」两个 tab 真正
+  // 用得到。头部计数用 task.finding_count，所以不必为了一次计数把全量发现拉
+  // 进首屏（该端点会合并任务下所有 run/scan 的 finding）。
+  const { data: taskFindings } = useTaskFindings(taskId, tab === "overview" || tab === "findings");
   // 服务端已按同一身份键去重；这里再走一次客户端去重，兜住 PostgreSQL 投影里
   // 尚未重投影的旧 dedup_key 行（否则同一发现会出现两行，与头部计数不符）。
   const findings = useMemo(
@@ -131,6 +146,7 @@ export default function TaskDetailPage() {
         else sp.delete("run");
         sp.delete("agent"); // 切换会话回到整段视角
       }),
+    false, // R7 会话页不自动选主 Agent；等用户点 run/worker
   );
   // 会话页泳道（?agent=system / 泳道短名）：run 内视图状态，深链可还原。
   const agentLaneParam = searchParams.get("agent") ?? undefined;
@@ -139,9 +155,11 @@ export default function TaskDetailPage() {
       if (lane) sp.set("agent", lane);
       else sp.delete("agent");
     });
-  const tab = normalizeTab(searchParams.get("tab"));
   // 一键「新目标」弹窗（无活跃 run 且已有 ≥1 次运行时入口可见）。
   const [goalOpen, setGoalOpen] = useState(false);
+  const [formOpen, setFormOpen] = useState(false);
+  // 任务级发现行→详情弹窗（与发现页同一组件：任务里的发现也必须能看详情）。
+  const [detailFinding, setDetailFinding] = useState<FlatFinding | null>(null);
 
   // run 级 tab（账本/文件/报告）跟随会话选择；未选中时回退最新有实例的 run。
   const latestInstanceId = runs.find((r) => r.instance_id)?.instance_id;
@@ -194,6 +212,12 @@ export default function TaskDetailPage() {
     <>
       {/* 一键「新目标」：保存目标 + 立即发起下一次运行。 */}
       <TaskGoalDialog open={goalOpen} onOpenChange={setGoalOpen} task={task} />
+      <TaskFormDialog
+        open={formOpen}
+        onOpenChange={setFormOpen}
+        projectId={task.project_id}
+        task={task}
+      />
       <Tabs
         value={tab}
         onValueChange={(v) => writeParams((sp) => sp.set("tab", v))}
@@ -225,19 +249,43 @@ export default function TaskDetailPage() {
                 </Badge>
               </Link>
             )}
-            {/* 任务级运行状态章（运行状态机投影）。 */}
-            <Badge
-              variant={runState === "running" ? "success" : runState === "idle" ? "muted" : "warning"}
-              className="shrink-0 gap-1"
-            >
-              {runState === "running" && (
-                <span className="size-1 rounded-full bg-emerald-500 pulse-dot" aria-hidden />
-              )}
-              {t(`taskDetail.state.${runState}`)}
-            </Badge>
+            {/* 任务级运行状态章（派生：可运行 / 排队 / 运行 / 暂停 / 已完成 / 未达成意图）。 */}
+            <TaskRunStateBadge task={task} runs={runs} />
+            {/* 默认落在「会话」tab 时的可发现性：只在配置了模型链/出口时出现，点击跳概览。 */}
+            {(task.llm_chain?.length ?? 0) > 0 && (
+              <button
+                type="button"
+                onClick={() => writeParams((sp) => sp.set("tab", "overview"))}
+                title={t("taskDetail.modelChainTitle")}
+              >
+                <Badge variant="outline" className="max-w-52 font-mono">
+                  <span className="truncate">
+                    {t("taskDetail.modelChip")} · {shortProfile(task.active_llm || task.llm_chain![0])}
+                  </span>
+                </Badge>
+              </button>
+            )}
+            {task.proxy ? (
+              <button
+                type="button"
+                onClick={() => writeParams((sp) => sp.set("tab", "overview"))}
+                title={t("taskDetail.proxyTitle")}
+              >
+                <Badge variant="outline" className="max-w-40 font-mono">
+                  <span className="truncate">
+                    {t("taskDetail.proxyChip")} ·{" "}
+                    {task.proxy === "direct" ? t("tasks.proxyDirect") : `#${task.proxy}`}
+                  </span>
+                </Badge>
+              </button>
+            ) : null}
             <div className="ml-auto flex shrink-0 items-center gap-2">
-              {/* 目标跑完（无活跃 run 且已有运行历史）→ 提供一键续驱入口。 */}
-              {runState === "idle" && runs.length > 0 && (
+              {/* 跑完后不给裸「运行」：继续只能走「新目标」（编辑目标并立即续跑）。 */}
+              <Button variant="outline" onClick={() => setFormOpen(true)}>
+                <Pencil className="h-4 w-4" />
+                {t("taskDetail.editTask")}
+              </Button>
+              {!taskRunIsActive(runState) && runs.length > 0 && (
                 <Button variant="outline" onClick={() => setGoalOpen(true)}>
                   <Target className="h-4 w-4" />
                   {t("tasks.newGoal")}
@@ -301,8 +349,11 @@ export default function TaskDetailPage() {
 
           {/* 概览：合并双栏时代的 态势+概览 —— objective 面板单挂载。 */}
           <TabsContent value="overview" className="mt-0 space-y-4">
-            {/* 任务目标：展示 + 就地编辑（保存不触发运行，区别于「新目标」） */}
-            <TaskGoalOverview task={task} />
+            {/* 任务配置：创建表单的全部字段（只读汇总），「编辑任务」打开同一套表单。 */}
+            <TaskConfigCard task={task} onEdit={() => setFormOpen(true)} />
+            {/* 高频策略：模型链（顺序=优先级）与出口代理，就地编辑。 */}
+            <TaskLLMChainCard task={task} />
+            <TaskProxyCard task={task} />
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
               <StatCard label={t("taskDetail.statRuns")} value={String(task.run_count ?? 0)} />
               <StatCard label={t("taskDetail.statFindings")} value={String(task.finding_count ?? 0)} />
@@ -315,6 +366,7 @@ export default function TaskDetailPage() {
                 value={task.schedule ? t(`tasks.interval${cap(task.schedule.interval)}`) : "—"}
               />
             </div>
+            <TaskAssetsCard task={task} />
             <PendingApprovalsCard
               taskId={task.id}
               onOpenAll={() => writeParams((sp) => sp.set("tab", "approvals"))}
@@ -335,10 +387,16 @@ export default function TaskDetailPage() {
                       .map((f) => (
                         <li
                           key={`${f.scan_id}-${f.id}`}
-                          className="flex items-center gap-2 border-b border-border px-3 py-2 last:border-0"
+                          className="border-b border-border last:border-0"
                         >
-                          <SeverityBadge severity={f.severity} />
-                          <span className="min-w-0 flex-1 truncate text-xs">{f.title}</span>
+                          <button
+                            type="button"
+                            onClick={() => setDetailFinding(f)}
+                            className="flex w-full items-center gap-2 px-3 py-2 text-left hover:bg-muted/30"
+                          >
+                            <SeverityBadge severity={f.severity} />
+                            <span className="min-w-0 flex-1 truncate text-xs">{f.title}</span>
+                          </button>
                         </li>
                       ))}
                   </ul>
@@ -353,24 +411,6 @@ export default function TaskDetailPage() {
             {/* 冷热分层可见性：最新 run 的冷路径同步健康（无 DSN = disabled 正常态）。
                 端点失败静默降级，不阻塞概览。 */}
             <LatestRunColdPath run={runs.find((r) => r.instance_id)} />
-            <Card>
-              <CardHeader>
-                <CardTitle>{t("taskDetail.policyTitle")}</CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-1.5 text-sm">
-                <PolicyRow label={t("tasks.fieldScanMode")} value={task.phase_policy?.scan_mode ?? "single"} />
-                <PolicyRow label={t("tasks.fieldIntensity")} value={task.phase_policy?.intensity ?? "active"} />
-                <PolicyRow
-                  label={t("tasks.fieldSchedule")}
-                  value={
-                    task.schedule
-                      ? `${t(`tasks.interval${cap(task.schedule.interval)}`)} ${task.schedule.time ?? ""} ${task.schedule.timezone ?? ""}`
-                      : t("tasks.noSchedule")
-                  }
-                />
-                <PolicyRow label={t("taskDetail.created")} value={timeAgo(task.created_at)} />
-              </CardContent>
-            </Card>
           </TabsContent>
 
           {/* 发现：任务级 findings 全宽列表。 */}
@@ -382,15 +422,25 @@ export default function TaskDetailPage() {
                     {findings.map((f: FlatFinding) => (
                       <li
                         key={`${f.scan_id}-${f.id}`}
-                        className="flex items-center gap-3 border-b border-border px-4 py-3 last:border-0"
+                        className="group flex items-center gap-3 border-b border-border px-4 py-3 last:border-0 hover:bg-muted/30"
                       >
-                        <SeverityBadge severity={f.severity} />
-                        <div className="min-w-0 flex-1">
-                          <div className="truncate text-sm font-medium">{f.title}</div>
-                          <div className="truncate text-xs text-muted-foreground mono">
-                            {f.endpoint || f.target}
+                        <button
+                          type="button"
+                          onClick={() => setDetailFinding(f)}
+                          className="flex min-w-0 flex-1 items-center gap-3 text-left"
+                        >
+                          <SeverityBadge severity={f.severity} />
+                          <div className="min-w-0 flex-1">
+                            <div className="truncate text-sm font-medium">{f.title}</div>
+                            <div className="truncate text-xs text-muted-foreground mono">
+                              {f.endpoint || f.target}
+                            </div>
                           </div>
-                        </div>
+                          <ChevronRight
+                            className="h-4 w-4 shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100"
+                            aria-hidden
+                          />
+                        </button>
                         <Link
                           to={`/scans/${f.scan_id}`}
                           className="shrink-0 text-xs text-muted-foreground hover:text-foreground"
@@ -539,9 +589,9 @@ export default function TaskDetailPage() {
             )}
           </TabsContent>
 
-          {/* 报告：终态 run 的 PDF。 */}
+          {/* 报告：任务级版本；只在手动点击时生成。 */}
           <TabsContent value="reports" className="mt-0">
-            <TaskReportsTab runs={runs} />
+            <TaskReportsTab taskId={taskId!} projectId={task?.project_id} />
           </TabsContent>
 
           {/* 消耗（REDESIGN §7.2 处方）：选中 run 的 token 用量图表。 */}
@@ -557,6 +607,15 @@ export default function TaskDetailPage() {
           </TabsContent>
         </div>
       </Tabs>
+
+      {/* 发现详情（任务级列表 + 概览关键发现共用）。scanId 用发现自身的来源
+          扫描，流量证据才会落在产生该发现的那个 run 上。 */}
+      <FindingDetailsDialog
+        scanId={detailFinding?.scan_id ?? ""}
+        sourceScanId={detailFinding?.scan_id}
+        finding={detailFinding}
+        onOpenChange={(open) => !open && setDetailFinding(null)}
+      />
     </>
   );
 }
@@ -608,30 +667,91 @@ function LatestRunColdPath({ run }: { run?: Run }) {
   );
 }
 
+function shortProfile(key: string): string {
+  const i = key.indexOf(":");
+  return i >= 0 ? key.slice(i + 1) : key;
+}
+
 /**
- * 概览「任务目标」卡片：展示当前 goal 并支持就地编辑。
- * 只保存目标、不发起运行（「新目标」按钮是保存+续驱的另一条路径）。
+ * 概览「任务配置」卡片：创建表单里的字段在这里只读汇总，编辑走同一个
+ * TaskFormDialog（「编辑任务」）。模型链/出口代理因为要高频率就地调，单独成卡。
  */
-function TaskGoalOverview({ task }: { task: Task }) {
+function TaskConfigCard({ task, onEdit }: { task: Task; onEdit: () => void }) {
+  const { t } = useI18n();
+  const contextPaths = task.context_paths ?? [];
+  return (
+    <Card>
+      <CardHeader className="flex flex-row items-center justify-between gap-2">
+        <CardTitle>{t("taskDetail.configTitle")}</CardTitle>
+        <Button size="sm" variant="outline" onClick={onEdit}>
+          <Pencil className="h-4 w-4" />
+          {t("taskDetail.editTask")}
+        </Button>
+      </CardHeader>
+      <CardContent className="space-y-2 text-sm">
+        <div className="space-y-0.5">
+          <div className="text-[11px] uppercase tracking-wider text-muted-foreground">{t("taskDetail.goalLabel")}</div>
+          <p className="whitespace-pre-wrap">{task.goal || "—"}</p>
+        </div>
+        <div className="space-y-0.5">
+          <div className="text-[11px] uppercase tracking-wider text-muted-foreground">{t("taskDetail.instructionLabel")}</div>
+          <p className="whitespace-pre-wrap">{task.instruction || "—"}</p>
+        </div>
+        <div className="grid gap-1.5 sm:grid-cols-2">
+          <PolicyRow label={t("tasks.fieldScanMode")} value={task.phase_policy?.scan_mode ?? "single"} />
+          <PolicyRow label={t("tasks.fieldIntensity")} value={task.phase_policy?.intensity ?? "active"} />
+          <PolicyRow
+            label={t("tasks.fieldAuditMode")}
+            value={t(`tasks.audit${cap(task.audit_mode ?? "inherit")}`)}
+          />
+          <PolicyRow
+            label={t("tasks.fieldSchedule")}
+            value={
+              task.schedule
+                ? `${t(`tasks.interval${cap(task.schedule.interval)}`)} ${task.schedule.time ?? ""} ${task.schedule.timezone ?? ""}`
+                : t("tasks.noSchedule")
+            }
+          />
+          <PolicyRow label={t("taskDetail.created")} value={timeAgo(task.created_at)} />
+        </div>
+        <div className="space-y-0.5">
+          <div className="text-[11px] uppercase tracking-wider text-muted-foreground">{t("taskDetail.contextFiles")}</div>
+          {contextPaths.length === 0 ? (
+            <p className="text-muted-foreground">—</p>
+          ) : (
+            <ul className="space-y-0.5 font-mono text-[11px] text-muted-foreground">
+              {contextPaths.map((path) => (
+                <li key={path} className="truncate" title={path}>{path}</li>
+              ))}
+            </ul>
+          )}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+/**
+ * 概览「出口代理」卡片：把这次任务钉在全局代理池的某一项（或直连/跟随全局）。
+ * 保存即写 task.proxy；下一次 Run 生效（运行中的 Run 保持启动时的快照）。
+ */
+function TaskProxyCard({ task }: { task: Task }) {
   const { t } = useI18n();
   const update = useUpdateTask();
-  const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState(task.goal ?? "");
+  const saved = task.proxy ?? "";
+  const [pin, setPin] = useState(saved);
 
   useEffect(() => {
-    setDraft(task.goal ?? "");
-    setEditing(false);
-  }, [task.goal, task.id]);
+    setPin(task.proxy ?? "");
+  }, [task.id, task.proxy]);
+
+  const dirty = pin !== saved;
 
   function save() {
-    const goal = draft.trim();
-    if (!goal || update.isPending) return;
+    if (update.isPending || !dirty) return;
     update
-      .mutateAsync({ id: task.id, req: { goal } })
-      .then(() => {
-        setEditing(false);
-        toast.success(t("toast.taskUpdated"));
-      })
+      .mutateAsync({ id: task.id, req: { proxy: pin } })
+      .then(() => toast.success(t("toast.taskUpdated")))
       .catch((err: Error) =>
         toast.error(`${t("toast.taskFailed")}: ${err.message}`),
       );
@@ -639,56 +759,78 @@ function TaskGoalOverview({ task }: { task: Task }) {
 
   return (
     <Card>
-      <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-        <CardTitle>{t("taskDetail.goalTitle")}</CardTitle>
-        {!editing && (
-          <Button size="sm" variant="outline" onClick={() => setEditing(true)}>
-            <Pencil className="mr-1 h-3.5 w-3.5" />
-            {t("taskDetail.editGoal")}
+      <CardHeader className="flex flex-row items-center justify-between gap-2">
+        <CardTitle>{t("taskDetail.proxyTitle")}</CardTitle>
+        {dirty && (
+          <Button size="sm" variant="outline" disabled={update.isPending} onClick={save}>
+            {t("common.save")}
           </Button>
         )}
       </CardHeader>
       <CardContent>
-        {editing ? (
-          <div className="space-y-2">
-            <Textarea
-              rows={3}
-              value={draft}
-              onChange={(e) => setDraft(e.target.value)}
-              placeholder={t("tasks.goalPlaceholder")}
-            />
-            <div className="flex justify-end gap-2">
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={() => {
-                  setDraft(task.goal ?? "");
-                  setEditing(false);
-                }}
-                disabled={update.isPending}
-              >
-                {t("common.cancel")}
-              </Button>
-              <Button
-                size="sm"
-                onClick={save}
-                disabled={update.isPending || !draft.trim()}
-              >
-                {t("common.save")}
-              </Button>
-            </div>
-          </div>
-        ) : (
-          <p className="whitespace-pre-wrap text-sm text-foreground">
-            {task.goal?.trim() ? task.goal : t("taskDetail.noGoal")}
-          </p>
-        )}
+        <TaskProxySelect value={pin} onChange={setPin} />
       </CardContent>
     </Card>
   );
 }
 
-/** 运行 tab 行内冷路径徽标；active=false 时不发请求（hooks 保持无条件）。 */
+/**
+ * 概览「模型链」卡片：任务级 LLM 凭据链，顺序即优先级。就地编辑 + 显式保存
+ * （避免每次上下移都打一次 PATCH）；运行中的 Run 不受影响，下一次 Run 生效。
+ */
+function TaskLLMChainCard({ task }: { task: Task }) {
+  const { t } = useI18n();
+  const update = useUpdateTask();
+  const savedChain = task.llm_chain ?? [];
+  const savedActive = task.active_llm ?? savedChain[0] ?? "";
+  const [chain, setChain] = useState<string[]>(savedChain);
+  const [active, setActive] = useState(savedActive);
+
+  useEffect(() => {
+    setChain(task.llm_chain ?? []);
+    setActive(task.active_llm ?? (task.llm_chain ?? [])[0] ?? "");
+  }, [task.id, task.llm_chain, task.active_llm]);
+
+  const dirty =
+    JSON.stringify(chain) !== JSON.stringify(savedChain) || active !== savedActive;
+
+  function save() {
+    if (update.isPending || !dirty) return;
+    update
+      .mutateAsync({
+        id: task.id,
+        req: { llm_chain: chain, active_llm: active || undefined },
+      })
+      .then(() => toast.success(t("toast.taskUpdated")))
+      .catch((err: Error) =>
+        toast.error(`${t("toast.taskFailed")}: ${err.message}`),
+      );
+  }
+
+  return (
+    <Card>
+      <CardHeader className="flex flex-row items-center justify-between gap-2">
+        <CardTitle>{t("taskDetail.llmChainTitle")}</CardTitle>
+        {dirty && (
+          <Button size="sm" variant="outline" disabled={update.isPending} onClick={save}>
+            {t("common.save")}
+          </Button>
+        )}
+      </CardHeader>
+      <CardContent>
+        <TaskLLMChain
+          chain={chain}
+          active={active}
+          onChange={(nextChain, nextActive) => {
+            setChain(nextChain);
+            setActive(nextActive);
+          }}
+        />
+      </CardContent>
+    </Card>
+  );
+}
+
 function RunColdPathBadge({
   instanceId,
   active,
@@ -703,6 +845,33 @@ function RunColdPathBadge({
 
 function cap(s: string) {
   return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+/** 本任务已知资产：项目级资产页的任务过滤入口（资产身份仍是项目级）。 */
+function TaskAssetsCard({ task }: { task: Task }) {
+  const { t } = useI18n();
+  const assets = useProjectAssets(task.project_id, { task_id: task.id, limit: 500 });
+  const count = assets.data?.total ?? 0;
+  return (
+    <Card>
+      <CardContent className="flex items-center justify-between gap-3 p-3">
+        <div className="flex min-w-0 items-center gap-2">
+          <Boxes className="h-4 w-4 text-muted-foreground" />
+          <div className="min-w-0">
+            <div className="text-sm font-medium">{t("assets.taskCardTitle")}</div>
+            <div className="truncate text-xs text-muted-foreground">
+              {t("assets.taskCardDescription").replace("{n}", String(count))}
+            </div>
+          </div>
+        </div>
+        <Button asChild size="sm" variant="outline">
+          <Link to={`/assets?task=${encodeURIComponent(task.id)}`}>
+            {t("assets.viewAll")}
+          </Link>
+        </Button>
+      </CardContent>
+    </Card>
+  );
 }
 
 /** 本任务待审批（最多 3 张，行内决策 + 跳审批 tab / 全局队列）。 */
@@ -792,8 +961,6 @@ function TaskApprovalsTab({ taskId }: { taskId: string }) {
   );
 }
 
-const TERMINAL_RUN_STATUS = ["finished", "completed", "stopped", "failed", "saved"];
-
 function approvalSummary(a: Approval): string {
   if (a.kind === "command") return a.payload.command ?? "";
   const method = a.payload.method ?? "";
@@ -832,55 +999,101 @@ function ApprovalHistoryRow({ approval: a }: { approval: Approval }) {
   );
 }
 
-/** 报告 tab：终态 run 的 PDF（按需由 /api/report/{id} 生成）。 */
-function TaskReportsTab({ runs }: { runs: Run[] }) {
+/** 报告 tab：任务级报告版本；生成是显式操作，扫描结束不再自动出 PDF。 */
+function TaskReportsTab({
+  taskId,
+  projectId,
+}: {
+  taskId: string;
+  projectId?: string;
+}) {
   const { t } = useI18n();
-  const withReport = runs.filter(
-    (r) => r.instance_id && TERMINAL_RUN_STATUS.includes(r.status),
+  const { data, isLoading } = useTaskReports(taskId);
+  const [dialogOpen, setDialogOpen] = useState(false);
+  const reports = data?.items ?? [];
+
+  const generateButton = (
+    <Button size="sm" onClick={() => setDialogOpen(true)}>
+      <Plus className="h-3.5 w-3.5" />
+      {t("reports.generate", "生成报告")}
+    </Button>
   );
-  if (runs.length === 0) {
-    return (
-      <EmptyState
-        title={t("taskDetail.reportsEmptyTitle")}
-        description={t("taskDetail.noRunsDescription")}
-      />
-    );
+
+  if (isLoading) {
+    return <Skeleton className="h-24 w-full" />;
   }
-  if (withReport.length === 0) {
+  if (reports.length === 0) {
     return (
-      <EmptyState
-        title={t("taskDetail.reportsEmptyTitle")}
-        description={t("taskDetail.reportsPendingDescription")}
-      />
+      <>
+        <EmptyState
+          title={t("taskDetail.reportsEmptyTitle")}
+          description={t(
+            "taskDetail.reportsPendingDescription",
+            "报告只在手动点击时生成。选择格式与模式后开始生成。",
+          )}
+          action={generateButton}
+        />
+        <GenerateReportDialog
+          open={dialogOpen}
+          onOpenChange={setDialogOpen}
+          defaultProjectId={projectId}
+          defaultTaskId={taskId}
+          lockTask
+        />
+      </>
     );
   }
   return (
-    <Card>
-      <CardContent className="p-0">
-        <ul>
-          {withReport.map((r) => (
-            <li
-              key={r.id}
-              className="flex flex-wrap items-center gap-3 border-b border-border px-4 py-3 last:border-0"
-            >
-              <FileText className="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden />
-              <span className="mono text-sm">{r.id}</span>
-              <ScanStatusPill status={r.status} />
-              <span className="text-xs text-muted-foreground">
-                {r.started_at ? timeAgo(r.started_at) : "—"}
-              </span>
-              <a
-                href={api.reportUrl(r.instance_id!)}
-                target="_blank"
-                rel="noreferrer"
-                className="ml-auto flex items-center gap-1 text-xs text-muted-foreground transition-colors hover:text-foreground"
+    <div className="space-y-3">
+      <div className="flex justify-end">{generateButton}</div>
+      <Card>
+        <CardContent className="p-0">
+          <ul>
+            {reports.map((report) => (
+              <li
+                key={report.id}
+                className="flex flex-wrap items-center gap-3 border-b border-border px-4 py-3 last:border-0"
               >
-                {t("taskDetail.reportsOpen")}
-              </a>
-            </li>
-          ))}
-        </ul>
-      </CardContent>
-    </Card>
+                <FileText className="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden />
+                <Badge variant="outline" className="mono text-[10px]">
+                  r{report.revision}
+                </Badge>
+                <Badge variant="outline" className="text-[10px]">
+                  {report.status}
+                </Badge>
+                <span className="text-xs text-muted-foreground">
+                  {timeAgo(report.created_at)}
+                </span>
+                {report.error && (
+                  <span className="text-xs text-red-600 dark:text-red-400">
+                    {report.error}
+                  </span>
+                )}
+                <div className="ml-auto flex flex-wrap items-center gap-1">
+                  {report.artifacts
+                    .filter((artifact) => artifact.kind === "total")
+                    .map((artifact) => (
+                      <a
+                        key={artifact.format}
+                        href={artifact.url}
+                        className="rounded border border-border px-2 py-0.5 text-[11px] uppercase hover:bg-muted"
+                      >
+                        {artifact.format}
+                      </a>
+                    ))}
+                </div>
+              </li>
+            ))}
+          </ul>
+        </CardContent>
+      </Card>
+      <GenerateReportDialog
+        open={dialogOpen}
+        onOpenChange={setDialogOpen}
+        defaultProjectId={projectId}
+        defaultTaskId={taskId}
+        lockTask
+      />
+    </div>
   );
 }

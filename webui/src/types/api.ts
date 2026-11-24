@@ -28,6 +28,20 @@ export interface VulnSummary {
   // "verified" (independently reproduced) or "needs-manual-verification"
   // (preserved but not confirmed — a human must review it).
   tags?: string[];
+  /** When report_vulnerability accepted this finding. Absent on rows persisted
+   *  before the field existed — callers fall back to the run's start time. */
+  found_at?: string;
+  // Exact MITM archive packets (session + sequence) that backed this finding
+  // when it was reported. Preferred over the endpoint/host heuristic.
+  traffic_refs?: TrafficRef[];
+}
+
+// (session, seq) identity of one archived HTTP exchange. A run can span
+// sibling session directories, and each restarts its archive sequence, so the
+// pair — not seq alone — is the stable key.
+export interface TrafficRef {
+  session?: string;
+  seq: number;
 }
 
 // One raw HTTP request/response pair from the per-scan traffic archive
@@ -42,6 +56,9 @@ export interface HttpExchange {
   // stripped). It is the join key against discovered assets (run target +
   // sub-scan targets) and lets the UI group raw packets per asset.
   host?: string;
+  // Owning session directory basename; (session, seq) is the unique row key
+  // across a run's sibling sessions.
+  session?: string;
   status?: number;
   channel?: string; // bearer / subprocess
   high_risk?: string; // AssessHTTP reason when the request pended the proxy gate
@@ -137,6 +154,63 @@ export interface ScanInstance extends AssessmentOutcome {
   sub_scan_remaining?: number;
   discovery?: SubScanSummary;
   sub_scan_skipped?: number;
+  /** Read-only container projection attached by GET /api/instances. */
+  container?: InstanceContainer;
+}
+
+/**
+ * 实例背后的工具容器投影（只读）。state 是运行时实际状态，desired_state /
+ * reconcile_status 是 PG toolbox_projects 的期望态与追赶水位，两者不互相推导。
+ */
+export interface InstanceContainer {
+  project_id?: string;
+  state: string;
+  container_id?: string;
+  image_digest?: string;
+  profile?: string;
+  desired_state?: string;
+  reconcile_status?: "pending" | "applied" | "gap" | "failed" | string;
+  last_error?: string;
+  observed_at?: string;
+}
+
+export interface ToolpackEntry {
+  name: string;
+  bin?: string;
+  category?: string;
+  purpose?: string;
+  capabilities?: string[];
+}
+
+/** GET /api/instances/{id}/container —— 容器元数据 + 镜像内工具清单（只读）。 */
+export interface InstanceContainerDetail {
+  instance_id: string;
+  project_id: string;
+  backend: "native" | "docker" | string;
+  available: boolean;
+  reason?: string;
+  actual?: { state: string; container_id?: string; image?: string };
+  desired?: {
+    desired_state?: string;
+    reconcile_status?: string;
+    desired_gen: number;
+    applied_gen: number;
+    profile?: string;
+    net_profile?: string;
+    image_digest?: string;
+    container_id?: string;
+    last_error?: string;
+    created_at?: string;
+    updated_at?: string;
+  };
+  tools: {
+    available: boolean;
+    profile?: string;
+    source?: string;
+    reason?: string;
+    items?: ToolpackEntry[];
+  };
+  observed_at: string;
 }
 
 export interface SubScanSummary extends AssessmentOutcome {
@@ -253,6 +327,9 @@ export interface ScanListItem {
   status: string;
   scan_mode?: string;
   stop_reason?: string;
+  // Dispatch instance (run identity). A run can own several scan records /
+  // sibling session directories; address run-scoped projections with this.
+  instance_id?: string;
   // RESPONSE-ONLY run/task mount linkage (D11; stamped from the platform
   // store at read time). Empty = unmounted legacy scan — honest "no task".
   task_id?: string;
@@ -585,11 +662,33 @@ export interface KeyPoolEntry {
   last_at?: string;
 }
 
+/** One automatic switch between pooled keys (/api/pool events). */
+export interface ProxyEntry {
+  index: number;
+  label: string;
+}
+
+export interface ProxyListView {
+  enabled: boolean;
+  required: boolean;
+  entries: ProxyEntry[];
+}
+
+export interface KeyFailoverEvent {
+  at: string;
+  reason: string;
+  from?: string;
+  to?: string;
+  cooldown_until?: string;
+}
+
 export interface KeyPoolView {
   keys: number;
   masked: string[];
   strategy: "off" | "round_robin" | "sticky";
   entries: KeyPoolEntry[];
+  // Recent automatic switches, newest first (fingerprints only, no secrets).
+  events?: KeyFailoverEvent[];
   restart_needed?: boolean;
 }
 
@@ -659,6 +758,8 @@ export interface EnvironmentVariableSetting {
   key: string;
   label: string;
   category: string;
+  /** Stable slug for translating the category: settings.env.category.<slug>. */
+  categoryKey: string;
   description: string;
   defaultValue?: string;
   placeholder?: string;
@@ -674,6 +775,10 @@ export interface EnvironmentVariableSetting {
   options?: string[];
   sensitive: boolean;
   requiresRestart: boolean;
+  /** Rendered behind the collapsed Advanced disclosure. */
+  advanced?: boolean;
+  /** Owned by a dedicated tab (or env-file only); never rendered here. */
+  hidden?: boolean;
   value: string;
   hasValue: boolean;
 }
@@ -974,6 +1079,9 @@ export interface TaskSchedule {
   timezone?: string; // IANA
 }
 
+/** Task-level HITL/audit switch (see Task.audit_mode). */
+export type TaskAuditMode = "inherit" | "off" | "enforce";
+
 export interface Task {
   id: string;
   project_id: string;
@@ -983,22 +1091,52 @@ export interface Task {
   phase_policy?: TaskPhasePolicy;
   schedule?: TaskSchedule;
   context_paths?: string[];
+  /**
+   * Task-level HITL/audit switch:
+   *   inherit — follow XALGORIX_APPROVAL_MODE (default);
+   *   off     — observe-only for this task's runs;
+   *   enforce — command + high-risk MITM HTTP calls block on operator approval.
+   * Applies to the next run; an in-flight run keeps its snapshot.
+   */
+  audit_mode?: TaskAuditMode;
   /** Structured objective; absent = "not structured" (never inferred). */
   objective?: Objective;
   /**
-   * Task model chain — "<provider>:<profileId>" keys, highest priority first.
-   * The run starts on active_llm; an explicit per-run provider_profile still
-   * wins.
+   * Task model chain — "<provider>:<profileId>" keys, highest priority first
+   * (4zreco task_llm_profiles port). The run starts on active_llm; an explicit
+   * per-run provider_profile still wins.
    */
   llm_chain?: string[];
   active_llm?: string;
+  /**
+   * Outbound proxy pin for this task's runs: "" = follow the global pool,
+   * "direct" = explicit direct egress, "N" = 1-based pool entry. A direct pin
+   * is rejected while the process runs proxy-required.
+   */
+  proxy?: string;
   created_at: string;
   updated_at?: string;
   archived_at?: string;
   run_count?: number;
   last_run_at?: string;
   last_run_status?: string;
+  /**
+   * Honest terminal reading of the last run: "full" = the run walked its
+   * graph frontier to an accepted finish (已完成); "partial" = bounded /
+   * physical stop, so the intent was not achieved (未达成意图). There is no
+   * "failed" reading.
+   */
+  last_run_completion?: "full" | "partial" | "";
   finding_count?: number;
+  /**
+   * Run gate (用户裁决): a task owns one run, so once a dispatch consumed this
+   * exact runnable content (goal/instruction/objective/phase policy/context
+   * files/model chain) a plain run must not be offered. `false` = that
+   * content already ran — hide the run button until the operator edits it.
+   * Absent = not projected (write responses / older backends): treat as
+   * runnable.
+   */
+  content_changed_since_run?: boolean;
 }
 
 export interface Run {
@@ -1136,6 +1274,7 @@ export interface TaskRequest {
   instruction?: string;
   phase_policy?: TaskPhasePolicy;
   schedule?: TaskSchedule | null;
+  audit_mode?: TaskAuditMode;
   /** 任务上下文文件（上传落点为项目所属任务目录）。 */
   context_paths?: string[];
   /** Structured objective; null clears it (PATCH), undefined leaves it. */
@@ -1144,6 +1283,8 @@ export interface TaskRequest {
   llm_chain?: string[];
   /** Chain head used by the next run; undefined leaves it. */
   active_llm?: string;
+  /** Outbound proxy pin: "" inherit, "direct", "N" pool entry. */
+  proxy?: string;
 }
 
 export interface ProjectRequest {
@@ -1272,16 +1413,113 @@ export interface InfoRegionParams {
   projectId: string;
   /** 可选：收窄到单个任务的 run 扫描集（后端校验归属，404 拒绝跨项目）。 */
   taskId?: string;
+  /** 可选：收窄到单个 run（后端校验属于项目，400 拒绝跨界）。 */
+  scanId?: string;
   subjectKind?: string;
   subject?: string;
   purpose?: string;
   nature?: InfoNature | "";
+  /** IG1b：聚合层/原子层/全部（默认 all）。 */
+  layer?: "aggregate" | "atom" | "all";
+  /** 聚合节点 kind 过滤（逗号语义；仅图可用时有效）。 */
+  kind?: string[];
   /** observed_at 严格时间边界（过滤，不是分页）。 */
   after?: string;
   /** observed_at 严格时间边界（过滤，不是分页）。 */
   before?: string;
   /** keyset 游标：上一页响应的 `next_cursor` 原样回传。 */
   cursor?: string;
+  limit?: number;
+}
+
+/** 信息空间热力图的阶段：原子按认识类型拆分，聚合按七环的行动/证据/判定链。 */
+export type InfoType =
+  | "observation"
+  | "inference"
+  | "belief"
+  | "intent"
+  | "fact"
+  | "finding";
+
+export const INFO_TYPES: InfoType[] = [
+  "observation",
+  "inference",
+  "belief",
+  "intent",
+  "fact",
+  "finding",
+];
+
+export interface InfoHeatmapRow {
+  subject: string;
+  subject_kind?: string;
+  total: number;
+  /** 每个请求列都有值（缺列为 0），不存在“缺列 vs 0”的歧义。 */
+  counts: Record<InfoType, number>;
+  last_observed?: string;
+}
+
+export interface InfoHeatmapResult {
+  available: boolean;
+  source?: string;
+  types: InfoType[];
+  rows: InfoHeatmapRow[];
+  /** 主体数超过 row_limit：rows 只是前 N 个主体，不是全量。 */
+  truncated: boolean;
+  subject_total: number;
+  /** 无主体坐标的信息条数：无法上热力图，单独披露。 */
+  unlabeled: number;
+  incomplete: boolean;
+  gap_reason?: string;
+}
+
+export interface InfoHeatmapParams {
+  projectId: string;
+  taskId?: string;
+  /** 可选：收窄到单个 run（资产 provenance 深链）。 */
+  scanId?: string;
+  subject?: string;
+  subjectKind?: string;
+  purpose?: string;
+  /** 主体子串搜索（项目地图搜索框）。 */
+  q?: string;
+  types?: InfoType[];
+  after?: string;
+  before?: string;
+  limit?: number;
+}
+
+/** 主体级关系：chain = 动作/证据链，info = 信息关联。 */
+export type InfoRelationCategory = "chain" | "info";
+
+export interface InfoRelationEdge {
+  src_subject: string;
+  src_kind?: string;
+  dst_subject: string;
+  dst_kind?: string;
+  rel: string;
+  category: InfoRelationCategory;
+  count: number;
+  src_title?: string;
+  dst_title?: string;
+  last_at?: string;
+}
+
+export interface InfoRelationsResult {
+  available: boolean;
+  source?: string;
+  edges: InfoRelationEdge[];
+  truncated: boolean;
+  incomplete: boolean;
+  gap_reason?: string;
+}
+
+export interface InfoRelationsParams {
+  projectId: string;
+  taskId?: string;
+  scanId?: string;
+  after?: string;
+  before?: string;
   limit?: number;
 }
 
@@ -1362,7 +1600,8 @@ export type DomainAuditOperation =
   | "agent_delegate"
   | "mcp_call"
   | "finding_recorded"
-  | "tool_observation";
+  | "tool_observation"
+  | "record_deviation";
 
 export interface DomainAuditRecord {
   scan_id: string;
@@ -1370,6 +1609,7 @@ export interface DomainAuditRecord {
   at: string;
   actor: DomainAuditActor;
   operation: DomainAuditOperation;
+  intent_id?: string;
   hypothesis_id?: string;
   evidence_id?: string;
   summary?: string;
@@ -1383,6 +1623,15 @@ export interface DomainAuditClaim {
   at: string;
   seq: number;
   summary?: string;
+}
+
+/** Executor-reported departure from its assigned intent (R8.4). */
+export interface DomainAuditDeviation {
+  intent_id?: string;
+  summary: string;
+  actor: DomainAuditActor;
+  at: string;
+  seq: number;
 }
 
 export interface DomainAuditGap {
@@ -1401,6 +1650,7 @@ export interface DomainAuditProjection {
   last_seq: number;
   timeline: DomainAuditRecord[];
   claims?: DomainAuditClaim[];
+  deviations?: DomainAuditDeviation[];
   hypothesis_final?: Record<string, DomainAuditState>;
 }
 
@@ -1464,6 +1714,78 @@ export interface ExplorationView {
   note?: string;
   nodes: ExplorationNode[];
   edges: ExplorationEdge[];
+}
+
+// ── 决策收件箱（PLANNER_OBSERVATION_AND_CORRECTION §2.4/§5.6）──────────────
+//
+// GET /api/scans/{id}/decisions 是「需要人决定的少数事项」的只读投影，不是
+// 事件流：停滞 worker（活池 StallReport）、blocked/open intent（图权威）、
+// 执行偏差（审计投影）。POST 走四个有界决策动作，actor=human，引擎按当前
+// 状态 CAS，冲突返回 4xx 而非静默覆盖。
+
+/** 一个停滞 worker（活池投影）。 */
+export interface DecisionStalledWorker {
+  unit_id: string;
+  agent_id: string;
+  lane: string;
+  idle_seconds: number;
+  active_tool: boolean;
+  last_progress?: string;
+}
+
+/** 一个 blocked intent 及其引擎记录的阻塞原因。 */
+export interface DecisionBlockedIntent {
+  unit_id: string;
+  title: string;
+  blocked_reason: string;
+}
+
+/** 一个等待 worker 的 open intent。 */
+export interface DecisionOpenIntent {
+  unit_id: string;
+  title: string;
+  priority: number;
+  target: string;
+  target_kind: string;
+}
+
+/** 一条执行器报告的偏离。 */
+export interface DecisionDeviation {
+  unit_id: string;
+  summary: string;
+  recorded_at: string;
+}
+
+export interface DecisionInboxView {
+  scan_id: string;
+  generated_at: string;
+  stalled: DecisionStalledWorker[];
+  blocked: DecisionBlockedIntent[];
+  open_intents: DecisionOpenIntent[];
+  deviations: DecisionDeviation[];
+}
+
+export type DecisionAction =
+  | "steer_work"
+  | "kill_work"
+  | "retire_intent"
+  | "reprioritize_intent";
+
+/** POST /api/scans/{id}/decisions 请求体。 */
+export interface DecisionRequest {
+  action: DecisionAction;
+  unit_id: string;
+  message?: string;
+  reason_code?: string;
+  reason?: string;
+  priority?: number;
+}
+
+export interface DecisionResult {
+  ok: boolean;
+  action: string;
+  unit_id: string;
+  message: string;
 }
 
 // ── 集成模块：MCP 服务器 / 用户技能 / Agent 档案（契约 §integration-*） ──
@@ -1571,6 +1893,23 @@ export interface UserSkillPatch {
   intent?: string;
   body?: string;
   enabled?: boolean;
+}
+
+/**
+ * GET /api/skills/builtin — 内置语料的只读投影（与 read_skill/list_skills
+ * 同一目录，编译进二进制）。不可写；`category` 即语料目录名。
+ */
+export interface BuiltinSkillEntry {
+  name: string;
+  category: string;
+  description: string;
+  intent?: string;
+  tags?: string[];
+}
+
+/** GET /api/skills/builtin/{name} — 含 markdown 正文（frontmatter 已剥离）。 */
+export interface BuiltinSkillDetail extends BuiltinSkillEntry {
+  body: string;
 }
 
 /** GET /api/agent-profiles — 内置行（builtin=true，只读）与用户行合并。 */
@@ -1749,7 +2088,22 @@ export type TranscriptKind =
   | "tool_result"
   | "approval"
   | "finding"
-  | "system";
+  | "system"
+  | "proposal";
+
+/** Main-agent intent draft shown as an actionable card until resolved. */
+export interface IntentProposal {
+  id: string;
+  task_id?: string;
+  title?: string;
+  target?: string;
+  target_kind?: string;
+  phase?: number;
+  vuln_class?: string;
+  endpoint?: string;
+  notes?: string;
+  status: "pending" | "confirmed" | "rejected" | string;
+}
 
 export interface TranscriptItem {
   seq: number;
@@ -1761,7 +2115,7 @@ export interface TranscriptItem {
   output?: string;
   status?: string;
   agent_id?: string;
-  /** Operator who produced a human turn / asked the answered question. */
+  /** Operator who produced a human turn / asked the answered question; absent for agent output. */
   created_by?: string;
   at: string;
   truncated?: boolean;
@@ -1775,6 +2129,8 @@ export interface TranscriptItem {
     reason?: string;
     decided: boolean;
   };
+  /** Intent draft card; `status=pending` makes it actionable. */
+  proposal?: IntentProposal;
 }
 
 export interface TranscriptPage {
@@ -1844,6 +2200,8 @@ export interface ScanPlanView {
 export interface DelegatedAgent {
   agent_id: string;
   lane: string;
+  /** 该 worker 拥有的 intent（工作单元）；legacy spawn 为空。 */
+  unit_id?: string;
   status: "queued" | "running" | "completed" | "failed";
   task?: string;
   target?: string;
@@ -1861,11 +2219,46 @@ export interface DelegatedAgent {
   }[];
 }
 
+/**
+ * 一个工作单元（intent）= 一条可见 worker 行。
+ * 主状态是图的单元状态；agent 执行状态只是明细。重派/重试追加到同一条。
+ */
+export interface WorkerUnit {
+  unit_id: string;
+  title?: string;
+  /** 图状态：open|running|paused|done|blocked|exhausted|stopped */
+  state: string;
+  /** UI 词表：queued|running|paused|completed|failed（未知状态原样透传）。 */
+  status: string;
+  vuln_class?: string;
+  endpoint?: string;
+  target?: string;
+  phase?: number;
+  priority?: number;
+  owner?: string;
+  lease_until?: string;
+  agent_ids?: string[];
+  agent_status?: string;
+  started_at?: string;
+  completed_at?: string;
+  /** Latest graph transition (claim/settle/retry); the worker rail sorts by it. */
+  updated_at?: string;
+  error?: string;
+  claimed_hypotheses?: {
+    id: string;
+    vuln_class?: string;
+    endpoint?: string;
+    status?: string;
+  }[];
+}
+
 /** GET /api/instances/{id}/agents —— worker 池投影（运行中/排队/上限）。 */
 export interface InstanceAgentsView {
   available: boolean;
   concurrency: { limit: number; running: number; queued: number };
   agents: DelegatedAgent[];
+  /** unit-keyed worker 列表；legacy spawn 模式为空时消费方回退 agents。 */
+  units?: WorkerUnit[];
   partial_reason?: "checkpoint" | "no_run" | string;
 }
 
@@ -1880,4 +2273,137 @@ export interface TaskWorkersView {
   total: number;
   page: number;
   size: number;
+}
+
+/** Asset kind vocabulary mirrors internal/assets/types.go (DB CHECK). */
+export type AssetKind =
+  | "root_domain"
+  | "subdomain"
+  | "ip"
+  | "service"
+  | "endpoint"
+  | "app";
+
+/** One project-scoped asset identity (GET /api/projects/{id}/assets). */
+export interface Asset {
+  id: number;
+  project_id: string;
+  kind: AssetKind;
+  key: string;
+  display_name?: string;
+  first_info_item_id?: string;
+  last_info_item_id?: string;
+  archived_at?: string;
+  archived_by?: string;
+  /** Set on a merge tombstone: links/edges already moved to this asset. */
+  merged_into_id?: number;
+  created_at: string;
+  updated_at: string;
+}
+
+/** One run/task provenance link for an asset. */
+export interface AssetLink {
+  scan_id: string;
+  task_id?: string;
+  source?: string;
+  created_at: string;
+}
+
+export interface AssetEdge {
+  src_id: number;
+  dst_id: number;
+  rel: string;
+}
+
+/** GET /api/projects/{id}/assets/{assetID}. */
+export interface AssetDetail {
+  asset: Asset;
+  links: AssetLink[];
+  edges: AssetEdge[];
+}
+
+/** GET /api/projects/{id}/assets list envelope. */
+export interface AssetListResponse {
+  project_id: string;
+  source: "assets" | "none";
+  items: Asset[];
+  total: number;
+}
+
+/** GET /api/projects/{id}/assets/edges — deterministic structural relations. */
+export interface AssetEdgeListResponse {
+  project_id: string;
+  edges: AssetEdge[];
+}
+
+export interface AssetListParams {
+  kind?: AssetKind[];
+  task_id?: string;
+  run_id?: string;
+  q?: string;
+  include_archived?: boolean;
+  limit?: number;
+}
+
+export interface RecordAssetInput {
+  kind: AssetKind;
+  key: string;
+  display_name?: string;
+  info_item_id?: string;
+}
+
+// ── manual report delivery (REPORT_DELIVERY_SPEC) ──────────────────────────
+
+export type ReportStatus =
+  | "queued"
+  | "generating"
+  | "ready"
+  | "failed"
+  | "cancelled";
+
+export type ReportMode = "template" | "agent";
+export type ReportFormat = "pdf" | "md" | "html";
+
+export interface ReportArtifact {
+  kind: "total" | "sub";
+  scan_id?: string;
+  target?: string;
+  format: ReportFormat;
+  bytes: number;
+  sha256?: string;
+  url: string;
+}
+
+export interface Report {
+  id: string;
+  project_id?: string;
+  task_id: string;
+  revision: number;
+  run_ids?: string[];
+  scan_ids?: string[];
+  status: ReportStatus;
+  template: string;
+  language: string;
+  mode: ReportMode;
+  model?: string;
+  prompt_version?: string;
+  formats: string[];
+  error?: string;
+  created_at: string;
+  started_at?: string;
+  finished_at?: string;
+  artifacts: ReportArtifact[];
+  progress?: string;
+  /** Response-only enrichment: task name and the targets this revision covers. */
+  task_name?: string;
+  targets?: string[];
+}
+
+export interface ReportCreateRequest {
+  run_ids?: string[];
+  formats: ReportFormat[];
+  template?: "standard";
+  language?: "zh-CN" | "en";
+  mode: ReportMode;
+  model?: string;
 }

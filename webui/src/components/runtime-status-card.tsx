@@ -3,6 +3,7 @@ import { Activity, Boxes, Layers, ShieldCheck, ShieldAlert } from "lucide-react"
 
 import { api } from "@/api/client";
 import { qk } from "@/api/queries";
+import { useI18n } from "@/i18n";
 import { Badge } from "@/components/ui/badge";
 import {
   Card,
@@ -22,6 +23,7 @@ import { Skeleton } from "@/components/ui/skeleton";
  * execution plane healthy?".
  */
 export function RuntimeStatusCard() {
+  const { t } = useI18n();
   const { data, isLoading, error } = useQuery({
     queryKey: qk.runtime,
     queryFn: () => api.runtimeStatus(),
@@ -33,13 +35,36 @@ export function RuntimeStatusCard() {
     return <Skeleton className="h-40 w-full" />;
   }
 
-  const backend = data?.backend ?? "native";
-  const isNative = backend === "native";
-  const healthy = data?.healthy ?? !error;
+  // No data is not the same as native: a failed request must not claim the
+  // platform executes tools in-process.
+  if (!data) {
+    return (
+      <Card className="overflow-hidden">
+        <CardHeader className="flex flex-row items-start justify-between gap-4 pb-3">
+          <div className="space-y-1">
+            <CardTitle className="flex items-center gap-2 text-base">
+              <Activity className="h-4 w-4 text-muted-foreground" />
+              {t("runtime.title")}
+            </CardTitle>
+            <CardDescription className="text-xs">
+              {error instanceof Error ? error.message : t("runtime.unavailable")}
+            </CardDescription>
+          </div>
+          <Badge variant="outline" className="border-destructive/40 text-destructive">
+            <ShieldAlert className="mr-1 h-3 w-3" />
+            {t("runtime.unavailable")}
+          </Badge>
+        </CardHeader>
+      </Card>
+    );
+  }
+
+  const isNative = data.backend === "native";
+  const healthy = data.healthy;
   const profileTone =
-    data?.profile === "full"
+    data.profile === "full"
       ? "border-warning/40 text-warning"
-      : data?.profile === "web"
+      : data.profile === "web"
         ? "border-primary/40 text-foreground"
         : "border-success/40 text-success";
 
@@ -49,12 +74,10 @@ export function RuntimeStatusCard() {
         <div className="space-y-1">
           <CardTitle className="flex items-center gap-2 text-base">
             <Activity className="h-4 w-4 text-muted-foreground" />
-            工具运行时
+            {t("runtime.title")}
           </CardTitle>
           <CardDescription className="text-xs">
-            {isNative
-              ? "工具在平台进程内执行（native）"
-              : "每次扫描的工具调用在独立容器中执行，产物仍写回同一扫描目录"}
+            {isNative ? t("runtime.subtitleNative") : t("runtime.subtitleDocker")}
           </CardDescription>
         </div>
         <Badge
@@ -70,30 +93,26 @@ export function RuntimeStatusCard() {
           ) : (
             <ShieldAlert className="mr-1 h-3 w-3" />
           )}
-          {healthy ? "健康" : "降级"}
+          {healthy ? t("runtime.healthy") : t("runtime.degraded")}
         </Badge>
       </CardHeader>
 
       <CardContent className="grid gap-4 sm:grid-cols-2">
         <div className="grid grid-cols-3 gap-3">
           <Metric
-            label="项目容器"
-            value={
-              data ? `${data.projects_active}/${data.project_limit || "∞"}` : "—"
-            }
-            hint="正在运行的项目容器数 / 当前上限（按宿主内存推导，可用 XALGORIX_MAX_PROJECTS 覆盖）"
+            label={t("runtime.metric.projects")}
+            value={`${data.projects_active}/${data.project_limit || "∞"}`}
+            hint={t("runtime.metric.projectsHint")}
           />
           <Metric
-            label="执行队列"
-            value={data ? String(data.exec_queue_depth) : "—"}
-            hint="等待容器内执行槽的调用数；槽位由 XALGORIX_TOOLBOX_CONCURRENCY 控制"
+            label={t("runtime.metric.queue")}
+            value={String(data.exec_queue_depth)}
+            hint={t("runtime.metric.queueHint")}
           />
           <Metric
-            label="槽位占用"
-            value={
-              data ? `${data.project_slot_used}/${data.project_slot_max}` : "—"
-            }
-            hint="平台侧的准入槽位占用；容器实际数量以运行时为准"
+            label={t("runtime.metric.slots")}
+            value={`${data.project_slot_used}/${data.project_slot_max}`}
+            hint={t("runtime.metric.slotsHint")}
           />
         </div>
 
@@ -101,19 +120,19 @@ export function RuntimeStatusCard() {
           <div className="flex items-center gap-2 text-xs text-muted-foreground">
             <Layers className="h-3.5 w-3.5" />
             <span className="font-mono text-[11px] text-foreground">
-              {isNative ? "native" : (data?.transport ?? "socket")}
+              {isNative ? "native" : (data.transport ?? "socket")}
             </span>
             <span>·</span>
             <span className="font-mono text-[11px] text-foreground">
-              {data?.image_digest || "无镜像"}
+              {data.image_digest || t("runtime.noImage")}
             </span>
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <Badge variant="outline" className={`font-mono text-[11px] ${profileTone}`}>
               <Boxes className="mr-1 h-3 w-3" />
-              {data?.profile || "core"}
+              {data.profile || "core"}
             </Badge>
-            {data?.reason ? (
+            {data.reason ? (
               <span className="line-clamp-2 text-[11px] text-muted-foreground">
                 {data.reason}
               </span>

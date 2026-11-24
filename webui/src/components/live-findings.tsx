@@ -7,7 +7,7 @@ import { EmptyState, ErrorState } from "@/components/states";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Button } from "@/components/ui/button";
 import { useFindingsList } from "@/api/queries";
-import { dedupFindings, type FlatFinding } from "@/lib/findings";
+import { dedupFindings, findingTime, type FlatFinding } from "@/lib/findings";
 import { timeAgo } from "@/lib/utils";
 import { useI18n } from "@/i18n";
 
@@ -102,7 +102,7 @@ export function LiveFindings({ projectId }: { projectId: string | null }) {
             </p>
           </div>
           <span className="shrink-0 text-[11px] text-muted-foreground mono tabular-nums">
-            {f.scan_started_at ? timeAgo(f.scan_started_at) : "—"}
+            {findingTime(f) ? timeAgo(findingTime(f)) : "—"}
           </span>
           <ExternalLink className="mt-0.5 size-3 shrink-0 text-muted-foreground" aria-hidden />
           <span className="sr-only">{t("live.findings.openRun")}</span>

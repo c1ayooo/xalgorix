@@ -314,6 +314,22 @@
   animation: drawer-in 0.2s ease-out;
 }
 
+/* One short fade/rise when a page mounts. The global reduced-motion rule
+   below collapses it to a no-op. */
+@keyframes page-enter {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.page-enter {
+  animation: page-enter 0.22s ease-out both;
+}
+
 /* Mono code block style */
 .mono {
   font-family: var(--font-mono);

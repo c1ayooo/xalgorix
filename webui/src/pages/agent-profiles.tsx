@@ -88,6 +88,7 @@ function ProfilesConfigTab() {
   const [formOpen, setFormOpen] = useState(false);
   const [editing, setEditing] = useState<AgentProfile | null>(null);
   const [deleting, setDeleting] = useState<AgentProfile | null>(null);
+  const [viewing, setViewing] = useState<AgentProfile | null>(null);
 
   const profiles = data?.profiles ?? [];
 
@@ -157,26 +158,28 @@ function ProfilesConfigTab() {
                 <p className="mt-1 line-clamp-2 text-xs text-muted-foreground">{p.focus}</p>
               </div>
               <div className="flex shrink-0 items-center gap-2">
-                <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                  <Switch
-                    checked={p.enabled}
-                    disabled={p.builtin}
-                    onCheckedChange={(v) =>
-                      update.mutate(
-                        { id: p.id, patch: { enabled: v } },
-                        {
-                          onSuccess: () => toast.success(t("toast.profileUpdated")),
-                          onError: (err: Error) =>
-                            toast.error(`${t("toast.profileFailed")}: ${err.message}`),
-                        },
-                      )
-                    }
-                  />
-                  {t("mcp.fieldEnabled")}
-                </label>
-                {p.builtin ? (
-                  <span className="text-[11px] text-muted-foreground">{t("agents.readonly")}</span>
-                ) : (
+                {p.builtin ? null : (
+                  <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                    <Switch
+                      checked={p.enabled}
+                      onCheckedChange={(v) =>
+                        update.mutate(
+                          { id: p.id, patch: { enabled: v } },
+                          {
+                            onSuccess: () => toast.success(t("toast.profileUpdated")),
+                            onError: (err: Error) =>
+                              toast.error(`${t("toast.profileFailed")}: ${err.message}`),
+                          },
+                        )
+                      }
+                    />
+                    {t("mcp.fieldEnabled")}
+                  </label>
+                )}
+                <Button size="sm" variant="outline" onClick={() => setViewing(p)}>
+                  {t("common.view")}
+                </Button>
+                {p.builtin ? null : (
                   <DropdownMenu>
                     <DropdownMenuTrigger asChild>
                       <Button size="sm" variant="outline">
@@ -210,6 +213,7 @@ function ProfilesConfigTab() {
         </div>
       )}
 
+      <ProfileDetailDialog target={viewing} onClose={() => setViewing(null)} />
       <ProfileFormDialog open={formOpen} onOpenChange={setFormOpen} editing={editing} />
       <ProfileDeleteDialog target={deleting} onClear={() => setDeleting(null)} />
     </div>
@@ -231,6 +235,92 @@ function ProfilesRecordsTab() {
 }
 
 const ROLE_PATTERN = /^[a-z0-9]+(-[a-z0-9]+)*$/;
+
+/** 只读档案详情：内置专家带引擎侧规范契约，用户档案即操作者填写的字段。 */
+function ProfileDetailDialog({
+  target,
+  onClose,
+}: {
+  target: AgentProfile | null;
+  onClose: () => void;
+}) {
+  const { t } = useI18n();
+  const classes = target?.vuln_classes ?? [];
+  const hidden = target?.tool_scope_hidden ?? [];
+
+  const field = (label: string, value?: string) => (
+    <div className="space-y-1">
+      <div className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+        {label}
+      </div>
+      {value ? (
+        <p className="whitespace-pre-wrap text-sm text-foreground/90">{value}</p>
+      ) : (
+        <p className="text-sm text-muted-foreground">—</p>
+      )}
+    </div>
+  );
+
+  return (
+    <Dialog open={!!target} onOpenChange={(v) => !v && onClose()}>
+      <DialogContent className="max-w-2xl">
+        <DialogHeader>
+          <DialogTitle className="font-mono text-base">{target?.role}</DialogTitle>
+          <DialogDescription className="flex flex-wrap items-center gap-1.5">
+            {target?.builtin ? (
+              <Badge variant="muted">
+                <Lock className="mr-1 h-3 w-3" />
+                {t("agents.builtin")}
+              </Badge>
+            ) : (
+              <Badge variant="muted">{t("agents.user")}</Badge>
+            )}
+            <Badge variant={target?.enabled ? "success" : "outline"}>
+              {target?.enabled ? t("agents.statusEnabled") : t("agents.statusDisabled")}
+            </Badge>
+          </DialogDescription>
+        </DialogHeader>
+        <div className="max-h-[60vh] space-y-4 overflow-y-auto pr-1">
+          {field(t("agents.fieldFocus"), target?.focus)}
+          <div className="space-y-1">
+            <div className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+              {t("agents.fieldClasses")}
+            </div>
+            {classes.length === 0 ? (
+              <p className="text-sm text-muted-foreground">—</p>
+            ) : (
+              <div className="flex flex-wrap gap-1.5">
+                {classes.map((c) => (
+                  <Badge key={c} variant="outline">
+                    {c}
+                  </Badge>
+                ))}
+              </div>
+            )}
+          </div>
+          {field(t("agents.fieldEvidence"), target?.evidence_contract)}
+          {field(t("agents.fieldStopping"), target?.stopping_rule)}
+          <div className="space-y-1">
+            <div className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+              {t("agents.fieldScope")}
+            </div>
+            {hidden.length === 0 ? (
+              <p className="text-sm text-muted-foreground">{t("agents.scopeDefault")}</p>
+            ) : (
+              <div className="flex flex-wrap gap-1.5">
+                {hidden.map((tool) => (
+                  <Badge key={tool} variant="outline" className="font-mono">
+                    {tool}
+                  </Badge>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
 
 function ProfileFormDialog({
   open,

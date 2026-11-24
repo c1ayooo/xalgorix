@@ -4,13 +4,17 @@ import {
   AlertTriangle,
   Check,
   ChevronRight,
+  Copy,
   MessageSquare,
+  Pencil,
   ShieldAlert,
   Terminal,
   User,
 } from "lucide-react";
+import { toast } from "sonner";
 import { Link } from "react-router-dom";
 import { Markdown } from "@/components/markdown";
+import { IntentProposalCard } from "@/components/chat/intent-proposal-card";
 import { cn } from "@/lib/utils";
 import { useI18n } from "@/i18n";
 import type { TranscriptItem } from "@/types/api";
@@ -96,15 +100,46 @@ function GuidanceStatusChip({ status }: { status: string }) {
 }
 
 /** 人工回合：右对齐品牌色气泡 + 头像（参照 UserRow）。guidance 行带状态章。 */
-function HumanRow({ item }: { item: TranscriptItem }) {
+function HumanRow({ item, onEdit }: { item: TranscriptItem; onEdit?: (text: string) => void }) {
+  const { t } = useI18n();
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(item.text ?? "");
+      toast.success(t("chat.copied"));
+    } catch {
+      toast.error(t("chat.copied"));
+    }
+  };
   return (
     <div className="mt-3 mb-2 flex min-w-0 justify-end gap-2">
       <div className="flex min-w-0 max-w-[85%] flex-col items-end gap-1.5">
         <div className="min-w-0 max-w-full whitespace-pre-wrap rounded-lg rounded-tr-sm bg-primary px-3 py-1.5 text-primary-foreground text-sm [overflow-wrap:anywhere]">
           {item.text}
         </div>
-        {item.status && <GuidanceStatusChip status={item.status} />}
-        <ActivityTime at={item.at} />
+        <div className="flex items-center gap-1.5">
+          {item.status && <GuidanceStatusChip status={item.status} />}
+          <button
+            type="button"
+            className="inline-flex items-center rounded p-0.5 text-muted-foreground transition-colors hover:bg-accent/40 hover:text-foreground"
+            title={t("chat.copyMessage")}
+            aria-label={t("chat.copyMessage")}
+            onClick={() => void copy()}
+          >
+            <Copy className="size-3" aria-hidden />
+          </button>
+          {onEdit && (
+            <button
+              type="button"
+              className="inline-flex items-center rounded p-0.5 text-muted-foreground transition-colors hover:bg-accent/40 hover:text-foreground"
+              title={t("chat.editMessage")}
+              aria-label={t("chat.editMessage")}
+              onClick={() => onEdit(item.text ?? "")}
+            >
+              <Pencil className="size-3" aria-hidden />
+            </button>
+          )}
+          <ActivityTime at={item.at} />
+        </div>
       </div>
       <div className="mt-0.5 flex size-6 shrink-0 items-center justify-center rounded-full bg-primary/10">
         <User className="size-3.5 text-primary" aria-hidden />
@@ -266,12 +301,17 @@ function FindingCard({ item }: { item: TranscriptItem }) {
 
 export function TranscriptView({
   items,
+  instanceId,
   live,
   staleFor,
   unobserved,
   empty,
+  taskId,
+  onEditMessage,
 }: {
   items: TranscriptItem[];
+  /** Run id for proposal-card actions (confirm/reject endpoints). */
+  instanceId?: string;
   /** 流式中：5s 内有真实事件到达（use-instance-activity）。 */
   live?: boolean;
   /** 运行中但事件停滞：预格式化的停滞时长（"2 分钟"）。 */
@@ -279,6 +319,10 @@ export function TranscriptView({
   /** 运行中但本页会话尚未观测到任何事件：中性等待行，不冒充流式。 */
   unobserved?: boolean;
   empty?: ReactNode;
+  /** Platform task id for proposal receipt worker links. */
+  taskId?: string;
+  /** Load a human turn back into the composer for editing and re-sending. */
+  onEditMessage?: (text: string) => void;
 }) {
   const { t } = useI18n();
   if (items.length === 0) {
@@ -307,7 +351,7 @@ export function TranscriptView({
                 <span className="h-px flex-1 bg-border" />
               </div>
             )}
-            {renderEntry(entry, index)}
+            {renderEntry(entry, index, instanceId, onEditMessage, taskId)}
           </Fragment>
         );
       })}
@@ -335,13 +379,30 @@ export function TranscriptView({
   );
 }
 
-function renderEntry(entry: TranscriptItem | ToolGroup, index: number): ReactNode {
+function renderEntry(
+  entry: TranscriptItem | ToolGroup,
+  index: number,
+  instanceId?: string,
+  onEditMessage?: (text: string) => void,
+  taskId?: string,
+): ReactNode {
   if ("kind" in entry) {
     switch (entry.kind) {
       case "human":
-        return <HumanRow key={entry.seq} item={entry} />;
+        return <HumanRow key={entry.seq} item={entry} onEdit={onEditMessage} />;
       case "assistant":
         return <AssistantRow key={entry.seq} item={entry} />;
+      case "proposal":
+        return entry.proposal ? (
+          <IntentProposalCard
+            key={entry.seq}
+            instanceId={instanceId}
+            taskId={taskId}
+            proposal={entry.proposal}
+          />
+        ) : (
+          <Fragment key={entry.seq} />
+        );
       case "approval":
         return <ApprovalCard key={entry.seq} item={entry} />;
       case "finding":

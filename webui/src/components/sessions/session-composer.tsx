@@ -8,7 +8,9 @@ import { useSendTaskGuidance } from "@/api/queries";
 import { MAX_GUIDANCE_CHARS, newRequestId } from "@/lib/guidance";
 
 /**
- * 会话页 Composer（guidance 语义，方案 §1：与对话页 Composer 各自独立）：
+ * 会话页 Composer —— 和主 Agent 的对话入口（R7：主 Agent = 聊天助手 +
+ * 意图插入）。发送仍走 guidance 端点：运行中它进入主 Agent 的 mainInbox，
+ * 由主 Agent 回答或把要求转成 add_intent/add_hint；无活跃运行时排队到下次。
  * 自适应高度、IME 安全的 Enter 发送、码点计数；运行中提供停止入口
  * （停止走 AlertDialog，由工作区持有）。
  */
@@ -17,6 +19,7 @@ export function SessionComposer({
   instanceId,
   running,
   paused,
+  seed,
   onStop,
   stopping,
 }: {
@@ -24,6 +27,8 @@ export function SessionComposer({
   instanceId: string;
   running: boolean;
   paused?: boolean;
+  /** Editing a sent turn: replace the draft text when nonce changes. */
+  seed?: { text: string; nonce: number };
   onStop: () => void;
   stopping?: boolean;
 }) {
@@ -33,6 +38,12 @@ export function SessionComposer({
   const [requestId, setRequestId] = useState(newRequestId);
   const [sending, setSending] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  useEffect(() => {
+    if (!seed || !seed.text) return;
+    setDraft(seed.text);
+    requestAnimationFrame(() => textareaRef.current?.focus());
+  }, [seed?.nonce]);
 
   useEffect(() => {
     const node = textareaRef.current;
@@ -58,12 +69,12 @@ export function SessionComposer({
           },
         );
       });
-      toast.success(result.status === "injected" ? t("toast.guidanceInjected") : t("toast.guidanceQueued"));
+      toast.success(result.status === "injected" ? t("toast.mainChatSent") : t("toast.mainChatQueued"));
       setDraft("");
       setRequestId(newRequestId());
     } catch (error) {
       // 失败恢复：保留草稿（发送失败不吞文本）。
-      toast.error(`${t("toast.guidanceFailed")}: ${(error as Error).message}`);
+      toast.error(`${t("toast.mainChatFailed")}: ${(error as Error).message}`);
     } finally {
       setSending(false);
     }
@@ -82,9 +93,9 @@ export function SessionComposer({
           }
         }}
         rows={1}
-        aria-label={t("console.modeInject")}
+        aria-label={t("sessions.composerAria")}
         aria-invalid={over || undefined}
-        placeholder={t("console.placeholderInject")}
+        placeholder={t("sessions.composerPlaceholder")}
         className={cn(
           "max-h-36 min-h-9 w-full resize-none bg-transparent py-2 text-sm outline-none placeholder:text-muted-foreground",
           paused && "bg-amber-500/5 rounded-md",

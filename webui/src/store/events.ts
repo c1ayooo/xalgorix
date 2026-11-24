@@ -53,6 +53,13 @@ interface StreamState {
   maxEvents: number;
   subscribedInstance?: string;
   lifecycleListeners: Set<LifecycleListener>;
+  /**
+   * Bumped whenever a vuln-bearing event lands. Findings views subscribe to
+   * this and invalidate their projection queries on change — the SSE frame is
+   * the push signal, the projection endpoint stays the data authority (same
+   * shape as the lifecycle bridge).
+   */
+  vulnRevision: number;
 
   // actions
   setStatus: (s: WSStatus, err?: string) => void;
@@ -136,6 +143,18 @@ const STREAM_URL = "/api/stream";
 const NAMED_STREAM_EVENT_TYPES = [
   "instance_started",
   "instance_updated",
+  // Main-agent / worker conversation and lifecycle frames are named SSE
+  // events too: without these listeners they never reach the store and the
+  // page only updates after a manual refresh.
+  "message",
+  "agent_queued",
+  "agent_started",
+  "agent_completed",
+  "agent_failed",
+  "agent_idle",
+  "plan_updated",
+  "intent_proposed",
+  "intent_proposal_resolved",
   "queue_started",
   "queue_finished",
   "target_started",
@@ -191,6 +210,7 @@ export const useEventsStore = create<StreamState>((set, get) => ({
   paused: false,
   maxEvents: 1000,
   lifecycleListeners: new Set<LifecycleListener>(),
+  vulnRevision: 0,
 
   setStatus: (s, err) => set({ status: s, lastError: err }),
 
@@ -269,7 +289,11 @@ export const useEventsStore = create<StreamState>((set, get) => ({
       if (events.length > state.maxEvents) {
         events.splice(0, events.length - state.maxEvents);
       }
-      return { events };
+      const carriesVulns = Array.isArray(next.vulns) && next.vulns.length > 0;
+      return {
+        events,
+        vulnRevision: state.vulnRevision + (carriesVulns ? 1 : 0),
+      };
     });
   },
 

@@ -3,6 +3,7 @@ import { Check, ChevronsUpDown, FolderKanban, Plus } from "lucide-react";
 import { Link } from "react-router-dom";
 import { useProjects } from "@/api/queries";
 import { useProjectSelection } from "@/store/project";
+import { resolveActiveProject } from "@/lib/use-active-project";
 import { useI18n } from "@/i18n";
 import { cn, menuContentClass, menuItemClass } from "@/lib/utils";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -18,8 +19,9 @@ export function ProjectSwitcher() {
   const { projectId, setProjectId } = useProjectSelection();
 
   const projects = data?.projects ?? [];
-  const active =
-    projects.find((p) => p.id === projectId) ?? projects[0] ?? null;
+  // Same fallback rule as useActiveProjectId: the switcher must never show a
+  // different project than the one the pages are querying.
+  const active = resolveActiveProject(projects, projectId);
 
   if (isLoading && projects.length === 0) {
     return (

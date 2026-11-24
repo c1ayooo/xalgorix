@@ -43,6 +43,7 @@ const OP_DOT: Record<string, string> = {
   record_objective: "bg-emerald-500",
   finding_recorded: "bg-emerald-500",
   tool_observation: "bg-violet-500",
+  record_deviation: "bg-rose-500",
   // 集成调用审计
   skill_load: "bg-muted-foreground/60",
   agent_delegate: "bg-muted-foreground/60",
@@ -174,6 +175,7 @@ export function AuditTimeline({
 
   const proj = data.projection;
   const claims = proj.claims ?? [];
+  const deviations = proj.deviations ?? [];
   // timeline 是 journal 正序（最旧在前）；渲染倒序（最新在上）。
   const all = proj.timeline ?? [];
   const records = [...all].reverse();
@@ -246,6 +248,43 @@ export function AuditTimeline({
                   </span>
                 </li>
               ))}
+            </ul>
+          </CardContent>
+        </Card>
+      )}
+
+      {deviations.length > 0 && (
+        <Card>
+          <CardContent className="p-0">
+            <p className="border-b border-border px-3 py-2 text-[11px] uppercase tracking-wide text-muted-foreground">
+              {t("audit.deviationsTitle")}
+            </p>
+            <ul>
+              {deviations
+                .slice(-20)
+                .reverse()
+                .map((d) => (
+                  <li
+                    key={`${d.seq}:${d.intent_id ?? ""}`}
+                    className="flex flex-wrap items-center gap-2 border-t border-border first:border-t-0 px-3 py-1.5"
+                  >
+                    <span className="w-14 shrink-0 font-mono text-[10px] tabular-nums text-muted-foreground">
+                      #{d.seq}
+                    </span>
+                    {d.intent_id && (
+                      <span className="shrink-0 font-mono text-[11px] text-rose-600 dark:text-rose-400">
+                        {d.intent_id}
+                      </span>
+                    )}
+                    <span className="min-w-0 flex-1 text-xs text-muted-foreground">
+                      {d.summary}
+                    </span>
+                    <ActorChip actor={d.actor} />
+                    <span className="shrink-0 font-mono text-[10px] tabular-nums text-muted-foreground">
+                      {new Date(d.at).toLocaleTimeString()}
+                    </span>
+                  </li>
+                ))}
             </ul>
           </CardContent>
         </Card>

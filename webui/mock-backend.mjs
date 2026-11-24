@@ -69,6 +69,72 @@ const MOCK_SCAN_TEXT = {
 
 const nowIso = () => new Date().toISOString();
 
+// One run's worker-pool projection, shared by GET /api/instances/{id}/agents and
+// the task-scoped GET /api/tasks/{id}/workers (the session rail's Run → worker
+// tree reads the latter). The mix of running/queued/completed keeps the
+// per-worker status distinction visible in dev.
+const mockAgentsView = (inst) => {
+  const started = new Date(Date.now() - 8 * 60_000).toISOString();
+  return {
+    available: true,
+    concurrency: { limit: 3, running: 2, queued: 1 },
+    agents: [
+      {
+        agent_id: `${inst.id}/spec-injection`,
+        lane: "injection-serverside",
+        status: "running",
+        task: "Own ONLY the injection-serverside lane",
+        started_at: started,
+        partial_events: 2,
+        claimed_hypotheses: [
+          { id: "h_mock_sqli", vuln_class: "sqli", endpoint: "/api/search", status: "testing" },
+        ],
+      },
+      {
+        agent_id: `${inst.id}/client-source`,
+        lane: "client-source",
+        status: "running",
+        task: "Own ONLY the client-source lane",
+        started_at: started,
+        claimed_hypotheses: [
+          { id: "h_mock_xss", vuln_class: "xss", endpoint: "/comment", status: "testing" },
+        ],
+      },
+      {
+        agent_id: `${inst.id}/business-logic`,
+        lane: "business-logic",
+        status: "queued",
+        task: "Own ONLY the business-logic lane",
+        queued_position: 1,
+      },
+      {
+        agent_id: `${inst.id}/recon-discovery`,
+        lane: "recon-discovery",
+        status: "completed",
+        started_at: new Date(Date.now() - 20 * 60_000).toISOString(),
+        completed_at: new Date(Date.now() - 12 * 60_000).toISOString(),
+        collected: true,
+      },
+    ],
+  };
+};
+
+// Image tool inventory fixture. Mirrors /opt/xalgorix/toolpack.yaml: core,
+// full, and web tools, where full/web are built FROM core.
+const MOCK_TOOLPACK = [
+  { name: "subfinder", bin: "/root/go/bin/subfinder", category: "recon", purpose: "被动子域枚举", capabilities: [], profiles: ["core"] },
+  { name: "httpx", bin: "/root/go/bin/httpx", category: "http", purpose: "HTTP 探活与指纹", capabilities: [], profiles: ["core"] },
+  { name: "nuclei", bin: "/root/go/bin/nuclei", category: "fuzz", purpose: "模板化漏洞扫描", capabilities: [], profiles: ["core"] },
+  { name: "nmap", bin: "/usr/bin/nmap", category: "network", purpose: "端口扫描", capabilities: ["NET_RAW"], profiles: ["full"] },
+  { name: "chromium", bin: "/usr/bin/chromium", category: "browser", purpose: "无头浏览器", capabilities: [], profiles: ["web"] },
+];
+const mockToolpack = (profile) =>
+  MOCK_TOOLPACK.filter(
+    (tool) =>
+      tool.profiles.includes(profile) ||
+      (tool.profiles.includes("core") && (profile === "full" || profile === "web")),
+  ).map(({ profiles, ...tool }) => tool);
+
 let state = {
   instances: [
     {
@@ -89,6 +155,16 @@ let state = {
       phases: [1, 2, 3, 4],
       company_name: "Acme",
       current_phase: 3,
+      container: {
+        project_id: "scan_01",
+        state: "ready",
+        container_id: "c9f3a1b2e4d5",
+        image_digest: "sha256:9d1f0a3c4b2e",
+        profile: "core",
+        desired_state: "ready",
+        reconcile_status: "applied",
+        observed_at: nowIso(),
+      },
       vulns: [
         { id: "v1", title: "/search 存在 SQL 注入", severity: "critical", endpoint: "https://acme.com/search?q=", cvss: 9.8, cve: "CVE-2024-1234" },
         { id: "v2", title: "/login 存在反射型 XSS", severity: "high", endpoint: "https://acme.com/login", cvss: 7.5 },
@@ -110,6 +186,16 @@ let state = {
       total_tokens: 256_000,
       scan_mode: "balanced",
       company_name: "Globex",
+      container: {
+        project_id: "scan_02",
+        state: "absent",
+        image_digest: "sha256:9d1f0a3c4b2e",
+        profile: "core",
+        desired_state: "stopping",
+        reconcile_status: "failed",
+        last_error: "stop timed out after 10s",
+        observed_at: nowIso(),
+      },
       vulns: [
         { id: "v6", title: "S3 bucket misconfiguration", severity: "high", endpoint: "https://cdn.globex.io", cvss: 7.1 },
         { id: "v7", title: "Outdated jQuery 1.4.2", severity: "low", endpoint: "https://globex.io/static/jquery.js", cvss: 3.1 },
@@ -242,6 +328,9 @@ let state = {
   // 旁路提问（chat_questions.go mock）：phase=running 时同 run 再问 → 409；
   // status=answered/failed 后回流转录（chat_question / chat_reply 行）。
   sideQuestions: [],
+  // 主 Agent 提案状态（proposal → 确认 → 写入）。mock 只演示确认/放弃的
+  // 卡片交互；真实写入由 internal/agent 的确认后插入路径完成。
+  proposalStatus: "pending",
   // 任务情报（契约 §3.7 mock）：按 task_id 聚合的观测项 + 操作者分诊覆盖层。
   intelTriages: new Map(), // taskId -> Map(fingerprint -> triage)
   convMeta: new Map(), // instance_id -> { title?, pinned?, archived? }（会话元数据覆盖层）
@@ -430,6 +519,22 @@ let state = {
       last_error: "connect: x509: certificate signed by unknown authority",
       created_by: "operator:admin",
       created_at: nowIso(),
+    },
+  ],
+  builtinSkills: [
+    {
+      name: "exploiting-sql-injection-vulnerabilities",
+      category: "web-application-security",
+      description: "Confirm SQL injection with boolean/time differentials and a control request.",
+      intent: "offensive",
+      tags: ["sqli", "injection", "owasp"],
+    },
+    {
+      name: "performing-memory-forensics-with-volatility3",
+      category: "incident-response",
+      description: "Extract processes, network state and artifacts from a memory image.",
+      intent: "defensive",
+      tags: ["dfir", "memory", "forensics"],
     },
   ],
   skills: [
@@ -725,6 +830,11 @@ function mockInstanceEvents(inst) {
       content: "Worker 结论（spec-injection）：\n\n- 同一接口，角色 A 可见 `users/42`，匿名 401——存在对象级访问控制差异\n- 已认领 IDOR 假设，下一步用两个低权账号交叉验证",
       agent_id: `${inst.id}/spec-injection`,
     },
+    { type: "message", content: "Worker 结论（client-source）：前端只做了展示层校验，`/comment` 直接渲染未编码的 HTML，具备存储型 XSS 条件。", agent_id: `${inst.id}/client-source` },
+    { type: "tool_call", tool_name: "browser_action", content: `browser_action open ${inst.targets}/comment`, agent_id: `${inst.id}/client-source` },
+    { type: "tool_result", content: "非持久脚本未执行；控制台无 CSP 拒绝记录", agent_id: `${inst.id}/client-source` },
+    { type: "message", content: "Worker 结论（recon-discovery）：API 主机暴露 `/api/v1/orders`、`/api/v1/users`、`/auth/token` 三个入口。", agent_id: `${inst.id}/recon-discovery` },
+    { type: "tool_result", content: "被动端点清点完成，写入 notes", agent_id: `${inst.id}/recon-discovery` },
     { type: "phase", content: "进入阶段：漏洞测试", agent_id: inst.id },
     { type: "tool_call", tool_name: "sqlmap", content: `sqlmap -u 'https://${inst.targets}/search?q=1' --batch --level=2`, agent_id: `${inst.id}/spec-injection` },
     { type: "vuln", content: "/search 存在 SQL 注入（critical，CVSS 9.8）", agent_id: `${inst.id}/spec-injection` },
@@ -828,6 +938,34 @@ function buildMockTranscript(instanceId, run) {
   // 终态系统行。
   if (inst.finished_at) {
     rows.push({ kind: "system", text: inst.status === "finished" ? "finished" : `aborted: ${inst.status}`, at: inst.finished_at });
+  }
+
+  // 主 Agent 提案 fixture：一条主回复 + 一张可确认的提案卡（proposal →
+  // confirm/reject 的真实端点见本文件下方路由）。
+  if (instanceId === "inst_01") {
+    const at = nowIso();
+    rows.push({
+      kind: "assistant",
+      role: "main",
+      text: "这项工作我先作为提案，确认后才会写入计划。",
+      at,
+    });
+    rows.push({
+      kind: "proposal",
+      at,
+      proposal: {
+        id: "proposal-mock-1",
+        task_id: state.proposalStatus === "confirmed" ? "human-mock-1" : undefined,
+        title: "测试 /api/v1/orders 越权（IDOR）",
+        target: "https://api.acme.com",
+        target_kind: "web",
+        phase: 8,
+        vuln_class: "idor",
+        endpoint: "/api/v1/orders",
+        notes: "两个低权账号交叉验证对象级访问控制",
+        status: state.proposalStatus,
+      },
+    });
   }
 
   rows.sort((a, b) => (Date.parse(a.at) || 0) - (Date.parse(b.at) || 0));
@@ -957,6 +1095,22 @@ const server = http.createServer(async (req, res) => {
   }
 
   // -------- Instances -------------------------------------------------------
+  if (method === "GET" && url === "/api/runtime") {
+    return send(res, {
+      backend: "docker",
+      transport: "socket",
+      profile: "core",
+      image: "xalgorix-toolbox:dev@sha256:9d1f0a3c4b2e",
+      image_digest: "sha256:9d1f0a3c4b2e",
+      project_limit: 4,
+      projects_active: state.instances.filter((i) => i.container?.state === "ready").length,
+      exec_queue_depth: 0,
+      project_slot_used: 1,
+      project_slot_max: 4,
+      healthy: true,
+      reconciled_at: nowIso(),
+    });
+  }
   if (method === "GET" && url === "/api/instances") {
     const qs = new URLSearchParams(req.url.split("?")[1] || "");
     const projectId = qs.get("project_id");
@@ -969,6 +1123,53 @@ const server = http.createServer(async (req, res) => {
   if (instOne && method === "GET") {
     const inst = state.instances.find((i) => i.id === instOne[1]);
     return inst ? send(res, inst) : send(res, { error: "not found" }, 404);
+  }
+  // 只读容器详情：实际态（运行时）+ 期望态（PG）+ 镜像工具清单。
+  const instContainer = url.match(/^\/api\/instances\/([^/]+)\/container$/);
+  if (instContainer && method === "GET") {
+    const inst = state.instances.find((i) => i.id === instContainer[1]);
+    if (!inst) return send(res, { error: "not found" }, 404);
+    const container = inst.container || {};
+    const available = container.state === "ready";
+    const profile = container.profile || "core";
+    return send(res, {
+      instance_id: inst.id,
+      project_id: container.project_id || inst.id,
+      backend: "docker",
+      available,
+      reason: available ? undefined : container.last_error || "container not found",
+      actual: {
+        state: container.state || "absent",
+        container_id: container.container_id,
+        image: available ? "xalgorix-toolbox:dev" : undefined,
+      },
+      desired: {
+        desired_state: container.desired_state,
+        reconcile_status: container.reconcile_status,
+        desired_gen: 2,
+        applied_gen: available ? 2 : 1,
+        profile,
+        net_profile: "direct",
+        image_digest: container.image_digest,
+        container_id: container.container_id,
+        last_error: container.last_error,
+        created_at: inst.started_at,
+        updated_at: nowIso(),
+      },
+      tools: available
+        ? {
+            available: true,
+            profile,
+            source: "/opt/xalgorix/toolpack.yaml",
+            items: mockToolpack(profile),
+          }
+        : {
+            available: false,
+            profile,
+            reason: "container is not running",
+          },
+      observed_at: nowIso(),
+    });
   }
   // 实例状态翻转辅助：同步 instance / run 投影 / 任务 last_run_status，
   // 并广播 instance_updated（WS→查询桥依赖；真实后端 server.go 同语义）。
@@ -1363,49 +1564,23 @@ const server = http.createServer(async (req, res) => {
         partial_reason: "no_run",
       });
     }
-    const started = new Date(Date.now() - 8 * 60_000).toISOString();
-    return send(res, {
-      available: true,
-      concurrency: { limit: 3, running: 2, queued: 1 },
-      agents: [
-        {
-          agent_id: `${inst.id}-sub-1`,
-          lane: "injection-serverside",
-          status: "running",
-          task: "Own ONLY the injection-serverside lane",
-          started_at: started,
-          partial_events: 2,
-          claimed_hypotheses: [
-            { id: "h_mock_sqli", vuln_class: "sqli", endpoint: "/api/search", status: "testing" },
-          ],
-        },
-        {
-          agent_id: `${inst.id}-sub-2`,
-          lane: "client-source",
-          status: "running",
-          task: "Own ONLY the client-source lane",
-          started_at: started,
-          claimed_hypotheses: [
-            { id: "h_mock_xss", vuln_class: "xss", endpoint: "/comment", status: "testing" },
-          ],
-        },
-        {
-          agent_id: `${inst.id}-sub-3`,
-          lane: "business-logic",
-          status: "queued",
-          task: "Own ONLY the business-logic lane",
-          queued_position: 1,
-        },
-        {
-          agent_id: `${inst.id}-sub-0`,
-          lane: "recon-discovery",
-          status: "completed",
-          started_at: new Date(Date.now() - 20 * 60_000).toISOString(),
-          completed_at: new Date(Date.now() - 12 * 60_000).toISOString(),
-          collected: true,
-        },
-      ],
-    });
+    return send(res, mockAgentsView(inst));
+  }
+
+  // Task-scoped worker history for the session rail's Run → worker tree. Same
+  // projection as /api/instances/{id}/agents, grouped under each mounted run.
+  const taskWorkersMatch = url.match(/^\/api\/tasks\/([^/]+)\/workers$/);
+  if (taskWorkersMatch && method === "GET") {
+    const taskId = taskWorkersMatch[1];
+    const items = state.runs
+      .filter((run) => run.task_id === taskId && run.instance_id)
+      .map((run) => {
+        const inst = state.instances.find((candidate) => candidate.id === run.instance_id);
+        const workers = mockAgentsView(inst ?? { id: run.instance_id });
+        return { ...run, workers };
+      })
+      .filter((item) => item.workers.agents.length > 0);
+    return send(res, { items, total: items.length, page: 1, size: 20 });
   }
 
   // -------- Plan projection (authority = engine plan) ----------------------
@@ -1547,6 +1722,151 @@ const server = http.createServer(async (req, res) => {
         .filter((hit) => kindFilter.length === 0 || hit.rels.some((rel) => kindFilter.includes(rel)));
       return send(res, { available: true, hits, truncated: false, incomplete: true, gap_reason: "mock watermark pending" });
     }
+    if (url.endsWith("/relations")) {
+      // Subject-level project graph. Titles mirror the objects that would have
+      // produced the relation; the chain is deliberate so the map demonstrates
+      // A (shell) → pivot → B without inventing a "pivot" relation type.
+      const edges = [
+        {
+          src_subject: "10.0.1.5:8080", src_kind: "container",
+          dst_subject: "10.0.2.10:22", dst_kind: "container",
+          rel: "yields", category: "chain", count: 2,
+          src_title: "intent: pivot via SOCKS tunnel",
+          dst_title: "fact: tunnel live on 10.0.2.10:22",
+          last_at: new Date(now - 8 * 60000).toISOString(),
+        },
+        {
+          src_subject: "10.0.2.10:22", src_kind: "container",
+          dst_subject: "10.0.3.7:8080", dst_kind: "container",
+          rel: "supports", category: "chain", count: 1,
+          src_title: "fact: shell on 10.0.2.10",
+          dst_title: "belief: 10.0.3.7 reachable from the tunnel",
+          last_at: new Date(now - 6 * 60000).toISOString(),
+        },
+        {
+          src_subject: "10.0.3.7:8080", src_kind: "container",
+          dst_subject: "api.example.com", dst_kind: "host",
+          rel: "derived_from", category: "chain", count: 1,
+          src_title: "fact: internal API reachable via pivot",
+          dst_title: "belief: api.example.com trusts the internal network",
+          last_at: new Date(now - 5 * 60000).toISOString(),
+        },
+        {
+          src_subject: "api.example.com", src_kind: "host",
+          dst_subject: "admin.example.com", dst_kind: "host",
+          rel: "supports", category: "chain", count: 3,
+          src_title: "evidence: shared session cookie",
+          dst_title: "belief: admin console shares the session",
+          last_at: new Date(now - 4 * 60000).toISOString(),
+        },
+        {
+          src_subject: "admin.example.com", src_kind: "host",
+          dst_subject: "auth.example.com", dst_kind: "host",
+          rel: "references", category: "info", count: 2,
+          src_title: "evidence: auth redirect chain",
+          dst_title: "observation: auth.example.com login",
+          last_at: new Date(now - 3 * 60000).toISOString(),
+        },
+        {
+          src_subject: "api.example.com", src_kind: "host",
+          dst_subject: "auth.example.com", dst_kind: "host",
+          rel: "same_session", category: "info", count: 1,
+          src_title: "observation: api traffic",
+          dst_title: "observation: auth traffic",
+          last_at: new Date(now - 2 * 60000).toISOString(),
+        },
+      ];
+      return send(res, {
+        available: true,
+        source: "graph",
+        edges,
+        truncated: false,
+        incomplete: false,
+      });
+    }
+    if (url.endsWith("/heatmap")) {
+      // Project nebula data: 80 subjects with a long-tail volume distribution so
+      // the map has a dense cold core and sparse hot outliers. Deterministic and
+      // cached so refresh does not reshuffle the mock.
+      if (!state.heatmapRows) {
+        const hosts = ["api", "admin", "auth", "static", "blog", "shop", "pay", "cdn", "mail", "vpn", "dev", "staging"];
+        const domains = ["example.com", "acme.test", "internal.lab"];
+        const paths = [
+          "/", "/login", "/api/v1/orders", "/api/v1/users", "/admin", "/search",
+          "/upload", "/graphql", "/health", "/static/app.js", "/checkout", "/profile",
+          "/api/v2/items", "/api/v2/session", "/oauth/token", "/webhooks", "/export",
+          "/import", "/metrics", "/debug/pprof", "/.well-known", "/robots.txt", "/sitemap.xml", "/favicon.ico",
+        ];
+        const containers = [
+          "10.0.1.5:8080", "10.0.1.6:8443", "10.0.2.10:22", "10.0.2.11:443",
+          "10.0.3.7:8080", "10.0.3.8:9000", "10.0.4.2:3306", "10.0.4.3:6379",
+          "10.0.5.4:9200", "10.0.5.5:5432", "10.0.6.6:27017", "10.0.6.7:8090",
+        ];
+        const apps = ["acme-portal", "admin-console", "partner-api", "legacy-crm", "mobile-gateway", "billing", "docs", "status-page"];
+        // Fractions per progress level; the rounding remainder goes to the last
+        // non-zero stage so a level never leaks into a higher ring.
+        const fractions = {
+          1: [1, 0, 0, 0, 0, 0],
+          2: [0.78, 0.22, 0, 0, 0, 0],
+          3: [0.64, 0.16, 0.2, 0, 0, 0],
+          4: [0.54, 0.14, 0.18, 0.14, 0, 0],
+          5: [0.48, 0.12, 0.16, 0.12, 0.12, 0],
+          6: [0.42, 0.1, 0.14, 0.11, 0.12, 0.11],
+        };
+        const order = ["observation", "inference", "belief", "intent", "fact", "finding"];
+        const list = [];
+        const push = (subject, kind, index) => {
+          const total = Math.max(1, Math.round(96 / Math.pow(index + 1, 0.82)));
+          const level = index < 2 ? 6 : index < 6 ? 5 : index < 14 ? 4 : index < 28 ? 3 : index < 48 ? 2 : 1;
+          const f = fractions[level];
+          let last = 0;
+          for (let k = 0; k < f.length; k += 1) if (f[k] > 0) last = k;
+          const counts = { observation: 0, inference: 0, belief: 0, intent: 0, fact: 0, finding: 0 };
+          let assigned = 0;
+          for (let k = 0; k < order.length; k += 1) {
+            counts[order[k]] =
+              k === last
+                ? Math.max(0, total - assigned)
+                : Math.floor(total * (f[k] || 0));
+            assigned += counts[order[k]];
+          }
+          list.push({
+            subject,
+            subject_kind: kind,
+            counts,
+            total,
+            last_observed: new Date(now - (index + 1) * 120000).toISOString(),
+          });
+        };
+        for (let i = 0; i < 36; i += 1) {
+          push(`${hosts[i % 12]}.${domains[Math.floor(i / 12)]}`, "host", i);
+        }
+        for (let i = 0; i < 24; i += 1) {
+          push(`https://${hosts[i % 12]}.${domains[i % 3]}${paths[i]}`, "endpoint", 36 + i);
+        }
+        containers.forEach((container, i) => push(container, "container", 60 + i));
+        apps.forEach((app, i) => push(app, "app", 72 + i));
+        state.heatmapRows = list.sort(
+          (a, b) => b.total - a.total || a.subject.localeCompare(b.subject),
+        );
+      }
+      const rows = state.heatmapRows;
+      const q = (qs.get("q") || "").toLowerCase();
+      const matched = q
+        ? rows.filter((row) => row.subject.toLowerCase().includes(q))
+        : rows;
+      const limit = Math.min(Math.max(Number(qs.get("limit") || 200), 1), 200);
+      return send(res, {
+        available: true,
+        source: "graph",
+        types: ["observation", "inference", "belief", "intent", "fact", "finding"],
+        rows: matched.slice(0, limit),
+        truncated: matched.length > limit,
+        subject_total: matched.length,
+        unlabeled: 3,
+        incomplete: false,
+      });
+    }
     return send(res, { available: false, reason: "unknown_info_endpoint" }, 404);
   }
 
@@ -1641,6 +1961,55 @@ const server = http.createServer(async (req, res) => {
   }
 
   // -------- LLM / environment / legacy-import settings ---------------------
+  if (method === "GET" && url === "/api/proxies") {
+    return send(res, {
+      enabled: true,
+      required: false,
+      entries: [
+        { index: 1, label: "socks5://10.0.0.5:1080" },
+        { index: 2, label: "http://10.0.0.6:8080" },
+      ],
+    });
+  }
+  if (method === "GET" && url === "/api/pool") {
+    return send(res, {
+      keys: 2,
+      masked: ["sk-…a1b2", "sk-…c3d4"],
+      strategy: "round_robin",
+      entries: [
+        { id: "fp-a1b2", masked: "sk-…a1b2", state: "ok" },
+        {
+          id: "fp-c3d4",
+          masked: "sk-…c3d4",
+          state: "cooling",
+          open_until: new Date(Date.now() + 8 * 60 * 1000).toISOString(),
+          trips: 2,
+          last_error: "quota exhausted for this account",
+          last_at: new Date(Date.now() - 2 * 60 * 1000).toISOString(),
+        },
+      ],
+      events: [
+        {
+          at: new Date(Date.now() - 2 * 60 * 1000).toISOString(),
+          reason: "quota_exhausted",
+          from: "fp-c3d4",
+          to: "fp-a1b2",
+          cooldown_until: new Date(Date.now() + 8 * 60 * 1000).toISOString(),
+        },
+      ],
+    });
+  }
+  if (method === "POST" && url === "/api/pool/reset") {
+    const body = await readBody(req);
+    return send(res, {
+      keys: 2,
+      masked: ["sk-…a1b2", "sk-…c3d4"],
+      strategy: "round_robin",
+      entries: [{ id: "fp-a1b2", masked: "sk-…a1b2", state: "ok" }],
+      events: [],
+      reset: body?.id || "all",
+    });
+  }
   if (method === "GET" && url === "/api/settings/llm") {
     return send(res, llmSettings);
   }
@@ -1681,6 +2050,130 @@ const server = http.createServer(async (req, res) => {
     };
     state.projects.push(proj);
     return send(res, proj, 201);
+  }
+
+  // -------- Asset graph (target-first drill-down) ---------------------------
+  // Mirrors internal/web/handlers_assets.go: identity list, project-level
+  // structural edges (host → path), detail, record/merge/archive.
+  const assetRoute = url.match(/^\/api\/projects\/([^/]+)\/assets(\/.*)?$/);
+  if (assetRoute) {
+    const projectId = assetRoute[1];
+    const rest = assetRoute[2] || "";
+    const project = state.projects.find((p) => p.id === projectId);
+    if (!project) return send(res, { error: "not found" }, 404);
+    if (!state.assets) {
+      const at = nowIso();
+      const row = (id, kind, key, displayName = key) => ({
+        id,
+        project_id: projectId,
+        kind,
+        key,
+        display_name: displayName,
+        first_info_item_id: `evidence:${state.instances[0]?.id || "run_mock_1"}:ev_${id}`,
+        last_info_item_id: `evidence:${state.instances[0]?.id || "run_mock_1"}:ev_${id}`,
+        created_at: at,
+        updated_at: at,
+      });
+      state.assets = [
+        row(1, "root_domain", "example.com"),
+        row(2, "subdomain", "api.example.com"),
+        row(3, "subdomain", "admin.example.com"),
+        row(4, "ip", "10.0.1.5", "target container"),
+        row(5, "service", "10.0.1.5:8080"),
+        row(6, "endpoint", "/api/v1/orders"),
+        row(7, "endpoint", "/api/v1/users"),
+        row(8, "endpoint", "/login"),
+        row(9, "endpoint", "/admin"),
+        row(10, "endpoint", "/static/app.js"),
+        row(11, "app", "acme-portal"),
+      ];
+      state.assetEdges = [
+        { src_id: 1, rel: "resolves_to", dst_id: 4 },
+        { src_id: 2, rel: "exposes", dst_id: 6 },
+        { src_id: 2, rel: "exposes", dst_id: 7 },
+        { src_id: 3, rel: "exposes", dst_id: 8 },
+        { src_id: 3, rel: "exposes", dst_id: 9 },
+        { src_id: 4, rel: "hosts", dst_id: 5 },
+        { src_id: 5, rel: "exposes", dst_id: 6 },
+      ];
+    }
+    const qs = new URLSearchParams(url.split("?")[1] || "");
+    const active = (a) => !a.merged_into_id && (qs.get("include_archived") === "true" || !a.archived_at);
+
+    if (rest === "/edges" && method === "GET") {
+      return send(res, { project_id: projectId, edges: state.assetEdges });
+    }
+    if (rest === "/merge" && method === "POST") {
+      const body = await readBody(req);
+      const source = state.assets.find((a) => a.id === Number(body.source_id));
+      const target = state.assets.find((a) => a.id === Number(body.target_id));
+      if (!source || !target || source.id === target.id) return send(res, { error: "conflict" }, 409);
+      for (const edge of state.assetEdges) {
+        if (edge.src_id === source.id) edge.src_id = target.id;
+        if (edge.dst_id === source.id) edge.dst_id = target.id;
+      }
+      source.archived_at = nowIso();
+      source.merged_into_id = target.id;
+      return send(res, { status: "merged", project_id: projectId, source_id: source.id, target_id: target.id });
+    }
+    if (rest === "/archive" && method === "POST") {
+      const body = await readBody(req);
+      const ids = new Set((body.ids || []).map(Number));
+      let updated = 0;
+      for (const asset of state.assets) {
+        if (!ids.has(asset.id) || asset.merged_into_id) continue;
+        asset.archived_at = body.archived ? nowIso() : undefined;
+        asset.archived_by = body.archived ? "mock-operator" : undefined;
+        updated += 1;
+      }
+      return send(res, { project_id: projectId, updated, archived: !!body.archived });
+    }
+    if (rest === "" && method === "GET") {
+      const kinds = qs.getAll("kind").flatMap((v) => v.split(",")).filter(Boolean);
+      const q = (qs.get("q") || "").toLowerCase();
+      const items = state.assets.filter(
+        (a) =>
+          active(a) &&
+          (kinds.length === 0 || kinds.includes(a.kind)) &&
+          (!q || a.key.toLowerCase().includes(q) || (a.display_name || "").toLowerCase().includes(q)),
+      );
+      return send(res, { project_id: projectId, source: "assets", items, total: items.length });
+    }
+    if (rest === "" && method === "POST") {
+      const body = await readBody(req);
+      const key = String(body.key || "").trim();
+      if (!key) return send(res, { error: "key is required" }, 400);
+      const at = nowIso();
+      const asset = {
+        id: Math.max(0, ...state.assets.map((a) => a.id)) + 1,
+        project_id: projectId,
+        kind: String(body.kind || "endpoint"),
+        key,
+        display_name: String(body.display_name || key),
+        first_info_item_id: body.info_item_id || "",
+        last_info_item_id: body.info_item_id || "",
+        created_at: at,
+        updated_at: at,
+      };
+      state.assets.push(asset);
+      return send(res, asset, 201);
+    }
+    const one = rest.match(/^\/(\d+)$/);
+    if (one && method === "GET") {
+      const asset = state.assets.find((a) => a.id === Number(one[1]));
+      if (!asset) return send(res, { error: "not found" }, 404);
+      const links = [
+        {
+          scan_id: state.instances[0]?.id || "run_mock_1",
+          task_id: state.tasks?.[0]?.id || "task_mock",
+          source: "traffic_observed",
+          created_at: asset.updated_at,
+        },
+      ];
+      const edges = state.assetEdges.filter((e) => e.src_id === asset.id || e.dst_id === asset.id);
+      return send(res, { asset, links, edges });
+    }
+    return send(res, { error: "not found" }, 404);
   }
   // -------- R3: project scope & fence (project page module) ------------------
   // Mirrors internal/web/project_scope.go closely enough for UI work: shape
@@ -2216,6 +2709,19 @@ const server = http.createServer(async (req, res) => {
   if (method === "GET" && url === "/api/skills") {
     return send(res, { skills: state.skills });
   }
+  // 内置语料只读投影（真实后端来自编译进二进制的 800+ SKILL.md）。
+  if (method === "GET" && url === "/api/skills/builtin") {
+    return send(res, { skills: state.builtinSkills });
+  }
+  const builtinSkillDetail = url.match(/^\/api\/skills\/builtin\/([^/]+)(?:\?.*)?$/);
+  if (method === "GET" && builtinSkillDetail) {
+    const hit = state.builtinSkills.find((k) => k.name === decodeURIComponent(builtinSkillDetail[1]));
+    if (!hit) return send(res, { error: "skill not found" }, 404);
+    return send(res, {
+      ...hit,
+      body: `# ${hit.name}\n\nMock built-in skill body (category: ${hit.category}).\n\n1. Recon the surface.\n2. Confirm with a deterministic control.`,
+    });
+  }
   if (url === "/api/skills" && method === "POST") {
     const body = await readBody(req);
     if (!/^[a-z0-9]+(-[a-z0-9]+)*$/.test(body.name || "")) {
@@ -2254,7 +2760,13 @@ const server = http.createServer(async (req, res) => {
 
   if (method === "GET" && url === "/api/agent-profiles") {
     const builtin = ["recon-discovery", "authz-logic", "business-logic", "injection-serverside", "client-source"].map((role, i) => ({
-      id: `builtin:${role}`, role, builtin: true, enabled: true, focus: "", vuln_classes: [], evidence_contract: "", stopping_rule: "", created_at: nowIso(),
+      id: `builtin:${role}`, role, builtin: true, enabled: true,
+      focus: `Mock focus for ${role}`,
+      vuln_classes: [],
+      evidence_contract: "A replayable differential or a rejected hypothesis with its control.",
+      stopping_rule: "Stop when the lane's assigned matrix is exhausted.",
+      tool_scope_hidden: ["spawn_agent", "create_agent", "check_agent", "wait_agent"],
+      created_at: nowIso(),
     }));
     return send(res, { profiles: [...builtin, ...state.agentProfiles] });
   }
@@ -2506,6 +3018,25 @@ const server = http.createServer(async (req, res) => {
     const taskIds = new Set(state.tasks.filter((t) => t.project_id === projConvs[1]).map((t) => t.id));
     const rows = conversationRows(includeArchived).filter((r) => taskIds.has(r.task_id));
     return send(res, { items: rows });
+  }
+
+  // 主 Agent 提案确认/放弃（contract：/api/conversations/{id}/intent-proposals/...）。
+  const proposalMatch = url.match(
+    /^\/api\/conversations\/([^/]+)\/intent-proposals\/([^/]+)\/(confirm|reject)$/,
+  );
+  if (proposalMatch && method === "POST") {
+    const [, instanceId, proposalId, action] = proposalMatch;
+    const run = state.runs.find((r) => r.instance_id === instanceId);
+    if (!run) {
+      return send(res, { error: "run is not live; intent proposals expire with the run" }, 409);
+    }
+    state.proposalStatus = action === "confirm" ? "confirmed" : "rejected";
+    return send(
+      res,
+      action === "confirm"
+        ? { status: "confirmed", proposal_id: proposalId, task_id: "human-mock-1" }
+        : { status: "rejected", proposal_id: proposalId },
+    );
   }
 
   const convSub = url.match(/^\/api\/conversations\/([^/]+)\/(transcript|attachments)$/);

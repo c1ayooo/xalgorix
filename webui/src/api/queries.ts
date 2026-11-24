@@ -1,12 +1,23 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  keepPreviousData,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import { api } from "./client";
 import type {
   ApprovalRuleRequest,
+  AssetListParams,
+  RecordAssetInput,
   ColdPathSyncState,
   ScanAuditView,
   ExplorationView,
+  DecisionInboxView,
+  DecisionRequest,
   ConversationPatch,
   InfoAssociationParams,
+  InfoHeatmapParams,
+  InfoRelationsParams,
   IntelTriageStatus,
   InfoContextParams,
   InfoRegionParams,
@@ -14,6 +25,7 @@ import type {
   ProjectRequest,
   ProjectScope,
   Role,
+  ReportCreateRequest,
   ScanRequest,
   ScanSchedule,
   TaskRequest,
@@ -39,12 +51,15 @@ export const qk = {
   // Paginated scans share the ["scans"] prefix so existing
   // invalidateQueries({ queryKey: qk.scans }) calls refresh them too.
   scansPage: (params: ListParams) => ["scans", "page", params] as const,
+  reports: ["reports"] as const,
+  taskReports: (taskId: string) => ["reports", "task", taskId] as const,
   scan: (id: string) => ["scan", id] as const,
   instances: ["instances"] as const,
   // Paginated instances share the ["instances"] prefix for the same reason.
   instancesPage: (params: ListParams) => ["instances", "page", params] as const,
   instance: (id: string) => ["instance", id] as const,
   instanceEvents: (id: string) => ["instance", id, "events"] as const,
+  instanceContainer: (id: string) => ["instance", id, "container"] as const,
   queue: ["queue"] as const,
   rateLimit: ["settings", "rate-limit"] as const,
   llmSettings: ["settings", "llm"] as const,
@@ -77,6 +92,10 @@ export const qk = {
     ["approvals", "rules", projectId ?? "all", kind ?? "all"] as const,
   infoRegion: (params: InfoRegionParams) =>
     ["info", "region", params] as const,
+  infoHeatmap: (params: InfoHeatmapParams) =>
+    ["info", "heatmap", params] as const,
+  infoRelations: (params: InfoRelationsParams) =>
+    ["info", "relations", params] as const,
   infoContext: (params: InfoContextParams) =>
     ["info", "context", params] as const,
   infoAssociation: (params: InfoAssociationParams) =>
@@ -84,10 +103,15 @@ export const qk = {
   coldPathSync: (scanId: string) => ["info", "coldpath", scanId] as const,
   scanAudit: (scanId: string) => ["info", "audit", scanId] as const,
   scanExploration: (scanId: string) => ["info", "exploration", scanId] as const,
+  // 决策收件箱：与探索投影同前缀（同一 run 的决策/@投影视图一起刷新）。
+  scanDecisions: (scanId: string) => ["info", "decisions", scanId] as const,
   // 集成模块（MCP / Skills / Agents）：定义 + 调用记录。配置类无轮询，
   // mutation 失效刷新；调用记录 15s 轻轮询。
   mcpServers: ["mcp", "servers"] as const,
   skills: ["skills"] as const,
+  builtinSkills: ["skills", "builtin"] as const,
+  builtinSkill: (name: string, category?: string) =>
+    ["skills", "builtin", name, category ?? "all"] as const,
   agentProfiles: ["agent-profiles"] as const,
   mcpInvocations: (params: InvocationListParams) =>
     ["mcp", "invocations", params] as const,
@@ -135,6 +159,67 @@ export function useScansList() {
   });
 }
 
+// Manual report delivery. Poll faster while any revision is queued/generating
+// so the dialog and the list surface progress without a second event channel.
+export function useReportsList() {
+  return useQuery({
+    queryKey: qk.reports,
+    queryFn: () => api.listReports(),
+    refetchInterval: (query) => {
+      const items = query.state.data?.items ?? [];
+      return items.some((r) => r.status === "queued" || r.status === "generating")
+        ? 2000
+        : 15000;
+    },
+  });
+}
+
+export function useTaskReports(taskId?: string) {
+  return useQuery({
+    queryKey: taskId ? qk.taskReports(taskId) : ["reports", "task", "none"],
+    queryFn: () => api.taskReports(taskId!),
+    enabled: !!taskId,
+    refetchInterval: (query) => {
+      const items = query.state.data?.items ?? [];
+      return items.some((r) => r.status === "queued" || r.status === "generating")
+        ? 2000
+        : 15000;
+    },
+  });
+}
+
+export function useCreateTaskReport() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ taskId, req }: { taskId: string; req: ReportCreateRequest }) =>
+      api.createTaskReport(taskId, req),
+    onSuccess: (report) => {
+      qc.invalidateQueries({ queryKey: qk.reports });
+      qc.invalidateQueries({ queryKey: qk.taskReports(report.task_id) });
+    },
+  });
+}
+
+export function useDeleteReport() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (reportId: string) => api.deleteReport(reportId),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: qk.reports });
+    },
+  });
+}
+
+export function useCancelReport() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (reportId: string) => api.cancelReport(reportId),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: qk.reports });
+    },
+  });
+}
+
 // Flattened + deduped findings across all scans, served by GET /api/findings
 // in a single server-side walk. Replaces the per-scan getScan() fan-out the
 // findings page used to do (an N+1 that shipped every scan's full event log
@@ -143,7 +228,10 @@ export function useFindingsList(projectId?: string, enabled = true) {
   return useQuery({
     queryKey: ["findings", "list", projectId ?? "all"],
     queryFn: () => api.listFindings(projectId),
-    refetchInterval: 15000,
+    // Findings land in the run record the moment report_vulnerability accepts
+    // them, so the page only needs a short poll to feel live — a running
+    // assessment reports findings seconds apart, not minutes.
+    refetchInterval: 5000,
     placeholderData: (prev) => prev,
     // 未选项目时缺省参数会扫全量记录（跨项目最坏情况），调用方可显式关掉。
     enabled,
@@ -156,8 +244,8 @@ export function useFindingsSummary(projectId?: string) {
   return useQuery({
     queryKey: ["findings", "summary", projectId ?? "all"],
     queryFn: () => api.findingsSummary(projectId),
-    refetchInterval: 10_000,
-    staleTime: 5_000,
+    refetchInterval: 5_000,
+    staleTime: 3_000,
     placeholderData: (prev) => prev,
   });
 }
@@ -190,6 +278,10 @@ export interface ScanTrafficOptions {
   method?: string;
   /** Hostname join key — pins traffic to one discovered asset. */
   host?: string;
+  /** Exact evidence refs ("session:seq,…") persisted by the finding report. */
+  refs?: string;
+  /** One exact archived record from the scan's own session. */
+  seq?: number;
   limit?: number;
   enabled?: boolean;
   /** Live views poll; archive-only consumers leave it off. */
@@ -207,6 +299,8 @@ export function useScanTrafficQuery(
     endpoint,
     method,
     host,
+    refs,
+    seq,
     limit = 20,
     enabled = true,
     refetchInterval = false,
@@ -220,9 +314,11 @@ export function useScanTrafficQuery(
       endpoint ?? "",
       method ?? "",
       host ?? "",
+      refs ?? "",
+      seq ?? 0,
       limit,
     ],
-    queryFn: () => api.scanTraffic(scanId!, { endpoint, method, host, limit }),
+    queryFn: () => api.scanTraffic(scanId!, { endpoint, method, host, refs, seq, limit }),
     enabled: enabled && !!scanId,
     staleTime,
     refetchInterval,
@@ -306,6 +402,19 @@ export function useInstanceEvents(id?: string) {
     enabled: !!id,
     staleTime: 1000,
     refetchInterval: 5000,
+  });
+}
+
+// Read-only container detail, fetched only while the dialog is open. The
+// endpoint inspects the live container and reads its image manifest, so it is
+// deliberately not polled from the list.
+export function useInstanceContainer(id?: string, enabled = true) {
+  return useQuery({
+    queryKey: id ? qk.instanceContainer(id) : ["instance", "none", "container"],
+    queryFn: () => api.instanceContainer(id!),
+    enabled: !!id && enabled,
+    staleTime: 5000,
+    retry: false,
   });
 }
 
@@ -901,11 +1010,14 @@ export function useInstanceAgents(instanceId?: string, live = false) {
 
 // 任务级 worker 历史（会话页左栏）：任务内每个 run 的 worker，终态由 checkpoint
 // 投影，所以 run 停下来后历史仍在。有活跃 run 时低频兜底刷新。
-export function useTaskWorkers(taskId?: string, live = false) {
+export function useTaskWorkers(taskId?: string, live = false, enabled = true) {
   return useQuery({
     queryKey: ["task-workers", taskId ?? "none"],
     queryFn: () => api.taskWorkers(taskId!),
-    enabled: !!taskId,
+    // 该端点按 run 逐个投影 worker（每个 run 一次 PG + checkpoint 读），是全
+    // 任务最重的一跳。首屏先让 task/runs/findings 拿到数据，runs 就绪后再取
+    // 历史，避免它和关键路径抢同一份 scan-summary 单飞走查。
+    enabled: !!taskId && enabled,
     retry: false,
     refetchInterval: live ? 6000 : false,
     placeholderData: (prev) => prev,
@@ -936,10 +1048,26 @@ export function useProjectConversations(projectId?: string, includeArchived = fa
   });
 }
 
-export function useTranscript(instanceId?: string, beforeSeq?: number, limit = 80, human = false) {
+export function useTranscript(
+  instanceId?: string,
+  beforeSeq?: number,
+  limit = 80,
+  human = false,
+  agent?: string,
+  unit?: string,
+) {
   return useQuery({
-    queryKey: ["conversation", instanceId ?? "none", "transcript", beforeSeq ?? 0, limit, human ? "human" : "full"],
-    queryFn: () => api.conversationTranscript(instanceId!, beforeSeq, limit, human),
+    queryKey: [
+      "conversation",
+      instanceId ?? "none",
+      "transcript",
+      beforeSeq ?? 0,
+      limit,
+      human ? "human" : "full",
+      agent ?? "",
+      unit ?? "",
+    ],
+    queryFn: () => api.conversationTranscript(instanceId!, beforeSeq, limit, human, agent, unit),
     enabled: !!instanceId,
     retry: false,
     refetchInterval: (query) => (query.state.data?.running ? 2500 : false),
@@ -959,13 +1087,44 @@ export function useUpdateConversation(taskId?: string) {
   });
 }
 
-export function useTaskFindings(id?: string) {
+/** Confirm a main-agent intent draft (transcript card). The click is the
+ *  operator's decision, so the backend writes the intent without a model turn. */
+export function useConfirmIntentProposal() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ instanceId, proposalId }: { instanceId: string; proposalId: string }) =>
+      api.confirmIntentProposal(instanceId, proposalId),
+    onSuccess: (_result, vars) => {
+      qc.invalidateQueries({ queryKey: ["conversation"] });
+      qc.invalidateQueries({ queryKey: ["scan-plan", vars.instanceId] });
+      qc.invalidateQueries({ queryKey: ["scan-graph", vars.instanceId] });
+      // The confirmed intent is now claimable: refresh the worker rail and the
+      // task-scoped worker history immediately, not only on the next SSE event.
+      qc.invalidateQueries({ queryKey: ["instance-agents", vars.instanceId] });
+      qc.invalidateQueries({ queryKey: ["task-workers"] });
+    },
+  });
+}
+
+/** Discard a main-agent intent draft. Nothing is written to the plan. */
+export function useRejectIntentProposal() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ instanceId, proposalId }: { instanceId: string; proposalId: string }) =>
+      api.rejectIntentProposal(instanceId, proposalId),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["conversation"] }),
+  });
+}
+
+export function useTaskFindings(id?: string, enabled = true) {
   return useQuery({
     queryKey: id ? qk.taskFindings(id) : ["task", "none", "findings"],
     queryFn: () => api.taskFindings(id!),
-    enabled: !!id,
+    enabled: !!id && enabled,
     retry: false,
-    refetchInterval: 15000,
+    // Same live cadence as the project findings page: a running run reports
+    // findings in seconds, so a 15s poll made the task tab look stale.
+    refetchInterval: 5000,
     placeholderData: (prev) => prev,
   });
 }
@@ -1218,6 +1377,31 @@ export function useInfoRegion(params: InfoRegionParams, enabled = true) {
   });
 }
 
+// 主体 × 信息类型密度聚合。冷路径同步是 15s 节奏；图谱查询本身很轻，
+// 但没必要比同步源更快刷新。
+export function useInfoHeatmap(params: InfoHeatmapParams, enabled = true) {
+  return useQuery({
+    queryKey: qk.infoHeatmap(params),
+    queryFn: () => api.infoHeatmap(params),
+    enabled: enabled && !!params.projectId,
+    refetchInterval: 15000,
+    placeholderData: keepPreviousData,
+    retry: false,
+  });
+}
+
+/** 项目主体关系图；与 heatmap 同一作用域/时间窗，15s 刷新。 */
+export function useInfoRelations(params: InfoRelationsParams, enabled = true) {
+  return useQuery({
+    queryKey: qk.infoRelations(params),
+    queryFn: () => api.infoRelations(params),
+    enabled: enabled && !!params.projectId,
+    refetchInterval: 15000,
+    placeholderData: keepPreviousData,
+    retry: false,
+  });
+}
+
 export function useInfoContext(params: InfoContextParams, enabled = true) {
   return useQuery({
     queryKey: qk.infoContext(params),
@@ -1281,6 +1465,29 @@ export function useScanAudit(scanId: string, running = false) {
   });
 }
 
+// 决策收件箱投影（只读；运行中 15s 轮询，与探索投影一致）。
+export function useScanDecisions(scanId: string, running = false) {
+  return useQuery({
+    queryKey: qk.scanDecisions(scanId),
+    queryFn: (): Promise<DecisionInboxView> => api.scanDecisions(scanId),
+    enabled: !!scanId,
+    refetchInterval: running ? 15000 : false,
+    retry: false,
+  });
+}
+
+// 决策动作：成功后刷新决策收件箱与探索投影（图可能已被动作改变）。
+export function useApplyScanDecision(scanId: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (req: DecisionRequest) => api.applyScanDecision(scanId, req),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: qk.scanDecisions(scanId) });
+      qc.invalidateQueries({ queryKey: qk.scanExploration(scanId) });
+    },
+  });
+}
+
 // ── 集成模块（MCP / Skills / Agents）─────────────────────────────────────────
 
 export function useMcpServers() {
@@ -1297,6 +1504,27 @@ export function useSkills() {
     queryKey: qk.skills,
     queryFn: api.listSkills,
     placeholderData: (prev) => prev,
+    retry: false,
+  });
+}
+
+export function useBuiltinSkills() {
+  return useQuery({
+    queryKey: qk.builtinSkills,
+    queryFn: api.listBuiltinSkills,
+    // 内置语料编译进二进制，进程生命周期内不变。
+    staleTime: Infinity,
+    retry: false,
+  });
+}
+
+/** 按需取一条内置技能正文；name 为空时不发请求（查看弹窗未打开）。 */
+export function useBuiltinSkill(name: string | null, category?: string) {
+  return useQuery({
+    queryKey: qk.builtinSkill(name ?? "", category),
+    queryFn: () => api.getBuiltinSkill(name as string, category),
+    enabled: !!name,
+    staleTime: Infinity,
     retry: false,
   });
 }
@@ -1490,19 +1718,100 @@ export function useDeleteUser() {
   });
 }
 
+// ── project asset operations ────────────────────────────────────────────────
+
+/** 项目资产列表；params 参与 key，筛选变化即重新取数。 */
+export function useProjectAssets(
+  projectId: string | null | undefined,
+  params: AssetListParams = {},
+) {
+  return useQuery({
+    queryKey: ["assets", "list", projectId ?? "none", params],
+    queryFn: () => api.listProjectAssets(projectId!, params),
+    enabled: !!projectId,
+    placeholderData: keepPreviousData,
+    retry: false,
+  });
+}
+
+/** 单个资产的 provenance links + incident edges。 */
+export function useProjectAsset(
+  projectId: string | null | undefined,
+  assetId: number | null,
+) {
+  return useQuery({
+    queryKey: ["assets", "detail", projectId ?? "none", assetId ?? 0],
+    queryFn: () => api.getProjectAsset(projectId!, assetId!),
+    enabled: !!projectId && !!assetId && assetId > 0,
+    retry: false,
+  });
+}
+
+/** 项目级结构边：目标 → 路径（exposes）等确定性关系。 */
+export function useProjectAssetEdges(projectId: string | null | undefined) {
+  return useQuery({
+    queryKey: ["assets", "edges", projectId ?? "none"],
+    queryFn: () => api.listProjectAssetEdges(projectId!),
+    enabled: !!projectId,
+    placeholderData: keepPreviousData,
+    retry: false,
+  });
+}
+
+export function useRecordProjectAsset(projectId: string | null | undefined) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: RecordAssetInput) =>
+      api.recordProjectAsset(projectId!, input),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["assets"] }),
+  });
+}
+
+export function useMergeProjectAssets(projectId: string | null | undefined) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      sourceId,
+      targetId,
+    }: {
+      sourceId: number;
+      targetId: number;
+    }) => api.mergeProjectAssets(projectId!, sourceId, targetId),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["assets"] }),
+  });
+}
+
+export function useArchiveProjectAssets(projectId: string | null | undefined) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ ids, archived }: { ids: number[]; archived: boolean }) =>
+      api.archiveProjectAssets(projectId!, ids, archived),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["assets"] }),
+  });
+}
+
 /** 类型仅作 API 返回形状标注的本地引用（避免 unused 告警由 hooks 消费）。 */
 export type { AgentProfile, McpServer, UserSkill };
+
 
 // ── LLM key pool (masked health + breaker reset) ────────────────────────────
 // Keys are configured via XALGORIX_API_KEY / XALGORIX_API_KEYS; this surface
 // only shows which key is cooling down (and why) and lets the operator clear a
 // breaker after topping up an account. Polled: health changes happen on the
 // request path, not through a pushed event.
-export function useKeyPool() {
+export function useKeyPool(refetchMs = 15000) {
   return useQuery({
     queryKey: ["llm", "keypool"],
     queryFn: api.keyPool,
-    refetchInterval: 15000,
+    refetchInterval: refetchMs,
+  });
+}
+
+export function useProxies() {
+  return useQuery({
+    queryKey: ["proxy", "list"],
+    queryFn: api.proxies,
+    staleTime: 30_000,
   });
 }
 

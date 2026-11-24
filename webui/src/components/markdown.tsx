@@ -50,6 +50,77 @@ function renderInline(text: string): React.ReactNode[] {
 
 type Segment = { type: "code"; content: string } | { type: "text"; content: string };
 
+type TableAlign = "left" | "center" | "right";
+
+function splitTableRow(line: string): string[] {
+  let row = line.trim();
+  if (row.startsWith("|")) row = row.slice(1);
+  if (row.endsWith("|")) row = row.slice(0, -1);
+  // A literal \| inside a cell must not split the row.
+  return row
+    .replace(/\\\|/g, "\u0000")
+    .split("|")
+    .map((cell) => cell.replace(/\u0000/g, "|").trim());
+}
+
+function tableAlignments(line: string): TableAlign[] | null {
+  if (!line.includes("|")) return null;
+  const cells = splitTableRow(line);
+  // A single "---" line is a horizontal rule, not a table delimiter.
+  if (cells.length < 2) return null;
+  const aligns: TableAlign[] = [];
+  for (const cell of cells) {
+    const m = cell.match(/^(:?)-{3,}(:?)$/);
+    if (!m) return null;
+    if (m[1] && m[2]) aligns.push("center");
+    else if (m[2]) aligns.push("right");
+    else aligns.push("left");
+  }
+  return aligns;
+}
+
+function renderTable(
+  header: string[],
+  aligns: TableAlign[],
+  rows: string[][],
+  key: string,
+): React.ReactNode {
+  const width = header.length;
+  const cellStyle = (index: number): React.CSSProperties => ({
+    textAlign: aligns[index] ?? "left",
+  });
+  return (
+    <div key={key} className="max-w-full overflow-x-auto rounded-md border border-border">
+      <table className="w-full min-w-max border-collapse text-xs">
+        <thead className="bg-muted/50">
+          <tr>
+            {header.map((cell, i) => (
+              <th
+                key={i}
+                style={cellStyle(i)}
+                className="border-b border-border px-2 py-1.5 font-medium text-foreground"
+              >
+                {renderInline(cell)}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row, r) => (
+            <tr key={r} className="border-b border-border/50 last:border-b-0">
+              {Array.from({ length: width }, (_, c) => (
+                <td key={c} style={cellStyle(c)} className="px-2 py-1 align-top text-foreground/90">
+                  {renderInline(row[c] ?? "")}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 function parseSegments(src: string): Segment[] {
   const normalized = src.replace(/\r\n/g, "\n").replace(/^\n+|\n+$/g, "");
   const segments: Segment[] = [];
@@ -124,7 +195,23 @@ function renderBlock(raw: string, key: string): React.ReactNode[] {
       out.push(<p key={`${key}-${n++}`}>{renderInline(bl.join(" "))}</p>);
     }
   };
-  for (const line of block.split("\n")) {
+  const lines = block.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const header = splitTableRow(line);
+    const aligns = i + 1 < lines.length ? tableAlignments(lines[i + 1]) : null;
+    if (line.includes("|") && aligns) {
+      flush();
+      const rows: string[][] = [];
+      let j = i + 2;
+      for (; j < lines.length; j++) {
+        if (!lines[j].trim() || !lines[j].includes("|")) break;
+        rows.push(splitTableRow(lines[j]));
+      }
+      out.push(renderTable(header, aligns, rows, `${key}-${n++}`));
+      i = j - 1;
+      continue;
+    }
     const h = line.match(/^(#{1,6})\s+(.*)$/);
     if (h) {
       flush();

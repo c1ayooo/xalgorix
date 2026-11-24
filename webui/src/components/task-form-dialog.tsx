@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
-import { ArrowDown, ArrowUp, Sparkles, X } from "lucide-react";
+import { Sparkles } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -12,6 +12,8 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { TaskLLMChain } from "@/components/task-llm-chain";
+import { TaskProxySelect } from "@/components/task-proxy-select";
 import { Textarea } from "@/components/ui/textarea";
 import {
   Select,
@@ -31,6 +33,7 @@ import type {
   ObjectiveKind,
   ObjectiveVerifyBy,
   Task,
+  TaskAuditMode,
   TaskSchedule,
 } from "@/types/api";
 
@@ -55,6 +58,8 @@ export function TaskFormDialog({
   const { t } = useI18n();
   const create = useCreateTask();
   const update = useUpdateTask();
+  const profilesQuery = useAuthProfiles();
+  const providersQuery = useProviders();
   const editing = !!task;
 
   const [name, setName] = useState("");
@@ -62,9 +67,12 @@ export function TaskFormDialog({
   const [instruction, setInstruction] = useState("");
   const [scanMode, setScanMode] = useState("single");
   const [intensity, setIntensity] = useState("active");
-  // Task model chain: order is priority, active is the next run's profile.
+  const [auditMode, setAuditMode] = useState<TaskAuditMode>("inherit");
+  // 任务级模型链（4zreco task_llm_profiles 移植）：顺序即优先级，active 项是
+  // 下一次运行的凭据；显式 provider_profile 仍可覆盖。
   const [llmChain, setLLMChain] = useState<string[]>([]);
   const [activeLLM, setActiveLLM] = useState("");
+  const [proxyPin, setProxyPin] = useState("");
   const [scheduleOn, setScheduleOn] = useState(false);
   const [interval, setIntervalValue] = useState<TaskSchedule["interval"]>("daily");
   const [time, setTime] = useState("02:00");
@@ -91,11 +99,13 @@ export function TaskFormDialog({
     setName(task?.name ?? "");
     setGoal(task?.goal ?? "");
     setInstruction(task?.instruction ?? "");
+    setScanMode(task?.phase_policy?.scan_mode ?? "single");
+    setIntensity(task?.phase_policy?.intensity ?? "active");
+    setAuditMode(task?.audit_mode ?? "inherit");
     const chain = task?.llm_chain ?? [];
     setLLMChain(chain);
     setActiveLLM(task?.active_llm ?? chain[0] ?? "");
-    setScanMode(task?.phase_policy?.scan_mode ?? "single");
-    setIntensity(task?.phase_policy?.intensity ?? "active");
+    setProxyPin(task?.proxy ?? "");
     if (task?.schedule) {
       setScheduleOn(true);
       setIntervalValue(task.schedule.interval);
@@ -152,42 +162,6 @@ export function TaskFormDialog({
       .finally(() => setAnalyzing(false));
   }
 
-  // Available models: AuthProfile "<provider>:<profileId>" + catalog names.
-  const profilesQuery = useAuthProfiles();
-  const providersQuery = useProviders();
-  const profileOptions = useMemo(() => {
-    const profiles = profilesQuery.data ?? [];
-    const byID = new Map((providersQuery.data ?? []).map((e) => [e.id, e]));
-    return profiles.map((p) => ({
-      value: `${p.provider}:${p.profileId}`,
-      label: `${byID.get(p.provider)?.displayName ?? p.provider} · ${p.profileId}`,
-    }));
-  }, [profilesQuery.data, providersQuery.data]);
-  const chainLabel = (key: string) =>
-    profileOptions.find((o) => o.value === key)?.label ?? key;
-
-  function addChainProfile(key: string) {
-    if (!key || llmChain.includes(key)) return;
-    const next = [...llmChain, key];
-    setLLMChain(next);
-    if (!activeLLM) setActiveLLM(key);
-  }
-
-  function removeChainProfile(key: string) {
-    const next = llmChain.filter((k) => k !== key);
-    setLLMChain(next);
-    if (activeLLM === key) setActiveLLM(next[0] ?? "");
-  }
-
-  // Up/down = priority switch (array order is the chain order).
-  function moveChainProfile(index: number, delta: number) {
-    const target = index + delta;
-    if (target < 0 || target >= llmChain.length) return;
-    const next = [...llmChain];
-    [next[index], next[target]] = [next[target], next[index]];
-    setLLMChain(next);
-  }
-
   function submit() {
     if (!name.trim() || !goal.trim()) return;
     if (objectiveOn && !objectiveStatement.trim()) return;
@@ -210,6 +184,7 @@ export function TaskFormDialog({
         scan_mode: scanMode as "single" | "wildcard" | "dast",
         intensity: intensity as "active" | "passive",
       },
+      audit_mode: auditMode,
       schedule: scheduleOn
         ? { interval, time, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone }
         : null,
@@ -218,6 +193,7 @@ export function TaskFormDialog({
       // [] clears the chain on PATCH; undefined would leave it as is.
       llm_chain: llmChain,
       active_llm: activeLLM || undefined,
+      proxy: proxyPin,
     };
     const mutation = editing
       ? update.mutateAsync({ id: task!.id, req })
@@ -337,89 +313,6 @@ export function TaskFormDialog({
               </ul>
             )}
           </div>
-          {/* Task-level model chain: order is priority; the green dot marks the
-              profile the next run starts on. */}
-          <div className="space-y-1.5">
-            <Label>{t("tasks.fieldLLMChain")}</Label>
-            <Select value="" onValueChange={addChainProfile}>
-              <SelectTrigger>
-                <SelectValue placeholder={t("tasks.llmChainAdd")} />
-              </SelectTrigger>
-              <SelectContent>
-                {profileOptions.length === 0 ? (
-                  <SelectItem value="__none__" disabled>
-                    {t("tasks.llmChainNoProfiles")}
-                  </SelectItem>
-                ) : (
-                  profileOptions.map((opt) => (
-                    <SelectItem
-                      key={opt.value}
-                      value={opt.value}
-                      disabled={llmChain.includes(opt.value)}
-                    >
-                      {opt.label}
-                    </SelectItem>
-                  ))
-                )}
-              </SelectContent>
-            </Select>
-            {llmChain.length === 0 ? (
-              <p className="text-[11px] text-muted-foreground">{t("tasks.llmChainEmpty")}</p>
-            ) : (
-              <ul className="divide-y divide-border rounded-md border border-border">
-                {llmChain.map((key, index) => (
-                  <li key={key} className="flex items-center gap-2 px-2 py-1.5 text-xs">
-                    <button
-                      type="button"
-                      onClick={() => setActiveLLM(key)}
-                      title={t("tasks.llmChainActive")}
-                      aria-pressed={activeLLM === key}
-                      className={`size-2 shrink-0 rounded-full ${
-                        activeLLM === key ? "bg-emerald-500" : "bg-muted-foreground/40"
-                      }`}
-                    />
-                    <span className="min-w-0 flex-1 truncate">{chainLabel(key)}</span>
-                    <span className="shrink-0 font-mono text-[10px] text-muted-foreground">
-                      #{index + 1}
-                    </span>
-                    <Button
-                      size="icon"
-                      variant="ghost"
-                      className="size-6"
-                      disabled={index === 0}
-                      onClick={() => moveChainProfile(index, -1)}
-                      aria-label={t("tasks.llmChainUp")}
-                      title={t("tasks.llmChainUp")}
-                    >
-                      <ArrowUp className="size-3" />
-                    </Button>
-                    <Button
-                      size="icon"
-                      variant="ghost"
-                      className="size-6"
-                      disabled={index === llmChain.length - 1}
-                      onClick={() => moveChainProfile(index, 1)}
-                      aria-label={t("tasks.llmChainDown")}
-                      title={t("tasks.llmChainDown")}
-                    >
-                      <ArrowDown className="size-3" />
-                    </Button>
-                    <Button
-                      size="icon"
-                      variant="ghost"
-                      className="size-6"
-                      onClick={() => removeChainProfile(key)}
-                      aria-label={t("tasks.llmChainRemove")}
-                      title={t("tasks.llmChainRemove")}
-                    >
-                      <X className="size-3" />
-                    </Button>
-                  </li>
-                ))}
-              </ul>
-            )}
-            <p className="text-[11px] text-muted-foreground">{t("tasks.llmChainHint")}</p>
-          </div>
           <div className="grid grid-cols-2 gap-3">
             <div className="space-y-1.5">
               <Label>{t("tasks.fieldScanMode")}</Label>
@@ -443,6 +336,36 @@ export function TaskFormDialog({
               </Select>
             </div>
           </div>
+          {/* 任务级 HITL/审计开关：enforce 时命令与经 MITM 的高危 HTTP 都会
+              进入审批队列并阻塞；off 只审计不拦截；inherit 跟随全局设置。 */}
+          <div className="space-y-1.5">
+            <Label>{t("tasks.fieldAuditMode")}</Label>
+            <Select
+              value={auditMode}
+              onValueChange={(v) => setAuditMode(v as TaskAuditMode)}
+            >
+              <SelectTrigger><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="inherit">{t("tasks.auditInherit")}</SelectItem>
+                <SelectItem value="off">{t("tasks.auditOff")}</SelectItem>
+                <SelectItem value="enforce">{t("tasks.auditEnforce")}</SelectItem>
+              </SelectContent>
+            </Select>
+            <p className="text-[11px] text-muted-foreground">
+              {t("tasks.auditHint")}
+            </p>
+          </div>
+          {/* 任务级模型链：「顺序即优先级」，当前项是下一次 Run 的起点；
+              运行期按链顺序在配额/认证失败时切换（共享 TaskLLMChain 组件）。 */}
+          <TaskProxySelect value={proxyPin} onChange={setProxyPin} />
+          <TaskLLMChain
+            chain={llmChain}
+            active={activeLLM}
+            onChange={(chain, active) => {
+              setLLMChain(chain);
+              setActiveLLM(active);
+            }}
+          />
           <div className="space-y-2 rounded-md border border-border p-3">
             <label className="flex items-center gap-2 text-sm">
               <input

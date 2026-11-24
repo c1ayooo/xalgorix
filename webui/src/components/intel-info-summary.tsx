@@ -39,7 +39,7 @@ export function IntelInfoSummary({
   const items = region.data?.items ?? [];
   const observed = items.filter((item) => item.nature === "observed").length;
   const inferred = items.length - observed;
-  const spaceHref = `/info?tab=region&task=${encodeURIComponent(taskId)}${
+  const spaceHref = `/info?task=${encodeURIComponent(taskId)}${
     projectId ? `&project=${encodeURIComponent(projectId)}` : ""
   }`;
 

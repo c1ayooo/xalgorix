@@ -19,29 +19,39 @@ import { useI18n } from "@/i18n";
 const LIVE_WINDOW_MS = 5000;
 
 /** 5s 内有新事件即视为「实时」（4zreco STREAM_WINDOW 语义）。返回集合为
- * 实例 id 与 agent_id 的并集键。附带 2s 重渲染节拍，保证过期下沉。 */
+ * 实例 id 与 agent_id 的并集键。附带 2s 重渲染节拍，保证过期下沉。
+ *
+ * 选择器返回的是**键集合的签名**而不是事件数组：同一批 agent 持续产事件时
+ * 集合不变，页面就不重渲染。旧实现直接订阅 events（1000 条环形缓冲），运行中
+ * 每个 SSE 帧都会让整块会话页重绘。 */
+const LIVE_SIGNATURE_SEP = "\u0001";
+
 export function useLiveSessionKeys(): Set<string> {
-  const events = useEventsStore((s) => s.events);
-  const [, setTick] = useState(0);
-  const hasRecent = useMemo(() => {
+  const signature = useEventsStore((s) => {
     const now = Date.now();
     const keys = new Set<string>();
-    for (const e of events) {
+    for (const e of s.events) {
       const at = e._receivedAt || 0;
       if (now - at <= LIVE_WINDOW_MS) {
         if (e.instance_id) keys.add(e.instance_id);
         if (e.agent_id) keys.add(e.agent_id);
       }
     }
-    return keys;
-  }, [events]);
+    return [...keys].sort().join(LIVE_SIGNATURE_SEP);
+  });
+  const [, setTick] = useState(0);
   useEffect(() => {
-    if (hasRecent.size === 0) return;
+    if (!signature) return;
     const t = setInterval(() => setTick((n) => n + 1), 2000);
     return () => clearInterval(t);
-  }, [hasRecent.size]);
-  return hasRecent;
+  }, [signature]);
+  return useMemo(
+    () => (signature ? new Set(signature.split(LIVE_SIGNATURE_SEP)) : EMPTY_KEYS),
+    [signature],
+  );
 }
+
+const EMPTY_KEYS: Set<string> = new Set();
 
 /** 事件流连接状态 → 会话栏头部的可见链路章（实时 / 重连中）。 */
 export function useStreamBadge(): { live: boolean; reconnecting: boolean } {

@@ -24,10 +24,13 @@ export function useRunSelection(
   runs: RunRef[],
   urlRun: string | null | undefined,
   onUrlRun: (instanceId: string | undefined) => void,
+  /** autoSelect=false keeps the workspace empty until the user picks a run
+   *  (R7 sessions page: no implicit main-agent selection). */
+  autoSelect = true,
 ) {
   const latest = useMemo(() => pickLatestRun(runs), [runs]);
   const urlValid = !!urlRun && runs.some((r) => r.instance_id === urlRun);
-  const selectedInstanceId = (urlValid ? urlRun : latest?.instance_id) ?? undefined;
+  const selectedInstanceId = urlValid ? urlRun : autoSelect ? latest?.instance_id : undefined;
   return {
     selectedInstanceId,
     /** 最新活跃 run 的 instance_id（无 URL 参数时的自动跟随目标）。 */

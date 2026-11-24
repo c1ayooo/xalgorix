@@ -2,6 +2,12 @@ import type {
   Approval,
   ApprovalsResponse,
   ApprovalsSummary,
+  Asset,
+  AssetDetail,
+  AssetEdgeListResponse,
+  AssetListParams,
+  AssetListResponse,
+  RecordAssetInput,
   ApprovalRule,
   ApprovalRuleRequest,
   AuthProfile,
@@ -14,6 +20,7 @@ import type {
   InstancesResponse,
   IntelTriageStatus,
   KeyPoolView,
+  ProxyListView,
   LLMSettings,
   LLMSettingsRequest,
   ListParams,
@@ -26,6 +33,9 @@ import type {
   ScopeValidateResult,
   QueueStatus,
   RateLimitSettings,
+  Report,
+  ReportCreateRequest,
+  ReportFormat,
   Run,
   ScanEventsPage,
   ScanFileContent,
@@ -60,11 +70,19 @@ import type {
   ColdPathSyncState,
   ScanAuditView,
   ExplorationView,
+  DecisionInboxView,
+  DecisionRequest,
+  DecisionResult,
   ScanPlanView,
   InstanceAgentsView,
+  InstanceContainerDetail,
   TaskWorkersView,
   InfoContextParams,
   InfoContextResult,
+  InfoHeatmapParams,
+  InfoHeatmapResult,
+  InfoRelationsParams,
+  InfoRelationsResult,
   InfoRegionParams,
   InfoRegionResult,
   AgentProfile,
@@ -79,6 +97,8 @@ import type {
   UserSkill,
   UserSkillPatch,
   UserSkillRequest,
+  BuiltinSkillEntry,
+  BuiltinSkillDetail,
   ScanSecurity,
 } from "@/types/api";
 import type { FlatFinding } from "@/lib/findings";
@@ -347,16 +367,26 @@ export const api = {
     http<ScanSecurity>(`/api/scans/${id}/security`),
   // Raw HTTP exchange archive written by the traffic proxy (finding detail
   // renders these packets). endpoint: case-insensitive URL substring (a
-  // finding's endpoint); method: exact method; limit: newest window (server
-  // caps at 100).
+  // finding's endpoint); method: exact method; refs: exact persisted
+  // "session:seq" evidence refs; seq: one exact record; limit: newest window
+  // (server caps at 100).
   scanTraffic: (
     id: string,
-    params?: { endpoint?: string; method?: string; host?: string; limit?: number },
+    params?: {
+      endpoint?: string;
+      method?: string;
+      host?: string;
+      refs?: string;
+      seq?: number;
+      limit?: number;
+    },
   ) => {
     const qs = new URLSearchParams();
     if (params?.endpoint) qs.set("endpoint", params.endpoint);
     if (params?.method) qs.set("method", params.method);
     if (params?.host) qs.set("host", params.host);
+    if (params?.refs) qs.set("refs", params.refs);
+    if (params?.seq) qs.set("seq", String(params.seq));
     if (params?.limit) qs.set("limit", String(params.limit));
     const suffix = qs.toString();
     return http<ScanTrafficView>(`/api/scans/${id}/traffic${suffix ? `?${suffix}` : ""}`);
@@ -394,6 +424,9 @@ export const api = {
   instancesPage: (params: ListParams) =>
     http<InstancesResponse>(`/api/instances${listQuery(params)}`),
   instance: (id: string) => http<ScanInstance>(`/api/instances/${id}`),
+  // 只读容器详情：实际状态（运行时）+ 期望态（PG）+ 镜像内工具清单。
+  instanceContainer: (id: string) =>
+    http<InstanceContainerDetail>(`/api/instances/${id}/container`),
   instanceEvents: (id: string) =>
     http<WSEvent[]>(`/api/instances/${id}/events`),
   // Worker 池投影：每个委派 agent 的真实生命周期 + 并发上限/排队。
@@ -516,6 +549,7 @@ export const api = {
   // LLM key pool: masked status (health/rotation) and breaker reset. The keys
   // themselves are configured via XALGORIX_API_KEY / XALGORIX_API_KEYS.
   keyPool: () => http<KeyPoolView>("/api/pool"),
+  proxies: () => http<ProxyListView>("/api/proxies"),
   resetKeyPool: (id?: string) =>
     http<KeyPoolView>("/api/pool/reset", {
       method: "POST",
@@ -545,6 +579,27 @@ export const api = {
     }),
 
   reportUrl: (scanId: string) => `/api/report/${scanId}`,
+
+  // Manual report delivery (REPORT_DELIVERY_SPEC). Generation is always an
+  // explicit operator action; the list poll exposes queued/generating progress.
+  listReports: (limit = 200) =>
+    http<{ items: Report[] }>(`/api/reports?limit=${limit}`),
+  taskReports: (taskId: string) =>
+    http<{ items: Report[] }>(`/api/tasks/${taskId}/reports`),
+  createTaskReport: (taskId: string, req: ReportCreateRequest) =>
+    http<Report>(`/api/tasks/${taskId}/reports`, { method: "POST", json: req }),
+  getReport: (reportId: string) => http<Report>(`/api/reports/${reportId}`),
+  deleteReport: (reportId: string) =>
+    http<void>(`/api/reports/${reportId}`, { method: "DELETE" }),
+  cancelReport: (reportId: string) =>
+    http<{ status: string }>(`/api/reports/${reportId}/cancel`, { method: "POST" }),
+  findingExportUrl: (
+    scanId: string,
+    vulnId: string,
+    format: ReportFormat | "json",
+    download = true,
+  ) =>
+    `/api/scans/${encodeURIComponent(scanId)}/findings/${encodeURIComponent(vulnId)}/export?format=${format}${download ? "&download=1" : ""}`,
 
   // Run 文件浏览器（只读，后端 scan_files.go）。列表/文本读取走 http()；
   // 图片预览、单文件下载、目录 ZIP 走原生 <a href>/img src —— cookie 会话
@@ -731,6 +786,49 @@ export const api = {
   deleteProject: (id: string) =>
     http<{ status: string }>(`/api/projects/${id}`, { method: "DELETE" }),
 
+  // Project asset operations (internal/web/handlers_assets.go). Identity is
+  // authoritative in the asset graph; links are per run/task.
+  listProjectAssets: (projectId: string, params: AssetListParams = {}) => {
+    const sp = new URLSearchParams();
+    for (const kind of params.kind ?? []) sp.append("kind", kind);
+    if (params.task_id) sp.set("task_id", params.task_id);
+    if (params.run_id) sp.set("run_id", params.run_id);
+    if (params.q && params.q.trim()) sp.set("q", params.q.trim());
+    if (params.include_archived) sp.set("include_archived", "true");
+    if (params.limit) sp.set("limit", String(params.limit));
+    const qs = sp.toString();
+    return http<AssetListResponse>(
+      `/api/projects/${encodeURIComponent(projectId)}/assets${qs ? `?${qs}` : ""}`,
+    );
+  },
+  recordProjectAsset: (projectId: string, input: RecordAssetInput) =>
+    http<Asset>(`/api/projects/${encodeURIComponent(projectId)}/assets`, {
+      method: "POST",
+      json: input,
+    }),
+  listProjectAssetEdges: (projectId: string) =>
+    http<AssetEdgeListResponse>(
+      `/api/projects/${encodeURIComponent(projectId)}/assets/edges`,
+    ),
+  getProjectAsset: (projectId: string, assetId: number) =>
+    http<AssetDetail>(
+      `/api/projects/${encodeURIComponent(projectId)}/assets/${assetId}`,
+    ),
+  mergeProjectAssets: (projectId: string, sourceId: number, targetId: number) =>
+    http<{ status: string }>(
+      `/api/projects/${encodeURIComponent(projectId)}/assets/merge`,
+      { method: "POST", json: { source_id: sourceId, target_id: targetId } },
+    ),
+  archiveProjectAssets: (
+    projectId: string,
+    ids: number[],
+    archived: boolean,
+  ) =>
+    http<{ updated: number }>(
+      `/api/projects/${encodeURIComponent(projectId)}/assets/archive`,
+      { method: "POST", json: { ids, archived } },
+    ),
+
   // 范围/围栏配置模块（internal/web/project_scope.go）：读、写、试算都打在
   // 同一对象上——dispatch 目标与 HITL 运行时围栏是同一个 platform.Scope。
   getProjectScope: (id: string) =>
@@ -767,16 +865,38 @@ export const api = {
     http<{ items: ConversationRow[] }>(
       `/api/projects/${projectId}/conversations${includeArchived ? "?include_archived=true" : ""}`,
     ),
-  conversationTranscript: (instanceId: string, beforeSeq?: number, limit = 80, human = false) => {
+  conversationTranscript: (
+    instanceId: string,
+    beforeSeq?: number,
+    limit = 80,
+    human = false,
+    agent?: string,
+    unit?: string,
+  ) => {
     const qs = new URLSearchParams({ limit: String(limit) });
     if (beforeSeq && beforeSeq > 0) qs.set("before_seq", String(beforeSeq));
     // human=1: the operator-conversation projection (human turns + side-question
     // answers); the full transcript keeps tool/plan/worker/lifecycle rows.
     if (human) qs.set("human", "1");
+    // unit=<intent>: every agent that ran one work unit (retries appended),
+    // filtered before pagination so the unit's own history is the page
+    // authority. agent=<agent_id> stays for legacy single-dispatch lanes.
+    if (unit) qs.set("unit", unit);
+    else if (agent) qs.set("agent", agent);
     return http<TranscriptPage>(`/api/conversations/${instanceId}/transcript?${qs.toString()}`);
   },
   updateConversation: (instanceId: string, patch: ConversationPatch) =>
     http<Run>(`/api/conversations/${instanceId}`, { method: "PATCH", json: patch }),
+  confirmIntentProposal: (instanceId: string, proposalId: string) =>
+    http<{ status: string; proposal_id: string; task_id?: string }>(
+      `/api/conversations/${instanceId}/intent-proposals/${proposalId}/confirm`,
+      { method: "POST" },
+    ),
+  rejectIntentProposal: (instanceId: string, proposalId: string) =>
+    http<{ status: string; proposal_id: string }>(
+      `/api/conversations/${instanceId}/intent-proposals/${proposalId}/reject`,
+      { method: "POST" },
+    ),
   uploadChatAttachment: async (instanceId: string, file: File) => {
     const form = new FormData();
     form.append("file", file);
@@ -881,10 +1001,13 @@ export const api = {
   infoRegion: (params: InfoRegionParams) => {
     const sp = new URLSearchParams({ project_id: params.projectId });
     if (params.taskId) sp.set("task_id", params.taskId);
+    if (params.scanId) sp.set("scan_id", params.scanId);
     if (params.subjectKind) sp.set("subject_kind", params.subjectKind);
     if (params.subject) sp.set("subject", params.subject);
     if (params.purpose) sp.set("purpose", params.purpose);
     if (params.nature) sp.set("nature", params.nature);
+    if (params.layer && params.layer !== "all") sp.set("layer", params.layer);
+    if (params.kind?.length) sp.set("kind", params.kind.join(","));
     if (params.after) sp.set("after", params.after);
     if (params.before) sp.set("before", params.before);
     if (params.cursor) sp.set("cursor", params.cursor);
@@ -892,6 +1015,38 @@ export const api = {
     return http<InfoRegionResult>(`/api/info/region?${sp.toString()}`).then((r) => ({
       ...r,
       items: arr(r.items),
+    }));
+  },
+  // 主体 × 信息类型密度聚合（只读；后端按项目白名单授权，行数有上限）。
+  infoHeatmap: (params: InfoHeatmapParams) => {
+    const sp = new URLSearchParams({ project_id: params.projectId });
+    if (params.taskId) sp.set("task_id", params.taskId);
+    if (params.scanId) sp.set("scan_id", params.scanId);
+    if (params.subject) sp.set("subject", params.subject);
+    if (params.subjectKind) sp.set("subject_kind", params.subjectKind);
+    if (params.purpose) sp.set("purpose", params.purpose);
+    if (params.q) sp.set("q", params.q);
+    if (params.types?.length) sp.set("type", params.types.join(","));
+    if (params.after) sp.set("after", params.after);
+    if (params.before) sp.set("before", params.before);
+    if (params.limit) sp.set("limit", String(params.limit));
+    return http<InfoHeatmapResult>(`/api/info/heatmap?${sp.toString()}`).then((r) => ({
+      ...r,
+      types: arr(r.types),
+      rows: arr(r.rows),
+    }));
+  },
+  // 主体级关系聚合（只读；project/task/run 白名单与 heatmap 相同）。
+  infoRelations: (params: InfoRelationsParams) => {
+    const sp = new URLSearchParams({ project_id: params.projectId });
+    if (params.taskId) sp.set("task_id", params.taskId);
+    if (params.scanId) sp.set("scan_id", params.scanId);
+    if (params.after) sp.set("after", params.after);
+    if (params.before) sp.set("before", params.before);
+    if (params.limit) sp.set("limit", String(params.limit));
+    return http<InfoRelationsResult>(`/api/info/relations?${sp.toString()}`).then((r) => ({
+      ...r,
+      edges: arr(r.edges),
     }));
   },
   infoContext: (params: InfoContextParams) => {
@@ -948,6 +1103,21 @@ export const api = {
       edges: arr(v.edges),
     })),
 
+  // 决策收件箱：只读投影 + 四个有界决策动作（不订阅事件流）。
+  scanDecisions: (scanId: string) =>
+    http<DecisionInboxView>(`/api/scans/${encodeURIComponent(scanId)}/decisions`).then((v) => ({
+      ...v,
+      stalled: arr(v.stalled),
+      blocked: arr(v.blocked),
+      open_intents: arr(v.open_intents),
+      deviations: arr(v.deviations),
+    })),
+  applyScanDecision: (scanId: string, req: DecisionRequest) =>
+    http<DecisionResult>(`/api/scans/${encodeURIComponent(scanId)}/decisions`, {
+      method: "POST",
+      json: req,
+    }),
+
   // ── 集成模块：MCP 服务器 / 用户技能 / Agent 档案（契约 §integration-*）──
   listMcpServers: () => http<{ servers: McpServer[] }>("/api/mcp-servers"),
   createMcpServer: (req: McpServerRequest) =>
@@ -960,6 +1130,14 @@ export const api = {
     http<McpServer>(`/api/mcp-servers/${encodeURIComponent(id)}/refresh`, { method: "POST" }),
 
   listSkills: () => http<{ skills: UserSkill[] }>("/api/skills"),
+  // 内置语料：只读（无 store 依赖，编译进二进制）。
+  listBuiltinSkills: () => http<{ skills: BuiltinSkillEntry[] }>("/api/skills/builtin"),
+  getBuiltinSkill: (name: string, category?: string) =>
+    http<BuiltinSkillDetail>(
+      `/api/skills/builtin/${encodeURIComponent(name)}${
+        category ? `?category=${encodeURIComponent(category)}` : ""
+      }`,
+    ),
   createSkill: (req: UserSkillRequest) =>
     http<UserSkill>("/api/skills", { method: "POST", json: req }),
   updateSkill: (id: string, patch: UserSkillPatch) =>

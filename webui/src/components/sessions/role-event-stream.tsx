@@ -76,6 +76,17 @@ export function RoleEventStream({
         ? t("sessions.decisionEmpty")
         : t("sessions.systemEmpty");
 
+  // 首次取数期间给骨架，避免分组一出现就短暂显示"暂无决策/系统事件"的假空态。
+  if (isLoading && !historyEvents) {
+    return (
+      <div className="min-h-0 flex-1 space-y-2 p-4" aria-busy="true">
+        <div className="h-3 w-1/3 animate-pulse rounded bg-muted" />
+        <div className="h-3 w-2/3 animate-pulse rounded bg-muted" />
+        <div className="h-3 w-1/2 animate-pulse rounded bg-muted" />
+      </div>
+    );
+  }
+
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col">
       {role === "plan" && rows.length > 0 && (

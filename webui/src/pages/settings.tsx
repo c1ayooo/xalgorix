@@ -1,7 +1,15 @@
 import { useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 import { toast } from "sonner";
 import { useSearchParams } from "react-router-dom";
-import { Search, RefreshCw, Trash2, CheckCircle2, AlertTriangle } from "lucide-react";
+import {
+  Search,
+  RefreshCw,
+  Trash2,
+  CheckCircle2,
+  AlertTriangle,
+  ChevronDown,
+  ChevronRight,
+} from "lucide-react";
 import {
   Card,
   CardContent,
@@ -35,7 +43,6 @@ import {
 } from "@/components/ui/alert-dialog";
 import { Switch } from "@/components/ui/switch";
 import { ErrorState } from "@/components/states";
-import { RuntimeStatusCard } from "@/components/runtime-status-card";
 import {
   useAuthProfiles,
   useDeleteAuthProfile,
@@ -165,6 +172,7 @@ export default function SettingsPage() {
   const [envValues, setEnvValues] = useState<Record<string, string>>({});
   const [envChanges, setEnvChanges] = useState<Record<string, string>>({});
   const [envFilter, setEnvFilter] = useState("");
+  const [envAdvancedOpen, setEnvAdvancedOpen] = useState(false);
   const [envRestartRequired, setEnvRestartRequired] = useState(false);
   const [savedRate, setSavedRate] = useState(false);
   const [savedLLM, setSavedLLM] = useState(false);
@@ -460,6 +468,21 @@ export default function SettingsPage() {
     });
   }
 
+  // The Environment tab is the surface of last resort: variables owned by a
+  // dedicated tab (LLM, notifications) or by internal tuning are hidden, and
+  // advanced knobs stay behind one collapsed disclosure.
+  const envNeedle = envFilter.trim().toLowerCase();
+  const visibleEnvVariables = (environment.data?.variables ?? []).filter(
+    (variable) => !variable.hidden,
+  );
+  const commonEnvVariables = visibleEnvVariables.filter(
+    (variable) => !variable.advanced && envVariableMatches(variable, envNeedle),
+  );
+  const advancedEnvVariables = visibleEnvVariables.filter(
+    (variable) => variable.advanced && envVariableMatches(variable, envNeedle),
+  );
+  const showAdvancedEnv = envAdvancedOpen || envNeedle !== "";
+
   return (
     <div className="space-y-6">
       <header className="space-y-1">
@@ -470,8 +493,6 @@ export default function SettingsPage() {
           {t("settings.subtitle")}
         </p>
       </header>
-
-      <RuntimeStatusCard />
 
       <Tabs value={activeTab} onValueChange={changeTab}>
         <TabsList className="flex h-auto flex-wrap">
@@ -1101,15 +1122,6 @@ export default function SettingsPage() {
               </CardContent>
             </Card>
           )}
-          <TrafficMitmCard
-            environment={environment.data}
-            updatePending={updateEnvironment.isPending}
-            onSave={(enabled) =>
-              updateEnvironment.mutateAsync({
-                XALGORIX_TRAFFICPROXY: enabled ? "true" : "false",
-              })
-            }
-          />
           </div>
         </TabsContent>
 
@@ -1586,31 +1598,98 @@ export default function SettingsPage() {
                 </CardContent>
               </Card>
 
-              {Object.entries(filterEnvironment(environment.data, envFilter)).map(
-                ([category, variables]) => (
-                  <Card key={category} className="overflow-hidden">
-                    <CardHeader className="pb-3">
-                      <CardTitle className="text-base">{category}</CardTitle>
-                    </CardHeader>
-                    <CardContent className="p-0">
-                      <div className="divide-y divide-border">
-                        {variables.map((variable) => (
-                          <EnvironmentRow
-                            key={variable.key}
-                            variable={variable}
-                            value={envValues[variable.key] ?? variable.value ?? ""}
-                            changed={Object.prototype.hasOwnProperty.call(
-                              envChanges,
-                              variable.key,
-                            )}
-                            onChange={(value) => updateEnvValue(variable, value)}
-                          />
-                        ))}
-                      </div>
+              {groupEnvVariables(commonEnvVariables).map(([categoryKey, variables]) => (
+                <Card key={categoryKey} className="overflow-hidden">
+                  <CardHeader className="pb-3">
+                    <CardTitle className="text-base">
+                      {t(`settings.env.category.${categoryKey}`, variables[0].category)}
+                    </CardTitle>
+                  </CardHeader>
+                  <CardContent className="p-0">
+                    <div className="divide-y divide-border">
+                      {variables.map((variable) => (
+                        <EnvironmentRow
+                          key={variable.key}
+                          variable={variable}
+                          value={envValues[variable.key] ?? variable.value ?? ""}
+                          changed={Object.prototype.hasOwnProperty.call(
+                            envChanges,
+                            variable.key,
+                          )}
+                          onChange={(value) => updateEnvValue(variable, value)}
+                        />
+                      ))}
+                    </div>
+                  </CardContent>
+                </Card>
+              ))}
+
+              {advancedEnvVariables.length > 0 && (
+                <Card className="overflow-hidden">
+                  <button
+                    type="button"
+                    onClick={() => setEnvAdvancedOpen((open) => !open)}
+                    aria-expanded={showAdvancedEnv}
+                    className="flex w-full items-center justify-between gap-3 px-4 py-3 text-left"
+                  >
+                    <div>
+                      <p className="text-sm font-medium">
+                        {t("settings.env.advanced.title")}
+                      </p>
+                      <p className="text-xs text-muted-foreground">
+                        {t("settings.env.advanced.description")}
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <Badge variant="muted">{advancedEnvVariables.length}</Badge>
+                      {showAdvancedEnv ? (
+                        <ChevronDown className="h-4 w-4 text-muted-foreground" />
+                      ) : (
+                        <ChevronRight className="h-4 w-4 text-muted-foreground" />
+                      )}
+                    </div>
+                  </button>
+                  {showAdvancedEnv && (
+                    <div className="border-t border-border">
+                      {groupEnvVariables(advancedEnvVariables).map(
+                        ([categoryKey, variables]) => (
+                          <div key={categoryKey}>
+                            <p className="px-4 pb-1 pt-3 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                              {t(
+                                `settings.env.category.${categoryKey}`,
+                                variables[0].category,
+                              )}
+                            </p>
+                            <div className="divide-y divide-border">
+                              {variables.map((variable) => (
+                                <EnvironmentRow
+                                  key={variable.key}
+                                  variable={variable}
+                                  value={envValues[variable.key] ?? variable.value ?? ""}
+                                  changed={Object.prototype.hasOwnProperty.call(
+                                    envChanges,
+                                    variable.key,
+                                  )}
+                                  onChange={(value) => updateEnvValue(variable, value)}
+                                />
+                              ))}
+                            </div>
+                          </div>
+                        ),
+                      )}
+                    </div>
+                  )}
+                </Card>
+              )}
+
+              {commonEnvVariables.length === 0 &&
+                advancedEnvVariables.length === 0 && (
+                  <Card>
+                    <CardContent className="p-4 text-sm text-muted-foreground">
+                      {t("settings.env.noMatches")}
                     </CardContent>
                   </Card>
-                ),
-              )}
+                )}
             </div>
           )}
         </TabsContent>
@@ -1827,92 +1906,6 @@ function normalizeReasoningEffort(value: string, ollamaMode: boolean): string {
   return value;
 }
 
-/**
- * 流量捕获（MITM）开关：写 XALGORIX_TRAFFICPROXY（默认开启）。该 env 项同时
- * 出现在「环境变量 → Proxy」组，这里给流量相关操作一个显式入口；缺省时按目录
- * 声明的默认值（true）展示，与后端 config 默认一致。
- */
-function TrafficMitmCard({
-  environment,
-  updatePending,
-  onSave,
-}: {
-  environment: EnvironmentSettings | undefined;
-  updatePending: boolean;
-  onSave: (enabled: boolean) => Promise<EnvironmentSettings>;
-}) {
-  const { t } = useI18n();
-  const [saved, setSaved] = useState(false);
-  const [restartNeeded, setRestartNeeded] = useState(false);
-
-  if (!environment) return <Skeleton className="h-32" />;
-
-  const variable = environment.variables.find(
-    (item) => item.key === "XALGORIX_TRAFFICPROXY",
-  );
-  const raw = envValue(environment, "XALGORIX_TRAFFICPROXY");
-  const enabled =
-    raw === ""
-      ? (variable?.defaultValue ?? "true") !== "false"
-      : raw === "true";
-
-  async function handleToggle(next: boolean) {
-    setSaved(false);
-    try {
-      const response = await onSave(next);
-      setRestartNeeded(
-        Boolean(response.restartRequired ?? variable?.requiresRestart),
-      );
-      setSaved(true);
-      toast.success(t("toast.saved"));
-      setTimeout(() => setSaved(false), 2500);
-    } catch (error) {
-      toast.error(
-        error instanceof Error ? error.message : t("common.somethingWrong"),
-      );
-    }
-  }
-
-  return (
-    <Card>
-      <CardHeader>
-        <CardTitle>{t("settings.card.trafficMitm")}</CardTitle>
-        <CardDescription>{t("settings.trafficMitm.desc")}</CardDescription>
-      </CardHeader>
-      <CardContent className="flex flex-wrap items-center justify-between gap-4">
-        <div className="min-w-0 space-y-1">
-          <Label htmlFor="traffic-mitm" className="text-sm">
-            {enabled
-              ? t("settings.trafficMitm.on")
-              : t("settings.trafficMitm.off")}
-          </Label>
-          <p className="text-xs text-muted-foreground">
-            {t("settings.trafficMitm.hint")}
-          </p>
-          {restartNeeded && (
-            <p className="text-xs text-amber-600 dark:text-amber-400">
-              {t("settings.trafficMitm.restart")}
-            </p>
-          )}
-        </div>
-        <div className="flex items-center gap-2">
-          {saved && (
-            <span className="text-xs text-success">
-              {t("settings.savedIndicator")}
-            </span>
-          )}
-          <Switch
-            id="traffic-mitm"
-            checked={enabled}
-            disabled={updatePending}
-            onCheckedChange={(next) => void handleToggle(next)}
-          />
-        </div>
-      </CardContent>
-    </Card>
-  );
-}
-
 function EnvironmentRow({
   variable,
   value,
@@ -1936,8 +1929,12 @@ function EnvironmentRow({
             <Badge variant="muted">{t("settings.env.defaultBefore")}{variable.defaultValue}</Badge>
           )}
         </div>
-        <p className="text-sm font-medium">{variable.label}</p>
-        <p className="text-xs text-muted-foreground">{variable.description}</p>
+        <p className="text-sm font-medium">
+          {t(`settings.env.key.${variable.key}.label`, variable.label)}
+        </p>
+        <p className="text-xs text-muted-foreground">
+          {t(`settings.env.key.${variable.key}.description`, variable.description)}
+        </p>
       </div>
       <EnvironmentControl variable={variable} value={value} onChange={onChange} />
     </div>
@@ -2053,34 +2050,46 @@ function envValue(data: EnvironmentSettings | undefined, key: string) {
   return data?.variables.find((variable) => variable.key === key)?.value ?? "";
 }
 
-function filterEnvironment(
-  data: EnvironmentSettings | undefined,
-  filter: string,
-) {
-  const needle = filter.trim().toLowerCase();
-  const variables = data?.variables ?? [];
-  const filtered = needle
-    ? variables.filter((variable) =>
-        [
-          variable.key,
-          variable.label,
-          variable.category,
-          variable.description,
-        ]
-          .join(" ")
-          .toLowerCase()
-          .includes(needle),
-      )
-    : variables;
-  return groupBy(filtered, (variable) => variable.category);
+// Environment cards follow the order an operator meets them: egress first,
+// then scan shape, then everything that only matters when tuning.
+const envCategoryOrder = [
+  "traffic_recording",
+  "proxy",
+  "runtime",
+  "hitl",
+  "rate_limits",
+  "oob",
+  "integrations",
+  "security",
+  "resources",
+];
+
+function envVariableMatches(
+  variable: EnvironmentVariableSetting,
+  needle: string,
+): boolean {
+  if (!needle) return true;
+  return [variable.key, variable.label, variable.category, variable.description]
+    .join(" ")
+    .toLowerCase()
+    .includes(needle);
 }
 
-function groupBy<T, K extends string>(items: T[], getKey: (item: T) => K) {
-  return items.reduce<Record<string, T[]>>((acc, item) => {
-    const key = getKey(item);
-    (acc[key] ||= []).push(item);
-    return acc;
-  }, {});
+function groupEnvVariables(
+  variables: EnvironmentVariableSetting[],
+): [string, EnvironmentVariableSetting[]][] {
+  const groups = new Map<string, EnvironmentVariableSetting[]>();
+  for (const variable of variables) {
+    const key = variable.categoryKey || variable.category;
+    const bucket = groups.get(key);
+    if (bucket) bucket.push(variable);
+    else groups.set(key, [variable]);
+  }
+  const rank = (key: string) => {
+    const index = envCategoryOrder.indexOf(key);
+    return index === -1 ? envCategoryOrder.length : index;
+  };
+  return [...groups.entries()].sort(([a], [b]) => rank(a) - rank(b));
 }
 
 function isMaskedSettingValue(value: string): boolean {

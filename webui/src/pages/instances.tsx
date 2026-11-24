@@ -35,6 +35,8 @@ import {
 } from "@/api/queries"
 import { ScanStatusPill } from "@/components/scan-status-pill"
 import { PhaseProgress } from "@/components/phase-progress"
+import { RuntimeStatusCard } from "@/components/runtime-status-card"
+import { ContainerDetailDialog } from "@/components/container-detail-dialog"
 import { Pagination, DEFAULT_PAGE_SIZE } from "@/components/Pagination"
 import { useDebounced } from "@/lib/use-debounced"
 import { timeAgo, formatDuration, shortId } from "@/lib/utils"
@@ -62,6 +64,7 @@ export default function InstancesPage() {
   const [mode, setMode] = useState<string>("all")
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState<number>(DEFAULT_PAGE_SIZE)
+  const [containerTarget, setContainerTarget] = useState<ScanInstance | null>(null)
   const debouncedQ = useDebounced(q, 300)
 
   // Reset to the first page whenever the filters change.
@@ -96,6 +99,8 @@ export default function InstancesPage() {
           {t("instances.subtitle")}
         </p>
       </header>
+
+      <RuntimeStatusCard />
 
       {error ? (
         <ErrorState
@@ -169,7 +174,11 @@ export default function InstancesPage() {
                 <>
                   <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
                     {instances.map((inst) => (
-                      <InstanceCard key={inst.id} instance={inst} />
+                      <InstanceCard
+                        key={inst.id}
+                        instance={inst}
+                        onOpenContainer={setContainerTarget}
+                      />
                     ))}
                   </div>
                   <Card>
@@ -188,6 +197,10 @@ export default function InstancesPage() {
           )}
         </>
       )}
+      <ContainerDetailDialog
+        instance={containerTarget}
+        onOpenChange={(open) => !open && setContainerTarget(null)}
+      />
     </div>
   )
 }
@@ -286,7 +299,13 @@ function ResourceStat({
   )
 }
 
-function InstanceCard({ instance }: { instance: ScanInstance }) {
+function InstanceCard({
+  instance,
+  onOpenContainer,
+}: {
+  instance: ScanInstance
+  onOpenContainer: (instance: ScanInstance) => void
+}) {
   const { t } = useI18n()
   const stop = useStopInstance()
   const pause = usePauseInstance()
@@ -318,6 +337,7 @@ function InstanceCard({ instance }: { instance: ScanInstance }) {
               {shortId(instance.id, 12)}
               {instance.scan_mode && <> · {instance.scan_mode}</>}
             </CardDescription>
+            <ContainerLine instance={instance} onOpen={() => onOpenContainer(instance)} />
           </div>
           <ScanStatusPill status={instance.status} className="shrink-0" />
         </div>
@@ -449,6 +469,55 @@ function InstanceCard({ instance }: { instance: ScanInstance }) {
       </AlertDialog>
     </Card>
   )
+}
+
+// One read-only line per card. Actual state (runtime) and reconcile watermark
+// (PG) are shown side by side; last_error is reachable via the native title
+// tooltip, and clicking opens the full container detail dialog.
+function ContainerLine({
+  instance,
+  onOpen,
+}: {
+  instance: ScanInstance
+  onOpen: () => void
+}) {
+  const { t } = useI18n()
+  const container = instance.container
+  if (!container) return null
+
+  const state = (container.state || "").toLowerCase()
+  const reconcile = (container.reconcile_status || "").toLowerCase()
+  const parts = [
+    container.container_id ? shortId(container.container_id, 8) : null,
+    state === "absent" ? t("instances.container.absent") : state || null,
+    reconcile || null,
+    container.image_digest || null,
+  ].filter(Boolean)
+  if (parts.length === 0) return null
+
+  const title =
+    container.last_error?.trim() ||
+    [container.project_id, container.container_id].filter(Boolean).join(" · ") ||
+    t("instances.container.title")
+
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      title={title}
+      className="mt-1 flex max-w-full items-center gap-1.5 truncate text-left font-mono text-[11px] text-muted-foreground transition-colors hover:text-foreground"
+    >
+      <span aria-hidden className={`size-1.5 shrink-0 rounded-full ${containerTone(state, reconcile)}`} />
+      <span className="truncate">{parts.join(" · ")}</span>
+    </button>
+  )
+}
+
+function containerTone(state: string, reconcile: string): string {
+  if (state === "failed" || reconcile === "failed" || reconcile === "gap") return "bg-red-500"
+  if (state === "pending" || state === "starting" || reconcile === "pending") return "bg-amber-500"
+  if (state === "ready" || state === "busy" || state === "idle") return "bg-emerald-500"
+  return "bg-muted-foreground/50"
 }
 
 function Stat({ icon, label, value }: { icon: ReactNode; label: string; value: string }) {

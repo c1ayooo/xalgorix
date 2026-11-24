@@ -7,9 +7,9 @@ import { timeAgo, cn } from "@/lib/utils";
 import { Skeleton } from "@/components/ui/skeleton";
 import { EmptyState } from "@/components/states";
 import { useI18n } from "@/i18n";
-import type { HttpExchange, ScanInstance } from "@/types/api";
+import type { HttpExchange } from "@/types/api";
 
-// 实时动态页的 HTTP 视图：聚合所有活跃 run 的 MITM 代理流量归档
+// 实时动态页的 HTTP 视图：聚合所有活跃/最近运行（含已结束）的 MITM 代理流量归档
 // （GET /api/scans/{id}/traffic），按时间倒序展示，展开即请求/响应 wire 包原文。
 //
 // 资产绑定：每条流量带后端派生的 `host`，与 run 的资产集合（target / 父域 /
@@ -18,13 +18,37 @@ import type { HttpExchange, ScanInstance } from "@/types/api";
 const TRAFFIC_LIMIT = 50;
 const LIVE_POLL_MS = 5000;
 
-export function LiveTraffic({ instances }: { instances: ScanInstance[] }) {
+/** 流量面板只需要的最小运行视图：实时实例与重启后从扫描列表重建的运行共用。 */
+export interface TrafficRun {
+  id: string;
+  name?: string;
+  targets?: string;
+  status: string;
+  started_at?: string;
+  parent_target?: string;
+  sub_scans?: { target: string }[];
+}
+
+function isActiveStatus(status?: string): boolean {
+  const s = (status || "").toLowerCase();
+  return s === "running" || s === "pending" || s === "paused";
+}
+
+export function LiveTraffic({
+  instances,
+  projectName,
+}: {
+  instances: TrafficRun[];
+  projectName?: string;
+}) {
   const { t } = useI18n();
   const trafficQueries = useQueries({
     queries: instances.map((inst) => ({
-      queryKey: ["scan", inst.id, "traffic", "", "", "", TRAFFIC_LIMIT] as const,
+      queryKey: ["scan", inst.id, "traffic", "", "", "", "", 0, TRAFFIC_LIMIT] as const,
       queryFn: () => api.scanTraffic(inst.id, { limit: TRAFFIC_LIMIT }),
-      refetchInterval: LIVE_POLL_MS,
+      // Active runs stream; a finished run's archive is immutable, so polling
+      // it would only burn IO.
+      refetchInterval: isActiveStatus(inst.status) ? LIVE_POLL_MS : false,
       staleTime: 3000,
       retry: false,
     })),
@@ -37,7 +61,7 @@ export function LiveTraffic({ instances }: { instances: ScanInstance[] }) {
   }, [instances]);
 
   const rows = useMemo(() => {
-    const out: { ex: HttpExchange; instance: ScanInstance; asset: boolean }[] = [];
+    const out: { ex: HttpExchange; instance: TrafficRun; asset: boolean }[] = [];
     trafficQueries.forEach((query, index) => {
       const inst = instances[index];
       if (!inst) return;
@@ -51,6 +75,7 @@ export function LiveTraffic({ instances }: { instances: ScanInstance[] }) {
   }, [assetsByInstance, instances, trafficQueries]);
 
   const loading = trafficQueries.some((q) => q.isLoading);
+  const anyError = trafficQueries.some((q) => q.isError);
   const anyPresent = trafficQueries.some((q) => q.data?.present);
 
   if (instances.length === 0) {
@@ -58,7 +83,11 @@ export function LiveTraffic({ instances }: { instances: ScanInstance[] }) {
       <EmptyState
         className="m-3"
         title={t("live.http.empty.title")}
-        description={t("live.http.noRuns")}
+        description={
+          projectName
+            ? t("live.http.noRunsInProject").replace("%s", projectName)
+            : t("live.http.noRuns")
+        }
       />
     );
   }
@@ -79,9 +108,11 @@ export function LiveTraffic({ instances }: { instances: ScanInstance[] }) {
         className="m-3"
         title={t("live.http.empty.title")}
         description={
-          anyPresent
-            ? t("live.http.empty.description")
-            : t("live.http.absent")
+          anyError
+            ? t("live.http.error")
+            : anyPresent
+              ? t("live.http.empty.description")
+              : t("live.http.absent")
         }
       />
     );
@@ -98,9 +129,10 @@ export function LiveTraffic({ instances }: { instances: ScanInstance[] }) {
       </div>
       {rows.map(({ ex, instance, asset }) => (
         <TrafficRow
-          key={`${instance.id}:${ex.seq}`}
+          key={`${instance.id}:${ex.session ?? ""}:${ex.seq}`}
           exchange={ex}
-          runName={instance.name || instance.targets.split(",")[0] || instance.id}
+          runName={instance.name || (instance.targets ?? "").split(",")[0] || instance.id}
+          runStatus={instance.status}
           asset={asset}
         />
       ))}
@@ -111,10 +143,12 @@ export function LiveTraffic({ instances }: { instances: ScanInstance[] }) {
 function TrafficRow({
   exchange,
   runName,
+  runStatus,
   asset,
 }: {
   exchange: HttpExchange;
   runName: string;
+  runStatus?: string;
   asset: boolean;
 }) {
   const { t } = useI18n();
@@ -174,6 +208,11 @@ function TrafficRow({
         <span className="mono shrink-0 max-w-[18ch] truncate text-[11px] text-muted-foreground">
           {runName}
         </span>
+        {runStatus && runStatus !== "running" && (
+          <span className="mono shrink-0 rounded-sm border border-border px-1 py-0.5 text-[10px] text-muted-foreground">
+            {runStatus}
+          </span>
+        )}
       </button>
       {open && hasRaw && (
         <div className="min-w-0 space-y-2 px-3 pb-3">
@@ -210,7 +249,7 @@ function TrafficRow({
 }
 
 /** 一个 run 的资产 host 集合：目标、父域、已发现子域（资产发现的落地面）。 */
-function assetHosts(inst: ScanInstance): Set<string> {
+function assetHosts(inst: TrafficRun): Set<string> {
   const hosts = new Set<string>();
   const add = (raw?: string) => {
     if (!raw) return;

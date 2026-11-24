@@ -7,9 +7,8 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { EmptyState, ErrorState } from "@/components/states";
 import { Skeleton } from "@/components/ui/skeleton";
-import { ScanStatusPill } from "@/components/scan-status-pill";
 import { TaskFormDialog } from "@/components/task-form-dialog";
-import { TaskRunButton } from "@/components/task-run-button";
+import { TaskRunButton, TaskRunStateBadge } from "@/components/task-run-button";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -168,8 +167,8 @@ export default function TasksPage() {
                         {t("tasks.lastRun")} {timeAgo(task.last_run_at)}
                       </span>
                     )}
-                    {task.last_run_status && (
-                      <ScanStatusPill status={task.last_run_status} />
+                    {(task.run_count ?? 0) > 0 && (
+                      <TaskRunStateBadge task={task} />
                     )}
                   </div>
                 </div>

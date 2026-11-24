@@ -12,6 +12,7 @@ import {
 } from "lucide-react";
 import { SeverityBadge } from "@/components/severity-badge";
 import { ApprovalInlineBar } from "@/components/approval-inline-bar";
+import { Markdown } from "@/components/markdown";
 import { EmptyState } from "@/components/states";
 import { cn } from "@/lib/utils";
 import { useI18n } from "@/i18n";
@@ -387,8 +388,8 @@ export function ExecutionTrace({
                   )}
                   <span className="mono tabular-nums">{formatTime(item.at)}</span>
                 </div>
-                <div className="whitespace-pre-wrap text-foreground">
-                  {item.event.content}
+                <div className="text-foreground">
+                  <Markdown source={item.event.content} />
                 </div>
               </div>
             </div>

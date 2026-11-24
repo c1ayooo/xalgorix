@@ -31,7 +31,11 @@ const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
       retry: 1,
-      refetchOnWindowFocus: false,
+      // A dashboard tab left in the background gets its intervals throttled
+      // by the browser; without a focus refetch it can sit on a snapshot from
+      // hours ago (the "findings are still 4h old" report). Focus refetch is
+      // gated by staleTime, so it costs one request per stale query on return.
+      refetchOnWindowFocus: true,
       staleTime: 10_000,
     },
   },

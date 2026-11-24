@@ -1,4 +1,6 @@
 import { useMemo, useState } from "react";
+import type { ReactNode } from "react";
+import { toast } from "sonner";
 import {
   Dialog,
   DialogContent,
@@ -7,8 +9,22 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { EmptyState, ErrorState } from "@/components/states";
-import { useScanExploration } from "@/api/queries";
+import {
+  useApplyScanDecision,
+  useScanDecisions,
+  useScanExploration,
+} from "@/api/queries";
 import { useI18n } from "@/i18n";
 import { explorationDot, explorationShortID } from "@/lib/exploration";
 import {
@@ -19,7 +35,13 @@ import {
   relStroke,
 } from "@/lib/layered-graph";
 import { cn } from "@/lib/utils";
-import type { ExplorationKind, ExplorationNode, ExplorationView } from "@/types/api";
+import type {
+  DecisionAction,
+  DecisionRequest,
+  ExplorationKind,
+  ExplorationNode,
+  ExplorationView,
+} from "@/types/api";
 
 /**
  * 「探索链路」tab 装配（Run 级，跟随 ?run= 选择）：三态 + 投影诚实标志 +
@@ -64,6 +86,7 @@ export function ExplorationTab({
 
   return (
     <div className="space-y-3">
+      <DecisionInbox scanId={scanId} running={running} />
       {data.incomplete && (
         <p className="rounded-sm border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-600 dark:text-amber-400">
           {data.note || t("explore.incomplete")}
@@ -78,6 +101,416 @@ export function ExplorationTab({
         <ExplorationGraph view={data} />
       )}
     </div>
+  );
+}
+
+/**
+ * 决策收件箱（PLANNER_OBSERVATION_AND_CORRECTION §2.4/§5.6）：只展示「需要
+ * 人决定的少数事项」——停滞 worker、blocked intent、open intent、执行偏离；
+ * 不展示事件流/token 流。四个动作（steer / kill / retire / reprioritize）都走
+ * 同一个 POST，actor=human，引擎按当前状态 CAS；冲突显示引擎原文。
+ */
+const KILL_REASON_CODES = [
+  "human",
+  "stagnant",
+  "repeated_failure",
+  "lane_violation",
+  "scope_violation",
+  "duplicate",
+  "superseded",
+] as const;
+
+interface DecisionForm {
+  action: DecisionAction;
+  unitId: string;
+}
+
+function DecisionInbox({ scanId, running }: { scanId: string; running?: boolean }) {
+  const { t } = useI18n();
+  const { data, isLoading, error, refetch } = useScanDecisions(scanId, running);
+  const apply = useApplyScanDecision(scanId);
+  const [form, setForm] = useState<DecisionForm | null>(null);
+  const [message, setMessage] = useState("");
+  const [reasonCode, setReasonCode] = useState<string>("human");
+  const [reason, setReason] = useState("");
+  const [priority, setPriority] = useState("");
+
+  function openForm(action: DecisionAction, unitId: string) {
+    setForm({ action, unitId });
+    setMessage("");
+    setReason("");
+    setReasonCode("human");
+    setPriority("");
+  }
+
+  function closeForm() {
+    setForm(null);
+  }
+
+  function submit() {
+    if (!form) return;
+    const req: DecisionRequest = { action: form.action, unit_id: form.unitId };
+    if (form.action === "steer_work") req.message = message.trim();
+    if (form.action === "kill_work") {
+      req.reason_code = reasonCode;
+      if (reason.trim()) req.reason = reason.trim();
+    }
+    if (form.action === "retire_intent") req.reason = reason.trim();
+    if (form.action === "reprioritize_intent") req.priority = Number(priority);
+    apply.mutate(req, {
+      onSuccess: (res) => {
+        toast.success(res.message || t("decisions.applied"));
+        setForm(null);
+      },
+      onError: (err) => {
+        toast.error(`${t("decisions.failed")}: ${err instanceof Error ? err.message : String(err)}`);
+      },
+    });
+  }
+
+  if (isLoading && !data) return <Skeleton className="h-24 w-full" />;
+  if (error) {
+    return (
+      <ErrorState
+        title={t("decisions.loadFailed")}
+        description={error instanceof Error ? error.message : ""}
+        action={
+          <button
+            type="button"
+            onClick={() => refetch()}
+            className="text-xs text-muted-foreground transition-colors hover:text-foreground"
+          >
+            {t("common.retry")}
+          </button>
+        }
+      />
+    );
+  }
+  if (!data) return null;
+
+  const total =
+    data.stalled.length +
+    data.blocked.length +
+    data.open_intents.length +
+    data.deviations.length;
+
+  const formValid =
+    form?.action === "steer_work"
+      ? message.trim().length > 0
+      : form?.action === "retire_intent"
+        ? reason.trim().length > 0
+        : form?.action === "reprioritize_intent"
+          ? priority.trim() !== "" &&
+            Number.isFinite(Number(priority)) &&
+            Number(priority) >= 0 &&
+            Number(priority) <= 100000
+          : form?.action === "kill_work";
+
+  return (
+    <section className="rounded-md border border-border bg-background/40">
+      <header className="flex flex-wrap items-baseline justify-between gap-2 border-b border-border px-3 py-2">
+        <h3 className="text-xs font-medium text-foreground">{t("decisions.title")}</h3>
+        <span className="text-[11px] text-muted-foreground">{t("decisions.subtitle")}</span>
+      </header>
+
+      {total === 0 ? (
+        <p className="px-3 py-3 text-xs text-muted-foreground">{t("decisions.empty")}</p>
+      ) : (
+        <div className="divide-y divide-border">
+          {data.stalled.map((row) => (
+            <DecisionRow
+              key={`stalled-${row.unit_id}`}
+              bucket={t("decisions.bucket.stalled")}
+              unitId={row.unit_id}
+              title={row.unit_id}
+              meta={[
+                row.lane,
+                `${row.idle_seconds}s ${t("decisions.idle")}`,
+                row.active_tool ? t("decisions.activeTool") : "",
+              ]
+                .filter(Boolean)
+                .join(" · ")}
+              actions={["steer_work", "kill_work"]}
+              form={form}
+              onOpen={openForm}
+              onClose={closeForm}
+              pending={apply.isPending}
+            >
+              <DecisionFormFields
+                action={form?.unitId === row.unit_id ? form.action : null}
+                message={message}
+                setMessage={setMessage}
+                reasonCode={reasonCode}
+                setReasonCode={setReasonCode}
+                reason={reason}
+                setReason={setReason}
+                priority={priority}
+                setPriority={setPriority}
+                valid={!!formValid}
+                pending={apply.isPending}
+                onSubmit={submit}
+                onCancel={closeForm}
+              />
+            </DecisionRow>
+          ))}
+
+          {data.blocked.map((row) => (
+            <DecisionRow
+              key={`blocked-${row.unit_id}`}
+              bucket={t("decisions.bucket.blocked")}
+              unitId={row.unit_id}
+              title={row.title || row.unit_id}
+              meta={row.blocked_reason || t("decisions.noReason")}
+              actions={["reprioritize_intent"]}
+              form={form}
+              onOpen={openForm}
+              onClose={closeForm}
+              pending={apply.isPending}
+            >
+              <DecisionFormFields
+                action={form?.unitId === row.unit_id ? form.action : null}
+                message={message}
+                setMessage={setMessage}
+                reasonCode={reasonCode}
+                setReasonCode={setReasonCode}
+                reason={reason}
+                setReason={setReason}
+                priority={priority}
+                setPriority={setPriority}
+                valid={!!formValid}
+                pending={apply.isPending}
+                onSubmit={submit}
+                onCancel={closeForm}
+              />
+            </DecisionRow>
+          ))}
+
+          {data.open_intents.map((row) => (
+            <DecisionRow
+              key={`open-${row.unit_id}`}
+              bucket={t("decisions.bucket.open")}
+              unitId={row.unit_id}
+              title={row.title || row.unit_id}
+              meta={[row.target, row.target_kind, `p=${row.priority}`]
+                .filter(Boolean)
+                .join(" · ")}
+              actions={["retire_intent", "reprioritize_intent"]}
+              form={form}
+              onOpen={openForm}
+              onClose={closeForm}
+              pending={apply.isPending}
+            >
+              <DecisionFormFields
+                action={form?.unitId === row.unit_id ? form.action : null}
+                message={message}
+                setMessage={setMessage}
+                reasonCode={reasonCode}
+                setReasonCode={setReasonCode}
+                reason={reason}
+                setReason={setReason}
+                priority={priority}
+                setPriority={setPriority}
+                valid={!!formValid}
+                pending={apply.isPending}
+                onSubmit={submit}
+                onCancel={closeForm}
+              />
+            </DecisionRow>
+          ))}
+
+          {data.deviations.map((row, i) => (
+            <div key={`dev-${row.unit_id}-${i}`} className="px-3 py-2 text-xs">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="rounded-sm bg-muted px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-muted-foreground">
+                  {t("decisions.bucket.deviation")}
+                </span>
+                <span className="font-mono text-[10px] text-muted-foreground">
+                  {row.unit_id || "—"}
+                </span>
+                {row.recorded_at && (
+                  <span className="ml-auto text-[10px] text-muted-foreground">
+                    {new Date(row.recorded_at).toLocaleString()}
+                  </span>
+                )}
+              </div>
+              <p className="mt-1 whitespace-pre-wrap text-muted-foreground">{row.summary}</p>
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function DecisionRow({
+  bucket,
+  unitId,
+  title,
+  meta,
+  actions,
+  form,
+  onOpen,
+  onClose,
+  pending,
+  children,
+}: {
+  bucket: string;
+  unitId: string;
+  title: string;
+  meta: string;
+  actions: DecisionAction[];
+  form: DecisionForm | null;
+  onOpen: (action: DecisionAction, unitId: string) => void;
+  onClose: () => void;
+  pending: boolean;
+  children: ReactNode;
+}) {
+  const { t } = useI18n();
+  const active = form?.unitId === unitId;
+  return (
+    <div className="px-3 py-2 text-xs">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="rounded-sm bg-muted px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-muted-foreground">
+          {bucket}
+        </span>
+        <span className="min-w-0 flex-1 truncate font-medium text-foreground" title={title}>
+          {title}
+        </span>
+        {meta && (
+          <span className="font-mono text-[10px] text-muted-foreground">{meta}</span>
+        )}
+      </div>
+      <div className="mt-1 flex flex-wrap gap-1.5">
+        {actions.map((action) => (
+          <Button
+            key={action}
+            type="button"
+            size="sm"
+            variant={active && form?.action === action ? "secondary" : "outline"}
+            disabled={pending}
+            onClick={() =>
+              active && form?.action === action ? onClose() : onOpen(action, unitId)
+            }
+          >
+            {t(`decisions.action.${action}`)}
+          </Button>
+        ))}
+      </div>
+      {active && children}
+    </div>
+  );
+}
+
+function DecisionFormFields({
+  action,
+  message,
+  setMessage,
+  reasonCode,
+  setReasonCode,
+  reason,
+  setReason,
+  priority,
+  setPriority,
+  valid,
+  pending,
+  onSubmit,
+  onCancel,
+}: {
+  action: DecisionAction | null;
+  message: string;
+  setMessage: (v: string) => void;
+  reasonCode: string;
+  setReasonCode: (v: string) => void;
+  reason: string;
+  setReason: (v: string) => void;
+  priority: string;
+  setPriority: (v: string) => void;
+  valid: boolean;
+  pending: boolean;
+  onSubmit: () => void;
+  onCancel: () => void;
+}) {
+  const { t } = useI18n();
+  if (!action) return null;
+  return (
+    <form
+      className="mt-2 space-y-1.5"
+      onSubmit={(e) => {
+        e.preventDefault();
+        if (valid && !pending) onSubmit();
+      }}
+    >
+      {action === "steer_work" && (
+        <Textarea
+          value={message}
+          onChange={(e) => setMessage(e.target.value)}
+          placeholder={t("decisions.placeholder.message")}
+          rows={2}
+          disabled={pending}
+        />
+      )}
+      {action === "kill_work" && (
+        <div className="flex flex-wrap gap-1.5">
+          <Select value={reasonCode} onValueChange={setReasonCode} disabled={pending}>
+            <SelectTrigger className="h-8 w-44 text-xs">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {KILL_REASON_CODES.map((code) => (
+                <SelectItem key={code} value={code}>
+                  {t(`decisions.reasonCode.${code}`, code)}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <Input
+            value={reason}
+            onChange={(e) => setReason(e.target.value)}
+            placeholder={t("decisions.placeholder.reason")}
+            className="h-8 flex-1 text-xs"
+            disabled={pending}
+          />
+        </div>
+      )}
+      {action === "retire_intent" && (
+        <Input
+          value={reason}
+          onChange={(e) => setReason(e.target.value)}
+          placeholder={t("decisions.placeholder.reasonRequired")}
+          className="h-8 text-xs"
+          disabled={pending}
+        />
+      )}
+      {action === "reprioritize_intent" && (
+        <div className="flex flex-wrap gap-1.5">
+          <Input
+            type="number"
+            min={0}
+            max={100000}
+            value={priority}
+            onChange={(e) => setPriority(e.target.value)}
+            placeholder={t("decisions.placeholder.priority")}
+            className="h-8 w-32 text-xs"
+            disabled={pending}
+          />
+          <Input
+            value={reason}
+            onChange={(e) => setReason(e.target.value)}
+            placeholder={t("decisions.placeholder.reason")}
+            className="h-8 flex-1 text-xs"
+            disabled={pending}
+          />
+        </div>
+      )}
+      <div className="flex gap-1.5">
+        <Button type="submit" size="sm" disabled={!valid || pending}>
+          {t("decisions.action.confirm")}
+        </Button>
+        <Button type="button" size="sm" variant="outline" onClick={onCancel} disabled={pending}>
+          {t("decisions.action.cancel")}
+        </Button>
+      </div>
+    </form>
   );
 }
 

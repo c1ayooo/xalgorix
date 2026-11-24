@@ -18,7 +18,14 @@ import type { ConversationRow } from "@/types/api";
 const LIST_PAGE = 100;
 const COLLAPSED_KEY = "xalgorix.chat.collapsed-tasks";
 
-type TaskGroup = { key: string; label: string; rows: ConversationRow[]; runningCount: number };
+type TaskGroup = {
+  key: string;
+  label: string;
+  rows: ConversationRow[];
+  runningCount: number;
+  /** 组内最近一次活动的时间戳，用于把活跃任务排到前面（4zreco 语义）。 */
+  lastActivity: number;
+};
 
 /** 三态表头勾选（全选/半选/空），native input + indeterminate ref。 */
 function HeaderCheckbox({ state, onChange, ...rest }: { state: boolean | "mixed"; onChange: (v: boolean) => void } & Omit<React.InputHTMLAttributes<HTMLInputElement>, "checked" | "onChange">) {
@@ -130,12 +137,18 @@ export function ConversationSidebar({
         label: row.task_name || "",
         rows: [],
         runningCount: 0,
+        lastActivity: 0,
       };
       group.rows.push(row);
       if (row.status === "running") group.runningCount++;
+      const activity = Date.parse(row.finished_at || row.started_at || "") || 0;
+      if (activity > group.lastActivity) group.lastActivity = activity;
       byTask.set(row.task_id, group);
     }
-    return [...byTask.values()].sort((a, b) => a.label.localeCompare(b.label, "zh-CN"));
+    // 最近有活动的任务排前面；同时间按名称稳定排序。
+    return [...byTask.values()].sort(
+      (a, b) => b.lastActivity - a.lastActivity || a.label.localeCompare(b.label, "zh-CN"),
+    );
   }, [visible]);
 
   const taskOptions = useMemo(() => {
@@ -299,6 +312,11 @@ export function ConversationSidebar({
             <p className="px-2 py-6 text-center text-muted-foreground text-xs">
               {taskFilter === null ? t("chat.emptyTitle") : t("chat.filterEmpty")}
             </p>
+          )}
+          {pinned.length > 0 && (
+            <div className="px-1.5 pt-1 pb-0.5 font-medium text-[10px] text-muted-foreground/70 uppercase tracking-wider">
+              {t("chat.pinnedSection")}
+            </div>
           )}
           {pinned.map((row) => (
             <ConversationItem key={row.id} {...itemProps(row, true)} />

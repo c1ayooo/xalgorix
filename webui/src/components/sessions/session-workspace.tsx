@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 import { Clock } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -16,9 +16,8 @@ import {
 import { EmptyState } from "@/components/states";
 import { Transcript } from "@/components/chat/transcript";
 import { SessionComposer } from "@/components/sessions/session-composer";
-import { PlanRail } from "@/components/plan-rail";
-import { planProgressFromProjection, planStateFromProjection } from "@/lib/plan-projection";
 import { findModule } from "@/components/sessions/modules/registry";
+import { WorkerStatusDot } from "@/components/sessions/modules/workers-module";
 import type { ModuleData } from "@/components/sessions/modules/types";
 import { ScanStatusPill } from "@/components/scan-status-pill";
 import { agentLane, fmtDuration, fmtTokens, isMainAgentLane } from "@/components/chat/format";
@@ -26,6 +25,9 @@ import { useI18n } from "@/i18n";
 import { useInstances, usePauseInstance, useResumeInstance, useStopInstance, useTranscript } from "@/api/queries";
 import { useLiveSessionKeys } from "@/components/session-item";
 import type { Run, TranscriptItem } from "@/types/api";
+
+/** 会话页首屏转录页大小；更早历史由 Transcript 的向上滚动分页补齐。 */
+const SESSION_TRANSCRIPT_PAGE = 200;
 
 /**
  * 会话页工作区（右栏）：头部（标题/权威来源/状态/时长/tokens/运行控制）+
@@ -61,38 +63,85 @@ export function SessionWorkspace({
   const stop = useStopInstance();
   const [stopOpen, setStopOpen] = useState(false);
   const [stopReason, setStopReason] = useState("");
+  const [editSeed, setEditSeed] = useState<{ text: string; nonce: number } | undefined>(undefined);
 
-  // 与 rail 同一查询键（limit=500）→ 共享缓存；时长/空态取自同份行。
-  const { data: transcriptData } = useTranscript(instanceId, undefined, 500);
+  // 首屏只取最近一页（滚动到顶再加载更早历史）。500 行意味着首开要拉 ~260KB
+  // 并一次渲染 500 个复杂行，是"进入 run 后整页卡住"的主因之一；200 行仍覆盖
+  // 一屏对话与最近工具回合，其余按需加载。
+  const { data: transcriptData } = useTranscript(instanceId, undefined, SESSION_TRANSCRIPT_PAGE);
   const items = useMemo(() => transcriptData?.items ?? [], [transcriptData]);
 
   const module = findModule(lane);
-  const isMain = !lane;
+  const isMain = !lane || lane === "main";
+  // Unit lanes are addressed as "unit:<unit_id>". One unit = one worker across
+  // every dispatch attempt; the server filters the transcript by the union of
+  // its agent ids, so the client filter must not narrow it again.
+  const unitKey = lane?.startsWith("unit:") ? lane.slice("unit:".length) : undefined;
+  const isUnitLane = !!unitKey;
+  // Worker lane identity/status travels with the transcript: the lane itself is
+  // a session, so it never needs a generic "no activity" placeholder.
+  const workerHeader = useMemo(() => {
+    if (isMain || module) return undefined;
+    if (isUnitLane) {
+      const unit = data.agents?.units?.find((entry) => entry.unit_id === unitKey);
+      if (!unit) return undefined;
+      return {
+        status: unit.status,
+        title: unit.title || unit.vuln_class || unit.endpoint || unit.unit_id,
+        state: unit.state,
+        task: unit.target || unit.endpoint,
+      };
+    }
+    const entry = data.agents?.agents.find((row) => row.agent_id === lane);
+    if (!entry) return undefined;
+    return {
+      status: entry.status,
+      title: entry.lane || entry.agent_id,
+      state: entry.status,
+      task: entry.task,
+    };
+  }, [data.agents, isMain, module, isUnitLane, lane, unitKey]);
   const laneFilter = useMemo(
-    () => (item: TranscriptItem) => filterForLane([item], instanceId, lane).length > 0,
-    [instanceId, lane],
+    () =>
+      isUnitLane
+        ? () => true
+        : (item: TranscriptItem) => filterForLane([item], instanceId, lane).length > 0,
+    [instanceId, lane, isUnitLane],
   );
+  // Unit lanes are server-filtered (persisted rows), but live delta bubbles
+  // still come from the whole instance. Restrict them to this unit's agents so
+  // two concurrently running units never show each other's typing.
+  const unitAgentIds = useMemo(() => {
+    if (!isUnitLane) return undefined;
+    const unit = data.agents?.units?.find((entry) => entry.unit_id === unitKey);
+    return new Set(unit?.agent_ids ?? []);
+  }, [data.agents, isUnitLane, unitKey]);
   const live = liveKeys.has(instanceId ?? "") || running;
 
-  // 运行时长 = 首步 → 末步；活动会话按当前时间续跳（1.5s 节拍）。
-  const [, setTick] = useState(0);
-  useEffect(() => {
-    if (!live) return;
-    const id = setInterval(() => setTick((n) => n + 1), 1500);
-    return () => clearInterval(id);
-  }, [live]);
-  const durationMs = useMemo(() => {
-    let min = Number.POSITIVE_INFINITY;
-    let max = 0;
-    for (const item of items) {
-      const at = Date.parse(item.at);
-      if (!Number.isFinite(at)) continue;
-      if (at < min) min = at;
-      if (at > max) max = at;
-    }
-    if (!Number.isFinite(min) || max === 0) return null;
-    return Math.max(0, (live ? Date.now() : max) - min);
-  }, [items, live]);
+  // 主 Agent 栏是纯对话：隐藏工具调用卡；意图/提示插入折叠成一条结果行；
+  // 只读查询工具留在 journal（审计）但不进入对话。PlanRail 等 Planner 内容
+  // 属于左栏 Planner 模块，不再混入主 Agent。
+  const mainTransform = useCallback(
+    (item: TranscriptItem): TranscriptItem | null => {
+      if (item.kind === "tool_use") return null;
+      if (item.kind !== "tool_result") return item;
+      const output = compactToolOutput(item.output);
+      // 失败（例如提案缺 target）不能伪装成成功，如实显示结果。
+      if ((item.output ?? "").trimStart().startsWith("error:")) {
+        return { ...item, kind: "system", text: `${t("sessions.actionFailed")} · ${output}` };
+      }
+      // propose_intent 的成功结果由 ProposalCard 呈现，工具结果行不再重复。
+      if (item.tool === "add_hint") {
+        return {
+          ...item,
+          kind: "system",
+          text: `${t("sessions.hintRecorded")} · ${output}`,
+        };
+      }
+      return null;
+    },
+    [t],
+  );
 
   if (!run || !instanceId) {
     return (
@@ -110,10 +159,8 @@ export function SessionWorkspace({
       ? t(module.titleKey ?? module.labelKey)
       : `${t("sessions.workspaceWorker")} · ${lane}`;
 
-  const emptyText = isMain ? (
+  const emptyText = (
     <p className="py-10 pl-0 text-center text-muted-foreground text-sm">{t("sessions.mainEmpty")}</p>
-  ) : (
-    <p className="py-10 text-center text-muted-foreground text-sm">{t("sessions.laneEmpty")}</p>
   );
 
   return (
@@ -142,12 +189,7 @@ export function SessionWorkspace({
           <span className="tabular-nums" title={t("sessions.tokens")}>
             {fmtTokens(run.total_tokens)}
           </span>
-          {durationMs != null && (
-            <span className="inline-flex items-center gap-1 tabular-nums" title={t("sessions.duration")}>
-              <Clock className="size-3" aria-hidden />
-              {fmtDuration(durationMs)}
-            </span>
-          )}
+          <RunDuration items={items} live={live} title={t("sessions.duration")} />
           {isMain && instance && paused && (
             <Button
               size="sm"
@@ -186,27 +228,38 @@ export function SessionWorkspace({
         </div>
       </div>
 
+      {workerHeader && (
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-border px-3 py-1.5 text-xs text-muted-foreground">
+          <WorkerStatusDot status={workerHeader.status} />
+          <span className="font-medium text-foreground">{workerHeader.title}</span>
+          <span className="rounded bg-muted px-1 font-mono text-[10px]">{workerHeader.state}</span>
+          {workerHeader.task && (
+            <span className="min-w-0 truncate" title={workerHeader.task}>
+              {workerHeader.task}
+            </span>
+          )}
+        </div>
+      )}
+
       {module ? (
         module.render(data)
       ) : (
-        <>
-          {/* 主会话视图直接暴露规划内容：引擎/模型产出的任务图 + 当前任务，
-              不必先点左栏 Planner 才知道"到底规划了什么"。 */}
-          {isMain && data.plan?.present && (
-            <PlanRail
-              plan={planStateFromProjection(data.plan)}
-              progress={planProgressFromProjection(data.plan)}
-              currentPhase={data.plan.current_phase}
-            />
-          )}
-          <Transcript
-            instanceId={instanceId}
-            running={running}
-            limit={500}
-            filter={laneFilter}
-            empty={emptyText}
-          />
-        </>
+        <Transcript
+          instanceId={instanceId}
+          running={running}
+          limit={SESSION_TRANSCRIPT_PAGE}
+          human={isMain}
+          filter={laneFilter}
+          taskId={taskId}
+          onEditMessage={(text) => setEditSeed({ text, nonce: Date.now() })}
+          transform={isMain ? mainTransform : undefined}
+          agent={isMain || isUnitLane ? undefined : lane}
+          unit={isUnitLane ? unitKey : undefined}
+          liveAgentIds={unitAgentIds}
+          // Worker lanes are identified by the header above; a truly empty one
+          // must not replace it with a generic "no activity" message.
+          empty={isMain ? emptyText : <></>}
+        />
       )}
 
       {isMain && (
@@ -215,6 +268,7 @@ export function SessionWorkspace({
           instanceId={instanceId}
           running={running}
           paused={paused}
+          seed={editSeed}
           onStop={() => setStopOpen(true)}
         />
       )}
@@ -262,9 +316,54 @@ export function SessionWorkspace({
   );
 }
 
+/**
+ * 运行时长 = 首步 → 末步；活动会话按 1.5s 节拍续跳。
+ *
+ * 自成一个叶子组件，节拍只重绘这一个 span——旧实现把 tick 放在工作区顶层，
+ * 每 1.5s 连同 200~500 行转录、composer 整块重渲染。
+ */
+function RunDuration({ items, live, title }: { items: TranscriptItem[]; live: boolean; title: string }) {
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    if (!live) return;
+    const id = setInterval(() => setTick((n) => n + 1), 1500);
+    return () => clearInterval(id);
+  }, [live]);
+  const durationMs = useMemo(() => {
+    let min = Number.POSITIVE_INFINITY;
+    let max = 0;
+    for (const item of items) {
+      const at = Date.parse(item.at);
+      if (!Number.isFinite(at)) continue;
+      if (at < min) min = at;
+      if (at > max) max = at;
+    }
+    if (!Number.isFinite(min) || max === 0) return null;
+    return Math.max(0, (live ? Date.now() : max) - min);
+    // tick 只用于让 live 分支的 Date.now() 随时间推进。
+  }, [items, live, tick]);
+  if (durationMs == null) return null;
+  return (
+    <span className="inline-flex items-center gap-1 tabular-nums" title={title}>
+      <Clock className="size-3" aria-hidden />
+      {fmtDuration(durationMs)}
+    </span>
+  );
+}
+
+/** 工具结果压成一行结果提示（意图/提示插入行）。 */
+function compactToolOutput(output?: string): string {
+  const line = (output ?? "").split("\n").find((value) => value.trim() !== "") ?? "";
+  return line.length > 120 ? `${line.slice(0, 120)}…` : line;
+}
+
 /** 泳道过滤（A 档映射）：主=非 main 泳道行（含人工，排除系统）；system=系统行；worker=该泳道行。 */
 function filterForLane(items: TranscriptItem[], instanceId: string | undefined, lane?: string): TranscriptItem[] {
-  if (!lane) return items.filter((item) => item.kind !== "system" && isMainAgentLane(instanceId, item.agent_id));
+  if (!lane || lane === "main") return items.filter((item) => item.kind !== "system" && isMainAgentLane(instanceId, item.agent_id));
   if (lane === "system") return items.filter((item) => item.kind === "system");
-  return items.filter((item) => agentLane(instanceId, item.agent_id) === lane);
+  // Lane values arrive as the raw agent id from /agents (which may carry an
+  // instance prefix), while event rows carry whatever id the agent emitted.
+  // Compare the normalized lane on both sides, never the raw strings.
+  const target = agentLane(instanceId, lane);
+  return items.filter((item) => agentLane(instanceId, item.agent_id) === target);
 }

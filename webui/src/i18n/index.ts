@@ -85,13 +85,13 @@ function subscribe(listener: () => void): () => void {
 }
 
 /** Translate a key for a specific language, with graceful fallback. */
-export function translate(lang: LanguageCode, key: string): string {
-  return translations[lang]?.[key] ?? translations[DEFAULT_LANGUAGE][key] ?? key;
+export function translate(lang: LanguageCode, key: string, fallback?: string): string {
+  return translations[lang]?.[key] ?? translations[DEFAULT_LANGUAGE][key] ?? fallback ?? key;
 }
 
 export interface I18n {
   lang: LanguageCode;
-  t: (key: string) => string;
+  t: (key: string, fallback?: string) => string;
   setLanguage: (raw: string | LanguageCode) => void;
 }
 
@@ -100,7 +100,7 @@ export function useI18n(): I18n {
   const lang = useSyncExternalStore(subscribe, getLanguage, () => DEFAULT_LANGUAGE);
   return {
     lang,
-    t: (key: string) => translate(lang, key),
+    t: (key: string, fallback?: string) => translate(lang, key, fallback),
     setLanguage,
   };
 }

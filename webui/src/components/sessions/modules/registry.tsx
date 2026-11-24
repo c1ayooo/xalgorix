@@ -2,7 +2,7 @@ import { RoleEventStream } from "@/components/sessions/role-event-stream";
 import { isDecisionEvent, type SessionRole } from "@/components/sessions/role-events";
 import { ObligationModule } from "@/components/sessions/modules/obligation-module";
 import { PlanModule } from "@/components/sessions/modules/plan-module";
-import { WorkersModule } from "@/components/sessions/modules/workers-module";
+import { WorkersModule, workerRows } from "@/components/sessions/modules/workers-module";
 import type { ContentModule, ModuleData, RailEntry } from "@/components/sessions/modules/types";
 
 /**
@@ -46,7 +46,10 @@ function workerBadge(data: ModuleData): string | undefined {
   const view = data.agents;
   if (!view?.available) return undefined;
   const limit = view.concurrency.limit > 0 ? `/${view.concurrency.limit}` : "";
-  const queued = view.concurrency.queued > 0 ? ` +${view.concurrency.queued}` : "";
+  // Units that are waiting (open intent, not dispatched yet) count as queued
+  // work; with no units the rows are agents and this equals concurrency.queued.
+  const waiting = workerRows(view).filter((row) => row.status === "queued").length;
+  const queued = waiting > 0 ? ` +${waiting}` : "";
   return `${view.concurrency.running}${limit}${queued}`;
 }
 
@@ -65,7 +68,10 @@ function roleModule(role: SessionRole, options: {
     authority: "telemetry",
     labelKey: options.labelKey,
     deepLink: true,
-    visible: (data) => options.count(data) > 0,
+    // 始终常驻：分组结构是页面的固定导航，不随 Run/事件存在与否伸缩；
+    // "没有 Run"或"引擎没产生该角色事件"都由主区空态说明（SESSIONS_MODULE_MAP
+    // §2 规则 1）。旧实现用 count>0 / instanceId 决定可见性，导致分组凭空消失。
+    visible: () => true,
     rail: (data) => {
       const count = options.count(data);
       return { labelKey: options.labelKey, badge: count > 0 ? String(count) : undefined };
@@ -85,7 +91,7 @@ const PLAN_MODULE: ContentModule = {
   labelKey: "sessions.groupPlan",
   titleKey: "sessions.planItemTitle",
   deepLink: true,
-  visible: (data) => !!data.instanceId,
+  visible: () => true,
   rail: (data) => ({ labelKey: "sessions.groupPlan", badge: planBadge(data) }),
   render: (data) => (
     <PlanModule
@@ -114,13 +120,19 @@ const OBLIGATION_MODULE: ContentModule = {
   labelKey: "sessions.groupObligation",
   titleKey: "sessions.obligationItemTitle",
   deepLink: true,
-  visible: (data) => !!data.instanceId && !!data.plan?.present,
+  // 同角色组：始终常驻，plan 尚未产出时由主区显示 absent 空态。
+  visible: () => true,
   rail: (data) => {
     const unfinished = data.plan?.counters.unfinished ?? 0;
     return { labelKey: "sessions.groupObligation", badge: unfinished > 0 ? String(unfinished) : undefined };
   },
   render: (data) => (
-    <ObligationModule plan={data.plan} agents={data.agents} running={data.running} />
+    <ObligationModule
+      plan={data.plan}
+      agents={data.agents}
+      running={data.running}
+      loading={data.planLoading || data.agentsLoading}
+    />
   ),
 };
 
@@ -132,17 +144,17 @@ const WORKERS_MODULE: ContentModule = {
   authority: "engine",
   labelKey: "sessions.groupWorker",
   deepLink: true,
-  visible: (data) => !!data.instanceId,
+  visible: () => true,
   rail: (data) => {
     const view = data.agents;
-    // 一个 worker 一行（含已结束的历史行）：组不是"再点一次才看到 worker"
-    // 的入口，点击具体行直接打开该 agent 的转录。
-    const children = (view?.agents ?? []).map((worker) => ({
-      id: worker.agent_id,
-      label: worker.lane || worker.task || worker.agent_id,
-      meta: worker.agent_id,
+    // 一个工作单元（intent）一行：重派/重试追加到同一条，不再按 agent 实例分身。
+    // 没有 unit 的 legacy spawn 仍按 agent 一行；点击直达该 lane 的转录。
+    const children = workerRows(view).map((worker) => ({
+      id: worker.key,
+      label: worker.label,
+      meta: worker.meta,
       status: worker.status,
-      active: data.lane === worker.agent_id,
+      active: data.lane === worker.key,
     }));
     return {
       labelKey: "sessions.groupWorker",
