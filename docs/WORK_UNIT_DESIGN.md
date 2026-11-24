@@ -21,6 +21,10 @@ WorkUnit **不是新顶层原语**（宪章 §2/§8）——它是本仓既有�
 | B3 证据生成计划（确定性）+ 控制面排除 | ✅ | `AutoPlanFromState`/`buildEnginePlan` 过滤 + `XALGORIX_CONTROL_PLANE_HOSTS`；`plan_units_test.go` |
 | B4 单位统一投影 | ✅ | `GET /api/scans/{id}/units`（`scan_units.go`，含租约过期标记）；`scan_units_test.go` |
 | B4 收工判据 | ✅（既有） | 收工闸门已对 open plan tasks / proven-unreported 拒绝（`hookFinishGatekeeper`/`hookLedgerFinishGate`），本方案不改闸门顺序 |
+| R7/M1 图权威接续 | ✅ | 迁移 `0019`–`0023`：`exploration_nodes/edges` 为 intent/belief/fact/finding/goal/hint 权威；PlanTask/PlanView/`/units` 改为 `v_plan_tasks`/`v_units` 视图；`unit_key` 幂等键；`internal/graph` PG CAS claim + lease/reclaim |
+| R7/M1 belief/fact 投影 | ✅ | `internal/agent/graph_projection.go`：Hypothesis→belief、Evidence→fact、accepted finding→finding、objective criterion→goal、guidance→hint；边 supports/proves/spawns |
+| R7/M2 派发单位 | ✅（默认 legacy） | `internal/orchestrator` worker pool（`XALGORIX_WORKER_CONCURRENCY` 1–10）从图 claim；`agentsgraph.Dispatch`；主 Agent `SurfaceMain`、worker `SurfaceWorker`、planner `SurfacePlanner` |
+| R7/M2 收工判据 | ✅（默认 legacy） | `hookPlannerWorkerFinishGate`：图 frontier 仍 open/running/paused 或没有任何 settled intent → 拒绝 finish |
 
 
 > **立项依据**：TSec 第二轮实测暴露——自动委派波把 specialist 派去侦察平台域名（30+ 分钟 × 1/3 并发）；模型对同一题重复 spawn（a-17、c-09 各有 running+queued 两个 worker）。根因不是模型笨，是**planner 的派活缺少「单位」与「认领」**：spawn 的任务是自由文本，没有独占、没有租约、没有完成判据。本文定义修复协议，分阶段落地，**不改变** Verifier、`report_vulnerability` 闸门与 HITL 语义。

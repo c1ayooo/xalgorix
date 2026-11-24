@@ -2,7 +2,7 @@
 
 ## Traffic proxy (loopback MITM, default on)
 
-Since R2b, Xalgorix runs a single-process loopback MITM proxy by default (`XALGORIX_TRAFFICPROXY=1`, off with `0`/`false`): the `http_request`/`send_request` tools (including verifier re-tests), the browser, and curl/wget/python subprocesses route through a local proxy that forwards via the configured upstream pool (or directly). Go-tool traffic is attributed to its run and recorded as observed InfoItems in the run's audit journal; browser and subprocess traffic is relayed but stays system-level (no run-token channel yet). TLS interception uses a dedicated CA generated under `~/.xalgorix/ca` (`XALGORIX_CA_DIR`); the built-in HTTP tools trust it automatically, curl/wget wrappers pass `--cacert`, and Python gets `REQUESTS_CA_BUNDLE`/`SSL_CERT_FILE` injected. WebSocket/upgrade requests fall back to raw passthrough (observed as metadata only). Still NOT proxied: loopback ports a scan explicitly opted into (Chromium bypasses the proxy for provisioned targets), programs that ignore proxy env vars entirely, and operator-level system egress (LLM APIs, notifications). Set `XALGORIX_TRAFFICPROXY=0` to restore direct routing (the loopback bridge then serves only proxy-required mode, as before).
+Since R2b, Xalgorix runs a single-process loopback MITM proxy by default (`XALGORIX_TRAFFICPROXY=1`, off with `0`/`false`): the `http_request`/`send_request` tools (including verifier re-tests), the browser, curl/wget/python subprocesses, and containerised tools route through a local proxy that forwards via the configured upstream pool (or directly). Go-tool traffic is attributed to its run via `Proxy-Authorization: Bearer`; subprocess traffic via `Basic` credentials minted into the environment / `.curlrc` / `.wgetrc`. **Each run also gets a dedicated listener port** (`ListenForScan`), because Chromium has no proxy-auth channel: the run's browser is launched with that port as `--proxy-server`, so its traffic is attributed (and archived) by the port alone. Container runtimes address the same per-run listener through the project network's gateway, so their `HTTP_PROXY` needs no token either. Attributed traffic is recorded as observed InfoItems in the run's audit journal **and** as raw request/response packets under `<ScanDir>/traffic/` (unredacted, 128 KiB per side); the dashboard's live HTTP view and each finding's evidence section read that archive, and the agent can quote it with `list_requests` / `list_requests seq=<n>`. TLS interception uses a dedicated CA generated under `~/.xalgorix/ca` (`XALGORIX_CA_DIR`); the built-in HTTP tools trust it automatically, curl/wget wrappers pass `--cacert`, and Python gets `REQUESTS_CA_BUNDLE`/`SSL_CERT_FILE` injected. WebSocket/upgrade requests fall back to raw passthrough (observed as metadata only). Still NOT proxied: loopback ports a scan explicitly opted into (Chromium bypasses the proxy for provisioned targets), programs that ignore proxy env vars entirely, and operator-level system egress (LLM APIs, notifications). HITL approval at the proxy covers the non-bearer channel (subprocess/browser) and only when `XALGORIX_APPROVAL_MODE=enforce`; bearer traffic is adjudicated at the tool registry. Set `XALGORIX_TRAFFICPROXY=0` to restore direct routing (the loopback bridge then serves only proxy-required mode, as before).
 
 Xalgorix supports **HTTP**, **HTTPS**, and **SOCKS5** upstream proxies for its built-in HTTP tools. Proxy-required mode also routes its browser and gives proxy-aware terminal/Python programs a loopback HTTP proxy. An HTTP/SOCKS5 proxy is not a whole-machine VPN: arbitrary subprocesses, raw sockets, ICMP, and UDP may bypass proxy environment variables. Enforce an OS/container outbound policy if the operator needs a guarantee that no direct target connection can leave the host.
 
@@ -63,8 +63,16 @@ See `proxies.txt.example` for the file format.
 | `XALGORIX_PROXY_URL`      | _(empty)_      | Single proxy string; takes precedence over `PROXY_FILE`      |
 | `XALGORIX_PROXY_FILE`     | _(empty)_      | Path to a file with one proxy per line                       |
 | `XALGORIX_PROXY_ROTATION` | `roundrobin`   | Rotation strategy: `roundrobin` or `random`                  |
+| `XALGORIX_TRAFFICPROXY_BIND` | `127.0.0.1:0` | Traffic-proxy listener address; use `0.0.0.0:<port>` when project containers must reach it through the network gateway |
+| `XALGORIX_TOOLBOX_PROXY_URL` | _(empty)_ | Egress proxy for tool traffic inside project containers (`XALGORIX_RUNTIME_BACKEND=docker`); must be project-network reachable |
+| `XALGORIX_TOOLBOX_BROWSER_PROXY` | _(empty)_ | Proxy handed to Chromium inside the project container (Chromium ignores `HTTP_PROXY`) |
+| `XALGORIX_EGRESS_MODE`    | `proxy`        | `proxy` routes cooperative clients through the traffic proxy; `enforce` adds an nftables boundary confining child egress to the proxy port (root + `nft`, fail-closed) |
 
-All variables can also be placed in `~/.xalgorix.env`.
+All variables can also be placed in `~/.xalgorix.env`. In the dashboard they
+live under **Settings → Environment → Proxy** (`XALGORIX_TOOLBOX_*`,
+`XALGORIX_TRAFFICPROXY_BIND` and `XALGORIX_EGRESS_MODE` are in the collapsed
+**Advanced** section). Changes marked *restart* take effect only after a
+restart; container proxy values apply to new scans.
 
 ## Proxy String Formats
 

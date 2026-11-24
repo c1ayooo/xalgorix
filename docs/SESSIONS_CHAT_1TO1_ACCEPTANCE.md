@@ -63,7 +63,7 @@
 4. 归档替代物理删除（多选操作文案为「归档」，AlertDialog 说明保留审计）。
 5. 发送键位配置（Enter/Cmd+Enter 切换）无设置面 → 仅 Enter 发送 / Shift+Enter 换行（IME 安全），配置项不接入。
 6. 参照 `bg-info/15` 实时章 → 本仓库沿用 emerald `/10`+`/30` 双档惯例（UI_DESIGN §5.1 合法变体）。
-7. 会话页 Worker/System 分组为 A 档前端映射（选中 run 的 agent_id 泳道 / system 行过滤）；Planner 无独立数据不显示；B 档聚合接口待裁决（方案 §5.4/§10.1）。
+7. 会话页左栏为两段式树：会话段 = 主 Agent 的 Run 列表（Run 行右侧 chevron 展开该 Run 的 worker 子行），工作区段 = plan/decision/obligation/workers/system 叶子行；只有真实列表可折叠，折叠组含选中项时组头保留品牌色圆点。Worker/System 仍是 A 档前端映射；B 档聚合接口待裁决（方案 §5.4/§10.1）。
 
 ## V1 验收记录（2026-11-22）
 

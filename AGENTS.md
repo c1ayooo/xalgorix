@@ -19,11 +19,15 @@
 9. **单二进制形态必须保住（v3.0 修订）**：go:embed 前端 + 自包含引擎不变；PG 是**必需部署依赖**（2026-11-22 用户裁决路线 B，废止无 DSN 降级）：无 DSN 启动 fail-fast 并给出指引，仓库提供 compose 模板。
 10. **搜索算法与研究项不进路线图**：A*/MCTS/POMCP/DESPOT 需三条同时满足（动作可回滚或幂等重放、有可采样的结果模型、预算可分区），当前一条都不满足；VOI 只作排序加权项（权重 ≤30%）且必须保留确定性 tie-break，同一份 ledger 快照给出同一排序。
 
+> **R7 双图编排修订（2026-11-23）**：本节第 2/5/6/7 项在 R7 下有一个**显式例外**，详见 `docs/CORE_PHILOSOPHY.md` 顶部 v3.1/R7 块与 `docs/DUAL_GRAPH_ORCHESTRATION.md`：Intent 的权威是探索图 `intent` 节点（PlanTask/PlanView 是视图）；Belief 的权威是 `belief` 节点（Evidence 明细仍在 ledger/InfoItem）；探索图与资产图是 PG 实时权威（读写 PG），事件/图投影仍不是决策权威。**planner_worker 是默认内置拓扑**；`XALGORIX_ORCHESTRATOR=legacy` 仅为隐藏的紧急回滚，不出现在设置页；worker 并发由设置页 `XALGORIX_WORKER_CONCURRENCY`（1–10）配置；该值热生效——新扫描启动时读取 `~/.xalgorix.env`，运行中的 pool 由 `SetWorkers` 热扩容/缩容（同时同步 `agentsgraph.SetMaxConcurrent`，扩容后排队 worker 立即出队；缩容等待当前 intent 结束），并发上限严格等于设置值。planner 有生产侧背压：池满时阻塞在 `Pool.WaitForSlot`，worker settle 后唤醒，每轮新增 intent 上限等于 worker 数。worker 预算默认 60 分钟；执行 lane 的合同 timebox 只可缩短到 30 分钟下限，control-plane API lane 仍用短 timebox；超时先 steer 收尾（wind-down）、宽限期内未完成再 `KillWorker`，随后结算 exhausted，禁止“intent 已 exhausted、worker 还在打容器”。`target_kind=task` 是分析 lane（`SurfaceAnalysis`：只有 notes/ledger/研究工具，没有 terminal/HTTP/browser），symbolic target（`task`、`task:*`）不构成网络授权；攻击容器必须由 `target_kind=container` 且 target 为具体 `IP:port` 的独立 intent 执行。改这些区域前先读该规格。
+
 ## 先读文档（按任务路由）
 
 - **理解任何改造/新功能设计前**：读 `docs/CORE_PHILOSOPHY.md`（v3.0）+ 本文件「核心设计思想」——信息驱动循环是主轴，不是可选项；v1 研究稿在 `docs/archive/`。
 - **做二开改造（项目/任务管理、流量代理/HITL、Eino 引擎、前端）前**：读 `docs/REDESIGN.md` —— 实现层设计总档（决策记录 D1–D12、里程碑 R0–R6 与宪章 M0–M5 并轨）。
 - **做 PG 主存储 / R6 / 状态持久化相关改动前**：读 `docs/PG_PRIMARY_STORAGE_SPEC.md` —— 对象清单、幂等键、写失败姿态、批次切分与测试接缝的唯一规格。
+- **改探索图 / intent 生命周期 / 图投影 / 运行期合规前**：读 `docs/INFO_GRAPH_CONTRACT.md` —— intent 契约、结论事务、确认门、不变量码表与 `/graph/validate` 的运行期判据。`done` intent 只能经 `ConcludeIntent` 事务产生，禁止直接 `Transition` 到 done。
+- **做跑分 / 长时基准任务前**：读 `docs/BENCHMARK_OPTIMIZATION.md` —— 第四轮 5400/23000 的根因、lane 分离/并发/截止检测/网络可达性的整改与下一轮验收指标。
 - **改任何 `internal/` 代码前**：读 `docs/ARCHITECTURE.md` —— 分层、包职责、数据流、并发模型的权威来源（v4.5.44 后 `internal/web` 已按文件拆分，`server.go` 只是薄核心+路由枢纽）。
 - **改任何 `webui/` 代码前**：读 `UI_DESIGN.md`（仓库根）—— 设计令牌、组件边界、反模式、验收清单。
 - **贡献流程 / 环境要求**：`CONTRIBUTING.md`。CI 门在 `.github/workflows/ci.yml`。
@@ -34,6 +38,7 @@
 - 版本号经 `-ldflags "-X main.version=..."` 注入（`Makefile` 的 `VERSION`），`main.go` 有 `debug.ReadBuildInfo` 回退。发版相关改动同步看 `scripts/release.py`。
 - webui 没有 lint/test 脚本，质量门是 `cd webui && npm run typecheck`（tsc -b）；后端门是 `make lint`（golangci-lint 版本钉在 Makefile 的 `GOLANGCI_LINT_VERSION`）+ `go test ./... -race`。
 - webui 独立开发用 `make webui-dev`（Vite 自动拉起 `mock-backend.mjs`，8787 端口，无需 Go 后端）。
+- `make image-toolbox` 有输入哈希门控：`tools/toolbox/build-inputs.sh` 把 recipe + helper 源码 + 基础镜像 digest 的 sha256 写进镜像 label `xalgorix.build_inputs`，一致就跳过 `docker build`（`TOOLBOX_FORCE=1` 强制；只改 `internal/` 永远不触发）。`tools/toolbox/Dockerfile` 里 gobuild 产物只允许出现在 profile 安装层（`core-tools`/`full-tools`/`web-tools`）**之上**——放到下面会让改一行 helper 重跑 6GB 安装层。
 
 ## 不可破坏的架构不变量
 
@@ -44,15 +49,17 @@
    - `DialGuard`（`tools.GuardDials`，挂在 `net.Dialer.Control`）：DNS 解析后的真实 IP 复查（防 DNS rebinding）；
    - `sandbox.CheckResolve/CheckRead`：所有文件系统读写的路径策略（读黑名单 `~/.ssh`、`/etc/shadow` 等优先于白名单）；
    - 代理 fail-closed：`ProxyRequired` 时工具不得回落直连；
-   - 密钥环境变量经 `tools.SanitEnv`/`SecretEnvKey` 从 terminal/python 子进程剥离。
-3. **持久化纪律（v3.0）**：状态与面板数据的持久化走 PG 事务（变更边界，幂等键 `(scan_id, seq)`）；仍留文件层的字节产物（工具输出归档、流量原始包、上传物、交付物）一律 `storage.WriteAtomic`（O_EXCL + fsync + rename + 目录 fsync）。`llm/keystore.go` 与 `tools/notes` 的固定 `.tmp` 是历史遗留，勿模仿、勿扩散。
+   - 密钥环境变量经 `tools.SanitizeEnviron`/`SecretEnvKey` 从 terminal/python 子进程剥离。
+3. **持久化纪律（v3.0）**：状态与面板数据的持久化走 PG 事务（变更边界，幂等键 `(scan_id, seq)`）；仍留文件层的字节产物（工具输出归档、流量原始包、上传物、交付物）一律 `storage.WriteAtomic`（O_EXCL + fsync + rename + 目录 fsync）。`llm/keystore.go` 的手写原子写（`CreateTemp` 随机 `.tmp` 后缀、无目录 fsync）与 `tools/notes` 的固定 `.tmp` 是历史遗留，勿模仿、勿扩散。
 4. **API 永不回传密钥**，只回 `*_configured` 布尔；机器令牌走 SHA-256 摘要 + 常数时间比较（`api_token.go`），不得引入明文比较。
 5. **findings 验证语义三选一**：`verified`（独立 Verifier 复现）/ `exploit-proven`（自带具体利用证据）/ `needs-manual-verification`（Verifier 不确定时**保留**，不得丢弃）。`report_vulnerability` 的门管线顺序（dedup→fabrication→method→proof→CVSS 复算→verifier→severity cap）不可重排。
 6. **事件流单向**：工具与 agent 只发事件到 per-scan channel → `processEvent`（每会话单 goroutine）→ SSE 事件流广播（`/api/stream`，原 WS 已移除）。不得在工具代码里直接 broadcast 或写 HTTP 响应。
 7. **Verifier 与闸门不可改**：`verifier.go` 的判定逻辑、工具面裁剪、轮次/时限，以及 `report_vulnerability` 的闸门顺序，在改造 InfoItem/点亮/VOI 时一律不动。
-7.5 **工具执行面可切换，语义不变（v4.6 起）**：`XALGORIX_RUNTIME_BACKEND=native|docker`。native 是默认且行为逐字节保留；docker 时每扫描一个 toolbox 容器（`internal/runtime`），但安全链六环仍在平台侧 dispatch 前判定，容器不是安全边界。`Exec` 绝不重试，只有 EnsureProject/StopProject/RemoveProject 幂等。容器实际状态权威是运行时（`xalgorix.*` 标签），期望态与 `desired_gen/applied_gen` 水位在 PG `toolbox_projects`；River 的 `toolbox` 队列只做保洁与追赶，不接管扫描循环/调度/审批/SSE。容器一律 `--cap-drop=ALL`，按 profile 加回 NET_RAW/NET_ADMIN/SYS_PTRACE，rootfs 只读，**工具容器内禁止出现 docker socket**。令牌/job 载荷内不得含密钥。
+7.5 **工具执行面可切换，语义不变（v4.6 起）**：`XALGORIX_RUNTIME_BACKEND=native|docker`。native 是默认且行为逐字节保留；docker 时每扫描一个 toolbox 容器（`internal/runtime`），但安全链六环仍在平台侧 dispatch 前判定，容器不是安全边界。`XALGORIX_TOOLBOX_NETWORK_MODE=internal|host`（默认 internal）选择容器网络：host 共享宿主网络命名空间以直达 VPN/靶场网段，六环不因此放宽。`Exec` 绝不重试，只有 EnsureProject/StopProject/RemoveProject 幂等。容器实际状态权威是运行时（`xalgorix.*` 标签），期望态与 `desired_gen/applied_gen` 水位在 PG `toolbox_projects`；River 的 `toolbox` 队列只做保洁与追赶，不接管扫描循环/调度/审批/SSE。容器一律 `--cap-drop=ALL`，按 profile 加回 NET_RAW/NET_ADMIN/SYS_PTRACE，rootfs 只读，**工具容器内禁止出现 docker socket**。令牌/job 载荷内不得含密钥。
 
 8. **信息层不得有孤儿事实**：任何被持久化的 finding 必须同时产出 `finding_ref` evidence 与一条 `purpose=finding` 的 InfoItem（`report_vulnerability` 落库后由引擎投影，不依赖模型二次调用）；工具输出中的敏感文件/凭据命中由引擎侧捕获为 `tool_observation`（密钥必须掩码）。收工闸门在「有 finding、无 evidence」时拒绝收工。
+
+9. **意图结论不得绕行**：`done` intent 必须经 `graph.Repository.ConcludeIntent` 单事务写入——校验 owner/lease/确认门/前置条件，幂等产出节点并连 `yields` 边，再迁移状态。禁止直接 `Transition` 到 `done` 或先写状态后写产出。运行期由 `graph.ValidateStore` / `GET /api/scans/{id}/graph/validate` 只读检查；检查器不修数据。
 
 ## 已知脆弱点（改动这些区域前先读对应测试）
 

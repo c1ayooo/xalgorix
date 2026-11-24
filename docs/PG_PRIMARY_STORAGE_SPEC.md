@@ -102,8 +102,11 @@ reconciler 按既有 M3 水位协议追赶。PG 成为必需依赖（无 DSN fai
      （eino 两测试）✓、runstate/web/domainjournal/platform DSN 门控集成测试 ✓、
      `go build ./...` ✓（coldpath 全包 run 有两个 River 测试在共享库上互相争抢 worker
      的隔离性 flake，单跑均过，非本批回归）。
-   - **R6.3 余片**：三快照生产注册补齐、读层 sibling 合并辅助代码退役评估、
-     ARCHITECTURE/API_CONTRACT 回写（✅ 本批已做）、`make build` 全门禁。
+   - **R6.3 状态（2026-11-23 回写）**：三快照生产注册已补齐、ARCHITECTURE/API_CONTRACT
+     已回写、门禁已跑。读层 sibling 合并辅助代码退役已评估：**保留为 pre-import
+     文件兜底**——`sessionDirsForProjection` 只在没有 PG 行（未导入的遗留目录）
+     时使用；有 PG 行时 security/transcript/events/scan-list 均走 instance 联合
+     读，不再枚举 sibling 目录。该结论已写入 `CORE_PHILOSOPHY.md` §17.1。
 10. **并行线协调**：finding 身份键重构（findingContentKey）进行中；run_findings 升级为
     findings 唯一存储（scan.json vulns 停写）落在 R6.1，以该重构落定的键为准。
 

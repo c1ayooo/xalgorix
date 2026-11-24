@@ -93,6 +93,12 @@ interface Task {
     timezone?: string;               // IANA
   };
   context_paths?: string[];          // 上传物路径（复用现有 upload-context）；Run 启动时全部与请求 scan_context 合并
+  audit_mode?: "inherit" | "off" | "enforce"; // 任务级 HITL/审计开关（缺省 inherit）
+  //   inherit = 跟随进程默认 XALGORIX_APPROVAL_MODE；
+  //   off     = 仅审计：受管调用照常执行，留在 tool_call 审计轨迹，不建审批行；
+  //   enforce = 命令（terminal/python/port_scan/browser 危险操作）与经 MITM 代理的
+  //             高危 HTTP 写请求创建审批行并阻塞，直到操作者批准/拒绝（超时=拒绝）。
+  //   生效时点在 run 派发：模式快照到该 run 的 ScanContext，任务/全局后续修改不影响在途 run。
   objective?: {                     // 结构化目标；缺省 = "未结构化"（不推断、不折算达成度）
     kind: "engagement" | "capability" | "finding_class" | "coverage";
     statement: string;              // 目标陈述（人工输入或 goal 分析改写）
@@ -113,14 +119,26 @@ interface Task {
   run_count?: number;
   last_run_at?: string;
   last_run_status?: string;
+  last_run_completion?: "full" | "partial" | ""; // 终态读法："full" = 双图走完（已完成）；"partial" = 有界/物理停止（未达成意图）。没有 "failed" 读法
   finding_count?: number;
+  content_changed_since_run?: boolean; // 任务可运行内容（goal/instruction/objective/phase_policy/context_paths/llm_chain/active_llm）相对上次派发是否变过；false = 这份内容已跑过，UI 不得再给裸「运行」，编辑内容后翻回 true。改名/改定时/改 audit_mode/归档不改变它
 }
 ```
+
+> **任务级出口代理（2026-11-24）**：`Task.proxy`（以及 POST/PATCH 的 `proxy` 字段）取值 `""`（跟随全局池）/ `"direct"`（显式直连）/ `"N"`（全局池第 N 项，1-based）。保存时按**当前**池校验：越界索引 400，`direct` 在 `XALGORIX_PROXY_REQUIRED` 下 400；派发时再次校验（池可能已被热更改过）。Run 启动时把选择快照为进程内 per-run egress（`scanctx` id 为键）；运行中的 Run 不受任务后续修改影响。**出口与流量记录是两层**：任务选的是出口池；MITM 开启时由本机 MITM 转发到该出口，MITM 关闭时 `httpclient`/`send_request`/`terminal`/`python`/`portscan`/`browser` 直接使用该出口（required 语义不变，失败即 fail-closed），host 网络的 toolbox 容器把该出口注入 `HTTP(S)_PROXY`；bridge 网络且 MITM 关闭时容器需 `XALGORIX_TOOLBOX_PROXY_URL` 指向可达地址。`GET /api/proxies` 返回 `{enabled, required, entries:[{index,label}]}`（label 已掩码）。全局代理设置（USE_PROXY/PROXY_URL/PROXY_FILE/ROTATION/REQUIRED/TRAFFICPROXY*/TLS_SKIP_VERIFY）保存后**热生效**：重新初始化上游池与 MITM 管理器，非法组合整单拒绝并回滚到旧策略。
+>
+> > **任务热更新（2026-11-24）**：对**活跃 Run** PATCH 任务时，持久化后立刻把变更投影到运行期，不重启 Run：写一条 `source=human` 的 InfoItem + `hint` 节点（`purpose` 由任务更新承载），更新 planner / worker pool 的 live brief 并 `Notify` 重规划（**不 kill/steer 在途 worker**），向主 Agent 注入结构化“任务配置已更新”消息，热换模型链 endpoints（下一次 LLM 调用生效），更新该 Run 的出口钉选并**强制关闭该 Run 的全部隧道**（下一次连接走新出口），同步 `AuditMode`。`name`/`schedule` 只持久化、不通知。`run_revision` 覆盖 goal/instruction/objective/phase_policy/context_paths/llm_chain/active_llm/**proxy**。
+>
+> **流量记录与出口分层（2026-11-24）**：`XALGORIX_TRAFFICPROXY`（设置分组「流量记录（MITM）」）只管拦截/留证/审批 wire gate；出口由「出口代理」分组（USE_PROXY/URL/FILE/ROTATION/REQUIRED/EGRESS_ROUTER）管理。`XALGORIX_EGRESS_ROUTER=auto`（默认）时，记录关闭 + 配了出口会在平台内启动 **forward-only** 路由监听（复用 per-run listener，不拦截不记录），任务换代理下一次连接生效、容器无需重建；`off` 保留旧语义（记录关=直连，容器代理改动下次 Run 生效）。记录关闭时仍累计 `run_egress_usage`（`(scan_id, proxy_label)` 聚合 connections/requests，掩码 label，无报文/凭据），由 flusher 周期性写 PG。
+>
+`GET /api/pool` 追加 `events:[{at,reason,from,to,cooldown_until}]`：最近 20 次进程级 key 自动切换（fingerprint，无密钥），供实时动态 LLM 面板展示；`reason ∈ rate_limit|quota_exhausted|overloaded|auth`。
+>
+> **任务运行闸门（2026-11-24）**：一个任务只挂一个 Run。派发被接受时后端把可运行内容的修订值（SHA-256，覆盖 goal/instruction/objective/phase_policy/context_paths/llm_chain/active_llm）记进 `tasks.context.run_revision`（不动 `updated_at`），读路径据此产出 `content_changed_since_run` 与 `last_run_completion`。前端据此决定是否显示「运行」：终态且内容未变 → 隐藏运行按钮，状态章读作「已完成」或「未达成意图」；改内容后按钮回来，点击即重派同一 Run 热续跑。该标记是 best-effort（写失败按"内容已变"处理，只放开不锁死）；`POST /api/tasks/{id}/runs` 本身不加 409，定时调度与显式 API 调用不受影响。
 
 | Method+Path | 请求 | 响应 |
 |---|---|---|
 | GET `/api/projects/{id}/tasks` | — | `{ tasks: Task[] }` |
-| POST `/api/projects/{id}/tasks` | `{ name, goal, instruction?, phase_policy?, schedule? }` | `Task` (201) |
+| POST `/api/projects/{id}/tasks` | `{ name, goal, instruction?, phase_policy?, schedule?, audit_mode? }` | `Task` (201) |
 | GET `/api/tasks/{id}` | — | `Task` |
 | PATCH `/api/tasks/{id}` | 同 POST 字段（部分更新） | `Task` |
 | DELETE `/api/tasks/{id}` | — | `{ status: "deleted" }` |
@@ -289,6 +307,30 @@ interface Guidance {
 - **转录 phase 字段**（同批增补）：`TranscriptItem.phase?` 携带工具事件的推断方法论阶段（`current_phase`），前端在阶段变化处插「阶段 N」分隔行，让上一轮终态与新一轮工作在视觉上分开（实例槽跨 scan 轮复用时，转录是跨轮 journal 的拼接）。
 - **诚实流式指示**（同批增补）：转录页「实时流式中…」改为跟随实例真实事件年龄（`use-instance-activity`，5s 窗口），停滞时显示 amber「已 {duration} 无新输出」，本页未观测到事件时显示中性等待行——running 状态投影不再冒充流式。
 
+### 3.1b 主 Agent 意图提案 — 确认后写入（2026-11-23 增补，`internal/agent/main_chat.go` + `internal/web/handlers_intent_proposals.go`）
+
+主 Agent 不再把对话消息直接写成 intent。具体工作先由 `propose_intent` 形成**草案**（`proposal-<ts>-<seq>`），草案只存在运行中 Agent 的进程内存里，**不进入探索图**；操作者确认后才由引擎写入 `origin=human` 的 intent。
+
+| Method+Path | 请求 | 响应 |
+|---|---|---|
+| POST `/api/conversations/{instanceID}/intent-proposals/{proposalID}/confirm` | 空体 | 200 `{ status:"confirmed", proposal_id, task_id }`；草案不存在/已裁决或 Run 不存活 → 409 |
+| POST `/api/conversations/{instanceID}/intent-proposals/{proposalID}/reject` | 空体 | 200 `{ status:"rejected", proposal_id }`；同上 409 |
+
+- **确认路径**：转录卡片点击走上述端点（确定性，不经模型）；文字路径是主 Agent 的 `confirm_intent` 工具，仅当草案来自**更早的回合**且当前用户消息是明确肯定（确认/执行/开始/派发/confirm/go ahead…）时才被接受。同一回合内提案 + 确认一律拒绝。
+- **写入语义**：确认时复用原直接插入的全部校验（target 必填、control-plane host 不得作 web/container 目标、phase 1–22、依赖解析），payload `origin=human`、`task_id` 在提案时预生成，`UpsertNode` 的 `unit_key` 保证幂等。
+- **事件**：`intent_proposed`（`result_meta`: `proposal_id/task_id/title/target/target_kind/phase/vuln_class/endpoint/notes/status=pending`）与 `intent_proposal_resolved`（`proposal_id/task_id/status=confirmed|rejected`）写 run journal 并经 SSE 广播；转录把同一 `proposal_id` 折叠成一张卡，后到的 resolved 只更新状态。
+- **主回复投影**：主 Agent 的 `message` 事件带 `result_meta.surface="main"`；转录映射 `role="main"`，人工投影（`?human=1`）包含它和 proposal 卡，worker 叙述仍留在完整转录。
+- **hint 边界**：只有 **queued** guidance（无活跃 agent、留给下次 Run）自动投影为 active hint；注入到主 Agent 的 live guidance 不再自动成为 hint，否则 planner 会绕过确认直接生成同一 intent。主 Agent 的 `add_hint` 是上下文类提示的唯一即时写入路径。
+- **生命周期**：草案随 Run 结束/进程重启消失，端点如实 409，不伪造确认；审计回合（`确认派发意图：…` / `放弃意图提案：…`）在确认成功后作为 injected guidance 行落库并广播 `guidance_injected`。
+
+### 3.1c 工作单元泳道 — 一个 intent 一个可见 worker（2026-11-24 增补，`internal/web/handlers_agents.go` + `chat_transcript.go`）
+
+`GET /api/conversations/{id}/transcript` 新增可选 `?unit=<intent_id>`：返回**该工作单元所有派发实例**的事件并集（重派/重试/租约回收追加到同一条 lane），过滤发生在分页之前，因此 unit 自己的历史就是分页权威。`?agent=<agent_id>` 保留为 legacy 单实例泳道；两者同时出现时 `unit` 优先。
+
+- **投影契约**：`GET /api/instances/{id}/agents` 与 `GET /api/tasks/{id}/workers` 的 `units[]` 是可见 worker 行（`unit_id/title/state/status/agent_ids/agent_status/claimed_hypotheses`）；`state` 是探索图 intent 状态的原文，`status` 是 UI 词表映射（open→queued、running→running、paused→paused、done→completed、blocked/exhausted/stopped→failed）。`agents[]` 保留为实例级明细，legacy `spawn_agent`（无 unit）仍按 agent 一行。
+- **unit → agent 解析**：投影优先读 `run_workers.unit_id`（migration 0029，生命周期边界写入），live run 再并上 agentsgraph 内存快照；图不可用时 `units` 为空，消费方回退 `agents`，worker 列表不会整体 404。
+- **前端深链**：unit 行写 `?agent=unit:<unit_id>`（复用既有 `?agent=` 通道，不新增 URL 语义）；转录请求发 `?unit=`，主区头部状态取 unit 的图状态。
+
 ## 3.2 项目维度过滤（overview 项目化，2026-11-20 增补；运行页接入 2026-11-22）
 
 现有端点追加**可选** `project_id` 查询参数（缺省 = 全部，兼容旧行为）：
@@ -299,13 +341,26 @@ interface Guidance {
 
 前端 overview 页与**运行页（/scans，2026-11-22 起）**均按当前项目（`useActiveProjectId`）带参查询；运行页此前未带参导致跨项目运行泄漏进列表，已修复。
 
+**实例容器投影（只读，2026-11-23 增补）**：`GET /api/instances` 的每个实例可带可选 `container` 对象（`{project_id,state,container_id,image_digest,profile,desired_state,reconcile_status,last_error,observed_at}`）。`state` 只来自容器运行时（`ListProjects`）；`desired_state`/`reconcile_status`/`last_error` 只来自 PG `toolbox_projects`，两者分开展示、互不推导。列表每请求最多一次运行时枚举 + 一次批量期望态读取，绝不做逐实例 inspect；运行时不可用时字段整体省略（不伪造 `absent`）。native 模式不返回该字段。
+
 ## 3.3 信息空间（R5，只读）
 
 项目级 InfoItem 激活入口。`project_id` 必填；`context`/`association` 的 `scan_id` 必须属于该项目。项目过滤通过 platform runs 的 `instance_id`/`legacy_scan_id` 并集实现，**不向 info_items 增加 project_id**。
 
 ```text
-GET /api/info/region?project_id=&subject_kind=&subject=&purpose=&nature=&after=&before=&limit=&cursor=
+GET /api/info/region?project_id=&task_id=&scan_id=&layer=&subject_kind=&subject=&purpose=&nature=&kind=&after=&before=&limit=&cursor=
 → { available: true, items: InfoItem[], truncated, has_more, next_cursor?, incomplete, gap_reason? }
+
+GET /api/info/heatmap?project_id=&task_id=&scan_id=&subject=&subject_kind=&purpose=&q=&type=&after=&before=&limit=
+→ { available: true, source: "graph", types: ["observation","inference","belief","intent","fact","finding"],
+    rows: [{ subject, subject_kind?, total, counts: {observation,inference,belief,intent,fact,finding}, last_observed? }],
+    truncated, subject_total, unlabeled, incomplete, gap_reason? }
+
+GET /api/info/relations?project_id=&task_id=&scan_id=&after=&before=&limit=
+→ { available: true, source: "graph",
+    edges: [{ src_subject, src_kind?, dst_subject, dst_kind?, rel,
+              category: "chain"|"info", count, src_title?, dst_title?, last_at? }],
+    truncated, incomplete, gap_reason? }
 
 GET /api/info/context?project_id=&scan_id=&subject=&subject_kind=&since=&until=&limit=
 → { available: true, items: InfoItem[], truncated, incomplete, gap_reason? }
@@ -314,6 +369,10 @@ GET /api/info/association?project_id=&scan_id=&ids=id1,id2&edge_types=supports,.
 → { available: true, hits: [{ item: InfoItem, path: string[], rels: string[], depth: number }], truncated, incomplete, gap_reason? }
 ```
 
+- **作用域收窄（IG1b / 热力图增补）**：`task_id` 把白名单收窄到该任务的 run 集（跨项目 404）；`scan_id` 把白名单收窄到单个 run（不属于当前项目/任务则为 **400**）。`layer=aggregate|atom|all` 默认 all；region 的 `kind` 是聚合节点 kind 逗号列表（仅图可用；冷路径收到 `kind` 返回 **400**，不得静默忽略）。
+- **`heatmap`（2026-11-24 增补；同日扩为项目热力图）**：区域点亮的聚合形态，只返回计数与坐标，不返回正文。阶段固定为 `observation`（原子 observed）/`inference`（原子 inferred，且必须有 `supports`，与 Region 的可激活规则一致）/`belief`/`intent`（行动）/`fact`/`finding`（聚合节点）。行按 `total DESC, subject ASC, subject_kind ASC` 确定性排序；`limit` 是**主体行数**上限（默认 40、最大 200，不是条目数）；`q` 对 subject 做大小写无关子串过滤（项目地图搜索，过滤发生在行上限之前）。`truncated` 表示主体总数超过行上限；`subject_total` 是过滤后的真实主体数；`unlabeled` 是无主体坐标、无法上图的条目数。无 graph reader 时 **503** `{available:false, reason:"heatmap_unavailable"}`，不得返回空图冒充无数据。前端 `/info` 用同一响应画项目星云：距离/大小/颜色 = 信息量。
+- **`relations`（2026-11-24 增补）**：主体级关系聚合，把同一 run 内的 `info_space_edges` 两端 join 到 `info_space_items`，**排除同主体边**，继承 project/task/run 白名单、时间窗与"无支持推断不上图"的激活规则。`category`：`chain` = `spawns/derived_from/yields/proves/supports/covers/depends_on`（动作/证据链），`info` = `references/contradicts/same_session/same_subject/materializes`（信息关联）；未知 rel 归 `chain`（未来生产者不被隐藏）。`limit` 默认 400、最大 800（边行数，不是条目数）；排序把 chain 放前面再按 count 降序，保证截断时优先保留攻击链。`src_title/dst_title` 是两端对象最新摘要的引用，不复制正文。**没有 pivot/tunnel 一等关系**：路径是真实关系链，`rel` 方向就是存储方向，不得反推或改名。无 reader 时 **503** `{available:false, reason:"relations_unavailable"}`。
+
 - `limit` 默认 50、上限 200；关联深度 1..3；`truncated`/`incomplete`/`gap_reason` 必须原样透传。
 - **`hits[].rels`（2026-11-22 增补）**：长度恒为 `len(path)-1`，第 `i` 项是 `path[i] → path[i+1]` 这条边的真实关系类型（`supports|contradicts|references|same_session|same_subject`）。遍历方向不影响类型语义。字段为加性可选：缺失时前端只能中性描边，**不得**用 `item.supports` 反推制造假边。
 - **Region 游标分页（2026-11-22 增补）**：`after`/`before` 是 `observed_at` 的严格时间边界（语义不变，不可当分页用——同一时刻并列行会跨页丢失/重复）。分页用 keyset：`next_cursor` 形如 `<observed_at RFC3339Nano>|<id>`，把上一页的 `next_cursor` 作为 `cursor` 传回即取下一页；排序固定 `observed_at DESC, id ASC`，游标条件为 `observed_at < cursor_at OR (observed_at = cursor_at AND id > cursor_id)`。`has_more` 表示还有下一页；非法 `cursor` 返回 **400**（不是 503）。`RegionResult` 不提供全量总数，前端不得用估算值冒充。
@@ -321,7 +380,7 @@ GET /api/info/association?project_id=&scan_id=&ids=id1,id2&edge_types=supports,.
 - 无 PostgreSQL 冷路径时返回 **503**：`{ available: false, reason: "cold_path_disabled", error }`，不得用空数组冒充“无数据”。
 - 有冷路径但读取失败时 `503` + `reason: "cold_path_unavailable"`。
 - InfoItem 形状沿用 `internal/infoitem.Item`：`id/scan_id/source_seq/nature/coordinates/supports/confidence/coordinate_status/...`。
-- 既有 `GET /api/scans/{id}/audit`（领域审计投影）与 `GET /api/scans/{id}/coldpath`（pending/applied/gap/failed/disabled）为同一信息空间的审计/同步状态来源，前端可复用。
+- 既有 `GET /api/scans/{id}/audit`（领域审计投影）与 `GET /api/scans/{id}/coldpath`（pending/applied/gap/failed/disabled）为同一信息空间的审计/同步状态来源，前端可复用。审计投影自 R8 起携带 `deviations: [{intent_id?, summary, actor, at, seq}]`（executor 计划偏离，只读）。
 
 - **WorkUnit 投影（2026-11-23 增补）**：`GET /api/scans/{id}/units` → `{ scan_id, source: live|record|none, units: [{kind: task|hypothesis, id, subject, state, owner?, lease_until?, vuln_class?, phase?, expired?}], counters: {tasks_open, tasks_claimed, tasks_expired, hypotheses_queued, hypotheses_testing, hypotheses_expired} }`——intent 单位=plan task、belief 单位=ledger hypothesis 的统一派发视图（只读；认领协议见 docs/WORK_UNIT_DESIGN.md）。
 
@@ -410,9 +469,21 @@ interface ApprovalRule {
 
 | Method+Path | 请求 | 响应 |
 |---|---|---|
-| GET `/api/scans/{id}/plan` | — | `PlanView`（见下） |
-| GET `/api/instances/{id}/agents` | — | `{ available, concurrency:{limit,running,queued}, agents: AgentEntry[], partial_reason? }` |
-| GET `/api/tasks/{id}/workers` | `?page&size` | `{ items: [{ ...Run, workers: { available, concurrency, agents: AgentEntry[], partial_reason? } }], total, page, size }` |
+| GET `/api/scans/{id}/plan` | — | `PlanView`（见下；R7 起优先读 `v_plan_tasks`） |
+| GET `/api/scans/{id}/units` | — | `{ scan_id, source: graph\|live\|record\|none, units: [{kind, id, subject, state, owner?, lease_until?, vuln_class?, phase?, expired?}], counters }`（R7 起优先 `v_units`） |
+| GET `/api/scans/{id}/graph` | — | `{ scan_id, source: graph\|none, counters, nodes: [{...Node, payload_object?}], edges: [{src_id,dst_id,rel}], conformance: {ok, errors, warnings, truncated, first?, first_detail?, projection_missing?, projection_stale?}, partial }`；`kind ∈ goal\|intent\|belief\|fact\|finding\|hint\|digest`，`rel ∈ spawns\|derived_from\|yields\|proves\|supports\|covers\|depends_on` |
+| GET `/api/scans/{id}/graph/validate` | — | `Report{scan_id, checked_at, ok, errors, warnings, violations:[{code,severity,kind?,unit_key?,node_id?,detail}], truncated?}`；只读运行期合规检查，错误码见 `docs/INFO_GRAPH_CONTRACT.md` §2；图不可用 503 |
+| GET `/api/scans/{id}/assets` | — | `{ scan_id, source: assets\|none, items: [{id, project_id, kind, key, display_name?, first/last_info_item_id?, archived_at?, archived_by?, merged_into_id?}], total }` |
+| GET `/api/projects/{id}/assets` | `?kind=`（可重复/逗号分隔）、`?task_id=`、`?run_id=`、`?q=`、`?include_archived=true`、`?limit=`（缺省 200，上限 1000） | `{ project_id, source: assets\|none, items: Asset[], total }`；默认隐藏 archived/merged 墓碑 |
+| POST `/api/projects/{id}/assets` | `{kind, key, display_name?, info_item_id?}` | `Asset`（201）；身份按 `(project, kind, key)` 去重，InfoItem 仅作 provenance 引用 |
+| GET `/api/projects/{id}/assets/{assetID}` | — | `{ asset, links: [{scan_id, task_id?, source?, created_at}], edges: [{src_id, dst_id, rel}] }`；未知资产 404 |
+| GET `/api/projects/{id}/assets/edges` | — | `{ project_id, edges: [{src_id, rel, dst_id}] }`；确定性排序 `src_id, rel, dst_id`，含 `exposes`（host → endpoint，URL 观测写入） |
+| POST `/api/projects/{id}/assets/merge` | `{source_id, target_id}` | `{status:"merged", project_id, source_id, target_id}`；links/edges 迁移到 target，source 留 `archived_at + merged_into_id` 墓碑；自并/已归档/跨项目 409/404 |
+| POST `/api/projects/{id}/assets/archive` | `{ids: number[], archived: bool}` | `{project_id, updated, archived}`；merged 墓碑不可单独恢复（`updated` 不计） |
+| — | 资产结构边（2026-11-24） | `exposes`（host → endpoint）由 `assetobs` 在同一 URL 观测中写入，是资产页「目标 → 路径」下钻的唯一依据；`resolves_to/hosts/serves/bound_to` 语义不变。资产页第一层只列目标（root_domain/subdomain/ip/service/app），路径在目标详情中展示；无父目标的路径单列「未归属路径」，不得猜归属。 |
+| GET `/api/instances/{id}/agents` | — | `{ available, concurrency:{limit,running,queued}, agents: AgentEntry[], units: WorkerUnit[], partial_reason? }`。**`units` 是可见 worker 行**：一个 intent（工作单元）一行，`status` 取图状态（open→queued/running/paused/done→completed/blocked·exhausted·stopped→failed），`agent_ids`/`agent_status` 是执行明细（重派/重试聚合同一行）；`agents` 保留为实例级投影，legacy spawn（无 unit）仍按 agent 一行 |
+| GET `/api/instances/{id}/container` | — | `{ instance_id, project_id, backend, available, reason?, actual?:{state,container_id?,image?}, desired?:{desired_state,reconcile_status,desired_gen,applied_gen,profile,net_profile,image_digest,container_id,last_error,created_at,updated_at}, tools:{available,profile,source,reason,items?:[{name,bin,category,purpose,capabilities}]}, observed_at }`。只读：不创建/启动/停止/调和容器；native 返回 `backend:"native", available:false`；`desired` 白名单**不含** `spec`（Env/代理凭据/mounts/socket 路径）。`tools` 从运行中容器的 `/opt/xalgorix/toolpack.yaml` 读取并按 profile 过滤，容器未运行则 `available:false` |
+| GET `/api/tasks/{id}/workers` | `?page&size` | `{ items: [{ ...Run, workers: { available, concurrency, agents: AgentEntry[], units: WorkerUnit[], partial_reason? } }], total, page, size }`；per-run 视图与 `/agents` 同语义（`units` 为主，`agents` 为明细） |
 
 ```jsonc
 // PlanView
@@ -444,7 +515,8 @@ interface ApprovalRule {
 }
 ```
 
-- **plan 解析顺序**：live agent 的 `PlanSnapshot()`（发布在 owner-loop 回合边界，immutable）→ 终态 `ScanRecord.PlanView`（与 plan 计数同一写入点持久化）→ 仅计数时 `partial:"not_persisted"` → `present:false`。**绝不把"明细缺失"渲染成"没有计划"**。
+- **plan 解析顺序（R7 起）**：探索图 `v_plan_tasks`（intent 节点，`unit_key=task_id`；owner/lease 来自图）→ live agent 的 `PlanSnapshot()` → 终态 `ScanRecord.PlanView` → 仅计数时 `partial:"not_persisted"` → `present:false`。图零行时回退旧路径以兼容迁移期 run。**绝不把"明细缺失"渲染成"没有计划"**。
+- **units/graph/assets**：都优先读 PG 权威（`v_units` / `exploration_nodes+edges` / `task_asset_links`）；图不可用时 `graph_unavailable` 让 run 进入可恢复 pause，而不是用内存计划静默续跑。
 - **agents 解析顺序**：`inst.agent.DelegationSnapshot()`（agentsgraph 内存状态）→ 终态读 `<scanDir>/execution-graph.json`（graph 自己写的 checkpoint，非第二套持久权威）；checkpoint 里的 `running/queued` 一律降级为 `failed`（进程/运行结束后不可能还在跑），并置 `partial_reason:"checkpoint"`。未知实例 → `available:false, partial_reason:"no_run"`，200 而非 404（面板需要中性态）。
 - **`claimed_hypotheses`** 是 ledger 的只读 join（仅 `status=testing` 且 `assigned_to` 非空），回答"这个 worker 现在到底在做什么"。
 - **`GET /api/tasks/{id}/workers`** 是任务级只读聚合：对任务内每个 run 复用上面同一 worker 投影（live agentsgraph → checkpoint），只返回委派过 worker 的 run。会话页左栏据此把**每个 run 的全部 worker（含 completed/failed）**常驻成行，历史不随实时输出消失；run 投影字段（title/status/时间）与 `/runs` 同源。
@@ -473,9 +545,11 @@ interface ApprovalRule {
 
 | Method+Path | 请求 | 响应 |
 |---|---|---|
-| GET `/api/scans/{id}/traffic` | `?endpoint=`（URL 子串，不区分大小写；缺省=全部）、`?method=`（精确方法）、`?limit=`（最新窗口，缺省 20，上限 100） | `{ scan_id, exchanges: HttpExchange[], total_matched, truncated, present }` |
+| GET `/api/scans/{id}/traffic` | `?endpoint=`（URL 子串，不区分大小写；缺省=全部）、`?method=`（精确方法）、`?host=`（资产 host，精确且忽略端口）、`?refs=`（finding 落库时绑定的精确证据，`session:seq,session:seq`）、`?seq=`（本 session 的单条记录）、`?limit=`（最新窗口，缺省 20，上限 100） | `{ scan_id, exchanges: HttpExchange[], total_matched, truncated, present }` |
 
-- **HttpExchange**：`{ seq, at, method, url, status?, channel?（bearer\|subprocess）, high_risk?（AssessHTTP 命中原因）, denied?（代理闸 403 拒绝）, upstream?, request_raw?, response_raw?, request_truncated?, response_truncated? }`。`request_raw` = 发往目标的 origin-form 包（run token 已随 Proxy-Authorization 逐跳剥离，**不出现在包里**）；`response_raw` = 解码后表示（无 chunked 帧）；双侧各截断于 128 KiB 并带 `*_truncated` 标记。
+- **run 级合并**：实例 id 请求（面板/实时视图）会合并该 run 名下的全部 sibling session 目录（checkpoint/resume、多目标派发各自从 seq 1 起号），按 `at` 升序后取最新 `limit`；每条带 `session`（session 目录 basename），`(session, seq)` 才是跨 session 唯一键。
+- **HttpExchange**：`{ seq, at, method, url, session?, host?, status?, channel?（bearer\|subprocess）, high_risk?（AssessHTTP 命中原因）, denied?（代理闸 403 拒绝）, upstream?, request_raw?, response_raw?, request_truncated?, response_truncated? }`。`request_raw` = 发往目标的 origin-form 包（run token 已随 Proxy-Authorization 逐跳剥离，**不出现在包里**）；`response_raw` = 解码后表示（无 chunked 帧）；双侧各截断于 128 KiB 并带 `*_truncated` 标记。
+- **证据绑定**：`report_vulnerability` 落库时按 endpoint+method+资产 host 从该 run 的归档中匹配（上限 20 条）并把 `traffic_refs: [{session?, seq}]` 写进 finding；详情优先用 `?refs=` 精确取包，旧 finding 无 refs 时才回退 endpoint/host 匹配。`session`/`seq` 只接受 basename 与正整数，路径穿越的 ref 被忽略。
 - **`present` 语义**：`false` = 该扫描无归档（代理关闭/pre-R2b 旧扫描/纯无归因流量），`true` + 空 `exchanges` = 有归档但无匹配——两种空态前端分开渲染。
 - 升级 passthrough（WebSocket 盲转发）与盲 CONNECT 无明文半程，**不产生 raw 记录**（与观测元数据边界一致）。未知 scan → 404；非 GET → 405。
 
@@ -485,9 +559,9 @@ interface ApprovalRule {
 
 **MCP**（`internal/tools/mcp`，官方 go-sdk v1.8.0）：stdio（argv 直 spawn、`SanitizeEnviron` 后追加服务器自带 Env）与 streamable HTTP（DialGuard 逐跳复查 + scopeguard 拒操作者机器端点，写入与连接时双重校验）。工具以 `mcp_<server>_<tool>` 注册进 registry → 熔断/参数校验/审批闸/五闸六环全继承；审批策略把 `mcp_*` 归 command 类（`require_approval=false` 的服务器由 broker 快照豁免）。Verifier 不接入。`POST {id}/refresh` 为操作者侧健康探测（回填 `tool_count/last_healthy_at/last_error`）。
 
-**Skills**：用户技能与内置 800+ 语料合并进 `read_skill/list_skills/search_skills`（固定 category `user`，同名用户技能遮蔽内置；`user` 文档带出处 banner）；每次成功加载写 domainjournal `skill_load` 审计。
+**Skills**：用户技能与内置 800+ 语料合并进 `read_skill/list_skills/search_skills`（固定 category `user`，同名用户技能遮蔽内置；`user` 文档带出处 banner）；每次成功加载写 domainjournal `skill_load` 审计。内置语料另经 `/api/skills/builtin`（索引）与 `/api/skills/builtin/{name}`（正文）只读投影给面板，**不需要 platform store**、无写路径；正文剥离 frontmatter，结构化字段（description/tags/intent/category）单独返回。该读取路径不做 alias/模糊解析（那是 agent 的 lookup 路径）。
 
-**Agent 档案**：用户档案与 5 个内置专家合并（内置行 API 只读、role 保留字 409）；参与自动委派波次 + `spawn_agent` 按名派生；`tool_scope_hidden` 数据驱动工具面裁剪。派生生命周期写 domainjournal `agent_delegate`。
+**Agent 档案**：用户档案与 5 个内置专家合并（内置行 API 只读、role 保留字 409）；参与自动委派波次 + `spawn_agent` 按名派生；`tool_scope_hidden` 数据驱动工具面裁剪。内置行现在返回**完整规范契约**（`focus`/`vuln_classes`/`evidence_contract`/`stopping_rule`）与**生效的** `tool_scope_hidden`（`agent.BuiltinSpecialistProfiles()` 按 `applyRoleToolScope` 同一解析：角色映射→`other` 回退），面板只读展示，不在 web 层复制规范字符串。派生生命周期写 domainjournal `agent_delegate`。
 
 **调用记录**：per-scan 权威 = domainjournal 三个新 Op（`skill_load`/`agent_delegate`/`mcp_call`）；跨扫描检索投影 = web 层 best-effort JSONL（`<dataDir>/_invocations/{mcp,skills,agents}.jsonl`，8MiB 单文件轮转，缺失文件 = 空列表不是错误）。投影缺失不影响扫描（`RecordApprovalRuleHit` 先例：定义行才是权威）。
 
@@ -498,6 +572,8 @@ interface ApprovalRule {
 | GET/PATCH/DELETE `/api/mcp-servers/{id}` | PATCH 同 create 的可选字段（transport 不可改；打码值提交 = 未修改） | `McpServer` / `{ok:true}` |
 | POST `/api/mcp-servers/{id}/refresh` | — | `McpServer`；探测失败 502 `{error, server}`（健康投影已回填） |
 | GET `/api/skills` | — | `{ skills: UserSkill[] }` |
+| GET `/api/skills/builtin` | — | `{ skills: [{name, category, description, intent?, tags?}] }`（内置语料索引，只读，无 store 依赖） |
+| GET `/api/skills/builtin/{name}` | `?category=`（可选，消歧） | `{name, category, description, intent?, tags?, body}`（frontmatter 已剥离）；未知 404 |
 | POST `/api/skills` | `{name(kebab), description, tags?, intent?, body(≤128KiB), enabled}` | `UserSkill`（201）— 重名 409、格式 400 |
 | GET/PATCH/DELETE `/api/skills/{id}` | PATCH 可选字段 | `UserSkill` / `{ok:true}` |
 | GET `/api/agent-profiles` | — | `{ profiles: AgentProfile[] }`（内置行前置，`builtin:true` 只读，id 形如 `builtin:<role>`） |
@@ -554,6 +630,22 @@ interface ApprovalRule {
 - `UserSkill`：`{id,name,category,description,tags?,intent?,body,enabled,created_by?,created_at,updated_at?}`。
 - `AgentProfile`：`{id,role,focus,vuln_classes,evidence_contract,stopping_rule,tool_scope_hidden?,enabled,builtin,created_by?,created_at,updated_at?}`。
 - `InvocationRecord`：`{id,module,ts,instance_id?,scan_id?,agent_id?,name,server?,status,error?,args?,outcome?}`（`args` 为 ≤512 字节 digest，敏感键打码）。
+
+## 3.11 报告交付（手动生成，2026-11-23 增补）
+
+报告只在操作者手动点击时生成；扫描结束与 wildcard 子域结束**不再**自动出 PDF，也不再广播 `report_ready`。规格见 `docs/REPORT_DELIVERY_SPEC.md`。
+
+- `POST /api/tasks/{id}/reports` — body `{run_ids?, formats:["pdf"|"md"|"html"], template:"standard", language:"zh-CN"|"en", mode:"template"|"agent", model?}` → `202 Report`。`run_ids` 缺省为最新 run；同一任务同时只允许一个 `queued|generating` 报告（第二请求 409）。
+- `GET /api/tasks/{id}/reports` → `{items: Report[]}`（revision 倒序）。
+- `GET /api/reports?limit=200` → `{items: Report[]}`（跨任务，Reports 页数据源）。
+- `GET /api/reports/{reportID}` → `Report`（含 `artifacts[]`、`progress`、`task_name`、`targets`）。
+- `GET /api/reports/{reportID}/download/{format}?kind=total|sub&scan_id=` → 文件附件。
+- `POST /api/reports/{reportID}/cancel` — 取消 queued/generating；`DELETE /api/reports/{reportID}` — 删除版本（生成中返回 409，需先取消）。
+- `GET /api/scans/{scanID}/findings/{vulnID}/export?format=md|html|json&download=1` — 单漏洞 SRC 提交件。
+
+`Report` 形状：`{id,project_id?,task_id,revision,run_ids[],scan_ids[],status,template,language,mode,model?,prompt_version?,formats[],error?,created_at,started_at?,finished_at?,artifacts[],progress?,task_name?,targets?}`；`artifacts[]` 为 `{kind:"total"|"sub",scan_id?,target?,format,bytes,sha256?,url}`。
+
+存储：元数据在 PG `reports` / `report_artifacts`（迁移 `0028_reports.sql`），字节产物在 `<dataDir>/reports/<taskID>/<reportID>/`（`report.json` + 请求的 PDF/MD/HTML；子报告在 `sub/`）。**报告内容含 HTTP raw 请求/响应，导出前统一脱敏**（Cookie/Authorization/token/密码/邮箱/手机号/身份证）；无抓包时明确标注并附重建 PoC，不伪造原文。进程重启时残留的 `queued|generating` 行由启动 reconciliation 标记 failed。
 
 ## 4. 前端已实现清单（本契约的消费方）
 

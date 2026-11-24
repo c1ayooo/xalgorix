@@ -115,14 +115,18 @@
 
 ```text
 SessionsPage（任务详情会话内容）
-├─ 左栏：会话列表
+├─ 左栏：会话列表（两段式树）
 │  ├─ 头部：折叠开关 / 实时状态 / 任务 Token 汇总
-│  └─ 角色分组
-│     ├─ 主 Agent 会话（新建入口）
-│     ├─ Planner 会话
-│     ├─ System 会话
-│     └─ Worker 会话
-└─ 右栏：当前会话
+│  ├─ 「会话」段
+│  │  └─ 主 Agent：Run 列表
+│  │     └─ Run 行 → 该 Run 的 worker 子行（行主体选中 / 右侧 chevron 展开）
+│  └─ 「工作区」段（叶子行，不是会话实体）
+│     ├─ 规划 Planner
+│     ├─ 决策
+│     ├─ 义务缺口
+│     ├─ Worker 池（pool 投影）
+│     └─ 系统审计
+└─ 右栏：当前会话 / 模块投影
    ├─ 头部：标题 / 实时 / 模型 / Token / 时长 / 控制
    ├─ 转录：完整 Activity 流，可展开工具与审批
    ├─ Composer：主 Agent 可输入；Worker 按状态可暂停/恢复/发消息
@@ -155,10 +159,9 @@ SessionsPage（任务详情会话内容）
 
 **A. 纯前端映射**
 
-- Run → 主 Agent 会话。
-- `agent_id` / 事件类型 → Worker、System 分组。
-- 每个分组复用现有 Run 转录或事件分页。
-- Planner 无独立数据时不显示该分组，不伪造。
+- Run → 主 Agent 会话；Run 行下挂该 Run 的 `agent_id` worker 子行（`/api/tasks/{id}/workers`）。
+- 工作区段 = `plan/decision/obligation/workers/system` 模块叶子行，复用现有 Run 转录或事件分页。
+- 只渲染真实存在的会话（Run / worker）；模块是七环投影，不伪装成会话，也不做「组头 + 同名条目」。
 
 **B. 完整角色会话（需要后端适配）**
 

@@ -43,7 +43,7 @@
 
 | M-14 | ✅已修（2026-11-21） | `GET /api/approvals/summary` 经真实 mux 不可达：`/api/approvals/` 前缀先匹配 `handleApprovalDetail`，GET 返 405；`handleApprovals` 内 summary 分支仅被直调 handler 的测试覆盖 | `internal/web/server.go`（`registerPlatformAPIRoutes`）、`internal/web/handlers_approvals.go`；回归 `TestApprovalsSummaryRoute`（走真实 mux，含 200/405/decision 分发） | 已闭合：精确模式先于子树匹配 |
 
-| M-15 | 已知限制（2026-11-21 随目标功能落地） | 任务目标的**达成度只观测不阻断**：未达成不改变完成状态/停止原因/收工闸门 | `internal/objective`、`internal/web/objective_service.go` | 目标未达成可能来自环境、授权或方法论覆盖不足，强行阻断会制造假失败与死锁；如实呈现"未达成"是当前取舍 |
+| M-15 | ✅已按 D10/R-goal 修订（2026-11-22；本条 2026-11-23 回写） | 目标达成度已升级为**收工义务**：required 且 `verify_by≠manual` 的判据未达成时，主动 finish 被 `hookGoalFinishGate` 拒绝；计划排空尾转有界 goal obligation（≤3 次）。仍不改变 finding 标签与 `objective.Evaluate` 的确定性 | `internal/agent/goal_gate.go`、`internal/objective`、`REDESIGN.md` D10 | 已闭合；`verify_by=manual` 判据永不阻断，资源预算/操作者停止/进程关停仍可终止 |
 | M-16 | 已知限制（2026-11-21 随目标功能落地） | `capability` 类判据（如 shell）依赖 finding 的 `exploitation_proof` 与漏洞类别名匹配（`shell`→rce/cmdi 等），无具体利用证据时判为未达成/不可判定 | `internal/objective/evaluate.go` | 能力类判据比漏洞类更依赖证据形态；别名表是显式小表，未知能力名退回严格 token 匹配，避免误判 |
 | M-17 | 已知限制（2026-11-21 随目标功能落地） | 目标标记（`Task.ObjectiveRef`）在模型调用 `build_plan` 重建计划后会被重新标记，但**不属于覆盖分母**，也不参与排序；模型自建计划不会携带引擎的覆盖底线任务 | `internal/agent/plan_tools.go`、`internal/agent/planner.go` | 目标只提供优先级上下文，不改变方法论义务；由 `build_plan` 的覆盖底线逻辑单独保证覆盖 |
 

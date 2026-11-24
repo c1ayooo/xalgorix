@@ -26,7 +26,7 @@
 | `plan` | 2 信念（PlanTask = Intent） | engine | `GET /api/scans/{id}/plan` | `completed+skipped/total` | `present:false` → absent；`partial:true` → 琥珀横幅（not_persisted/truncated） |
 | `decision` | 2 信念（Hypothesis） | telemetry（事件流；账本权威见「账本」tab） | run-events（`record_hypothesis`/`add_hypothesis_evidence`） | 事件计数 | absent（本 run 无决策动作） |
 | `obligation` | 3 义务 | engine（只读投影，不重算闸门） | plan 未完成/跳过项 + agents 空闲行 | `counters.unfinished` | absent（无未完成义务） |
-| `workers` | 4 行动 | engine（agentsgraph） | `GET /api/instances/{id}/agents` + 左栏 `GET /api/tasks/{id}/workers` | `running/limit(+queued)` | `available:false` / `agents:[]` / 全 completed / 部分 queued 四态分开 |
+| `workers` | 4 行动 | engine（agentsgraph + 图单元状态） | `GET /api/instances/{id}/agents` + 左栏 `GET /api/tasks/{id}/workers`（`units[]` 为主，`agents[]` 为明细） | `running/limit(+queued)` | `available:false` / `units:[] && agents:[]` / 全 completed / 部分 queued 四态分开 |
 | `system` | 5 证据（审计投影） | telemetry | run-events（phase/paused/resumed/stopped/error/finished/recovery） | 事件计数 | absent |
 
 规则（代码里是 `ContentModule.visible`）：
@@ -56,7 +56,17 @@
 | 活跃判据 | 5s `live` 窗口（事件可能被 `safeSend(...,0)` 丢弃） | 状态点权威；`live` 仅作辅助提示 |
 | 做了什么 | 无 | `claimed_hypotheses`（当前认领的假设/端点） |
 | 终态 | 空 | checkpoint 重建；持久 `running` 降级为 `failed` |
-| 左栏 | 单个 Workers 入口，只显示运行中计数 | 每个 run 下**逐 worker 常驻一行**（任务级 `/workers` 聚合，含 completed/failed）；点击一次写入 `?run=&agent=` 打开该 worker 转录；`live` 只作状态点 |
+| 左栏 | 单个 Workers 入口，只显示运行中计数 | 每个 run 行可展开其 **worker 子行**（任务级 `/workers` 聚合，含 completed/failed；选中 run 默认展开）；点击子行一次写入 `?run=&agent=` 打开该 worker 转录；`live` 只作状态点 |
+
+### 4.1 可见身份 = 工作单元（2026-11-24 增补）
+
+R7 池派发的 worker 拥有一个权威 intent（unit）。面板把**unit 作为可见 worker 行**，agent 实例只是明细：
+
+- `units[]` 由 `/agents` 与 `/workers` 下发：`unit_id/title/state/status/agent_ids/agent_status/claimed_hypotheses`；行主状态取图状态，`agent_status` 只作执行细节。
+- 重派、重试、租约回收都聚到同一行（`agent_ids` 追加，`N×` 徽标），不会出现"同一题两个 worker"。
+- 点击 unit 行写 `?agent=unit:<unit_id>`；转录请求发 `?unit=`，服务端取该 unit 全部 agent 的事件并集后再分页，因此 worker 泳道历史跨尝试连续。
+- legacy `spawn_agent`（无 unit）仍按 agent 一行，`?agent=<agent_id>` 语义不变。
+- 跨 worker 共享仍走黑板：`read_ledger` / `read_info_item` / ledger evidence；unit 行只解决"谁是那个 worker"的投影问题，不改状态权威。
 
 调度侧配套（P1/P2）：
 
@@ -80,7 +90,22 @@
 
 | 层 | 用例 |
 |---|---|
-| agentsgraph | `TestSnapshotReportsConcurrentAndQueuedAgents`、`TestStateSinkEmitsLifecycleEvents`、`TestReadCheckpointState*` |
-| agent | `TestPlanSnapshot*`、`TestDelegationSnapshotReportsPoolAndQueue`、`TestClaimNextHypothesis_SpecialistBorrowsUnownedWork`、`TestBudgetFairShare*`、`TestWaveRescheduleIsOptIn` |
-| web | `TestScanPlanProjection_*`、`TestInstanceAgentsProjection_*`、`TestTargetConcurrencyLimitDefaultsToSerial` |
+| agentsgraph | `TestSnapshotReportsConcurrentAndQueuedAgents`、`TestStateSinkEmitsLifecycleEvents`、`TestReadCheckpointState*`、`TestDispatchRunsAndCollects` |
+| agent | `TestPlanSnapshot*`、`TestDelegationSnapshotReportsPoolAndQueue`、`TestClaimNextHypothesis_SpecialistBorrowsUnownedWork`、`TestBudgetFairShare*`、`TestWaveRescheduleIsOptIn`、`TestToolSurface*`、`TestPlannerWorkerFinishGate` |
+| web | `TestScanPlanProjection_*`、`TestInstanceAgentsProjection_*`、`TestScanGraphProjection_*`、`TestScanAssetsProjection_*`、`TestScanUnits*`、`TestTargetConcurrencyLimitDefaultsToSerial`、`TestWorkerUnits_*`、`TestUnitTranscriptItems_*`、`TestUnitAgentIDs_*` |
+| orchestrator | `TestPoolClaimsAndSettles`、`TestPoolFailureSettlesBlocked`、`TestSeedIfEmpty`、`TestPlannerApplyAddsAndDedupes` |
 | 前端 | `npm run typecheck`；`make webui` 重建嵌入产物 |
+
+## 7. R7 planner_worker 语义（默认内置）
+
+planner_worker 是默认拓扑，不是设置项。`XALGORIX_WORKER_CONCURRENCY=1..10` 可在设置页修改；`XALGORIX_ORCHESTRATOR=legacy` 仅为隐藏的紧急回滚。
+
+- **主会话（无 `?agent=`）**：main chat 按用户消息触发，具体工作先 `propose_intent` 形成草案，操作者确认（转录提案卡端点或更早回合的 `confirm_intent`）后才写入 intent；`add_hint` 只承载上下文；保留 `finish`。不执行、不巡检、不跑 plan。主会话转录含人工消息、main chat 回复（`role=main`）、提案卡与 hint 记录；worker/planner 事件按 `agent_id` 分泳道。
+- **默认选择**：会话页不自动选主 Agent；打开任务时主区为空态，用户点 run/worker 才展示内容。
+- **左栏结构（2026-11-23 两段式树）**：左栏分「会话」与「工作区」两段。「会话」段 = 主 Agent 的 Run 列表，Run 行右侧独立 chevron 展开该 Run 的 worker 子行（Run 行主体负责选中，两个点击目标互不吞并；选中 Run 默认展开）；「工作区」段 = `plan/decision/obligation/workers/system` **叶子行**，点击打开对应七环投影，不显示 chevron。只有真实列表（主 Agent 列表、Run 的 worker 子行）可折叠——模块条目不再「组头 + 同名条目」重复层级。折叠态存 `xalgorix.sessions.groups.<taskId>.main`，worker 展开集合存 `xalgorix.sessions.workers.<taskId>`；折叠组含选中项时组头保留品牌色圆点。
+- **Plan 模块**：`/plan` 优先 `v_plan_tasks`；`plan_updated` 由 LLM planner 或 human intent 发出，前端只做失效重读。任务行可显示 `owner`/`lease_until`。
+- **Workers 模块**：worker pool 通过 `agentsgraph.Dispatch` 产生标准 `sub_*` 行；`/agents` 与 `/tasks/{id}/workers` 的 `units[]` 按 unit（intent）聚合成可见行，`agents[]` 保留为实例明细；claim 的 intent 由 graph owner/lease 表示，unit 行状态取图状态、不复用 run 状态。所有执行事件流都在 unit 行（`?unit=` 并集），legacy spawn 仍在 agent 行。
+- **收工**：main chat 保留 `finish`；planner 在“本轮无新 intent 且 frontier 排空”时用 `[SYSTEM]` 唤醒 main，main 决定是否 finish；有 open/running intent 或未确认提案时 finish 被拒。
+- **Planner 活动**：planner 轮次的 `plan_updated` 只做失效；规划文本/JSON 不进入主转录。独立 planner session 的 activity 投影仍是 M3 余项。
+- **空态**：`plan.present:false` = 图里没有 intent；`workers.agents:[]` = 当前 run 没有 worker 行；两者都不是前端渲染丢失。
+- **边界**：图是 PG 实时权威；PlanTask/PlanView 是视图；事件/图投影不参与判定。详见 `docs/DUAL_GRAPH_ORCHESTRATION.md`。

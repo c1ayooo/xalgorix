@@ -230,7 +230,7 @@ finding carries exactly one verification tag:
   data, OOB callback, …). Proven, not a guess.
 - `needs-manual-verification` — preserved but not yet concretely proven.
 
-`internal/reporting` renders the branded PDF from the persisted findings.
+`internal/reportdelivery` renders the manually generated report (PDF/Markdown/HTML) from a read-only ReportSpec assembled from persisted findings + traffic archives; `internal/reporting` remains the legacy single-scan PDF renderer behind `/api/report/{id}`.
 
 ## Information model, domain audit & cold path
 
@@ -469,6 +469,20 @@ for *organization*, never a second scan-state authority.
 - `XALGORIX_APPROVAL_MODE` defaults to **off** (headless scheduled scans
   must not stall on pendings); `enforce` enables the pipeline. Operator
   allowlist additions: `XALGORIX_APPROVAL_ALLOWLIST`.
+- **Task-level switch (audit_mode)**: a task stores `inherit | off | enforce`.
+  At dispatch the effective value (task override, else the process default)
+  is snapshotted onto `ScanRequest.AuditMode` → `scanSession.auditMode` →
+  `ScanContext.AuditMode` (`internal/web/task_audit.go`). Both gates read that
+  one field:
+  - the agent's Eino approval broker is constructed per run only when the
+    snapshotted mode is `enforce` (`einoApprovalBroker`), and evaluates with
+    an explicit enforce policy;
+  - the traffic-proxy adapter is always installed and resolves the per-run
+    mode from the attribution's live `ScanContext` before creating a row.
+  `off` keeps the call in the ordinary tool-call audit trail with no approval
+  row; `enforce` blocks command + high-risk MITM HTTP calls until decided
+  (timeout = rejection). Existing tasks default to `inherit`, so the
+  pre-feature posture is unchanged.
 
 ## Traffic proxy — `internal/trafficproxy` (R2b)
 
@@ -497,12 +511,24 @@ The single-process shared loopback MITM proxy (REDESIGN §4/D4), default ON
   unattributed rather than impersonating a Run. Attributed traffic overrides
   the process dial-guard base with the scan's scopeguard config (per-scan
   provisioned loopback ports still work; Chromium bypasses the proxy for those
-  ports). Browser traffic remains system-level because rod has no token channel.
-- Subprocess approval: Basic-attributed requests never passed the tool-layer
-  gate, so the proxy may adjudicate a high-risk HTTP request through
+  ports). **Browser traffic gets a run-scoped listener** (`ListenForScan`,
+  ephemeral port on the manager's bind host) so attribution is carried by the
+  port while Chromium's `--proxy-server` never needs credentials; container
+  runtimes address the same listener through the project network's gateway
+  (`ProjectHandle.ProxyURL`). The listener is closed on run teardown/resume.
+- Raw archive: attributed exchanges additionally persist the exact wire
+  packets (headers + bodies, unredacted, 128 KiB/side) under
+  `<ScanDir>/traffic/tr_<seq>.json` (`scanctx.TrafficArchive`). The dashboard
+  reads them through `GET /api/scans/{id}/traffic` (merging a run's sibling
+  session directories, with exact `refs=session:seq` evidence lookup); each
+  finding pins its evidence refs at report time. The agent reads the same
+  archive with `list_requests` / `list_requests seq=<n>`.
+- Subprocess/browser approval: non-Bearer-attributed requests never passed the
+  tool-layer gate, so the proxy may adjudicate a high-risk HTTP request through
   `web.proxyHighRiskGate` / `trafficproxy.SetHighRiskGate`. It reuses the same
   `ApprovalService` slot queue, timeout=reject, WS events and redaction; Bearer
-  traffic and unattributed traffic are never re-gated.
+  traffic and unattributed traffic are never re-gated. The gate is installed
+  only in `XALGORIX_APPROVAL_MODE=enforce` (default off → observe-only).
 - Observation: request/response summaries become observed InfoItems in the
   owning run's `domainjournal` via `OpObserveTraffic` (new operation),
   written by a bounded single-writer sink off the request path (overflow is
@@ -656,7 +682,7 @@ target + instruction
      (web.SetScanStateBackend; scan.json only in nil-backend test mode)
    → cold path: journal observer/reconciler → River → PostgreSQL
    → search_info: bounded region/association/context reads (no verdict role)
-   → report.go / internal/reporting: branded PDF on demand
+   → reportdelivery: manual task-level report (PDF/MD/HTML, total + per-target sub reports)
    → notify.go: Discord/Telegram lifecycle + finding notifications
                  (completion summaries are opt-in)
 ```

@@ -10,6 +10,36 @@
 >
 > **开发前提**：当前未上生产环境，允许调整内部 API、JSON schema 和测试夹具，不背负生产数据迁移；但仍须保持每步可运行、可测试、可回滚，不得把“无生产”解释为跳过正确性与安全回归。
 
+> **v3.1 / R7 修订（2026-11-23，双图编排，用户裁决）**：本节是**显式例外**，与下文冲突时以本节为准；其余条款继续有效。实现规格见 `docs/DUAL_GRAPH_ORCHESTRATION.md`。
+>
+> 1. **§2 对象映射**：Intent 的权威是探索图 `intent` 节点（`exploration_nodes(kind='intent')`），PlanTask/PlanView 是它的读写视图；Belief 的权威是 `belief` 节点（Hypothesis 生命周期/owner/lease 在节点，Evidence 明细仍在 ledger/InfoItem）；Fact/Finding/Goal/Hint 分别由 `fact`/`finding`/`goal`/`hint` 节点承载，Finding 仍只由 `report_vulnerability` 成功后写入。
+> 2. **§5 字段级权威**：探索对象的生命周期归图；finding 接受仍归报告门；goal 判定仍归确定性 `objective.Evaluate`；InfoItem 的 observed/inferred 仍归 InfoItem；模型自述仍为最低权威。图节点只存权威引用与摘要，不复制正文。
+> 3. **§6/D12**：探索图（`exploration_nodes/edges`）与资产图（`assets`）是 **PG 实时权威（读写 PG）**；其余扫描状态仍保持“内存 + PG”。事件、activity、图投影是审计/读模型，不是决策权威。PG 不可用时 planner/worker 退避、Run 进入可恢复 pause，不以内存计划静默续跑。
+> 4. **不变项**：Verifier 判定/工具面/时限、`report_vulnerability` 闸门顺序、HITL 语义、SSE 单向、扫描隔离、单二进制形态、M0–M5/R6 既有验收全部不变。
+> 5. **落地状态**：M1（图权威/PlanTask 视图/节点投影/资产图/API）完成；M2（planner_worker：main chat 按用户消息**提案**、操作者确认后才写入 intent（`propose_intent` → confirm 端点/`confirm_intent`），hint 只承载上下文、LLM planner、1–10 worker 池、工具面硬裁剪）已实现并作为**默认内置拓扑**。`XALGORIX_ORCHESTRATOR=legacy` 仅为隐藏的紧急回滚，不出现在设置页；worker 并发 1–10 由设置页 `XALGORIX_WORKER_CONCURRENCY` 配置。
+
+> **v3.2 现状校准（2026-11-23）**：本版只校准“现状事实”与里程碑状态，不改变目标设计。§1.1/§1.2/§1.3/§3.4/§4.2/§4.3/§5.2/§6.1/§6.3/§7/§8/§9.5/§13/§16 按代码现状改写；§10 增加落地状态快照；§17.1 记录校准项。事实基线：PG 主存储（R6.0–R6.3）、Eino 单运行时、River 异步层、HITL 审批链、MCP 客户端、SSE 事件流、planner_worker 默认拓扑、探索图/资产图 PG 权威均已落地。
+
+> **v3.3 / 信息即图（2026-11-24，用户裁决）**：本节补充而非替代 §3/§4/§7/§8；冲突时以本节为准，实现规格见 `docs/INFO_AS_GRAPH_SPEC.md`。
+>
+> 1. **两层同一空间**：探索图是信息空间的**聚合层**（节点=信息聚合，边=信息关系+工作关系）；InfoItem 是**原子层**（一次观测/推导一条实例），Evidence 是原子信息在 hypothesis 下的投影。两者不是两个世界，而是同一空间的粒度差异。
+> 2. **规范键是 `run_id`**：`exploration_nodes.scan_id` 是 run 身份（D11 instance id）；`info_items.scan_id` 是产生它的 ScanContext id（一个 run 可跨 sibling 上下文）。原子经 `run_journal(scan_id, seq) -> instance_id` 归一化，缺失回退自身 `scan_id`。跨层查询一律以 `run_id` 为准。
+> 3. **图节点坐标**：聚合节点 payload 的 `info` 块承载 subject/purpose/nature/observed_at/context；`state/owner/lease/priority` 是控制字段，不属于信息内容。图节点只存摘要/引用，不复制正文。
+> 4. **激活入口**：三类激活（区域/关联/切片）以统一只读视图 `info_space_items` / `info_space_edges` 为查询入口；直接调用 ledger/surface 的确定性 API 仍是合法实现与回退。图可用时 worker 的 `search_info` 默认 `source=auto` 优先读统一空间。
+> 5. **不变项**：图状态权威（`ConcludeIntent`、claim 谓词、precondition/confirmation）、`report_vulnerability` 门管线与 Verifier、事件非权威、PG 单库、无 A*/MCTS/POMDP、无 pgvector、扫描隔离、单二进制形态。
+> 6. **落地状态（2026-11-24）**：IG0（统一读视图 + `run_id` 归一化）、IG1a（`infospace` reader、`search_info source=graph`）、IG1b（Web `layer` 过滤 + 索引/EXPLAIN）、IG2（planner 消费点亮）、IG3（聚合↔原子链接与 `materializes` 跨层关联）、IG4（intent 级 VOI）、IG5（gap→候选）全部完成；验收见 `docs/INFO_AS_GRAPH_SPEC.md` §7。
+
+> **v3.4 / 上下文压缩（2026-11-24，用户裁决）**：本节是 §3/§4/§5/§6/§8 在压缩路径上的显式修订；冲突时以本节为准，实现规格见 `docs/CONTEXT_COMPRESSION_SPEC.md`，里程碑见 `docs/INFO_AS_GRAPH_SPEC.md` IG6。
+>
+> 1. **压缩是投影，不是摘要算法**：上下文压缩的产物是探索图的 `kind='digest'` 节点（`active → superseded`）+ 一条 `nature=inferred` 的 InfoItem；不是匿名文本消息。热路径（下一轮消息装配）从 `scanctx` 内存权威（ledger/coverage/findings/notes）确定性渲染快照，PG 只承载持久化与跨会话读取，不得为压缩把热路径全走 PG。
+> 2. **无出处不得注入**：digest 的每一行必须携带可解析 ID（hypothesis/evidence/finding/InfoItem/archive id），InfoItem 的 `supports` 非空；没有 ID 的摘要不得进入判定、收工依据或“已测/已确认”的叙述。finding 行只来自 `report_vulnerability` 报告门，候选区必须标注 UNVERIFIED。
+> 3. **不得递归摘要**：快照每轮从权威 store 重算；只允许窗口外 transcript 老化。新 digest 以 `derived_from` 连上一条 digest 与本次老化区间，旧节点置 `superseded`，血缘显式保留。
+> 4. **触发以真实计量为准**：主触发用 provider 返回的 `usage.PromptTokens` 与窗口比例（默认 0.75），字节估计只在无 usage 时兜底并按 CJK 修正；`XALGORIX_CONTEXT_COMPACT_TOKENS=0` 仍表示禁用。不新增用户可见开关。
+> 5. **人工输入不是聊天记录**：主会话裁剪前必须把操作者消息投影为 `hint`（`origin=human`，observed，幂等）；投影失败时不得静默丢弃，宁可本轮不裁剪。
+> 6. **冷路径边界**：模型生成的摘要只允许在 River 冷路径产出 `inferred` InfoItem（带 `supports`），不得进入热循环，不得阻塞装配。
+> 7. **不变项**：Verifier、`report_vulnerability` 门管线、claim 谓词、`ConcludeIntent`、工具面、HITL、SSE 单向、扫描隔离、PG 单库、无搜索算法、无 pgvector 全部不变。
+> 8. **落地状态（2026-11-24）**：IG6a（digest 角色/确定性/真实 token 触发/notes 预算/主会话 hint 投影）、IG6b（digest 节点 active→superseded、`derived_from`、`OpContextDigest` InfoItem inferred+supports、`graph_info_links` materializes）、IG6c（热路径状态快照替换文本 digest，段序/预算/权威标注）、IG6d（冷路径 River、worker 8KB 种子、resume 12KB digest、`list_hints`）全部完成；验收见 `docs/CONTEXT_COMPRESSION_SPEC.md` §9 与 `docs/INFO_AS_GRAPH_SPEC.md` IG6。hint 的 `consumed` 生命周期仍保持“扫描结束前不消费”。
+
 ---
 
 ## 1. 系统定位与适用边界
@@ -18,19 +48,22 @@
 
 以下只描述当前代码事实，不是目标设计：
 
-- Xalgorix 是单 Go 二进制、单进程运行形态的自主渗透 agent，内嵌 React 仪表盘，同时提供 CLI/TUI、REST API 与 WebSocket。
+- Xalgorix 是单 Go 二进制、单进程运行形态的自主渗透 agent，内嵌 React 仪表盘，同时提供 CLI/TUI、REST API 与 SSE 事件流（`GET /api/stream`；旧 WebSocket hub 已移除，`WSEvent` 仅为历史类型名）。
 - 一个 target session 围绕一个目标和一条 instruction 运行；系统同时存在多目标队列、多实例资源准入、定时任务与 wildcard 子扫描，不能把整个系统描述为“只能单目标串行”。
+- 主循环由 Eino ADK 单运行时承载（`internal/engine`；`internal/agent.Agent.Run` 无条件进入 `runLoop`，不存在引擎开关或回滚分岔）。
 - 方法论由代码强制：22 阶段定义于 `internal/methodology/registry.go`，漏洞类注册表、endpoint×class 覆盖矩阵与 coverage epoch 共同约束探索范围。
 - 判定由代码强制：扫描级 hypothesis/evidence ledger、受限工具面的独立 Verifier，以及 `report_vulnerability` 的报告门管线共同约束 finding 的接受与标签。
-- 工具面在编译期注册。工具数、漏洞类数和报告门数量是随代码变化的派生事实，不在宪章中写死；需要展示时由代码或测试生成。
-- 当前权威持久化是每扫描 JSON/JSONL 文件；尚无 PostgreSQL、River、Eino、完整 HITL 审批链或 MCP 客户端实现。
+- 内置工具面在编译期注册；另有运行时注入面（MCP 服务器 `internal/tools/mcp`、动态工具检索、agent profiles/user skills）。工具数、漏洞类数和报告门数量是随代码变化的派生事实，不在宪章中写死；需要展示时由代码或测试生成。
+- 持久化（v3.0/R6）：状态与面板数据的唯一持久态是 PostgreSQL；`XALGORIX_DATABASE_URL` 必需，无 DSN 启动 fail-fast（`cmd/xalgorix/main.go`），文件只承载字节产物。River 只做异步补全/保洁（`internal/jobs`、`internal/coldpath`）。
+- 平台层已落地：项目/任务/Run 模型（`internal/platform`）、HITL 审批链（`internal/approval` + `internal/engine/approval.go` + `approvals` 表）、探索图/资产图 PG 权威（`internal/graph`、`internal/assets`）、MCP 客户端（`internal/tools/mcp`）。
+- 执行拓扑默认 `planner_worker`（main chat + planner + 1–10 worker 池，`internal/orchestrator`）；`XALGORIX_ORCHESTRATOR=legacy` 只是隐藏的紧急回滚。
 
 ### 1.2 当前系统不是什么
 
-- 不是通用 Fact/Intent 求解器，也没有跨扫描任务图。
-- 但当前**已经存在扫描内共享的 Hypothesis/Evidence ledger**：coordinator 与 specialists 读写同一扫描级账本。
-- 当前 `agentsgraph` 已有 runner、并发信号量、取消、结果收集与共享预算；它是固定一波、受预算约束的子 Agent 执行图，不是通用 Worker 池，也不是 Eino。
-- 不是项目/企业/资产/审批运营平台；现有扫描队列与定时任务不等于项目管理和 HITL。
+- 不是通用 Fact/Intent 求解器；但已有扫描内共享的探索图（intent/belief/fact/finding/goal/hint 节点）与跨扫描资产图（`assets`），两者是 PG 实时权威，不是搜索策略。
+- 当前**存在扫描内共享的 Hypothesis/Evidence ledger**：main chat、planner 与 workers 读写同一扫描级账本；Evidence 明细仍在 ledger/InfoItem，图节点只存权威引用与摘要。
+- `agentsgraph` 有 runner、并发信号量、取消、结果收集与共享预算；R7 起它同时承载 planner_worker 的 `Dispatch`/`DispatchWithSurface` 池路径（intent 租约、`SteerUnit`/`KillUnit`），不再是固定一波。
+- 项目/任务/审批/资产平台已落地（D6/D7/D12、R1–R4、R7）；它仍不是企业级多租户运营平台（无组织、计费、跨租户运营面）。
 
 ### 1.3 本宪章的主语
 
@@ -39,7 +72,7 @@
 1. 扫描级共享 ledger 与 agentsgraph；
 2. Web 层多目标队列和实例生命周期；
 3. 只读审计投影；
-4. PostgreSQL 冷路径及跨扫描检索。
+4. PostgreSQL 主存储及跨扫描检索（InfoItem 冷补全、资产图）。
 
 脱离这些对象写出的通用求解框架条款，不属于本期实现范围。
 
@@ -73,6 +106,8 @@ v1 概念与本仓对象的对照，**不得反向使用**：
 | Hint | 引擎义务：phase obligation、completion gate、coverage epoch、hook nudge | 人工输入 |
 | Verdict | Verifier 三态、引擎拥有的确定性验证结果、报告管线标签 | InfoItem 置信度 |
 
+**v3.1/R7 起**：Intent 的权威是探索图 `intent` 节点（PlanTask/PlanView 是其读写视图），Belief 的权威是 `belief` 节点；本表保留对象语义对照，不再表示 PlanTask 拥有独立持久权威。
+
 **入门测试**：任何新能力动手前必须回答“它落在七环的哪一环、由哪个对象承载、如何验收”。回答不出来的不进入实现。
 
 ---
@@ -84,6 +119,7 @@ v1 概念与本仓对象的对照，**不得反向使用**：
 - **InfoItem** 是信息模型的全局实例，承担跨扫描检索、来源追踪与审计。
 - **Evidence** 是信息在某条 hypothesis 下的投影视角，回答“这条信息为什么支持、反驳或控制该假设”。
 - 一个 InfoItem 可以投影到多个 hypothesis；一个 hypothesis 可以关联多个 InfoItem。不得通过复制全文制造多份无来源关系的真相。
+- v3.3：图节点是信息**聚合**，InfoItem 是**原子实例**；同一信息空间的不同粒度，规范连接键为 `run_id`。
 
 ### 3.2 InfoItem 最小模型
 
@@ -121,17 +157,20 @@ Evidence 继续保留每假设 40 条、单字段 4096 字符及现有内存上�
 
 ```text
 热路径：工具/引擎/人工输入
-  → scanctx / ledger Evidence
-  → storage.WriteAtomic 写 JSON
-  → 产生带 scan_id + seq 的可追赶变更记录
+  → scanctx / ledger Evidence（进程内权威）
+  → 变更边界 PG 事务（幂等键 scan_id + seq，行级 instance_id 盖章）
+  → 失败记 failed 水位，扫描继续，reconciler 按幂等键追赶
 
-冷路径：变更记录
-  → River 异步补全与写入 PG（有 DSN 时）
-  → reconciler 检查缺口并补投
-  → 审计视图展示同步状态
+字节产物（工具输出归档、流量原始包、上传物、交付物）
+  → storage.WriteAtomic 原子写文件
+
+冷路径：domain journal 变更
+  → River 异步 InfoItem 补全 / 关系候选 / 审计投影
+  → reconciler 检查 PG 水位缺口并补投
+  → 审计视图展示 pending / applied / gap / failed
 ```
 
-- 热路径落 JSON 失败按现有扫描持久化语义处理，不得伪装成功。
+- 热路径 PG 写失败按 §6.4 处理（内存权威撑住、记 failed 水位、reconciler 追赶），不得伪装成功。
 - PG 或坐标补全失败不阻断核心扫描，但必须形成可见的 pending/failed/gap 状态，不能静默丢失。
 - 模型生成的 inferred InfoItem 未关联支持证据时，可以保存为待修正信息，但不得进入证明、判定或收工依据。
 
@@ -179,12 +218,12 @@ Evidence 继续保留每假设 40 条、单字段 4096 字符及现有内存上�
 
 **消费者**：
 
-- Verifier 的 baseline/控制组装；
-- `report_vulnerability` 的同类同端点去重与证据引用；
-- `verify_*` 复用既有 baseline；
-- 跨扫描同主体历史证据查询。
+- Verifier 的 baseline/控制组装（**部分**：Verifier 独立复测自带负向/基线对照；引擎尚未从关系边装配 baseline 注入 `VerificationRequest`）；
+- `report_vulnerability` 的同类同端点去重与证据引用（已接线）；
+- `verify_*` 复用既有 baseline（已接线，按类各自实现）；
+- 跨扫描同主体历史证据查询（已接线：`read_ledger(filter=schedulable)` / `claim_next_hypothesis` 的 same-subject 提示，`internal/agent/ledger_cross_scan.go`）。
 
-**实现**：扫描内关系索引或 PostgreSQL 递归 CTE。返回结果必须保留路径、深度和截断标志，不能把无界遍历交给调用方。
+**实现**：扫描内关系索引或 PostgreSQL 递归 CTE。返回结果必须保留路径、深度和截断标志，不能把无界遍历交给调用方。生产端现写四类确定性边：`supports`（ledger 证据）、`references`（冷路径词法召回）、`same_subject`/`same_session`（字段精确比较）、`contradicts`（同一 subject+purpose+hypothesis 下 control/baseline 对 probe/exploit/finding_ref）；矛盾边来自证据角色，不来自文本猜测。
 
 ### 4.3 语境切片
 
@@ -192,9 +231,9 @@ Evidence 继续保留每假设 40 条、单字段 4096 字符及现有内存上�
 
 **消费者**：
 
-- `VerificationRequest` 的目标、端点、方法和证据字段装配；
-- 报告生成时的 finding + evidence + traffic 引用；
-- 人工审计视图。
+- `VerificationRequest` 的目标、端点、方法和证据字段装配（字段已装配于 `internal/tools/reporting`，但来源是 `report_vulnerability` 入参，尚未经语境切片查询）；
+- 报告生成时的 finding + evidence + traffic 引用（已接线）；
+- 人工审计视图（已接线：`/info` 语境切片 Tab、账本审计时间线）。
 
 ### 4.4 共同查询契约
 
@@ -207,6 +246,7 @@ Evidence 继续保留每假设 40 条、单字段 4096 字符及现有内存上�
 - 空结果与错误的区别。
 
 直接调用 ledger/surface/reporting 的确定性 API 是允许的，可视为激活的一种实现。**禁止的是绕过来历与证据，直接凭模型上下文记忆复述事实。**
+- v3.3：查询入口优先统一只读视图 `info_space_items/info_space_edges`（聚合层 + 原子层，以 `run_id` 连接）；InfoItem 表与 ledger 确定性 API 是合法实现与回退。
 
 不得为了“使用点亮”而把已有热路径全部经过 PostgreSQL，也不得要求每个操作机械地依次执行三类查询。
 
@@ -224,7 +264,7 @@ Evidence 继续保留每假设 40 条、单字段 4096 字符及现有内存上�
 
 ### 5.2 审计完整性是 M2 的前置条件
 
-普通 WS/遥测事件允许背压策略，但**领域审计记录不得复用可静默丢弃的遥测通道**。要还原“谁在何时认领哪条 hypothesis”，必须先保证：
+普通 SSE/遥测事件允许背压策略，但**领域审计记录不得复用可静默丢弃的遥测通道**。要还原“谁在何时认领哪条 hypothesis”，必须先保证：
 
 1. 每次 ledger 状态变化在变更边界产生专用审计记录；
 2. 审计记录带 `scan_id + seq`、操作者、操作、对象、前后状态摘要和时间；
@@ -241,7 +281,7 @@ Evidence 继续保留每假设 40 条、单字段 4096 字符及现有内存上�
 
 ### 6.1 持久化边界
 
-- per-scan 状态继续经 `scanctx` 路由；进程内权威是内存，读路径永不碰网络。
+- per-scan 状态继续经 `scanctx` 路由；进程内权威是内存，读路径不依赖网络（探索图/资产图按顶部 v3.1 第 3 条直接读写 PG，是显式例外）。
 - 扫描生命周期继续由现有 Web 状态机和资源准入控制。
 - 字节产物（工具输出归档、流量原始包、上传物、交付物）继续使用 `storage.WriteAtomic` 写文件；状态与面板数据的持久化走 PG 事务。
 - 持久化写失败**不得阻断**已启动 Run 的推理、工具执行、finding 保存、现有报告或扫描收工：失败记 `failed` 水位并审计可见，恢复后由 reconciler 追赶（§6.4）。调度入口在派发前无法读取项目 scope 时按 D7 授权边界 fail-closed（跳过本次排期），这是授权前置检查，不是热路径对可用性的依赖；已在途 Run 不受影响。
@@ -262,7 +302,7 @@ PG 承载（R6 全量清单见 `docs/PG_PRIMARY_STORAGE_SPEC.md`）：
 ### 6.3 真相源与幂等
 
 - 进程内权威是内存；**PG 是唯一持久态**（v3.0 起不再有并行的 JSON 持久态）。不做跨存储分布式事务。
-- 每扫描变更使用 `(scan_id, seq)` 作为幂等键（会话内 seq 语义不变）；状态行带写入时盖章的 `instance_id` 列，run 级聚合与清理按 instance_id 进行。D11 的 fill-once `legacy_scan_id` 关联随 scan.json 停写退役——身份在写入点由 scanctx 直接携带，不再依赖事后回填。
+- 每扫描变更使用 `(scan_id, seq)` 作为幂等键（会话内 seq 语义不变）；状态行带写入时盖章的 `instance_id` 列，run 级聚合与清理按 instance_id 进行。身份在写入点由 scanctx 携带 `instance_id`，新写入不再事后回填；`legacy_scan_id` 列保留双重职责（2026-11-24 校准，以代码为准）：①运行期 run↔scan 身份关联——run 派发时 fill-once 写入（`ProjectScanIDs` 依赖它学到 scan id，`internal/web/scan_session.go`），scan record 保存以它作 fallback 身份匹配（`internal/runstate/scan_record_backend.go`）；②存量导入器幂等（`ImportLegacyRun`）。它是 `instance_id` 的关联视图，不是并行身份权威。
 - 同一幂等键重复投递不得产生重复状态变化。
 - 不同 scan 的 seq 不相互比较；跨会话/跨扫描排序必须使用时间或独立全局标识，不能假设各扫描 seq 可比较。
 
@@ -281,7 +321,7 @@ v3.0 把 M3 水位协议从 InfoItem 扩展到全部状态表。内存权威使�
 
 - 追赶必须幂等，允许重复扫描和重复投递。
 - 审计视图至少区分 `pending / applied / gap / failed`。
-- 对 PG 侧的写入与其 River 入队可以使用同一 DB 事务和 `InsertTx`。
+- 入队姿态（2026-11-24 校准，以代码为准）：当前 River 入队走非事务 `client.Insert`，PG 写与入队不在同一事务；"写成功但入队前崩溃"的窗口由 reconciler 按连续水位追赶覆盖，不依赖同事务入队。若未来引入同事务入队，必须与 reconciler 协议并存而非替代。
 
 ### 6.5 River 的允许与禁止范围
 
@@ -315,6 +355,9 @@ VOI 必须在信息模型、审计与纯排序测试就绪后单独接入：
 - 同一不可变快照的纯排序结果必须完全一致；
 - 排序与认领分离测试：纯函数负责排序，`ClaimNext` 负责原子状态迁移。
 
+**落地状态（M5，2026-11-23）**：VOI 已接入 `claim_next_hypothesis` 排序（`XALGORIX_VOI_WEIGHT`，默认 0，`MaxVOIWeight=0.30`）；planner/worker 的 intent 生成尚未消费 VOI，因此本节公式目前只作用于假设认领。
+**v3.3 扩展（IG4，已落地）**：同一公式已作用于 intent 排序（关联 belief/fact 的 VOI 取 max，缺省 0），仍保留 `w<=0.30` 与稳定 tie-break；`w=0` 时保持原 phase 顺序。
+
 “连续调用两次 ClaimNext 结果相同”不是有效验收，因为第一次调用会改变快照。金样本必须测试不可变快照排序，认领则另测并发互斥与状态迁移。
 
 ### 7.3 搜索算法不进入本期路线图
@@ -331,11 +374,12 @@ A* / MCTS / POMCP / DESPOT 作为研究项。若未来要引入，至少先证�
 
 ## 8. 原语：State + Operation + Obligation
 
-- **State**：当前状态集合，包括 ledger、surface、findings 及其权威文件。
+- **State**：当前状态集合，包括 ledger、surface、findings 的内存权威与 PG 持久态（v3.0 起无并行 JSON 持久态）。
 - **Operation**：作用于状态的动作，包括 PlanTask 与 tool call。
 - **Obligation**：引擎对 Agent 的硬约束，包括 phase obligation、收工闸门、coverage epoch 与 hook 拦截。
 
-人工输入是 `source=human` 的 InfoItem，经区域点亮进入视野，不新增顶层原语。
+人工输入不新增顶层原语：R7 起 guidance 同时投影为 `hint` 节点（计划面）与 `source=human` 的 observed InfoItem（`OpRecordGuidance`，信息层）；结构化目标经 `OpRecordObjective` 投影为 `source=human` 的 InfoItem。区域点亮因此能看到人工指引与目标。
+v3.3：信息聚合视图（`info_space_*`）是**读模型**，不是新的写权威；它把 State 里的图节点与原子 InfoItem 投影成一个可查询空间，操作仍落在 State/Operation/Obligation 三个原语上。
 
 Obligation 不得被 InfoItem 置信度或 VOI 绕过。删掉 Obligation 就无法表达“适用阶段没有 disposition 不许收工”等防烂尾约束。goal 收工义务（R-goal，REDESIGN D10）是同一原语的操作者目标实例：required 判据未达成不许主动收工——它只能被物理上限（预算/操作者停止/进程关停）与有界阀终止，不能被“置信度高所以达成”绕过；判定用 `internal/objective` 确定性评估器，不引入 LLM。
 
@@ -347,7 +391,7 @@ Obligation 不得被 InfoItem 置信度或 VOI 绕过。删掉 Obligation 就无
 2. **Verifier 归属**：Verifier 只使用所属 Agent 的 client 与受限工具面；所属 Agent 在报告验证期间保持阻塞。不得跨 Agent 串用 verifier/client，不得把同一 Agent 的验证并发化。
 3. **判定边界**：InfoItem 不得替代 Verifier 或确定性验证证据；finding 标签只能由报告管线给出。
 4. **安全链**：scope → redirects → dial → sandbox → proxy fail-closed → 环境剥离不得绕过；同时不得把特定 Go transport 或文件策略夸大为覆盖所有浏览器、终端和 Python 行为的 OS 沙箱。
-5. **遥测单向**：工具与 Agent 的实时遥测经 per-scan channel → `processEvent` → WS；不得在工具中直接 broadcast 或写 HTTP 响应。领域审计持久化位于状态变更边界，不依赖可丢弃的遥测投递。
+5. **遥测单向**：工具与 Agent 的实时遥测经 per-scan channel → `processEvent` → SSE（`/api/stream`）；不得在工具中直接 broadcast 或写 HTTP 响应。领域审计持久化位于状态变更边界，不依赖可丢弃的遥测投递。
 6. **密钥边界**：API 永不回传密钥，只回 `*_configured` 布尔；现有令牌摘要与常数时间比较不得退化。
 7. **持久化纪律（v3.0）**：状态与面板数据的持久化走 PG 事务（变更边界，§6.3/§6.4）；仍留在文件层的字节产物（工具输出归档、流量原始包、上传物、交付物）统一走安全原子写，不得新增固定临时文件或直接截断式写入。
 8. **报告语义**：`verified / exploit-proven / needs-manual-verification` 三标签及报告门顺序不得被信息模型改写。
@@ -359,6 +403,8 @@ Obligation 不得被 InfoItem 置信度或 VOI 绕过。删掉 Obligation 就无
 每一步独立可回滚；前一步验收不过，不进入下一步。工期是排期参考，不是验收标准。
 
 > **v3.0 追加（2026-11-22）**：R6 系列（PG 主存储，批次 R6.0–R6.3）按同一纪律推进——批次切分、验收与测试接缝见 `docs/PG_PRIMARY_STORAGE_SPEC.md`，里程碑归口 `REDESIGN.md` §9。M3 的水位/幂等协议是 R6.1 追赶协议的直接前身。
+>
+> **状态快照（2026-11-23，以代码为准）**：P0、M0–M5、R6.0–R6.3、R7 M1–M2/R8 已落地；R7 剩余缺口见 `docs/DUAL_GRAPH_ORCHESTRATION.md` §7（资产摄取、planner 工具循环、真实 run 验收等）。下表是验收判据，不是当前进度。
 
 | 步骤 | 内容 | 必须通过的验收 |
 |---|---|---|
@@ -382,7 +428,7 @@ Obligation 不得被 InfoItem 置信度或 VOI 绕过。删掉 Obligation 就无
 - 预热后按主体+时间过滤查询的 p95 不超过 200ms；
 - 同时记录 p50/p95/p99、执行计划与截断结果，结果存入基准测试输出。
 
-硬件或 CI 环境变化时重建基线，不用不同环境的绝对数值做直接比较。
+硬件或 CI 环境变化时重建基线，不用不同环境的绝对数值做直接比较。基准实现：`internal/infoitem/postgres/benchmark_regression_test.go`（`XALGORIX_TEST_DATABASE_URL` 门控，输出 p50/p95/p99）。
 
 ### 10.2 变更隔离
 
@@ -417,7 +463,7 @@ M0–M5 默认冻结：
 - ~~任何让“没有 PG 就跑不起来”的改动~~（v3.0 废止：PG 自 R6 起为必需依赖，见 §6.6；此条保留删除线以存裁决痕迹）；
 - 以“点亮”为名禁止 ledger/surface/reporting 的确定性直查；
 - 把可丢弃的实时遥测当成完整审计记录；
-- 在 M0–M5 中同时实施项目/企业/资产/审批平台；
+- 把项目/企业/资产/审批平台并入 M0–M5 信息层验收（R 系列已独立落地）；
 - 在没有具体相似度消费者前强制引入 pgvector；
 - 借架构改造并发化同一 Agent 的 Verifier 或重排报告闸门。
 
@@ -431,8 +477,8 @@ M0–M5 默认冻结：
 - Intentest 的 POMDP 表述与信念更新；
 - 事件溯源作为状态权威，前置是 prompt 装配、上下文压缩、预算与外部副作用均可完整记录；
 - 模型辅助 VOI 估计，前置是可校准的决策价值标签集与离线评估；
-- 跨扫描资产图与锚点，前置是 M3/M4 的冷路径和激活入口稳定；
-- 项目/任务/HITL 审批模型，需独立定义状态机、权限和审计边界；
+- 跨任务资产运营 UI（`/assets` API 已有，前端尚未建运营面；observed 摄取与 `record_asset` 已落地）；
+- 企业级多租户/组织模型（项目/任务/HITL 审批已落地，不在研究项）；
 - pgvector 相似度检索，需先证明确定性属性和关系查询不能满足消费者需求。
 
 ---
@@ -442,7 +488,7 @@ M0–M5 默认冻结：
 | # | v1 问题 | v2 及本版处理 |
 |---|---|---|
 | 1 | 将 Hypothesis 近似为 Intent，对象映射方向错误 | 拆成 Belief/Hypothesis 与 Intent/PlanTask |
-| 2 | 把事件投影当成完整当前状态 | 事件仅用于审计与回归；状态权威仍为扫描状态与原子文件 |
+| 2 | 把事件投影当成完整当前状态 | 事件仅用于审计与回归；状态权威 = 内存 + PG（v3.0）；不再有并行 JSON 持久态 |
 | 3 | 二原语删除引擎强制义务 | 改为 State + Operation + Obligation |
 | 4 | 三类点亮没有消费者，且误伤确定性直查 | 为每类指定消费者、共同查询契约和预算 |
 | 5 | 以仓外系统和不可验收周期作为主要基线 | 改为本仓对象、金样本和逐里程碑验收 |
@@ -481,7 +527,7 @@ M0–M5 默认冻结：
 - **领域审计记录**：状态变更边界产生的持久化记录，不使用可静默丢弃的实时遥测语义。
 - **审计投影**：由领域审计记录还原的只读历史视图，不参与判定，必须能显示缺口。
 - **source seq / watermark**：每扫描单调变化序号及 PG 已应用的连续位置，用于幂等和崩溃追赶。
-- **reconciler**：比较文件源与 PG 水位并补投缺口的恢复机制；与 River 正常异步处理互补。
+- **reconciler**：比较源 seq（内存/PG `run_journal`，遗留目录仅兜底）与 PG 水位并补投缺口的恢复机制；与 River 正常异步处理互补。
 - **VOI**：信息决策价值，仅作为受限、确定性的排序加权项，不改变验证权威或 Obligation。
 
 ---
@@ -495,9 +541,26 @@ M0–M5 默认冻结：
 | 3 | PG 范围 | 冷路径：InfoItem/边/审计投影/水位（§6.2） | 全部状态与面板数据 + 原 M3 范围（§6.2） |
 | 4 | 事件流 | 文件 journal（events.jsonl / domain_journal.jsonl） | PG events/journal 表；文件只留字节产物（§5.1/§6.2） |
 | 5 | 无 DSN | 降级纯文件、核心能力不减（§6.6） | 废止：PG 必需，无 DSN fail-fast + compose 模板（§6.1/§6.6） |
-| 6 | run↔scan 关联 | fill-once `legacy_scan_id` 事后回填 | 写入点盖章 `instance_id` 列；fill-once 退役（§6.3） |
+| 6 | run↔scan 关联 | fill-once `legacy_scan_id` 事后回填 | 写入点盖章 `instance_id` 为身份权威；`legacy_scan_id` 保留为运行期 run↔scan 关联列（派发时 fill-once，`ProjectScanIDs` 依赖）与存量导入幂等（§6.3，2026-11-24 校准） |
 | 7 | 幂等键 | `(scan_id, seq)`（M3 协议） | 保持 `(scan_id, seq)`，扩展到全部状态表（§6.4） |
 | 8 | 续跑重放 | 上一会话 events.jsonl（D11 L2） | PG 全历史 + 保尾预算（REDESIGN D12） |
 | 9 | 单二进制 | 单二进制 + 无 DSN 可跑 | 单二进制保留；PG 为部署要求（§6.6） |
 
 不变项：主循环七环、对象映射、Verifier/闸门冻结（§11）、审计完整性纪律（§5.2）、§12 其余全部条目、VOI 确定性边界（§7）。落地规格：`docs/PG_PRIMARY_STORAGE_SPEC.md`。
+
+### 17.1 v3.2 现状校准（2026-11-23）
+
+| # | 原表述 | 校准后（以代码为准） |
+|---|---|---|
+| 1 | 仅 REST/WebSocket | 仅 REST/SSE（`/api/stream`）；`WSEvent` 为历史类型名 |
+| 2 | 权威持久化为每扫描 JSON/JSONL；无 PG/River/Eino/HITL/MCP | PG 主存储且 DSN 必需；River/Eino/HITL/MCP 客户端/项目任务资产平台均已落地 |
+| 3 | agentsgraph 固定一波、非 Worker 池 | agentsgraph 同时承载 planner_worker 池路径（intent 租约、steer/kill） |
+| 4 | 不是项目/资产/审批平台 | 项目/任务/审批/资产平台已落地；仍非企业级多租户 |
+| 5 | 热路径写 JSON、冷路径 River 写 PG（有 DSN 时） | 热路径写 PG（内存权威 + 变更边界事务）；文件只留字节产物；无 DSN fail-fast |
+| 6 | `legacy_scan_id` 关联退役 | 新写入不再回填；列与 `ImportLegacyRun` 保留给存量导入幂等 |
+| 7 | VOI 未落地 | `claim_next_hypothesis` 已接 VOI（默认权重 0，上限 0.30）；planner intent 生成未消费 |
+| 8 | 人类输入统一为 `source=human` InfoItem | objective 与 delivered guidance 均投影为 observed InfoItem；guidance 另有 hint 节点 |
+| 9 | 关联点亮含矛盾/同会话语义 | 已接线：`supports`/`references`/`same_subject`/`same_session`/`contradicts` 均有确定性生产者 |
+| 10 | 跨扫描资产图/项目 HITL 属研究项 | 已落地并移出研究项；资产 observed 摄取与 `record_asset` 已落地，剩余资产运营 UI |
+
+修订依据：`internal/web/sse_hub.go`、`cmd/xalgorix/main.go:266`、`internal/jobs/jobs.go`、`internal/engine`、`internal/approval`、`internal/tools/mcp`、`internal/tools/agentsgraph/agentsgraph.go`、`internal/graph`、`internal/assets`、`internal/scanctx/ledger_voi.go`、`internal/agent/ledger_cross_scan.go`、`internal/infoitem/postgres/store.go`。
