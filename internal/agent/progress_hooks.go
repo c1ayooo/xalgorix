@@ -12,34 +12,40 @@ package agent
 // projection, not a state authority.
 
 import (
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
 )
 
-// progressMutatingTools lists tools whose successful execution is an
-// information-layer increment. Keep this list to mutations; adding a
-// read/search tool here would let a busy read loop masquerade as progress.
-var progressMutatingTools = map[string]bool{
-	// Notes (the model-facing information mirror).
-	"add_note": true,
-	// Ledger hypotheses and evidence.
-	"record_hypothesis":       true,
-	"add_hypothesis_evidence": true,
-	"update_hypothesis":       true,
-	// Findings pass the report gate, but an accepted finding is the strongest
-	// information-layer increment a run can produce.
-	"report_vulnerability": true,
-	"submit_verdict":       true,
-	// Asset graph and intelligence projections.
-	"record_asset":        true,
-	"record_intelligence": true,
-	"ingest_har":          true,
-	// Deviation/audit projections that change the ledger's state.
-	"record_deviation": true,
-	// Deterministic access-control hypothesis generation.
-	"authz_matrix": true,
+// progressToolSignals maps a successful mutating tool to the typed increments
+// it produces. Keep this list to mutations; read/search tools are handled by
+// progressAnalysisTools and never count as information-layer writes.
+var progressToolSignals = map[string][]scanctx.ProgressSignal{
+	"add_note":                {scanctx.SignalInfo},
+	"record_hypothesis":       {scanctx.SignalBelief},
+	"update_hypothesis":       {scanctx.SignalBelief},
+	"add_hypothesis_evidence": {scanctx.SignalEvidence},
+	"report_vulnerability":    {scanctx.SignalFinding},
+	"submit_verdict":          {scanctx.SignalFinding},
+	"record_asset":            {scanctx.SignalAsset},
+	"record_intelligence":     {scanctx.SignalObservation},
+	"ingest_har":              {scanctx.SignalObservation, scanctx.SignalCoverage},
+	"record_deviation":        {scanctx.SignalWorkflow},
+	"authz_matrix":            {scanctx.SignalBelief, scanctx.SignalCoverage},
+	"complete_work":           {scanctx.SignalWorkflow},
+}
+
+// progressAnalysisTools are read/search tools over existing information. A
+// distinct read is analysis progress even when no new InfoItem is written; the
+// same reference repeatedly is only touch (MarkAnalysis dedupes).
+var progressAnalysisTools = map[string]bool{
+	"read_tool_output": true,
+	"read_info_item":   true,
+	"search_info":      true,
+	"read_ledger":      true,
+	"read_notes":       true,
 }
 
 // hookProgressToolStart marks a tool as actively executing so the stall clock
@@ -53,6 +59,7 @@ func hookProgressToolStart(state *ScanState, args map[string]string) HookResult 
 		return HookResult{}
 	}
 	agentID := progressAgentID(state)
+	sc.Progress.ObserveToolAction(agentID)
 	sc.Progress.BeginTool(agentID, args["tool_name"])
 	if budget := toolActiveBudget(args["tool_name"]); budget > 0 {
 		sc.Progress.SetToolDeadline(agentID, time.Now().Add(budget))
@@ -92,13 +99,31 @@ func hookProgressLedger(state *ScanState, args map[string]string) HookResult {
 	agentID := progressAgentID(state)
 	sc.Progress.EndTool(agentID)
 	sc.Progress.Touch(agentID)
-	// A failed call changed nothing: touch keeps the liveness clock honest but
-	// the information layer did not move.
+	tool := strings.TrimSpace(args["tool_name"])
+	// Phase-1 observation only: record how many actions happened since the
+	// last information-layer signal and how often the same canonical
+	// (tool,target,outcome) repeats. Nothing here changes agent behavior.
+	sc.Progress.ObserveToolOutcome(agentID, spinSignature(tool, args))
+	// A failed call changed nothing: touch keeps the liveness clock honest, and
+	// the failure is classified so the snapshot can distinguish a blocked
+	// environment from a worker that stopped working.
 	if strings.TrimSpace(args["error"]) != "" {
+		sc.Progress.MarkFailure(agentID, tool, args["error"])
 		return HookResult{}
 	}
-	tool := strings.TrimSpace(args["tool_name"])
-	if !progressMutatingTools[tool] {
+	sc.Progress.ClearFailures(agentID)
+
+	if progressAnalysisTools[strings.ToLower(tool)] {
+		key := strings.ToLower(tool) + "|" + analysisReference(args)
+		sc.Progress.MarkAnalysis(agentID, key)
+		if strings.EqualFold(tool, "read_tool_output") {
+			sc.Progress.MarkSignal(agentID, scanctx.SignalArtifact)
+		}
+		return HookResult{}
+	}
+
+	signals := progressToolSignals[tool]
+	if len(signals) == 0 {
 		return HookResult{}
 	}
 	// A write that stores the same value again is a successful tool call but not
@@ -107,8 +132,20 @@ func hookProgressLedger(state *ScanState, args map[string]string) HookResult {
 	if tool == "add_note" && strings.EqualFold(strings.TrimSpace(args["state_changed"]), "false") {
 		return HookResult{}
 	}
-	sc.Progress.MarkProgress(agentID)
+	sc.Progress.MarkMutation(agentID, signals...)
 	return HookResult{}
+}
+
+// analysisReference identifies the object a read touched. It keeps the same
+// reference from refreshing the clock repeatedly while allowing a new ID/URL
+// to count as new analysis progress.
+func analysisReference(args map[string]string) string {
+	for _, key := range []string{"id", "url", "target", "path", "file", "name"} {
+		if value := strings.TrimSpace(args[key]); value != "" {
+			return value
+		}
+	}
+	return strings.TrimSpace(args["command"])
 }
 
 func progressAgentID(state *ScanState) string {
@@ -120,4 +157,67 @@ func progressAgentID(state *ScanState) string {
 		return "root"
 	}
 	return agentID
+}
+
+// spinSignature canonicalises one tool result for the Phase-1 spin
+// observation. It must collapse retries of the same dead action: same tool,
+// same host:port, same outcome class.
+func spinSignature(tool string, args map[string]string) string {
+	tool = strings.ToLower(strings.TrimSpace(tool))
+	return tool + "|" + spinTarget(args) + "|" + spinOutcome(args["error"], args["output"])
+}
+
+var spinHostPortRE = regexp.MustCompile(`(?i)(?:https?://)?(\[[0-9a-f:]+\]|[a-z0-9._-]+):(\d{1,5})`)
+
+// spinTarget extracts the most specific target an action names.
+func spinTarget(args map[string]string) string {
+	for _, key := range []string{"url", "target", "endpoint", "host"} {
+		if raw := strings.TrimSpace(args[key]); raw != "" {
+			return normalizeSpinTarget(raw)
+		}
+	}
+	if cmd := strings.TrimSpace(args["command"]); cmd != "" {
+		if m := spinHostPortRE.FindStringSubmatch(cmd); len(m) == 3 {
+			return strings.ToLower(m[1] + ":" + m[2])
+		}
+	}
+	return "?"
+}
+
+func normalizeSpinTarget(raw string) string {
+	raw = strings.TrimSpace(strings.ToLower(raw))
+	raw = strings.TrimPrefix(raw, "https://")
+	raw = strings.TrimPrefix(raw, "http://")
+	if i := strings.IndexAny(raw, "/?#"); i >= 0 {
+		raw = raw[:i]
+	}
+	if raw == "" {
+		return "?"
+	}
+	return raw
+}
+
+var spinHTTPStatusRE = regexp.MustCompile(`HTTP/\d\.\d\s+(\d{3})`)
+
+// spinOutcome collapses a result to a stable class.
+func spinOutcome(errText, output string) string {
+	if strings.TrimSpace(errText) != "" {
+		return "error"
+	}
+	lower := strings.ToLower(output)
+	switch {
+	case strings.Contains(lower, "connection refused"):
+		return "refused"
+	case strings.Contains(lower, "timed out"), strings.Contains(lower, "timeout"):
+		return "timeout"
+	case strings.Contains(lower, "platform submission guard"):
+		return "gate"
+	}
+	if m := spinHTTPStatusRE.FindStringSubmatch(output); len(m) == 2 {
+		return m[1]
+	}
+	if strings.TrimSpace(output) == "" {
+		return "empty"
+	}
+	return "ok"
 }

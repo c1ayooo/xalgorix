@@ -277,6 +277,12 @@ func (s *Server) resolveScanCredentials(ctx context.Context, req ScanRequest, cf
 		// byte-identical to the composite resolver, including the
 		// openai_responses (Codex / ChatGPT) path + its required
 		// chatgpt-account-id / OpenAI-Beta / originator headers.
+		//
+		// A task-scoped provider profile owns its provider/base. It does NOT
+		// inherit XALGORIX_API_BASE/XALGORIX_LLM: a provider-specific key
+		// (e.g. deepseek official) combined with a global gateway base is an
+		// authentication mismatch. The global branch already handles the
+		// operator's configured model/base.
 		built, berr := llm.BuildCatalogEndpoint(entry, prof, "", cfg.APIBase)
 		if berr != nil {
 			return llm.Endpoint{}, berr

@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/url"
 	"sort"
 	"strings"
@@ -430,13 +431,21 @@ func (p *Pool) StallReport() []StalledWorker {
 	out := make([]StalledWorker, 0, len(snapshot))
 	for unit, worker := range snapshot {
 		lastProgress := worker.started
+		var snap scanctx.ProgressSnapshot
 		if progress != nil {
-			if _, prog, ok := progress.AgentTimes(worker.agentID); ok && !prog.IsZero() {
-				lastProgress = prog
+			snap = progress.SnapshotFor(worker.agentID, worker.started, now)
+			if !snap.LastSignal.IsZero() {
+				lastProgress = snap.LastSignal
 			}
 		}
 		idle := now.Sub(lastProgress)
-		if idle < stallThreshold(worker.lane) {
+		threshold := stallThreshold(worker.lane)
+		// A worker's declared profile owns its window; lanes without a profile
+		// keep the legacy lane threshold.
+		if worker.lane == "worker" && snap.Profile != "" && snap.Profile != scanctx.ProfileDefault {
+			threshold = snap.StallAfter
+		}
+		if idle < threshold {
 			continue
 		}
 		var activeName string
@@ -458,6 +467,8 @@ func (p *Pool) StallReport() []StalledWorker {
 			ActiveToolName: activeName,
 			ActiveFor:      activeFor,
 			LastProgress:   lastProgress,
+			ProgressStatus: snap.Status,
+			ProgressReason: snap.Reason,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -545,6 +556,11 @@ type containerTarget struct {
 	addr string
 }
 
+// maxContainerAttackGenerationsPerAddr bounds retries for one exact
+// code+address pair. Three failed lanes on the same address is a dead target or
+// a bad address, not a transient that more workers will fix.
+const maxContainerAttackGenerationsPerAddr = 3
+
 // materializeContainerIntents turns a published container address into a real
 // execution-surface attack intent. This is the engine-owned half of lane
 // separation: the API lane only orchestrates; the engine guarantees an attack
@@ -566,6 +582,11 @@ func (p *Pool) materializeContainerIntents() {
 	activeTargets := make(map[string]bool, len(nodes))
 	activeBase := make(map[string]bool, len(nodes))
 	maxGen := make(map[string]int, len(nodes))
+	// sameAddr counts how many attack lanes already targeted one exact
+	// code+address pair. A lane that keeps dying without progress (a loopback
+	// proxy address mis-recorded as container_addr, a container that never
+	// came up) must not spawn generations forever.
+	sameAddr := make(map[string]int, len(nodes))
 	active := 0
 	for i := range nodes {
 		n := &nodes[i]
@@ -580,6 +601,9 @@ func (p *Pool) materializeContainerIntents() {
 				base := "container-attack:" + code
 				if gen, ok := containerUnitGeneration(unitKey, base); ok && gen > maxGen[base] {
 					maxGen[base] = gen
+				}
+				if target := strings.TrimSpace(str(payload["target"])); target != "" {
+					sameAddr[base+"|"+target]++
 				}
 				if n.State == graph.StateOpen || n.State == graph.StateRunning || n.State == graph.StatePaused {
 					activeBase[base] = true
@@ -612,6 +636,12 @@ func (p *Pool) materializeContainerIntents() {
 		base := "container-attack:" + strings.ToLower(t.code)
 		if activeBase[base] || activeTargets[t.addr] {
 			// A live lane already owns this resource instance or address.
+			continue
+		}
+		if sameAddr[base+"|"+t.addr] >= maxContainerAttackGenerationsPerAddr {
+			// This exact code+address already burned the retry budget without a
+			// live lane. Re-materialising it only multiplies token spend (round 6
+			// had 19 lanes against the loopback proxy address 127.0.0.1:44715).
 			continue
 		}
 		unit := base
@@ -677,6 +707,20 @@ func (p *Pool) materializeContainerIntents() {
 // first challenge's unit key — only one lane was materialized per note. Solved
 // or closed rows are filtered per line so the live rows in the same note still
 // materialize.
+// isLocalContainerAddr rejects operator-machine addresses recorded as
+// container_addr. The traffic proxy listen address (127.0.0.1:44715) once
+// leaked into a note and produced 19 loopback attack lanes.
+func isLocalContainerAddr(host string) bool {
+	h := strings.Trim(strings.ToLower(strings.TrimSpace(host)), "[]")
+	if h == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(h); ip != nil {
+		return ip.IsLoopback() || ip.IsUnspecified()
+	}
+	return false
+}
+
 func collectContainerTargets(noteMap map[string]string, controlPlane []string) []containerTarget {
 	seen := map[string]bool{}
 	var out []containerTarget
@@ -708,7 +752,7 @@ func collectContainerTargets(noteMap map[string]string, controlPlane []string) [
 			}
 			for _, addr := range addrs {
 				host := strings.SplitN(addr, ":", 2)[0]
-				if isControlPlaneTarget(host, controlPlane) || seen[addr] {
+				if isLocalContainerAddr(host) || isControlPlaneTarget(host, controlPlane) || seen[addr] {
 					continue
 				}
 				seen[addr] = true
@@ -838,6 +882,11 @@ func (p *Pool) runOne(node *graph.Node, owner string) {
 		log.Printf("[orchestrator] %s: dispatch %s failed: %v", owner, unitID, err)
 		p.settle(node, owner, graph.StateBlocked, "dispatch failed: "+err.Error())
 		return
+	}
+	// P2: bind the typed progress profile before the reclaim watch starts, so
+	// the first snapshot already uses the right weights/window.
+	if p.cfg.ScanCtx != nil && p.cfg.ScanCtx.Progress != nil {
+		p.cfg.ScanCtx.Progress.SetProfile(agentID, p.progressProfileForIntent(node, surface))
 	}
 	p.trackActive(unitID, agentID, surface, time.Now())
 	defer p.untrackActive(unitID)
@@ -1425,6 +1474,29 @@ func (p *Pool) surfaceForIntent(node *graph.Node) string {
 		return "analysis"
 	}
 	return "worker"
+}
+
+// progressProfileForIntent picks the typed-progress profile. An explicit
+// planner value wins; otherwise analysis lanes are multistage and web targets
+// are web. The profile only changes weights/windows, never authorization.
+func (p *Pool) progressProfileForIntent(node *graph.Node, surface string) scanctx.ProgressProfile {
+	if node != nil {
+		payload := node.PayloadJSON()
+		if raw := strings.TrimSpace(str(payload["progress_profile"])); raw != "" {
+			return scanctx.NormalizeProgressProfile(raw)
+		}
+		kind := strings.ToLower(strings.TrimSpace(str(payload["target_kind"])))
+		switch kind {
+		case "task":
+			return scanctx.ProfileMultistage
+		case "web":
+			return scanctx.ProfileWeb
+		}
+	}
+	if surface == "analysis" {
+		return scanctx.ProfileMultistage
+	}
+	return scanctx.ProfileDefault
 }
 
 func isControlPlaneHost(host string, controlPlane []string) bool {

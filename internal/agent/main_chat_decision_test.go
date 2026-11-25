@@ -15,8 +15,9 @@ func decisionAgent(t *testing.T, scanID string) (*Agent, *graph.MemoryStore) {
 	store := graph.NewMemoryStore()
 	graph.SetBackend(store)
 	t.Cleanup(func() { graph.SetBackend(nil) })
-	sctx := scanctx.New(scanID, "")
+	sctx := scanctx.New(scanID, t.TempDir())
 	sctx.SetInstanceID(scanID)
+	t.Cleanup(sctx.Close)
 	return &Agent{state: &ScanState{ScanContextID: sctx.ID}, scanCtx: sctx}, store
 }
 
@@ -54,6 +55,12 @@ func TestMainChatRetireIntentDeletesOpenIntent(t *testing.T) {
 	// The plan view no longer lists a retired intent.
 	if tasks, err := store.PlanTasks(context.Background(), "scan-retire"); err != nil || len(tasks) != 0 {
 		t.Fatalf("plan tasks after retire = %+v err=%v", tasks, err)
+	}
+	decisions := ag.scanCtx.Ledger.Decisions()
+	if len(decisions) != 1 || decisions[0].Action != "retire_intent" ||
+		decisions[0].InfoUse != "none" || decisions[0].NoInfoReason != "operator_decision" ||
+		decisions[0].Reason != "direction exhausted" {
+		t.Fatalf("retire decision = %+v", decisions)
 	}
 	// A second retire is a conflict, not a silent success.
 	if _, err := ag.mainChatRetireIntent(map[string]string{"unit_id": "task-1", "reason": "again"}); err == nil {
@@ -159,5 +166,19 @@ func TestMainToolsAllowDecisionActions(t *testing.T) {
 		if SurfaceWorker.Allows(tool) {
 			t.Fatalf("worker surface must not allow %s", tool)
 		}
+	}
+}
+
+func TestReprioritizeIntentRecordsDecision(t *testing.T) {
+	ag, store := decisionAgent(t, "scan-priority")
+	insertIntent(t, store, "scan-priority", "task-pri")
+	if err := ag.ReprioritizeIntent("task-pri", 99000, "urgent operator direction"); err != nil {
+		t.Fatalf("reprioritize: %v", err)
+	}
+	decisions := ag.scanCtx.Ledger.Decisions()
+	if len(decisions) != 1 || decisions[0].Action != "reprioritize_intent" ||
+		decisions[0].Selected != "task-pri" || decisions[0].Reason != "urgent operator direction" ||
+		decisions[0].InfoUse != "none" || decisions[0].NoInfoReason != "operator_decision" {
+		t.Fatalf("reprioritize decision = %+v", decisions)
 	}
 }

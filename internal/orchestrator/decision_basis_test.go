@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/c1ayooo/xalgorix/v4/internal/graph"
@@ -53,5 +54,31 @@ func TestIntentUnknownDecisionBasisIsRejected(t *testing.T) {
 	}}})
 	if added != 0 {
 		t.Fatalf("an invented decision basis must be rejected, added=%d", added)
+	}
+}
+
+func TestDecisionBasisAcceptsGraphNodeIDsAndCriteria(t *testing.T) {
+	store := graph.NewMemoryStore()
+	sctx := scanctx.New("basis-graph", t.TempDir())
+	t.Cleanup(sctx.Close)
+	node, err := store.UpsertNode(context.Background(), graph.NodeInput{
+		ScanID: "basis-graph", Kind: graph.KindFact, UnitKey: "f-1",
+		State: graph.StateConfirmed, Payload: `{"summary":"live route observed"}`,
+	})
+	if err != nil || node == nil {
+		t.Fatalf("seed node: %v", err)
+	}
+	p := &Planner{
+		cfg: PlannerConfig{
+			ScanID: "basis-graph", Repo: store, ScanCtx: sctx,
+			ObjectiveCriteria: []PlannerCriterion{{ID: "C1"}},
+		},
+		ctx: context.Background(),
+	}
+	if bad := p.invalidDecisionBasis([]string{"C1", "GOAL", fmt.Sprint(node.ID)}); bad != "" {
+		t.Fatalf("criterion/GOAL/graph node must be valid, rejected %q", bad)
+	}
+	if bad := p.invalidDecisionBasis([]string{"999999"}); bad == "" {
+		t.Fatal("a nonexistent graph id must be rejected")
 	}
 }

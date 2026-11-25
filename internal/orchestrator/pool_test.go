@@ -1015,3 +1015,58 @@ func TestPoolConcludesDeclaredExit(t *testing.T) {
 		t.Fatalf("receipt payload = %+v", payload)
 	}
 }
+
+// TestCollectContainerTargetsSkipsLocalAddresses pins the round-6 waste: the
+// traffic proxy's 127.0.0.1 listen address was recorded as a container_addr
+// and produced 19 loopback attack lanes. A container target must be a real
+// remote address.
+func TestCollectContainerTargetsSkipsLocalAddresses(t *testing.T) {
+	got := collectContainerTargets(map[string]string{
+		"handoff": "unique_code=c-07 container_addr=127.0.0.1:44715\n" +
+			"unique_code=c-08 container_addr=localhost:8080\n" +
+			"unique_code=c-09 container_addr=[::1]:8443\n" +
+			"unique_code=c-10 container_addr=10.0.177.16:23\n",
+	}, nil)
+	if len(got) != 1 || got[0].addr != "10.0.177.16:23" {
+		t.Fatalf("targets = %+v, want only 10.0.177.16:23", got)
+	}
+}
+
+// TestMaterializeContainerIntentsCapsRetriesPerAddress bounds dead-container
+// retries while still admitting a genuine new address for the same code.
+func TestMaterializeContainerIntentsCapsRetriesPerAddress(t *testing.T) {
+	store := graph.NewMemoryStore()
+	sctx := scanctx.New("mat-cap", t.TempDir())
+	if err := sctx.Notes.Set("handoff_c07", "unique_code=c-07 container_addr=10.0.177.176:23"); err != nil {
+		t.Fatal(err)
+	}
+	p, err := New(context.Background(), Config{
+		ScanID: "mat-cap", Workers: 3, Repo: store, Root: &fakeRoot{}, ScanCtx: sctx,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, unit := range []string{"container-attack:c-07", "container-attack:c-07:g2", "container-attack:c-07:g3"} {
+		if _, err := store.UpsertNode(context.Background(), graph.NodeInput{
+			ScanID: "mat-cap", Kind: graph.KindIntent, UnitKey: unit,
+			State: graph.StateBlocked, Priority: containerAttackPriority, Origin: "engine",
+			Payload: `{"task_id":"` + unit + `","target":"10.0.177.176:23","target_kind":"container","unique_code":"c-07"}`,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p.materializeContainerIntents()
+	nodes, _ := store.ListNodes(context.Background(), "mat-cap", graph.KindIntent)
+	if len(nodes) != 3 {
+		t.Fatalf("dead address retried past the cap: %d nodes", len(nodes))
+	}
+	// A genuinely new address for the same code is still admitted.
+	if err := sctx.Notes.Set("handoff_c07", "unique_code=c-07 container_addr=10.0.177.99:23"); err != nil {
+		t.Fatal(err)
+	}
+	p.materializeContainerIntents()
+	nodes, _ = store.ListNodes(context.Background(), "mat-cap", graph.KindIntent)
+	if len(nodes) != 4 {
+		t.Fatalf("new address for c-07 was suppressed: %d nodes", len(nodes))
+	}
+}

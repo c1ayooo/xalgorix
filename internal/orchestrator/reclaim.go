@@ -38,6 +38,7 @@ import (
 
 	"github.com/c1ayooo/xalgorix/v4/internal/agent"
 	"github.com/c1ayooo/xalgorix/v4/internal/graph"
+	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
 )
 
 // noProgressMessage tells a stalled worker to checkpoint before the kill. It is
@@ -111,6 +112,8 @@ func (p *Pool) watchProgress(unitID, agentID, surface string) *progressWatch {
 		defer ticker.Stop()
 		started := time.Now()
 		activeLogged := false
+		lastSpinLog := time.Time{}
+		defer p.logSpinObservation(unitID, agentID, started, true)
 		for {
 			select {
 			case <-w.done:
@@ -120,6 +123,16 @@ func (p *Pool) watchProgress(unitID, agentID, surface string) *progressWatch {
 			case <-ticker.C:
 			}
 			idle := time.Since(p.lastProgressAt(agentID, started))
+			if snap, ok := p.spinSnapshot(agentID, started); ok {
+				// Phase-1 observation only: log the blind spot the time clock
+				// cannot see (actions since the last signal, repeated failure
+				// signatures). No decision reads this.
+				if snap.ActionsSinceProgress >= 20 || snap.MaxRepeat >= 3 || time.Since(lastSpinLog) >= 5*time.Minute {
+					log.Printf("[spin] unit=%s agent=%s actions_since_progress=%d signals=%d max_repeat=%d last_sig=%q idle_no_signal=%s",
+						unitID, agentID, snap.ActionsSinceProgress, snap.Signals, snap.MaxRepeat, snap.LastSignature, snap.IdleSinceSignal.Round(time.Second))
+					lastSpinLog = time.Now()
+				}
+			}
 			if idle < limit {
 				continue
 			}
@@ -181,17 +194,42 @@ func (p *Pool) watchProgress(unitID, agentID, surface string) *progressWatch {
 	return w
 }
 
-// lastProgressAt resolves the worker's last information-layer increment. A
-// worker with no ledger entry is measured from its start time.
+// spinSnapshot reads the observe-only spin projection when available.
+func (p *Pool) spinSnapshot(agentID string, started time.Time) (scanctx.SpinSnapshot, bool) {
+	if p == nil || p.cfg.ScanCtx == nil || p.cfg.ScanCtx.Progress == nil || strings.TrimSpace(agentID) == "" {
+		return scanctx.SpinSnapshot{}, false
+	}
+	return p.cfg.ScanCtx.Progress.SpinSnapshotFor(agentID, started, time.Now()), true
+}
+
+// logSpinObservation writes the final Phase-1 line when a worker's watch
+// stops, so every lane has one comparable record even if it never crossed a
+// periodic threshold.
+func (p *Pool) logSpinObservation(unitID, agentID string, started time.Time, final bool) {
+	if !final {
+		return
+	}
+	snap, ok := p.spinSnapshot(agentID, started)
+	if !ok {
+		return
+	}
+	log.Printf("[spin] final unit=%s agent=%s actions_since_progress=%d signals=%d max_repeat=%d last_sig=%q elapsed=%s",
+		unitID, agentID, snap.ActionsSinceProgress, snap.Signals, snap.MaxRepeat, snap.LastSignature,
+		time.Since(started).Round(time.Second))
+}
+
+// lastProgressAt resolves the worker's last typed progress increment. A worker
+// with no ledger entry is measured from its start time. Artifact, belief,
+// evidence and coverage progress all count; an analysis worker is not reclaimed
+// merely because no new InfoItem was written.
 func (p *Pool) lastProgressAt(agentID string, started time.Time) time.Time {
 	if p == nil || p.cfg.ScanCtx == nil || p.cfg.ScanCtx.Progress == nil || strings.TrimSpace(agentID) == "" {
 		return started
 	}
-	_, last, ok := p.cfg.ScanCtx.Progress.AgentTimes(agentID)
-	if !ok || last.IsZero() {
-		return started
+	if last := p.cfg.ScanCtx.Progress.LastSignalAt(agentID); !last.IsZero() {
+		return last
 	}
-	return last
+	return started
 }
 
 func (p *Pool) steer(unitID, msg string) {

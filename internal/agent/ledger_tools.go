@@ -277,7 +277,9 @@ func (a *Agent) readInfoItemTool(args map[string]string) (tools.Result, error) {
 		if err != nil {
 			return tools.Result{Error: "encode trace: " + err.Error()}, nil
 		}
-		a.recordInfoRead("read_info_item", "trace", []string{id}, len(trace.Reads)+len(trace.Evidence) > 0, false, false, "trace lookup")
+		count := len(trace.Reads) + len(trace.Evidence) + len(trace.Decisions)
+		a.recordInfoRead("read_info_item", "trace", infoReadQueryJSON(id, "trace", target),
+			[]string{id}, count, count > 0, false, false, "trace lookup")
 		return tools.Result{Output: string(out)}, nil
 	}
 
@@ -293,8 +295,10 @@ func (a *Agent) readInfoItemTool(args map[string]string) (tools.Result, error) {
 					if err != nil {
 						return tools.Result{Error: "encode info item: " + err.Error()}, nil
 					}
-					a.recordInfoRead("read_info_item", layer, []string{id, ev.ID}, true,
-						layer == "detail" && len(ev.Summary) > 4096, false, "ledger read")
+					truncated := layer == "detail" && (len([]rune(ev.Summary)) > 4096 ||
+						len([]rune(ev.Request)) > 4096 || len([]rune(ev.Response)) > 4096)
+					a.recordInfoRead("read_info_item", layer, infoReadQueryJSON(id, layer, target),
+						[]string{id, ev.ID}, 1, true, truncated, false, "ledger read")
 					return tools.Result{Output: string(out)}, nil
 				}
 			}
@@ -309,40 +313,57 @@ func (a *Agent) readInfoItemTool(args map[string]string) (tools.Result, error) {
 	defer cancel()
 	item, err := reader.GetByID(ctx, target, id)
 	if errors.Is(err, infoitem.ErrNotFound) {
-		a.recordInfoRead("read_info_item", layer, []string{id}, false, false, false, "cold-path not found")
+		a.recordInfoRead("read_info_item", layer, infoReadQueryJSON(id, layer, target),
+			[]string{id}, 0, false, false, false, "cold-path not found")
 		return tools.Result{Error: "info item not found: " + id + " (scan " + target + ")"}, nil
 	}
 	if err != nil {
-		a.recordInfoRead("read_info_item", layer, []string{id}, false, false, true, "cold-path error: "+err.Error())
+		a.recordInfoRead("read_info_item", layer, infoReadQueryJSON(id, layer, target),
+			[]string{id}, 0, false, false, true, "cold-path error: "+err.Error())
 		return tools.Result{Error: "cold-path read failed: " + err.Error()}, nil
 	}
 	var payload any
+	truncated := false
 	switch layer {
 	case "detail":
-		payload = infoitem.DetailOf(item, 0)
+		detail := infoitem.DetailOf(item, 0)
+		payload = detail
+		truncated = detail.Truncated
 	case "artifact":
 		payload = infoitem.ArtifactOf(item)
 	default:
-		payload = infoitem.Index(item, 0, 0)
+		index := infoitem.Index(item, 0, 0)
+		payload = index
+		truncated = index.Truncated
 	}
 	out, err := json.Marshal(payload)
 	if err != nil {
 		return tools.Result{Error: "encode info item: " + err.Error()}, nil
 	}
-	a.recordInfoRead("read_info_item", layer, []string{id}, true, false, false, "cold-path read")
+	a.recordInfoRead("read_info_item", layer, infoReadQueryJSON(id, layer, target),
+		[]string{id}, 1, true, truncated, false, "cold-path read")
 	return tools.Result{Output: string(out)}, nil
 }
 
 // recordInfoRead appends one engine-side read trace. Failures are logged by the
 // ledger but never turn a successful read into an error.
-func (a *Agent) recordInfoRead(tool, mode string, refs []string, found, truncated, incomplete bool, reason string) {
+func (a *Agent) recordInfoRead(tool, mode, query string, refs []string, count int, found, truncated, incomplete bool, reason string) {
 	if a == nil || a.scanCtx == nil || a.scanCtx.Ledger == nil {
 		return
 	}
 	_ = a.scanCtx.Ledger.AppendInfoRead(scanctx.InfoRead{
-		Tool: tool, Mode: mode, Reason: reason, RefIDs: refs,
+		Tool: tool, Mode: mode, Query: query, Reason: reason, RefIDs: refs, ResultCount: count,
 		Actor: a.ledgerOrigin(), Found: found, Truncated: truncated, Incomplete: incomplete,
 	}, scanctx.AuditActorForAgent(a.ledgerOrigin()))
+}
+
+func infoReadQueryJSON(id, layer, scanID string) string {
+	q := map[string]any{"id": id, "layer": layer}
+	if strings.TrimSpace(scanID) != "" {
+		q["scan_id"] = strings.TrimSpace(scanID)
+	}
+	b, _ := json.Marshal(q)
+	return string(b)
 }
 
 func infoItemView(hypothesisID string, ev *scanctx.Evidence, layer string) map[string]any {

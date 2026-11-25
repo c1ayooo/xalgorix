@@ -172,6 +172,7 @@ func allEnvSettingDefinitions() []envSettingDefinition {
 		{Key: "XALGORIX_MAX_TOOL_CALLS", Label: "Max tool calls (budget)", Category: "Runtime", Description: "Per-scan tool-call cap; the scan stops cleanly when reached (findings preserved). 0 = unlimited.", DefaultValue: "0", InputType: "number", RequiresRestart: true},
 		{Key: "XALGORIX_MAX_DURATION", Label: "Max duration seconds (budget)", Category: "Runtime", Description: "Per-scan wall-clock cap in seconds; the scan stops cleanly when reached. 0 = unlimited.", DefaultValue: "0", InputType: "number", RequiresRestart: true},
 		{Key: "XALGORIX_MAX_TOKENS", Label: "Max LLM tokens (budget)", Category: "Runtime", Description: "Per-scan total-token cap; the scan stops cleanly when reached. 0 = unlimited.", DefaultValue: "0", InputType: "number", RequiresRestart: true},
+		{Key: "XALGORIX_MAX_WORKER_TOKENS", Label: "Max tokens per worker", Category: "Runtime", Description: "Caps one delegated worker's own LLM spend; at the cap it stops with a partial/resumable result instead of retrying a dead target. Root agents are unaffected. 0 = unlimited. Takes effect on restart.", DefaultValue: "0", InputType: "number", RequiresRestart: true},
 		{Key: "XALGORIX_APPROVAL_MODE", Label: "HITL approval mode", Category: "HITL", Description: "enforce routes command executions and high-risk HTTP through the operator approval queue (timeout = rejection); off (default) runs without approvals. Per-call exemptions are managed as approval rules on the Approvals page — they narrow what enforce asks about. Takes effect on restart.", DefaultValue: "off", InputType: "select", Options: []string{"off", "enforce"}, RequiresRestart: true},
 		{Key: "XALGORIX_APPROVAL_TIMEOUT", Label: "Approval timeout (seconds)", Category: "HITL", Description: "How long a pending approval waits before timeout = rejection. Default 600s; must stay under the smallest gated tool's hard ceiling (browser_action 10m) or the tool timeout fires first and abandons the verdict. Takes effect on restart.", DefaultValue: "600", InputType: "number", RequiresRestart: true},
 		{Key: "XALGORIX_APPROVAL_MAX_PENDING", Label: "Approval max pending per run", Category: "HITL", Description: "Concurrent pending approvals allowed per run (default 1); overflow queues FIFO for a free slot. Higher values let autonomous scans keep working while several requests wait, at the cost of a longer operator queue. Takes effect on restart.", DefaultValue: "1", InputType: "number", RequiresRestart: true},
@@ -381,6 +382,7 @@ var environmentAdvancedKeys = map[string]bool{
 	// Runtime.
 	"XALGORIX_MAX_CONCURRENT_AGENTS":   true,
 	"XALGORIX_MAX_TOKENS":              true,
+	"XALGORIX_MAX_WORKER_TOKENS":       true,
 	"XALGORIX_MAX_TOOL_CALLS":          true,
 	"XALGORIX_SCAN_HEADERS_FILE":       true,
 	"XALGORIX_DISABLE_BROWSER":         true,

@@ -45,6 +45,9 @@ func TestLocatorHistoryKeepsLogicalIdentity(t *testing.T) {
 	if locs[0].AssetID != asset.ID || locs[1].AssetID != asset.ID {
 		t.Fatalf("locator lost logical identity: %+v", locs)
 	}
+	if locs[0].InstanceID != "container-new" || locs[1].InstanceID != "container-old" {
+		t.Fatalf("instance history = %+v", locs)
+	}
 	if _, err := store.ListAssetLocators(ctx, "other-project", asset.ID); err == nil {
 		t.Fatal("locator history crossed the project boundary")
 	}

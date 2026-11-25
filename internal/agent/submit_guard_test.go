@@ -18,10 +18,10 @@ func platformGuardAgent(t *testing.T, surface ToolSurface) *Agent {
 	}
 }
 
-func submitCall(code string) map[string]string {
+func submitCall(code, flag string) map[string]string {
 	return map[string]string{
 		"url":  "http://bench.example.com/openapi/v1/challenges/submit?unique_code=" + code,
-		"body": `{"unique_code":"` + code + `"}`,
+		"body": `{"unique_code":"` + code + `","flag":"` + flag + `"}`,
 	}
 }
 
@@ -29,7 +29,7 @@ func submitCall(code string) map[string]string {
 // tool in this run printed is refused (round 5 submitted 449 such values).
 func TestSubmitGuardBlocksUnobservedValue(t *testing.T) {
 	a := platformGuardAgent(t, SurfaceOrchestrator)
-	blocked, reason := a.shouldBlockForPlatformDiscipline("http_request", submitCall("flag{invented}"))
+	blocked, reason := a.shouldBlockForPlatformDiscipline("http_request", submitCall("c-08", "flag{invented}"))
 	if !blocked {
 		t.Fatal("unobserved flag must be blocked")
 	}
@@ -41,11 +41,11 @@ func TestSubmitGuardBlocksUnobservedValue(t *testing.T) {
 func TestSubmitGuardAllowsObservedValue(t *testing.T) {
 	a := platformGuardAgent(t, SurfaceOrchestrator)
 	a.observePlatformResult("terminal_execute", map[string]string{"command": "cat /flag"}, "flag{real-flag}")
-	blocked, reason := a.shouldBlockForPlatformDiscipline("http_request", submitCall("flag{real-flag}"))
+	blocked, reason := a.shouldBlockForPlatformDiscipline("http_request", submitCall("c-08", "flag{real-flag}"))
 	if blocked {
 		t.Fatalf("observed flag was blocked: %s", reason)
 	}
-	if got := a.submitGuard().Attempts("flag{real-flag}"); got != 1 {
+	if got := a.submitGuard().Attempts("c-08"); got != 1 {
 		t.Fatalf("attempts = %d, want 1", got)
 	}
 }
@@ -54,7 +54,7 @@ func TestSubmitGuardRejectsProbeValues(t *testing.T) {
 	a := platformGuardAgent(t, SurfaceOrchestrator)
 	for _, code := range []string{"flag{probe}", "flag{r6c_probe}", "flag{contract_probe}", "dummy_flag"} {
 		a.submitGuard().Observe(code) // even an observed probe is never a flag
-		blocked, reason := a.shouldBlockForPlatformDiscipline("http_request", submitCall(code))
+		blocked, reason := a.shouldBlockForPlatformDiscipline("http_request", submitCall("c-08", code))
 		if !blocked {
 			t.Fatalf("%s must be blocked as a probe", code)
 		}
@@ -69,7 +69,7 @@ func TestSubmitGuardRejectsUnknownCatalogCode(t *testing.T) {
 	a.submitGuard().Observe(`{"challenges":[{"unique_code":"c-08","score":100}]}`)
 	// Observed in output but absent from the catalog: an invented challenge id.
 	a.submitGuard().Observe("trying unique_code=c-25 anyway")
-	blocked, reason := a.shouldBlockForPlatformDiscipline("http_request", submitCall("c-25"))
+	blocked, reason := a.shouldBlockForPlatformDiscipline("http_request", submitCall("c-25", "flag{x}"))
 	if !blocked {
 		t.Fatal("code outside the platform catalog must be blocked")
 	}
@@ -78,7 +78,7 @@ func TestSubmitGuardRejectsUnknownCatalogCode(t *testing.T) {
 	}
 	// A listed code with provenance still passes.
 	a.submitGuard().Observe("flag{c-08}")
-	blocked, reason = a.shouldBlockForPlatformDiscipline("http_request", submitCall("c-08"))
+	blocked, reason = a.shouldBlockForPlatformDiscipline("http_request", submitCall("c-08", "flag{c-08}"))
 	if blocked {
 		t.Fatalf("catalogued code blocked: %s", reason)
 	}
@@ -88,7 +88,7 @@ func TestSubmitGuardRejectsLoops(t *testing.T) {
 	a := platformGuardAgent(t, SurfaceOrchestrator)
 	a.observePlatformResult("terminal_execute", map[string]string{"command": "cat /flag"}, "flag{loop}")
 	loop := map[string]string{
-		"command": "for i in $(seq 1 40); do curl -s -X POST http://bench.example.com/openapi/v1/challenges/submit -d 'unique_code=flag{loop}'; done",
+		"command": "for i in $(seq 1 40); do curl -s -X POST http://bench.example.com/openapi/v1/challenges/submit -d 'unique_code=c-08&flag=flag{loop}'; done",
 	}
 	blocked, reason := a.shouldBlockForPlatformDiscipline("terminal_execute", loop)
 	if !blocked {
@@ -98,7 +98,7 @@ func TestSubmitGuardRejectsLoops(t *testing.T) {
 		t.Fatalf("reason = %q", reason)
 	}
 	double := map[string]string{
-		"command": "curl http://bench.example.com/openapi/v1/challenges/submit?unique_code=flag{loop} && curl http://bench.example.com/openapi/v1/challenges/submit?unique_code=flag{loop}",
+		"command": "curl http://bench.example.com/openapi/v1/challenges/submit?unique_code=c-08&flag=flag{loop} && curl http://bench.example.com/openapi/v1/challenges/submit?unique_code=c-08&flag=flag{loop}",
 	}
 	if blocked, _ := a.shouldBlockForPlatformDiscipline("terminal_execute", double); !blocked {
 		t.Fatal("two submits in one call must be blocked")
@@ -110,7 +110,7 @@ func TestSubmitGuardRejectsLoops(t *testing.T) {
 func TestSubmitGuardKeepsLifecycleOnControlPlaneLane(t *testing.T) {
 	worker := platformGuardAgent(t, SurfaceWorker)
 	worker.observePlatformResult("terminal_execute", map[string]string{"command": "cat /flag"}, "flag{worker-flag}")
-	blocked, reason := worker.shouldBlockForPlatformDiscipline("http_request", submitCall("flag{worker-flag}"))
+	blocked, reason := worker.shouldBlockForPlatformDiscipline("http_request", submitCall("c-08", "flag{worker-flag}"))
 	if !blocked {
 		t.Fatal("execution lane must not submit challenges")
 	}
@@ -139,7 +139,7 @@ func TestSubmitGuardKeepsLifecycleOnControlPlaneLane(t *testing.T) {
 	// Legacy CLI agents keep the historical full surface.
 	legacy := platformGuardAgent(t, SurfaceLegacyRoot)
 	legacy.observePlatformResult("terminal_execute", map[string]string{"command": "cat /flag"}, "flag{legacy-flag}")
-	if blocked, reason := legacy.shouldBlockForPlatformDiscipline("http_request", submitCall("flag{legacy-flag}")); blocked {
+	if blocked, reason := legacy.shouldBlockForPlatformDiscipline("http_request", submitCall("c-08", "flag{legacy-flag}")); blocked {
 		t.Fatalf("legacy surface blocked: %s", reason)
 	}
 }
@@ -157,7 +157,7 @@ func TestSubmitGuardIgnoresTargetApplicationRoutes(t *testing.T) {
 	}
 	// No control-plane hosts configured (normal pentest run) => inert.
 	plain := &Agent{scanCtx: scanctx.New("no-cp", ""), toolSurface: SurfaceOrchestrator}
-	if blocked, _ := plain.shouldBlockForPlatformDiscipline("http_request", submitCall("flag{x}")); blocked {
+	if blocked, _ := plain.shouldBlockForPlatformDiscipline("http_request", submitCall("c-08", "flag{x}")); blocked {
 		t.Fatal("guard must be inert without a configured control-plane host")
 	}
 }
@@ -165,7 +165,7 @@ func TestSubmitGuardIgnoresTargetApplicationRoutes(t *testing.T) {
 func TestSubmitGuardRejectsRepeatedSubmitAfterAcceptance(t *testing.T) {
 	a := platformGuardAgent(t, SurfaceOrchestrator)
 	a.observePlatformResult("terminal_execute", map[string]string{"command": "cat /flag"}, "flag{once}")
-	call := submitCall("flag{once}")
+	call := submitCall("c-08", "flag{once}")
 	if blocked, reason := a.shouldBlockForPlatformDiscipline("http_request", call); blocked {
 		t.Fatalf("first submit blocked: %s", reason)
 	}
@@ -186,5 +186,29 @@ func TestSubmitGuardRequiresParseableCode(t *testing.T) {
 	})
 	if !blocked || !strings.Contains(reason, "unique_code") {
 		t.Fatalf("blocked=%v reason=%q", blocked, reason)
+	}
+}
+
+// TestSubmitGuardAcceptsRealCatalogCodeWithFlagLiteral is the regression test
+// for the round-6 zero-score bug: the platform listing is a bare JSON array,
+// the catalog must learn every code from it, and the submitted flag literal
+// must never be checked against the code catalog.
+func TestSubmitGuardAcceptsRealCatalogCodeWithFlagLiteral(t *testing.T) {
+	a := platformGuardAgent(t, SurfaceOrchestrator)
+	// Two start acks teach two codes; the full listing adds f1-04.
+	a.submitGuard().Observe(`{"unique_code":"e1-01","container_addr":["10.0.189.8:80"]}`)
+	a.submitGuard().Observe(`{"unique_code":"e1-02","container_addr":["10.0.189.9:80"]}`)
+	a.submitGuard().Observe(`[{"unique_code":"e1-01","difficulty":"medium","total_score":250,"flag_count":1,"correct_flag_count":0,"is_completed":false,"container_status":"running","container_addr":["10.0.189.8:80"]},` +
+		`{"unique_code":"f1-04","difficulty":"easy","total_score":100,"flag_count":1,"correct_flag_count":0,"is_completed":false,"container_status":"running","container_addr":["10.0.189.9:9013"]}]`)
+	if got := a.submitGuard().CatalogSize(); got != 3 {
+		t.Fatalf("catalog size = %d, want 3", got)
+	}
+	a.observePlatformResult("terminal_execute", map[string]string{"command": "cat /challenge/flag.txt"}, "flag{907600af-c8c1-4c5a-bded-84635df833dc}")
+	call := submitCall("f1-04", "flag{907600af-c8c1-4c5a-bded-84635df833dc}")
+	if blocked, reason := a.shouldBlockForPlatformDiscipline("http_request", call); blocked {
+		t.Fatalf("catalogued code + observed flag was blocked: %s", reason)
+	}
+	if got := a.submitGuard().Attempts("f1-04"); got != 1 {
+		t.Fatalf("attempts(f1-04) = %d, want 1", got)
 	}
 }

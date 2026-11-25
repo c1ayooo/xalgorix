@@ -256,11 +256,13 @@ type LedgerStore struct {
 	// for the main agent's decision inbox. The domain journal remains the
 	// audit authority; this projection is not persisted or replayed.
 	deviations []Deviation
-	// infoReads / actionAttempts are bounded R3 trace projections. The journal
-	// is the audit authority; these are read-only joins for tracing.
+	// infoReads / actionAttempts / decisions are bounded trace projections. The
+	// journal is the audit authority; these are read-only joins for tracing.
 	infoReads      []InfoRead
 	actionAttempts []ActionAttempt
+	decisions      []Decision
 	actionSeq      int
+	decisionSeq    int
 }
 
 // Deviation is one executor-recorded departure from its assigned intent.

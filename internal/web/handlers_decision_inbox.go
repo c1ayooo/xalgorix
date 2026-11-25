@@ -45,12 +45,14 @@ const decisionInboxReadTimeout = 5 * time.Second
 
 // decisionStalledView is one stalled worker (live pool projection).
 type decisionStalledView struct {
-	UnitID       string `json:"unit_id"`
-	AgentID      string `json:"agent_id"`
-	Lane         string `json:"lane"`
-	IdleSeconds  int64  `json:"idle_seconds"`
-	ActiveTool   bool   `json:"active_tool"`
-	LastProgress string `json:"last_progress,omitempty"`
+	UnitID         string `json:"unit_id"`
+	AgentID        string `json:"agent_id"`
+	Lane           string `json:"lane"`
+	IdleSeconds    int64  `json:"idle_seconds"`
+	ActiveTool     bool   `json:"active_tool"`
+	LastProgress   string `json:"last_progress,omitempty"`
+	ProgressStatus string `json:"progress_status,omitempty"`
+	ProgressReason string `json:"progress_reason,omitempty"`
 }
 
 // decisionBlockedView is one blocked intent with the engine's recorded reason.
@@ -85,16 +87,57 @@ type decisionDeviationView struct {
 	RecordedAt string `json:"recorded_at"`
 }
 
+// decisionTraceView is one structured planning/control decision from the
+// durable journal. It is the human-readable half of the P1 decision trace:
+// action, selected intent, information use and reason. The full snapshot
+// (candidates/constraints/digest) stays in the journal record.
+type decisionTraceView struct {
+	ID             string   `json:"id,omitempty"`
+	Action         string   `json:"action"`
+	Actor          string   `json:"actor,omitempty"`
+	IntentID       string   `json:"intent_id,omitempty"`
+	Selected       string   `json:"selected,omitempty"`
+	BasisRefs      []string `json:"basis_refs,omitempty"`
+	Reason         string   `json:"reason,omitempty"`
+	InfoUse        string   `json:"info_use,omitempty"`
+	NoInfoReason   string   `json:"no_info_reason,omitempty"`
+	SnapshotDigest string   `json:"snapshot_digest,omitempty"`
+	ShadowPolicy   string   `json:"shadow_policy,omitempty"`
+	ShadowChanged  bool     `json:"shadow_changed,omitempty"`
+	ShadowReason   string   `json:"shadow_reason,omitempty"`
+	RecordedAt     string   `json:"recorded_at,omitempty"`
+}
+
+// decisionImpactView is the deterministic first cut of P1 item 6: were
+// decisions made with information, or explicitly without it? It is a count,
+// not a causal claim; real-run comparison remains an evaluation task.
+type decisionImpactView struct {
+	Total         int `json:"total"`
+	WithBasis     int `json:"with_basis"`
+	WithoutBasis  int `json:"without_basis"`
+	NoInfo        int `json:"no_info"`
+	ShadowChanged int `json:"shadow_changed"`
+}
+
+// decisionAuditView is the journal-derived half of the inbox.
+type decisionAuditView struct {
+	Deviations []decisionDeviationView
+	Decisions  []decisionTraceView
+	Impact     decisionImpactView
+}
+
 // decisionInboxView is the GET response. Every list is non-nil so the panel
 // renders [] rather than null.
 type decisionInboxView struct {
-	ScanID      string                   `json:"scan_id"`
-	GeneratedAt string                   `json:"generated_at"`
-	Stalled     []decisionStalledView    `json:"stalled"`
-	Blocked     []decisionBlockedView    `json:"blocked"`
-	Paused      []decisionPausedView     `json:"paused"`
-	OpenIntents []decisionOpenIntentView `json:"open_intents"`
-	Deviations  []decisionDeviationView  `json:"deviations"`
+	ScanID          string                   `json:"scan_id"`
+	GeneratedAt     string                   `json:"generated_at"`
+	Stalled         []decisionStalledView    `json:"stalled"`
+	Blocked         []decisionBlockedView    `json:"blocked"`
+	Paused          []decisionPausedView     `json:"paused"`
+	OpenIntents     []decisionOpenIntentView `json:"open_intents"`
+	Deviations      []decisionDeviationView  `json:"deviations"`
+	RecentDecisions []decisionTraceView      `json:"recent_decisions"`
+	DecisionImpact  decisionImpactView       `json:"decision_impact"`
 }
 
 // decisionRequest is the POST body.
@@ -144,13 +187,14 @@ func (s *Server) getScanDecisions(w http.ResponseWriter, r *http.Request) {
 	}
 	runID := s.graphRunID(scanID)
 	view := decisionInboxView{
-		ScanID:      scanID,
-		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
-		Stalled:     []decisionStalledView{},
-		Blocked:     []decisionBlockedView{},
-		Paused:      []decisionPausedView{},
-		OpenIntents: []decisionOpenIntentView{},
-		Deviations:  []decisionDeviationView{},
+		ScanID:          scanID,
+		GeneratedAt:     time.Now().UTC().Format(time.RFC3339),
+		Stalled:         []decisionStalledView{},
+		Blocked:         []decisionBlockedView{},
+		Paused:          []decisionPausedView{},
+		OpenIntents:     []decisionOpenIntentView{},
+		Deviations:      []decisionDeviationView{},
+		RecentDecisions: []decisionTraceView{},
 	}
 
 	// Stalled workers: the live pool's own projection. No event stream.
@@ -160,11 +204,13 @@ func (s *Server) getScanDecisions(w http.ResponseWriter, r *http.Request) {
 	if pool != nil {
 		for _, stalled := range pool.StallReport() {
 			entry := decisionStalledView{
-				UnitID:      stalled.UnitID,
-				AgentID:     stalled.AgentID,
-				Lane:        stalled.Lane,
-				IdleSeconds: int64(stalled.IdleFor.Seconds()),
-				ActiveTool:  stalled.ActiveTool,
+				UnitID:         stalled.UnitID,
+				AgentID:        stalled.AgentID,
+				Lane:           stalled.Lane,
+				IdleSeconds:    int64(stalled.IdleFor.Seconds()),
+				ActiveTool:     stalled.ActiveTool,
+				ProgressStatus: stalled.ProgressStatus,
+				ProgressReason: stalled.ProgressReason,
 			}
 			if !stalled.LastProgress.IsZero() {
 				entry.LastProgress = stalled.LastProgress.UTC().Format(time.RFC3339)
@@ -252,41 +298,73 @@ func (s *Server) getScanDecisions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	view.Deviations = s.decisionDeviations(r.Context(), scanID, runID)
+	audit := s.decisionAudit(r.Context(), scanID, runID)
+	view.Deviations = audit.Deviations
+	view.RecentDecisions = audit.Decisions
+	view.DecisionImpact = audit.Impact
 	writeJSONStatus(w, http.StatusOK, view)
 }
 
-// decisionDeviations projects the run's executor deviations from the audit
-// journal. A missing/legacy journal simply yields an empty list: the inbox
-// never fabricates a history.
-func (s *Server) decisionDeviations(ctx context.Context, scanID, runID string) []decisionDeviationView {
+// decisionAudit projects the run's executor deviations and decision records
+// from one durable-journal read. A missing/legacy journal yields empty lists:
+// the inbox never fabricates a history.
+func (s *Server) decisionAudit(ctx context.Context, scanID, runID string) decisionAuditView {
+	out := decisionAuditView{
+		Deviations: []decisionDeviationView{},
+		Decisions:  []decisionTraceView{},
+	}
 	path := ""
 	if dir, ok := s.resolveScanDirByID(scanID); ok {
 		path = filepath.Join(dir, domainjournal.FileName)
 	}
 	recs, _, err := domainjournal.ReadRecordsResolved(ctx, path, runID)
 	if err != nil {
-		return []decisionDeviationView{}
+		return out
 	}
 	proj := domainjournal.Project(runID, recs)
-	if len(proj.Deviations) == 0 {
-		return []decisionDeviationView{}
-	}
-	deviations := proj.Deviations
-	if len(deviations) > decisionInboxLimit {
-		deviations = deviations[len(deviations)-decisionInboxLimit:]
-	}
-	out := make([]decisionDeviationView, 0, len(deviations))
-	for _, d := range deviations {
+	for _, d := range proj.Deviations {
 		recordedAt := ""
 		if !d.At.IsZero() {
 			recordedAt = d.At.UTC().Format(time.RFC3339)
 		}
-		out = append(out, decisionDeviationView{
-			UnitID:     d.IntentID,
-			Summary:    d.Summary,
-			RecordedAt: recordedAt,
+		out.Deviations = append(out.Deviations, decisionDeviationView{
+			UnitID: d.IntentID, Summary: d.Summary, RecordedAt: recordedAt,
 		})
+	}
+	if len(out.Deviations) > decisionInboxLimit {
+		out.Deviations = out.Deviations[len(out.Deviations)-decisionInboxLimit:]
+	}
+	for _, rec := range proj.Timeline {
+		if rec.Operation != domainjournal.OpDecision || rec.Decision == nil {
+			continue
+		}
+		d := rec.Decision
+		out.Impact.Total++
+		if len(d.BasisRefs) > 0 {
+			out.Impact.WithBasis++
+		} else {
+			out.Impact.WithoutBasis++
+		}
+		if d.InfoUse == domainjournal.DecisionInfoUseNone {
+			out.Impact.NoInfo++
+		}
+		if d.ShadowChanged {
+			out.Impact.ShadowChanged++
+		}
+		entry := decisionTraceView{
+			ID: d.ID, Action: d.Action, Actor: d.Actor, IntentID: d.IntentID,
+			Selected: d.Selected, BasisRefs: append([]string(nil), d.BasisRefs...),
+			Reason: d.Reason, InfoUse: d.InfoUse, NoInfoReason: d.NoInfoReason,
+			SnapshotDigest: d.SnapshotDigest, ShadowPolicy: d.ShadowPolicy,
+			ShadowChanged: d.ShadowChanged, ShadowReason: d.ShadowReason,
+		}
+		if !rec.At.IsZero() {
+			entry.RecordedAt = rec.At.UTC().Format(time.RFC3339)
+		}
+		out.Decisions = append(out.Decisions, entry)
+	}
+	if len(out.Decisions) > decisionInboxLimit {
+		out.Decisions = out.Decisions[len(out.Decisions)-decisionInboxLimit:]
 	}
 	return out
 }

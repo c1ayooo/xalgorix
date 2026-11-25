@@ -10,6 +10,7 @@ package orchestrator
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -26,6 +27,7 @@ import (
 
 	"github.com/c1ayooo/xalgorix/v4/internal/assets"
 	"github.com/c1ayooo/xalgorix/v4/internal/discovery"
+	"github.com/c1ayooo/xalgorix/v4/internal/domainjournal"
 	"github.com/c1ayooo/xalgorix/v4/internal/gaps"
 	"github.com/c1ayooo/xalgorix/v4/internal/graph"
 	"github.com/c1ayooo/xalgorix/v4/internal/infoitem"
@@ -60,6 +62,11 @@ type StalledWorker struct {
 	ActiveToolName string
 	ActiveFor      time.Duration
 	LastProgress   time.Time
+	// Typed progress read model (P2). Observation only: it tells the planner
+	// whether the worker is active, merely analysis-progressing, blocked by the
+	// environment, or genuinely stalled.
+	ProgressStatus string
+	ProgressReason string
 }
 
 // PlannerConfig assembles one run's planning loop.
@@ -150,7 +157,10 @@ type Planner struct {
 	initialDone   atomic.Bool
 	settlePending atomic.Bool
 	stallPending  atomic.Bool
-	drained       atomic.Bool
+	// forceWake bypasses the minimum gap between model rounds (stall symptoms
+	// and operator brief edits are urgent, not routine settles).
+	forceWake atomic.Bool
+	drained   atomic.Bool
 	// backoffIdx walks plannerBackoffLadder after consecutive no-action rounds.
 	backoffIdx atomic.Int64
 	// modelRounds counts rounds where the model actually answered. An empty
@@ -184,6 +194,26 @@ type Planner struct {
 // plannerNotifyCoalesce merges a burst of worker settles into one round.
 const plannerNotifyCoalesce = 2 * time.Second
 
+// plannerMinModelGap is the minimum spacing between model planning rounds when
+// the only trigger is a routine worker settle. Round 6 ran 38 model rounds in
+// 27 minutes on a 60s heartbeat plus a settle wake for every lane, re-sending
+// the graph/ledger/notes context each time. First round, stalls and operator
+// brief edits bypass the gap.
+const plannerMinModelGap = 90 * time.Second
+
+// plannerSettleGap returns how long to wait before the next settle-triggered
+// model round. Pure so the cadence is testable without a clock.
+func plannerSettleGap(last, now time.Time) time.Duration {
+	if last.IsZero() {
+		return 0
+	}
+	remain := plannerMinModelGap - now.Sub(last)
+	if remain < 0 {
+		return 0
+	}
+	return remain
+}
+
 // plannerBackoffLadder returns the round interval ladder: the configured base
 // (60s by default), then 2m, 5m, 15m for consecutive no-action rounds.
 func plannerBackoffLadder(base time.Duration) []time.Duration {
@@ -196,6 +226,7 @@ func plannerBackoffLadder(base time.Duration) []time.Duration {
 // UpdateBriefing replaces the live task brief and wakes the planner so the new
 // direction is picked up in the next round (no worker kill/steer).
 func (p *Planner) UpdateBriefing(brief LiveTaskBrief) {
+	p.forceWake.Store(true)
 	p.briefMu.Lock()
 	p.brief = brief.clone()
 	p.briefInit = true
@@ -330,6 +361,7 @@ func (p *Planner) Stall() {
 		return
 	}
 	p.stallPending.Store(true)
+	p.forceWake.Store(true)
 	p.wake()
 }
 
@@ -375,7 +407,12 @@ func (p *Planner) recordRound(acted, settle, stall bool) {
 }
 
 func (p *Planner) loop() {
-	p.round()
+	lastRound := time.Time{}
+	runRound := func() {
+		p.round()
+		lastRound = time.Now()
+	}
+	runRound()
 	for {
 		if p.ctx.Err() != nil {
 			return
@@ -391,10 +428,36 @@ func (p *Planner) loop() {
 			woke = true
 		case <-timer.C:
 		}
+		// Routine settle wakes are coalesced and rate-limited: a planner round
+		// re-sends the whole graph/ledger/notes context, and a 5-worker pool
+		// settles often enough to trigger one every ~40s. Stalls and operator
+		// brief edits (forceWake) stay immediate.
+		urgent := p.forceWake.Swap(false) || p.stallPending.Load()
+		if woke && !urgent {
+			// Wait in short chunks so a stall arriving inside the gap is not
+			// delayed for the full 90s.
+			for wait := plannerSettleGap(lastRound, time.Now()); wait > 0; wait = plannerSettleGap(lastRound, time.Now()) {
+				chunk := wait
+				if chunk > 5*time.Second {
+					chunk = 5 * time.Second
+				}
+				gap := time.NewTimer(chunk)
+				select {
+				case <-p.ctx.Done():
+					gap.Stop()
+					return
+				case <-gap.C:
+				}
+				if p.stallPending.Load() || p.forceWake.Load() {
+					p.forceWake.Store(false)
+					break
+				}
+			}
+		}
 		if woke && !p.coalesce() {
 			return
 		}
-		p.round()
+		runRound()
 	}
 }
 
@@ -415,19 +478,20 @@ func (p *Planner) coalesce() bool {
 }
 
 type plannerIntent struct {
-	TaskID        string         `json:"task_id"`
-	Title         string         `json:"title"`
-	Phase         plannerInt     `json:"phase"`
-	VulnClass     string         `json:"vuln_class"`
-	Endpoint      string         `json:"endpoint"`
-	Target        string         `json:"target"`
-	TargetKind    string         `json:"target_kind"`
-	DependsOn     plannerStrings `json:"depends_on"`
-	Notes         string         `json:"notes"`
-	ObjectiveRef  string         `json:"objective_ref"`
-	AssetRef      string         `json:"asset_ref"`
-	DecisionBasis plannerStrings `json:"decision_basis_refs"`
-	TimeboxS      plannerInt     `json:"timebox_s"`
+	TaskID          string         `json:"task_id"`
+	Title           string         `json:"title"`
+	Phase           plannerInt     `json:"phase"`
+	VulnClass       string         `json:"vuln_class"`
+	Endpoint        string         `json:"endpoint"`
+	Target          string         `json:"target"`
+	TargetKind      string         `json:"target_kind"`
+	DependsOn       plannerStrings `json:"depends_on"`
+	Notes           string         `json:"notes"`
+	ObjectiveRef    string         `json:"objective_ref"`
+	AssetRef        string         `json:"asset_ref"`
+	DecisionBasis   plannerStrings `json:"decision_basis_refs"`
+	ProgressProfile string         `json:"progress_profile"`
+	TimeboxS        plannerInt     `json:"timebox_s"`
 }
 
 // plannerInt accepts a JSON number or a string ("6", "phase 6") and extracts
@@ -492,6 +556,10 @@ func (v *plannerStrings) UnmarshalJSON(b []byte) error {
 type plannerOutput struct {
 	Intents []plannerIntent `json:"intents"`
 	Retire  []string        `json:"retire"`
+	// RetireReasons/RetireBasis are optional structured justification for a
+	// retirement; they feed the decision audit, never the transition itself.
+	RetireReasons map[string]string   `json:"retire_reasons,omitempty"`
+	RetireBasis   map[string][]string `json:"retire_basis_refs,omitempty"`
 }
 
 // round runs one planning round and reports whether it changed the plan
@@ -510,6 +578,7 @@ func (p *Planner) round() (acted bool) {
 		log.Printf("[planner] %s: %d stalled worker(s) in this round", p.cfg.ScanID, len(stalls))
 	}
 	first := !p.initialDone.Swap(true)
+	log.Printf("[planner] %s: round start (first=%v settle=%v stall=%v)", p.cfg.ScanID, first, settle, stall)
 	defer func() {
 		if p.roundActions.Load() > 0 {
 			acted = true
@@ -562,11 +631,15 @@ func (p *Planner) round() (acted bool) {
 			added += a
 			retired += r
 			if len(parsed.Intents) == 0 && len(parsed.Retire) == 0 {
-				// A legal empty plan is a valid decision; a plan whose intents
-				// were all rejected is not. Only the former may drain the
-				// frontier. Non-empty plans are counted after the loop when they
-				// actually added/retired something.
-				p.planRounds.Add(1)
+				// A legal empty plan is a valid decision ONLY when the frontier
+				// already holds work (it means "everything I can think of is
+				// covered/blocked"). On an EMPTY frontier an empty plan is a
+				// deadlock: the planner is the only producer, so waiting for a
+				// settle/stall trigger that can never arrive would hang the run
+				// at phase 1 with zero intents. Keep the frontier-floor retry
+				// semantics documented in the charter (failed/empty first round
+				// must retry with backoff instead of draining forever).
+				p.noteEmptyPlan()
 			}
 			break
 		}
@@ -599,6 +672,31 @@ func (p *Planner) round() (acted bool) {
 		}
 	}
 	return added > 0 || retired > 0
+}
+
+// noteEmptyPlan accounts one legal empty plan. It drains the frontier only
+// when there is already intents to wait on; an empty frontier keeps planRounds
+// at zero so shouldPlan retries with the backoff ladder (frontier floor).
+func (p *Planner) noteEmptyPlan() {
+	if p.frontierEmpty() {
+		log.Printf("[planner] %s: empty plan on an empty frontier — retrying with backoff (frontier floor)", p.cfg.ScanID)
+		return
+	}
+	p.planRounds.Add(1)
+}
+
+// frontierEmpty reports whether no claimable/executing/paused intent exists.
+func (p *Planner) frontierEmpty() bool {
+	if p.cfg.Repo == nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(p.ctx, 3*time.Second)
+	defer cancel()
+	counts, err := p.cfg.Repo.Counts(ctx, p.cfg.ScanID)
+	if err != nil {
+		return false
+	}
+	return counts.OpenIntents+counts.RunningIntents+counts.PausedIntents == 0
 }
 
 // shouldPlan is the cheap gate that runs before any model call. It only reads
@@ -1027,6 +1125,12 @@ func (p *Planner) stalledWorkersBlock() string {
 		if !w.LastProgress.IsZero() {
 			fmt.Fprintf(&b, " last_progress=%s ago",
 				promptrender.Cell(time.Since(w.LastProgress).Round(time.Second).String(), 24))
+		}
+		if w.ProgressStatus != "" {
+			fmt.Fprintf(&b, " status=%s", promptrender.Cell(w.ProgressStatus, 40))
+		}
+		if w.ProgressReason != "" {
+			fmt.Fprintf(&b, " reason=%s", promptrender.Cell(w.ProgressReason, 200))
 		}
 		b.WriteString("\n")
 	}
@@ -1718,6 +1822,14 @@ func (p *Planner) apply(out plannerOutput) (added, retired int) {
 			newCap = avail
 		}
 	}
+	// One immutable candidate snapshot for this round. Each accepted intent
+	// records its own decision with exactly one candidate marked selected; the
+	// order (Rank) is the deterministic presentation order the model produced.
+	candidates := plannerDecisionCandidates(out.Intents)
+	// P4: a deterministic counterfactual ranking is recorded beside the actual
+	// decision. It never reorders the plan; it only makes the alternative
+	// auditable for later calibration.
+	shadow := shadowVoiOrder(out.Intents, voiHyps)
 	for i, in := range out.Intents {
 		if added >= newCap {
 			break
@@ -1855,6 +1967,7 @@ func (p *Planner) apply(out plannerOutput) (added, retired int) {
 			"objective_ref":       p.normalizeObjectiveRef(in.ObjectiveRef),
 			"asset_ref":           p.normalizeAssetRef(ctx, in.AssetRef),
 			"decision_basis_refs": in.DecisionBasis,
+			"progress_profile":    string(scanctx.NormalizeProgressProfile(in.ProgressProfile)),
 			"contract":            p.plannerContract(in.DependsOn, int(in.TimeboxS)),
 		})
 		voi := 0.0
@@ -1877,6 +1990,13 @@ func (p *Planner) apply(out plannerOutput) (added, retired int) {
 		if controlLaneKey != "" {
 			activeEndpoints[controlLaneKey] = true
 		}
+		selectedCandidates := decisionCandidatesWithSelection(candidates, i)
+		if i < len(selectedCandidates) {
+			// A model may omit task_id; the engine then generates one. The
+			// candidate snapshot must name the same id the plan will contain.
+			selectedCandidates[i].ID = taskID
+		}
+		p.recordIntentDecision(in, taskID, selectedCandidates, shadow, i)
 		added++
 	}
 	// Dependency edges need every node id resolved first.
@@ -1900,17 +2020,187 @@ func (p *Planner) apply(out plannerOutput) (added, retired int) {
 		_ = p.cfg.Repo.ReplaceDependencyEdges(ctx, p.cfg.ScanID, dst, deps)
 	}
 	// Retire only open intents; running work is settled by its worker.
-	for _, taskID := range out.Retire {
-		t, ok := byID[strings.TrimSpace(taskID)]
+	for _, raw := range out.Retire {
+		taskID := strings.TrimSpace(raw)
+		t, ok := byID[taskID]
 		if !ok || t.GraphState != string(graph.StateOpen) {
 			continue
 		}
 		if ok, _ := p.cfg.Repo.Transition(ctx, p.cfg.ScanID, t.NodeID, graph.KindIntent,
 			graph.StateOpen, graph.StateDeleted); ok {
+			p.recordRetireDecision(taskID, out.RetireReasons[taskID], out.RetireBasis[taskID])
 			retired++
 		}
 	}
 	return added, retired
+}
+
+func parseCommaRefs(raw string) []string {
+	var out []string
+	for _, ref := range strings.Split(raw, ",") {
+		if ref = strings.TrimSpace(ref); ref != "" {
+			out = append(out, ref)
+		}
+	}
+	return out
+}
+
+// shadowVoiOrder is the P4 counterfactual policy: rank candidates by estimated
+// VOI, then earlier phase, then stable id. It is deterministic for one immutable
+// input and never feeds back into claim priority or intent selection.
+func shadowVoiOrder(intents []plannerIntent, hypotheses []scanctx.Hypothesis) []int {
+	order := make([]int, len(intents))
+	for i := range order {
+		order[i] = i
+	}
+	sort.SliceStable(order, func(a, b int) bool {
+		left, right := intents[order[a]], intents[order[b]]
+		lv := intentVOI(hypotheses, strings.TrimSpace(left.Target), strings.TrimSpace(left.Endpoint), left.VulnClass)
+		rv := intentVOI(hypotheses, strings.TrimSpace(right.Target), strings.TrimSpace(right.Endpoint), right.VulnClass)
+		if lv != rv {
+			return lv > rv
+		}
+		if left.Phase != right.Phase {
+			return left.Phase < right.Phase
+		}
+		lid, rid := strings.TrimSpace(left.TaskID), strings.TrimSpace(right.TaskID)
+		if lid == "" {
+			lid = fmt.Sprintf("candidate-%d", order[a]+1)
+		}
+		if rid == "" {
+			rid = fmt.Sprintf("candidate-%d", order[b]+1)
+		}
+		return lid < rid
+	})
+	return order
+}
+
+// plannerDecisionCandidates snapshots the round's proposed intents in the
+// order the model produced them. Rank is 1-based and stable for a given
+// immutable model output; it is what a later replay compares against.
+func plannerDecisionCandidates(intents []plannerIntent) []domainjournal.DecisionCandidate {
+	out := make([]domainjournal.DecisionCandidate, 0, len(intents))
+	for i, in := range intents {
+		id := strings.TrimSpace(in.TaskID)
+		if id == "" {
+			id = fmt.Sprintf("candidate-%d", i+1)
+		}
+		out = append(out, domainjournal.DecisionCandidate{
+			ID: id, Kind: "intent", Title: strings.TrimSpace(in.Title), Rank: i + 1,
+		})
+	}
+	return out
+}
+
+func decisionCandidatesWithSelection(candidates []domainjournal.DecisionCandidate, selected int) []domainjournal.DecisionCandidate {
+	out := append([]domainjournal.DecisionCandidate(nil), candidates...)
+	if selected >= 0 && selected < len(out) {
+		out[selected].Selected = true
+	}
+	return out
+}
+
+// decisionSnapshotDigest binds one decision to its immutable input snapshot:
+// the ordered candidate set, the constraints evaluated, and the selected ID.
+// Equal snapshots always produce the same digest.
+func decisionSnapshotDigest(candidates []domainjournal.DecisionCandidate, constraints []string, selected string) string {
+	payload, _ := json.Marshal(struct {
+		Candidates  []domainjournal.DecisionCandidate `json:"candidates"`
+		Constraints []string                          `json:"constraints"`
+		Selected    string                            `json:"selected"`
+	}{Candidates: candidates, Constraints: constraints, Selected: selected})
+	sum := sha256.Sum256(payload)
+	return fmt.Sprintf("%x", sum[:])
+}
+
+func (p *Planner) recordIntentDecision(in plannerIntent, taskID string, candidates []domainjournal.DecisionCandidate, shadow []int, selectedIndex int) {
+	if p == nil || p.cfg.ScanCtx == nil || p.cfg.ScanCtx.Ledger == nil {
+		return
+	}
+	constraints := []string{
+		"target=pass", "control_plane=pass", "discovery=pass",
+		"decision_basis=pass", "dependency=pass", "dedupe=pass", "capacity=pass",
+	}
+	basis := append([]string(nil), in.DecisionBasis...)
+	infoUse, noInfo := domainjournal.DecisionInfoUseUsed, ""
+	if len(basis) == 0 {
+		infoUse, noInfo = domainjournal.DecisionInfoUseNone, domainjournal.DecisionNoInfoBasisRefs
+	}
+	shadowOrder := make([]string, 0, len(shadow))
+	for _, idx := range shadow {
+		if idx < 0 || idx >= len(candidates) {
+			continue
+		}
+		id := candidates[idx].ID
+		if idx == selectedIndex {
+			id = taskID
+		}
+		shadowOrder = append(shadowOrder, id)
+	}
+	shadowChanged := len(shadow) > 0 && shadow[0] != selectedIndex
+	shadowReason := ""
+	if shadowChanged {
+		shadowReason = fmt.Sprintf("voi-first shadow policy would select %s; actual selection is %s",
+			shadowOrder[0], taskID)
+	}
+	decision := domainjournal.Decision{
+		Action:          "create_intent",
+		Actor:           "planner",
+		IntentID:        taskID,
+		BasisRefs:       basis,
+		Candidates:      candidates,
+		HardConstraints: constraints,
+		Selected:        taskID,
+		Reason:          strings.TrimSpace(in.Notes),
+		InfoUse:         infoUse,
+		NoInfoReason:    noInfo,
+		SnapshotDigest:  decisionSnapshotDigest(candidates, constraints, taskID),
+		ShadowPolicy:    "voi-first",
+		ShadowOrder:     shadowOrder,
+		ShadowChanged:   shadowChanged,
+		ShadowReason:    shadowReason,
+	}
+	if _, err := p.cfg.ScanCtx.Ledger.AppendDecision(decision, scanctx.AuditActorForAgent("planner")); err != nil {
+		log.Printf("[planner] %s: record decision for %s failed: %v", p.cfg.ScanID, taskID, err)
+	}
+}
+
+func (p *Planner) recordRetireDecision(taskID, reason string, basis []string) {
+	if p == nil || p.cfg.ScanCtx == nil || p.cfg.ScanCtx.Ledger == nil {
+		return
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "planner retirement (no reason supplied)"
+	}
+	validBasis := make([]string, 0, len(basis))
+	for _, ref := range basis {
+		if bad := p.invalidDecisionBasis([]string{ref}); bad == "" {
+			validBasis = append(validBasis, strings.TrimSpace(ref))
+		}
+	}
+	infoUse, noInfo := domainjournal.DecisionInfoUseUsed, ""
+	if len(validBasis) == 0 {
+		infoUse, noInfo = domainjournal.DecisionInfoUseNone, domainjournal.DecisionNoInfoBasisRefs
+	}
+	constraints := []string{"open_only=pass"}
+	candidates := []domainjournal.DecisionCandidate{{ID: taskID, Kind: "intent", Rank: 1, Selected: true}}
+	decision := domainjournal.Decision{
+		Action:          "retire_intent",
+		Actor:           "planner",
+		IntentID:        taskID,
+		BasisRefs:       validBasis,
+		Candidates:      candidates,
+		HardConstraints: constraints,
+		Selected:        taskID,
+		Reason:          reason,
+		InfoUse:         infoUse,
+		NoInfoReason:    noInfo,
+		SnapshotDigest:  decisionSnapshotDigest(candidates, constraints, taskID),
+	}
+	if _, err := p.cfg.ScanCtx.Ledger.AppendDecision(decision, scanctx.AuditActorForAgent("planner")); err != nil {
+		log.Printf("[planner] %s: record retire decision for %s failed: %v", p.cfg.ScanID, taskID, err)
+	}
 }
 
 // callModel makes one bounded planner LLM call with the planner tool surface.
@@ -1929,8 +2219,10 @@ func (p *Planner) callModel(msgs []llm.Message) (string, []llm.ToolCall, error) 
 	}()
 	select {
 	case r := <-done:
+		log.Printf("[planner] %s: model returned content=%dB tool_calls=%d err=%v", p.cfg.ScanID, len(r.content), len(r.calls), r.err)
 		return r.content, r.calls, r.err
 	case <-callCtx.Done():
+		log.Printf("[planner] %s: model round timed out", p.cfg.ScanID)
 		return "", nil, fmt.Errorf("round timed out")
 	}
 }
@@ -1975,9 +2267,12 @@ func plannerToolDefinitions() []llm.ToolDefinition {
 			{Name: "vuln_class"}, {Name: "phase"}, {Name: "endpoint"},
 			{Name: "task_id"}, {Name: "depends_on", Description: "Comma-separated task ids"},
 			{Name: "notes"}, {Name: "objective_ref"}, {Name: "asset_ref"}, {Name: "timebox_s"}, {Name: "decision_basis_refs", Description: "Comma-separated ledger IDs (Hypothesis/Evidence) this intent is based on; omission means low-impact necessary work."},
+			{Name: "progress_profile", Description: "Optional web|protocol|binary|multistage; controls typed progress weights/window."},
 		}},
-		{Name: "retire_intent", Description: "Retire one OPEN intent by task id.", Parameters: []llm.ToolParameter{
+		{Name: "retire_intent", Description: "Retire one OPEN intent by task id. Supply a reason (and optional decision basis refs) so the retirement is traceable.", Parameters: []llm.ToolParameter{
 			{Name: "task_id", Required: true},
+			{Name: "reason", Description: "Why the intent is retired (audited)"},
+			{Name: "decision_basis_refs", Description: "Optional comma-separated ledger IDs that justify the retirement"},
 		}},
 		{Name: "steer_work", Description: "Send a course correction to one running worker (unit_id). Prefer steer before kill.", Parameters: []llm.ToolParameter{
 			{Name: "unit_id", Required: true}, {Name: "message", Description: "What to change and why", Required: true},
@@ -2006,14 +2301,15 @@ func (p *Planner) execPlannerTool(call llm.ToolCall, addedSoFar int) (string, in
 			return fmt.Sprintf("add_intent rejected: this round already added the maximum of %d intents", p.maxIntents()), 0, 0
 		}
 		in := plannerIntent{
-			TaskID:       strings.TrimSpace(call.Args["task_id"]),
-			Title:        strings.TrimSpace(call.Args["title"]),
-			VulnClass:    strings.TrimSpace(call.Args["vuln_class"]),
-			Endpoint:     strings.TrimSpace(call.Args["endpoint"]),
-			Target:       strings.TrimSpace(call.Args["target"]),
-			TargetKind:   strings.TrimSpace(call.Args["target_kind"]),
-			Notes:        strings.TrimSpace(call.Args["notes"]),
-			ObjectiveRef: strings.TrimSpace(call.Args["objective_ref"]),
+			TaskID:          strings.TrimSpace(call.Args["task_id"]),
+			Title:           strings.TrimSpace(call.Args["title"]),
+			VulnClass:       strings.TrimSpace(call.Args["vuln_class"]),
+			Endpoint:        strings.TrimSpace(call.Args["endpoint"]),
+			Target:          strings.TrimSpace(call.Args["target"]),
+			TargetKind:      strings.TrimSpace(call.Args["target_kind"]),
+			Notes:           strings.TrimSpace(call.Args["notes"]),
+			ObjectiveRef:    strings.TrimSpace(call.Args["objective_ref"]),
+			ProgressProfile: strings.TrimSpace(call.Args["progress_profile"]),
 		}
 		for _, ref := range strings.Split(call.Args["decision_basis_refs"], ",") {
 			if ref = strings.TrimSpace(ref); ref != "" {
@@ -2037,7 +2333,15 @@ func (p *Planner) execPlannerTool(call llm.ToolCall, addedSoFar int) (string, in
 		}
 		return "intent added", added, 0
 	case "retire_intent":
-		_, retired := p.apply(plannerOutput{Retire: []string{strings.TrimSpace(call.Args["task_id"])}})
+		taskID := strings.TrimSpace(call.Args["task_id"])
+		out := plannerOutput{Retire: []string{taskID}}
+		if reason := strings.TrimSpace(call.Args["reason"]); reason != "" {
+			out.RetireReasons = map[string]string{taskID: reason}
+		}
+		if basis := parseCommaRefs(call.Args["decision_basis_refs"]); len(basis) > 0 {
+			out.RetireBasis = map[string][]string{taskID: basis}
+		}
+		_, retired := p.apply(out)
 		if retired == 0 {
 			return "retire_intent rejected (unknown or not open)", 0, 0
 		}
@@ -2170,16 +2474,28 @@ func (p *Planner) readInfoItem(id string) string {
 	if p.cfg.ScanCtx != nil && p.cfg.ScanCtx.Ledger != nil {
 		for _, h := range p.cfg.ScanCtx.Ledger.All() {
 			if h.ID == id {
-				return fmt.Sprintf("belief %s [%s] %s @ %s conf=%.2f\nnext: %s", h.ID, h.Status,
+				truncated := len([]rune(h.NextAction)) > 600
+				p.recordReadTrace(id, "belief", true, truncated, "planner belief read")
+				out := fmt.Sprintf("belief %s [%s] %s @ %s conf=%.2f\nnext: %s", h.ID, h.Status,
 					h.VulnClass, h.Endpoint, h.Confidence, truncateText(h.NextAction, 600))
+				if truncated {
+					out += "\n[truncated: missing detail is unknown, not absent]"
+				}
+				return out
 			}
 			for _, ev := range h.Evidence {
 				if ev.ID != id {
 					continue
 				}
-				return fmt.Sprintf("evidence %s (hypothesis %s, kind=%s, nature=%s)\n%s\nrequest: %s\nresponse: %s",
+				truncated := len([]rune(ev.Summary)) > 1200 || len([]rune(ev.Request)) > 1200 || len([]rune(ev.Response)) > 1200
+				p.recordReadTrace(id, "detail", true, truncated, "planner evidence read")
+				out := fmt.Sprintf("evidence %s (hypothesis %s, kind=%s, nature=%s)\n%s\nrequest: %s\nresponse: %s",
 					ev.ID, h.ID, ev.Kind, ev.Nature, truncateText(ev.Summary, 1200),
 					truncateText(ev.Request, 1200), truncateText(ev.Response, 1200))
+				if truncated {
+					out += "\n[truncated: missing detail is unknown, not absent]"
+				}
+				return out
 			}
 		}
 	}
@@ -2187,7 +2503,13 @@ func (p *Planner) readInfoItem(id string) string {
 	// resolve them before the read-model lookup (XALG010).
 	if strings.HasPrefix(id, "to_") && p.cfg.ScanCtx != nil && p.cfg.ScanCtx.ToolOutputs != nil {
 		if content, ok := p.cfg.ScanCtx.ToolOutputs.Get(id); ok {
-			return "tool_output " + id + " (archived raw output)\n" + truncateText(content, 4000)
+			truncated := len([]rune(content)) > 4000
+			p.recordReadTrace(id, "artifact", true, truncated, "planner archived-output read")
+			out := "tool_output " + id + " (archived raw output)\n" + truncateText(content, 4000)
+			if truncated {
+				out += "\n[truncated: fetch the full archive by id; missing tail is unknown, not absent]"
+			}
+			return out
 		}
 	}
 	// The planner's Information space block renders aggregate items by graph
@@ -2197,7 +2519,26 @@ func (p *Planner) readInfoItem(id string) string {
 	if block := p.readInfoSpaceItem(id); block != "" {
 		return block
 	}
+	p.recordReadTrace(id, "index", false, false, "planner read: not found")
 	return "read_info_item: not found in this run's ledger or information space"
+}
+
+// recordReadTrace makes planner information reads visible to the same trace
+// join the workers use. The planner never executes tools, but its reads still
+// change the next decision and must be attributable.
+func (p *Planner) recordReadTrace(id, layer string, found, truncated bool, reason string) {
+	if p == nil || p.cfg.ScanCtx == nil || p.cfg.ScanCtx.Ledger == nil {
+		return
+	}
+	query, _ := json.Marshal(map[string]string{"id": id, "layer": layer, "role": "planner"})
+	count := 0
+	if found {
+		count = 1
+	}
+	_ = p.cfg.ScanCtx.Ledger.AppendInfoRead(scanctx.InfoRead{
+		Tool: "read_info_item", Mode: layer, Query: string(query), RefIDs: []string{id},
+		ResultCount: count, Actor: "planner", Found: found, Truncated: truncated, Reason: reason,
+	}, scanctx.AuditActorForAgent("planner"))
 }
 
 // readInfoSpaceItem resolves one item id through the unified read model. It
@@ -2237,8 +2578,13 @@ func (p *Planner) readInfoSpaceItem(id string) string {
 		fmt.Fprintf(&b, " observed=%s", item.ObservedAt.UTC().Format(time.RFC3339))
 	}
 	b.WriteString("\npayload: ")
+	payloadTruncated := len([]rune(string(item.Payload))) > 4000
 	b.WriteString(promptrender.Cell(truncateText(string(item.Payload), 4000), 4000))
 	b.WriteString("\n")
+	if payloadTruncated {
+		b.WriteString("[truncated: missing detail is unknown, not absent]\n")
+	}
+	p.recordReadTrace(id, "detail", true, payloadTruncated, "planner info-space read")
 	return b.String()
 }
 
@@ -2261,13 +2607,16 @@ Rules:
 - Never submit, report, or fabricate evidence you did not obtain from the target.
 - Do not duplicate an existing intent (same target + class + title) or an in-flight orchestration endpoint; do not re-create a retired/completed direction without material new evidence.
 - For every intent set objective_ref to the GOAL or an OBJECTIVE criterion id it serves (for example "GOAL" or "C1"). If no criterion exists, use "GOAL".
+- Set progress_profile when the task shape is non-web: binary (artifact/analysis-heavy), protocol (packet/protocol work), multistage (serial analysis chain). Omit for ordinary web work. The engine uses it only to weight typed progress signals, never to widen authorization.
 - timebox_s is an optional per-intent execution budget in seconds (60-86400). Use a short box only for cheap checks; for exploitation lanes omit it or use a generous value — execution lanes get a floor regardless.
 - steer_work(unit_id,message) corrects one running worker; kill_work(unit_id,reason_code,reason) ends one. reason_code must be one of stagnant|repeated_failure|lane_violation|scope_violation|duplicate|superseded. Prefer steer over kill, and never kill a worker that is still producing information-layer progress.
 - When an intent follows from an observed belief/evidence, set decision_basis_refs to those ledger IDs (Hypothesis/Evidence); low-impact necessary recon may cite GOAL. Unknown refs are rejected by the engine.
+- If an intent uses NO new information (pure policy/scope maintenance), omit decision_basis_refs; the engine records no_basis_refs explicitly instead of inventing a source. Never cite an ID you did not read.
+- An information read flagged incomplete/truncated/gap is a PARTIAL view, not evidence of absence. Never plan or retire work on "nothing was found" from such a result; narrow the query or read the gap reason first.
 - read_ledger(filter=schedulable) shows the FORMAL hypotheses the scheduler may use. When one matches the goal, base the next intent on it (its claim, preconditions and falsification condition) instead of inventing a direction; coverage seeds are prompts, not claimable work.
 - Never claim a goal is met; never report a finding.
 - Return STRICT JSON only, no markdown fences:
-{"intents":[{"task_id":"optional-stable-id","title":"...","phase":6,"vuln_class":"sqli","endpoint":"/api/users","target":"https://app.example","target_kind":"web","depends_on":[],"notes":"why","objective_ref":"GOAL","timebox_s":1800}],"retire":["task-id"]}`
+{"intents":[{"task_id":"optional-stable-id","title":"...","phase":6,"vuln_class":"sqli","endpoint":"/api/users","target":"https://app.example","target_kind":"web","depends_on":[],"notes":"why","objective_ref":"GOAL","timebox_s":1800}],"retire":["task-id"],"retire_reasons":{"task-id":"why"},"retire_basis_refs":{"task-id":["H-1"]}}`
 
 // plannerBenchmarkRules is appended only when the task configures a
 // control-plane API (the benchmark/CTF harness). Engagement planning must not
@@ -2413,8 +2762,19 @@ func (p *Planner) discoveryInput(existing []graph.PlanTask) discovery.Input {
 // intents always pass. A rejected discovery proposal is logged and surfaced to
 // the run events instead of being silently dropped.
 func (p *Planner) admitDiscovery(in plannerIntent, target string, existing []graph.PlanTask) (bool, string) {
+	// The control-plane API lane is platform orchestration, never target
+	// reconnaissance: list/start/close/submit are state queries, not a port or
+	// content sweep. Classifying them by words in the notes rejected a real
+	// "GET /openapi/v1/challenges" reconcile intent as a port scan.
+	if strings.EqualFold(strings.TrimSpace(in.TargetKind), "control_plane_api") {
+		return true, ""
+	}
 	base := p.discoveryInput(existing)
-	if discovery.LooksLikePortDiscoveryIntent(in.Title, in.VulnClass, in.Notes) {
+	// Classify by the intent's DECLARED action (title + vuln_class), not by its
+	// notes. Notes routinely quote the operator's prohibitions ("do not run a
+	// port scan", "no dirbusting"), and scanning that text made the gate fire
+	// on the prohibition instead of the action.
+	if discovery.LooksLikePortDiscoveryIntent(in.Title, in.VulnClass, "") {
 		// The intent's own target must authorize the sweep; a URL elsewhere in
 		// the run never grants it.
 		if !discovery.AuthorizedHostTarget([]string{target}) {
@@ -2423,7 +2783,7 @@ func (p *Planner) admitDiscovery(in plannerIntent, target string, existing []gra
 		d := discovery.PortProposalAllowed(base)
 		return d.Owed, d.Reason
 	}
-	if discovery.LooksLikeContentDiscoveryIntent(in.Title, in.VulnClass, in.Notes) {
+	if discovery.LooksLikeContentDiscoveryIntent(in.Title, in.VulnClass, "") {
 		d := discovery.ContentDiscoveryProposalAllowed(base)
 		return d.Owed, d.Reason
 	}
@@ -2434,33 +2794,61 @@ func (p *Planner) admitDiscovery(in plannerIntent, target string, existing []gra
 // ledger hypothesis/evidence ID (or the semantic GOAL id). Empty refs are
 // allowed: low-impact necessary work is justified by the goal/policy.
 func (p *Planner) invalidDecisionBasis(refs []string) string {
-	if len(refs) == 0 || p.cfg.ScanCtx == nil || p.cfg.ScanCtx.Ledger == nil {
+	if len(refs) == 0 {
 		return ""
 	}
-	l := p.cfg.ScanCtx.Ledger
+	ledger := (*scanctx.LedgerStore)(nil)
+	if p.cfg.ScanCtx != nil {
+		ledger = p.cfg.ScanCtx.Ledger
+	}
+	criteria := map[string]bool{}
+	for _, c := range p.cfg.ObjectiveCriteria {
+		if id := strings.TrimSpace(c.ID); id != "" {
+			criteria[strings.ToUpper(id)] = true
+		}
+	}
 	for _, raw := range refs {
 		ref := strings.TrimSpace(raw)
 		if ref == "" || strings.EqualFold(ref, "GOAL") {
 			continue
 		}
-		if _, ok := l.Get(ref); ok {
+		// Objective criterion IDs are first-class decision bases.
+		if criteria[strings.ToUpper(ref)] {
 			continue
 		}
-		found := false
-		for _, h := range l.All() {
-			for _, ev := range h.Evidence {
-				if strings.EqualFold(ev.ID, ref) || strings.EqualFold(ev.InfoItemID, ref) {
-					found = true
+		// Ledger hypothesis/evidence IDs.
+		if ledger != nil {
+			if _, ok := ledger.Get(ref); ok {
+				continue
+			}
+			found := false
+			for _, h := range ledger.All() {
+				for _, ev := range h.Evidence {
+					if strings.EqualFold(ev.ID, ref) || strings.EqualFold(ev.InfoItemID, ref) {
+						found = true
+						break
+					}
+				}
+				if found {
 					break
 				}
 			}
 			if found {
-				break
+				continue
 			}
 		}
-		if !found {
-			return ref
+		// Aggregate information-space IDs are graph node IDs (INFO_AS_GRAPH_SPEC
+		// §aggregate layer). The planner overview prints them, so the model
+		// legitimately cites them as evidence for an intent.
+		if id, err := strconv.ParseInt(ref, 10, 64); err == nil && id > 0 && p.cfg.Repo != nil {
+			ctx, cancel := context.WithTimeout(p.ctx, 3*time.Second)
+			node, nerr := p.cfg.Repo.GetNode(ctx, p.cfg.ScanID, id)
+			cancel()
+			if nerr == nil && node != nil {
+				continue
+			}
 		}
+		return ref
 	}
 	return ""
 }

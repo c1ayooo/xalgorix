@@ -2863,6 +2863,12 @@ func retryAfterDelay(raw string) (time.Duration, bool) {
 // surfaces the earlier attempt so the model can cite it or change approach
 // instead of re-running the same request blindly. The journal record carries
 // both action IDs; the projection is bounded and audit-only.
+// repeatActionBudget is the number of identical target-facing attempts after
+// which the worker is told its repeat budget is exhausted. The action is not
+// force-skipped: a changed approach or a deliberate re-test remains possible,
+// but the trace and the nudge make the repeat visible instead of silent.
+const repeatActionBudget = 5
+
 func hookActionTrace(state *ScanState, args map[string]string) HookResult {
 	if state == nil {
 		return HookResult{}
@@ -2881,12 +2887,20 @@ func hookActionTrace(state *ScanState, args map[string]string) HookResult {
 	if err != nil {
 		return HookResult{}
 	}
-	if prior == nil || att.Count != 2 {
+	if prior == nil {
 		return HookResult{}
 	}
-	return HookResult{Nudge: fmt.Sprintf(
-		"🔁 REPEAT ACTION (%s, first repeat): %s. The same action already ran as %s (%s). Cite that result as evidence or change the approach; do not repeat it blindly.",
-		att.ID, summary, prior.ID, prior.Summary)}
+	if att.Count == 2 {
+		return HookResult{Nudge: fmt.Sprintf(
+			"🔁 REPEAT ACTION (%s, first repeat): %s. The same action already ran as %s (%s). Cite that result as evidence or change the approach; do not repeat it blindly.",
+			att.ID, summary, prior.ID, prior.Summary)}
+	}
+	if att.Count == repeatActionBudget {
+		return HookResult{Nudge: fmt.Sprintf(
+			"⛔ REPEAT BUDGET EXHAUSTED (%s, attempt %d): %s. This exact target-facing action has now run %d times with no new approach. Stop repeating it; either cite the existing result as evidence, change the tool/parameters/identity, or record a deviation explaining why the same action is still necessary.",
+			att.ID, att.Count, summary, att.Count)}
+	}
+	return HookResult{}
 }
 
 var actionTraceTools = map[string]bool{

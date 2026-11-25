@@ -1,6 +1,9 @@
 package agent
 
 import (
+	"context"
+	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -29,7 +32,7 @@ func toolResultMsg(name, body string) llm.Message {
 func TestBoundedContextDisabledByDefault(t *testing.T) {
 	a, sctx := newBoundedContextAgent(t, false)
 	raw := strings.Repeat("HTTP/1.1 200 OK\n", 400)
-	result := capToolOutputForLLM(raw)
+	result := capToolOutputForLLM("terminal_execute", raw)
 	msg := toolResultMsg("send_request", result)
 
 	// The flag gates every agent-side archive/stub path.
@@ -64,7 +67,7 @@ func TestBoundedContextDisabledByDefault(t *testing.T) {
 // older messages stubbed once, idempotent, unarchived messages untouched.
 func TestAgeOutToolOutputsStubsOlderMessages(t *testing.T) {
 	a, sctx := newBoundedContextAgent(t, true)
-	if a.toolArchiveActiveWindow() != 8 {
+	if a.toolArchiveActiveWindow() != 4 {
 		t.Fatalf("default window = %d", a.toolArchiveActiveWindow())
 	}
 
@@ -78,7 +81,7 @@ func TestAgeOutToolOutputsStubsOlderMessages(t *testing.T) {
 			t.Fatalf("archive failed for message %d", i)
 		}
 		ids[i] = id
-		body := capToolOutputForLLM(raw)
+		body := capToolOutputForLLM("terminal_execute", raw)
 		a.messages = append(a.messages, llm.Message{
 			Role:    "user",
 			Content: "Tool 'curl' result:\n" + body + "\n" + archiveToolResultMarker(id),
@@ -115,13 +118,13 @@ func TestAgeOutToolOutputsStubsOlderMessages(t *testing.T) {
 		}
 	}
 	// 12 archived curl messages + 1 unarchived legacy tool message = 13
-	// tool-result messages; the newest 8 (7 curl + legacy) stay verbatim, the
-	// oldest 5 curl messages are stubbed.
-	if stubbed != 5 {
-		t.Fatalf("stubbed = %d, want 5", stubbed)
+	// tool-result messages; the newest 4 (3 curl + legacy) stay verbatim, the
+	// oldest 9 curl messages are stubbed.
+	if stubbed != 9 {
+		t.Fatalf("stubbed = %d, want 9", stubbed)
 	}
-	if verbatim != 7 {
-		t.Fatalf("verbatim recent window = %d, want 7", verbatim)
+	if verbatim != 3 {
+		t.Fatalf("verbatim recent window = %d, want 3", verbatim)
 	}
 	if !strings.Contains(a.messages[len(a.messages)-1].Content, "small old result") {
 		t.Fatal("unarchived legacy message must stay verbatim")
@@ -179,6 +182,39 @@ func TestReadToolOutputRetrievesOriginal(t *testing.T) {
 	}
 }
 
+// A model-transcribed id (prefix or padding dropped) still retrieves the
+// byte-identical original; a genuinely wrong id reports the archive's extent
+// instead of merely blaming the stub.
+func TestReadToolOutputToleratesTranscribedID(t *testing.T) {
+	a, sctx := newBoundedContextAgent(t, true)
+	raw := strings.Repeat("TRANSCRIBED-ID-LINE\n", 300)
+	id := sctx.ToolOutputs.Archive("send_request", raw, 1)
+	if id == "" {
+		t.Fatal("archive failed")
+	}
+	numeric := strings.TrimPrefix(id, "to_")
+	for _, spelling := range []string{numeric, "to_" + strings.TrimLeft(numeric, "0")} {
+		res, err := a.readToolOutputTool(map[string]string{"id": spelling})
+		if err != nil {
+			t.Fatalf("Get(%q) tool error: %v", spelling, err)
+		}
+		if res.Error != "" {
+			t.Fatalf("Get(%q) result error: %s", spelling, res.Error)
+		}
+		if res.Output != raw {
+			t.Fatalf("Get(%q) returned %d bytes, want %d", spelling, len(res.Output), len(raw))
+		}
+	}
+
+	res, err := a.readToolOutputTool(map[string]string{"id": "to_999999"})
+	if err != nil {
+		t.Fatalf("tool error: %v", err)
+	}
+	if res.Error == "" || !strings.Contains(res.Error, "highest id") {
+		t.Fatalf("miss message must state the archive extent: %q", res.Error)
+	}
+}
+
 // TestArchiveMarkerPreservesToolMessageShape guarantees the annotated message
 // still parses as a tool-result message (isToolResultMessage) so compaction
 // digests, aging, and byte-metrics heuristics keep working.
@@ -195,5 +231,86 @@ func TestArchiveMarkerPreservesToolMessageShape(t *testing.T) {
 	// Marker regex tolerates longer sequences.
 	if _, ok := archiveIDFromMessage("Tool 'x' result:\nno marker here"); ok {
 		t.Fatal("unmarked message must not yield an id")
+	}
+}
+
+// TestReadToolOutputPaginates pins the paging contract that replaced the
+// archive-of-archive loop: a 27 KB listing must be readable in bounded pages,
+// each page below the per-message cap, with an explicit next call.
+func TestReadToolOutputPaginates(t *testing.T) {
+	a, sctx := newBoundedContextAgent(t, true)
+	var b strings.Builder
+	for i := 0; i < 900; i++ {
+		fmt.Fprintf(&b, `{"unique_code":"c-%03d","description":"challenge %d"},`, i, i)
+	}
+	content := b.String()
+	if len(content) < 20000 {
+		t.Fatalf("fixture too small: %d", len(content))
+	}
+	id := sctx.ToolOutputs.Archive("http_request", content, 1)
+	if id == "" {
+		t.Fatal("archive failed")
+	}
+
+	first, err := a.readToolOutputTool(map[string]string{"id": id, "limit": "12000"})
+	if err != nil || first.Error != "" {
+		t.Fatalf("first page: err=%v output=%q", err, first.Error)
+	}
+	if !strings.Contains(first.Output, "bytes 0-12000 of "+strconv.Itoa(len(content))) {
+		t.Fatalf("first page header missing: %.160q", first.Output)
+	}
+	if !strings.Contains(first.Output, content[:12000]) {
+		t.Fatal("first page did not carry the head bytes")
+	}
+	if !strings.Contains(first.Output, `offset=12000`) {
+		t.Fatal("first page did not print the next call")
+	}
+
+	second, err := a.readToolOutputTool(map[string]string{"id": id, "offset": "12000", "limit": "12000"})
+	if err != nil || second.Error != "" {
+		t.Fatalf("second page: err=%v output=%q", err, second.Error)
+	}
+	if !strings.Contains(second.Output, content[12000:24000]) {
+		t.Fatal("second page did not carry the middle bytes")
+	}
+	if strings.Contains(second.Output, "[end of output]") {
+		t.Fatal("second page ended early")
+	}
+
+	last, err := a.readToolOutputTool(map[string]string{"id": id, "offset": strconv.Itoa(len(content) - 500)})
+	if err != nil || last.Error != "" {
+		t.Fatalf("last page: err=%v output=%q", err, last.Error)
+	}
+	if !strings.Contains(last.Output, content[len(content)-500:]) {
+		t.Fatal("last page did not carry the tail bytes")
+	}
+	if !strings.Contains(last.Output, "[end of output]") {
+		t.Fatal("last page did not say it was the end")
+	}
+
+	past, err := a.readToolOutputTool(map[string]string{"id": id, "offset": strconv.Itoa(len(content) + 10)})
+	if err != nil || past.Error != "" {
+		t.Fatalf("past-end page: err=%v output=%q", err, past.Error)
+	}
+	if !strings.Contains(past.Output, "past the end") {
+		t.Fatalf("past-end page did not explain the bound: %q", past.Output)
+	}
+}
+
+// TestReadToolOutputIsNotReArchived keeps the retrieval path idempotent: the
+// page a caller requested must not be replaced by another archive stub.
+func TestReadToolOutputIsNotReArchived(t *testing.T) {
+	a, sctx := newBoundedContextAgent(t, true)
+	page := strings.Repeat("x", 12000)
+	before := sctx.ToolOutputs.Count()
+	out := (&einoObserver{agent: a}).TransformToolOutput(context.Background(), "read_tool_output", nil, page, nil, nil)
+	if sctx.ToolOutputs.Count() != before {
+		t.Fatalf("read_tool_output was archived again: %d -> %d", before, sctx.ToolOutputs.Count())
+	}
+	if strings.Contains(out, archiveMarkerPrefix) {
+		t.Fatal("read_tool_output page was replaced by an archive marker")
+	}
+	if !strings.Contains(out, page) {
+		t.Fatal("read_tool_output page content was not delivered")
 	}
 }

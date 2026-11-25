@@ -239,6 +239,17 @@ type DecisionCandidate struct {
 	RejectedBy string  `json:"rejected_by,omitempty"`
 }
 
+// Stable information-use categories. They keep "the decision used information"
+// and "the decision explicitly used none" machine-checkable instead of prose.
+const (
+	DecisionInfoUseUsed = "used"
+	DecisionInfoUseNone = "none"
+
+	DecisionNoInfoBasisRefs    = "no_basis_refs"
+	DecisionNoInfoOperator     = "operator_decision"
+	DecisionNoInfoEnginePolicy = "engine_policy"
+)
+
 // Decision is the structured snapshot of one material planning or control
 // decision. It is an audit projection: the graph/plan remains authoritative.
 //
@@ -260,6 +271,13 @@ type Decision struct {
 	InfoUse         string              `json:"info_use,omitempty"`
 	NoInfoReason    string              `json:"no_info_reason,omitempty"`
 	SnapshotDigest  string              `json:"snapshot_digest,omitempty"`
+	// ShadowPolicy/ShadowOrder record a counterfactual ranking without
+	// controlling execution. ShadowChanged says the shadow policy's top choice
+	// differed from the actual selection; the plan is never rewritten from it.
+	ShadowPolicy  string   `json:"shadow_policy,omitempty"`
+	ShadowOrder   []string `json:"shadow_order,omitempty"`
+	ShadowChanged bool     `json:"shadow_changed,omitempty"`
+	ShadowReason  string   `json:"shadow_reason,omitempty"`
 }
 
 // Record is one durable domain event. Sequence is per scan and assigned by the

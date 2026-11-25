@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/c1ayooo/xalgorix/v4/internal/graph"
 	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
@@ -143,5 +144,80 @@ func TestPlannerStillAdmitsNormalTestingIntent(t *testing.T) {
 	}}})
 	if added != 1 {
 		t.Fatalf("a normal testing intent must never be gated by discovery policy, added=%d", added)
+	}
+}
+
+func TestEmptyPlanOnEmptyFrontierDoesNotDrain(t *testing.T) {
+	store := graph.NewMemoryStore()
+	p := &Planner{cfg: PlannerConfig{ScanID: "floor", Repo: store}, ctx: context.Background()}
+	p.noteEmptyPlan()
+	if p.planRounds.Load() != 0 {
+		t.Fatal("an empty plan on an empty frontier must keep retrying, not count as a drained plan")
+	}
+	// With work in the frontier, an empty plan is a legal decision.
+	if _, err := p.cfg.Repo.UpsertNode(context.Background(), graph.NodeInput{
+		ScanID: "floor", Kind: graph.KindIntent, UnitKey: "i-1", State: graph.StateOpen,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	p.noteEmptyPlan()
+	if p.planRounds.Load() != 1 {
+		t.Fatal("an empty plan with open work is a valid decision")
+	}
+}
+
+// TestPlannerControlPlaneAPIIntentBypassesDiscovery pins the round-7 failure:
+// a control-plane reconcile intent ("GET /openapi/v1/challenges") was rejected
+// as a port sweep because its notes quoted the operator's "no port scanning"
+// rule. The API lane is orchestration, not target recon.
+func TestPlannerControlPlaneAPIIntentBypassesDiscovery(t *testing.T) {
+	p := discoveryPlanner(t, PlannerConfig{
+		ScanID: "cp-api", NoiseProfile: "balanced", Target: "https://bench.example.com",
+		ControlPlaneHosts: []string{"bench.example.com"},
+	}, nil)
+	in := plannerIntent{
+		Title:      "列题：GET /openapi/v1/challenges（BENCHMARK_TOKEN 鉴权）",
+		Target:     "https://bench.example.com",
+		TargetKind: "control_plane_api",
+		Endpoint:   "/openapi/v1/challenges",
+		Notes:      "平台域名只用于 API 调用；禁止端口扫描、目录爆破与爬虫。",
+		Phase:      1,
+	}
+	if ok, reason := p.admitDiscovery(in, in.Target, nil); !ok {
+		t.Fatalf("control-plane API read must be admitted, reason=%q", reason)
+	}
+}
+
+// TestPlannerIgnoresDiscoveryWordsQuotedInNotes proves classification uses the
+// declared action (title + vuln_class), not notes that quote prohibitions.
+func TestPlannerIgnoresDiscoveryWordsQuotedInNotes(t *testing.T) {
+	p := discoveryPlanner(t, PlannerConfig{
+		ScanID: "notes-quote", NoiseProfile: "balanced", Target: "https://app.example.com",
+	}, nil)
+	in := plannerIntent{
+		Title:    "列题：GET /openapi/v1/challenges",
+		Target:   "https://app.example.com",
+		Endpoint: "/openapi/v1/challenges",
+		Notes:    "操作者要求：禁止端口扫描与目录爆破，只允许 API 调用。",
+		Phase:    1,
+	}
+	if ok, reason := p.admitDiscovery(in, in.Target, nil); !ok {
+		t.Fatalf("an intent whose notes quote a prohibition must not be gated as discovery, reason=%q", reason)
+	}
+}
+
+// TestPlannerSettleGap pins the settle-triggered cadence: routine wakes are
+// spaced by plannerMinModelGap, while the first round and urgent triggers do
+// not wait.
+func TestPlannerSettleGap(t *testing.T) {
+	now := time.Now()
+	if got := plannerSettleGap(time.Time{}, now); got != 0 {
+		t.Fatalf("first round must not wait: %v", got)
+	}
+	if got := plannerSettleGap(now.Add(-30*time.Second), now); got != time.Minute {
+		t.Fatalf("30s after a round, wait = %v, want 60s", got)
+	}
+	if got := plannerSettleGap(now.Add(-2*time.Minute), now); got != 0 {
+		t.Fatalf("stale round must not wait: %v", got)
 	}
 }

@@ -104,3 +104,37 @@ func TestScanContextEnsureSubmitGuard(t *testing.T) {
 		t.Fatal("nil context must not allocate")
 	}
 }
+
+// TestSubmitGuardLearnsBareChallengeListing pins the production bug: the
+// platform's /challenges payload is a bare JSON array, so the old keyword gate
+// never learned the catalog and real codes were refused as "not in this
+// round's challenge catalog".
+func TestSubmitGuardLearnsBareChallengeListing(t *testing.T) {
+	g := NewSubmitGuard()
+	g.Observe(`[{"unique_code":"e1-01","difficulty":"medium","total_score":250,"flag_count":1,"correct_flag_count":0,"is_completed":false,"container_status":"stopped","container_addr":[]},` +
+		`{"unique_code":"f1-04","difficulty":"easy","total_score":100,"flag_count":1,"correct_flag_count":0,"is_completed":false,"container_status":"stopped","container_addr":[]},` +
+		`{"unique_code":"c-08","difficulty":"medium","total_score":300,"flag_count":1,"correct_flag_count":0,"is_completed":false,"container_status":"stopped","container_addr":[]}]`)
+	if got := g.CatalogSize(); got != 3 {
+		t.Fatalf("catalog size = %d, want 3", got)
+	}
+	for _, code := range []string{"e1-01", "f1-04", "c-08"} {
+		if !g.CatalogContains(code) {
+			t.Fatalf("catalog missing %s", code)
+		}
+	}
+}
+
+// TestSubmitGuardLearnsStartAcknowledgement keeps lifecycle replies
+// authoritative even when no full listing was observed: a start/close response
+// naming a unique_code proves the code exists in this round.
+func TestSubmitGuardLearnsStartAcknowledgement(t *testing.T) {
+	g := NewSubmitGuard()
+	g.Observe(`{"unique_code":"h-10","container_addr":["10.0.189.10:8443"]}`)
+	if !g.CatalogContains("h-10") {
+		t.Fatal("start acknowledgement did not teach h-10")
+	}
+	g.Observe(`{"unique_code":"c-99","error":"boom"}`)
+	if g.CatalogContains("c-99") {
+		t.Fatal("plain echo taught an unacknowledged code")
+	}
+}

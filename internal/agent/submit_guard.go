@@ -46,9 +46,15 @@ const (
 )
 
 // platformCall is the parsed shape of a platform-API call.
+//
+// Codes and Flags are kept apart on purpose: a challenge code must be checked
+// against the platform's catalog, while a submitted flag value must be checked
+// against this run's observed output. Mixing them made every literal flag fail
+// the catalog test ("flag{...} is not in this round's challenge catalog").
 type platformCall struct {
 	Kind  platformCallKind
 	Codes []string
+	Flags []string
 	Loop  bool
 	Host  string
 }
@@ -69,6 +75,11 @@ var (
 	// `_`/`-` count as separators so `dummy_flag` and `flag{r6c_probe}` match
 	// while an ordinary word inside a longer token does not.
 	submitProbeRE = regexp.MustCompile(`(?i)(?:^|[^a-z0-9])(?:probe|dummy|placeholder|contract_probe|reconcile_probe|test_?flag|fake|example)(?:$|[^a-z0-9])`)
+	// submitValueRE matches the flag field's value in a JSON body or a query /
+	// form string, including non-flag-shaped values (so `dummy_flag` can be
+	// rejected as a probe instead of being silently ignored).
+	submitValueRE = regexp.MustCompile(`(?i)"flag"\s*:\s*"([^"]{1,200})"`)
+	submitQueryRE = regexp.MustCompile(`(?i)[?&]flag=([^&\s]{1,200})`)
 	// submitAcceptedRE matches a platform acceptance response.
 	submitAcceptedRE = regexp.MustCompile(`(?i)"correct"\s*:\s*true|\bcorrect\b\s*[:=]\s*true|already\s+(?:solved|passed|completed)|flag\s+is\s+correct|提交成功|答案正确`)
 )
@@ -145,35 +156,46 @@ func parsePlatformCall(text string) (platformCall, bool) {
 	case strings.Contains(tail, "/close"):
 		call.Kind = platformCallClose
 	}
-	call.Codes = platformCallCodes(text)
+	call.Codes, call.Flags = platformCallValues(text)
 	call.Loop = submitLoopRE.MatchString(text) ||
 		strings.Count(lower, "/challenges/submit") > 1
 	return call, true
 }
 
-// platformCallCodes extracts the candidate flag / unique_code values in
-// priority order: flags, explicit codes, then bare UUIDs.
-func platformCallCodes(text string) []string {
+// platformCallValues extracts challenge codes and submitted flag values.
+// Codes are unique_code/challenge_id arguments; flags are flag-shaped strings
+// and bare UUIDs. A code argument whose value is itself flag-shaped is treated
+// as a flag, never as a code (the platform never names a challenge `flag{...}`).
+func platformCallValues(text string) (codes, flags []string) {
 	seen := make(map[string]bool)
-	var out []string
-	add := func(v string) {
+	add := func(dst *[]string, v string) {
 		v = strings.Trim(strings.TrimSpace(v), `"'`)
 		if v == "" || seen[v] {
 			return
 		}
 		seen[v] = true
-		out = append(out, v)
+		*dst = append(*dst, v)
 	}
 	for _, m := range submitFlagRE.FindAllString(text, -1) {
-		add(m)
-	}
-	for _, m := range submitCodeRE.FindAllStringSubmatch(text, -1) {
-		add(m[1])
+		add(&flags, m)
 	}
 	for _, m := range submitUUIDRE.FindAllString(text, -1) {
-		add(m)
+		add(&flags, m)
 	}
-	return out
+	for _, m := range submitCodeRE.FindAllStringSubmatch(text, -1) {
+		if submitFlagRE.MatchString(m[1]) {
+			add(&flags, m[1])
+			continue
+		}
+		add(&codes, m[1])
+	}
+	for _, m := range submitValueRE.FindAllStringSubmatch(text, -1) {
+		add(&flags, m[1])
+	}
+	for _, m := range submitQueryRE.FindAllStringSubmatch(text, -1) {
+		add(&flags, m[1])
+	}
+	return codes, flags
 }
 
 // platformURLHost extracts the hostname from a URL argument. A scheme-less
@@ -237,35 +259,51 @@ func (a *Agent) shouldBlockForPlatformDiscipline(toolName string, args map[strin
 		return false, ""
 	}
 	if len(call.Codes) == 0 {
-		return true, "submit without a parseable unique_code: name the challenge's unique_code (or its flag) exactly as the platform printed it."
+		if len(call.Flags) == 0 {
+			return true, "submit without a parseable unique_code: name the challenge's unique_code (or its flag) exactly as the platform printed it."
+		}
+		return true, "submit names a flag but no unique_code: include the challenge's unique_code exactly as the platform printed it."
 	}
 	guard := a.submitGuard()
 	if guard == nil {
 		return false, ""
 	}
-	for _, code := range call.Codes {
-		if submitProbeRE.MatchString(code) {
+	all := make([]string, 0, len(call.Codes)+len(call.Flags))
+	all = append(all, call.Codes...)
+	all = append(all, call.Flags...)
+	for _, value := range all {
+		if submitProbeRE.MatchString(value) {
 			return true, fmt.Sprintf(
 				"%q is a probe/placeholder value, not a flag the target produced. Never submit probe, dummy or example values; "+
-					"they return an error and burn the submit budget.", code,
+					"they return an error and burn the submit budget.", value,
 			)
 		}
-		observed := guard.Observed(code)
-		inCatalog := guard.CatalogContains(code)
-		if !observed && !inCatalog {
-			return true, fmt.Sprintf(
-				"%q was not observed anywhere in this run's tool output. Submitting a value recalled from notes, memory or a previous run "+
-					"is a recollection bypass: only submit a flag this run actually read from the target (or a unique_code the platform listed).",
-				code,
-			)
-		}
-		if guard.CatalogSize() > 0 && !inCatalog {
+	}
+	// A challenge code is validated against the platform's own listing. When
+	// no listing was observed there is nothing to compare against, so the code
+	// is allowed and the platform's 404 decides: refusing legitimate codes
+	// whenever the listing fetch failed costs more than it protects.
+	for _, code := range call.Codes {
+		if guard.CatalogSize() > 0 && !guard.CatalogContains(code) {
 			return true, fmt.Sprintf(
 				"%q is not in this round's challenge catalog (%d codes observed from /challenges). "+
 					"Submit only codes the platform listed; invented ids such as bare words or out-of-range suffixes are refused.",
 				code, guard.CatalogSize(),
 			)
 		}
+	}
+	// A flag value must have been printed by a tool in this run. The catalog is
+	// about challenge codes, never about flag strings.
+	for _, flag := range call.Flags {
+		if !guard.Observed(flag) {
+			return true, fmt.Sprintf(
+				"%q was not observed anywhere in this run's tool output. Submitting a value recalled from notes, memory or a previous run "+
+					"is a recollection bypass: only submit a flag this run actually read from the target.",
+				flag,
+			)
+		}
+	}
+	for _, code := range call.Codes {
 		if verdict := guard.Reserve(code, time.Now()); !verdict.Allowed {
 			return true, verdict.Reason
 		}

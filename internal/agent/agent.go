@@ -3149,6 +3149,14 @@ func (a *Agent) overBudget(toolCallsTotal int) (bool, string) {
 			return true, fmt.Sprintf("%d tokens ≥ cap %d", total, a.cfg.MaxTokens)
 		}
 	}
+	// Per-worker cap: one delegated lane must not burn the whole scan budget
+	// retrying a dead or wrong target. Uses this agent's own client counter,
+	// not the scan-wide total, so a productive sibling is unaffected.
+	if a.cfg.MaxWorkerTokens > 0 && a.client != nil && strings.TrimSpace(a.delegatedAgentID) != "" {
+		if _, _, used := a.client.GetTokens(); used >= a.cfg.MaxWorkerTokens {
+			return true, fmt.Sprintf("worker tokens %d ≥ cap %d", used, a.cfg.MaxWorkerTokens)
+		}
+	}
 	return false, ""
 }
 

@@ -132,3 +132,19 @@ func TestDigestPreservesAuthoritativeIDs(t *testing.T) {
 		t.Fatal("coverage advisory must not be promoted into the digest")
 	}
 }
+
+func TestRepeatedActionBudgetIsSurfaced(t *testing.T) {
+	_, state := newTestCtxState(t)
+	args := map[string]string{
+		"tool_name": "http_request", "url": "https://app.test/api/orders?id=1",
+		"method": "GET", "output": "HTTP/1.1 403 Forbidden",
+	}
+	for i := 0; i < repeatActionBudget; i++ {
+		res := hookActionTrace(state, args)
+		if i+1 == repeatActionBudget {
+			if !strings.Contains(res.Nudge, "REPEAT BUDGET EXHAUSTED") {
+				t.Fatalf("budget nudge = %q", res.Nudge)
+			}
+		}
+	}
+}

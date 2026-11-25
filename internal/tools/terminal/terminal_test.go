@@ -588,3 +588,27 @@ func TestRunShellAppliesPythonMemoryGuardEndToEnd(t *testing.T) {
 		t.Fatalf("terminal python did not inherit the 256MB guard: %q", out)
 	}
 }
+
+func TestExecuteMissingCommandReportsCapabilityMissing(t *testing.T) {
+	sc := scanctx.New("term-capability-missing", t.TempDir())
+	scanctx.Activate(sc)
+	t.Cleanup(func() {
+		CleanupContext(sc.ID)
+		scanctx.Deactivate(sc.ID)
+	})
+	res, err := executeCommandWithContextID(sc.ID, map[string]string{
+		"command": "xalgorix_missing_tool_xyz --version",
+	})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if res.Metadata["capability_missing"] != "xalgorix_missing_tool_xyz" {
+		t.Fatalf("metadata = %+v output=%s", res.Metadata, res.Output)
+	}
+	if !strings.Contains(res.Output, "capability_missing") {
+		t.Fatalf("output = %s", res.Output)
+	}
+	if res.Error != "" {
+		t.Fatalf("capability gap must not be a tool error: %q", res.Error)
+	}
+}

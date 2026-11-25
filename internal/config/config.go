@@ -426,6 +426,12 @@ type Config struct {
 	MaxToolCalls   int
 	MaxDurationSec int
 	MaxTokens      int
+	// MaxWorkerTokens bounds one delegated worker's own LLM spend
+	// (XALGORIX_MAX_WORKER_TOKENS). 0 = unlimited. A worker that reaches the
+	// cap stops with a partial/resumable result instead of retrying a dead
+	// target until the global budget is gone. Root agents are never capped by
+	// this field (only MaxTokens applies to them).
+	MaxWorkerTokens int
 	// MaxNonProgressSec bounds active time without validated assessment evidence.
 	// XALGORIX_MAX_NON_PROGRESS defaults to one hour; 0 disables this clock.
 	MaxNonProgressSec int
@@ -760,6 +766,7 @@ func load() *Config {
 		MaxToolCalls:                envOrInt("XALGORIX_MAX_TOOL_CALLS", 0),
 		MaxDurationSec:              envOrInt("XALGORIX_MAX_DURATION", 0),
 		MaxTokens:                   envOrInt("XALGORIX_MAX_TOKENS", 0),
+		MaxWorkerTokens:             envOrInt("XALGORIX_MAX_WORKER_TOKENS", 0),
 		MaxNonProgressSec:           envOrInt("XALGORIX_MAX_NON_PROGRESS", 3600),
 		PlanCompleteFindingIdle:     envOrInt("XALGORIX_PLAN_COMPLETE_IDLE", 0),
 

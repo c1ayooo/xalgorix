@@ -11,12 +11,12 @@ import (
 // (observed on app.joinhomebase.com).
 func TestCapToolOutputForLLM(t *testing.T) {
 	small := "endpoints:\n/graphql\n/api/v5/users"
-	if got := capToolOutputForLLM(small); got != small {
+	if got := capToolOutputForLLM("terminal_execute", small); got != small {
 		t.Errorf("small output should pass through unchanged, got %q", got)
 	}
 
 	big := strings.Repeat("A", 40000) + "TAIL_MARKER"
-	got := capToolOutputForLLM(big)
+	got := capToolOutputForLLM("terminal_execute", big)
 	if len(got) >= len(big) {
 		t.Fatalf("large output was not capped: in=%d out=%d", len(big), len(got))
 	}
@@ -31,6 +31,15 @@ func TestCapToolOutputForLLM(t *testing.T) {
 	}
 	if !strings.HasSuffix(got, "TAIL_MARKER") {
 		t.Error("capped output should keep the tail")
+	}
+
+	// Compact/list tools get the smaller cap.
+	compact := capToolOutputForLLM("read_ledger", big)
+	if len(compact) > maxToolResultCompactBytes+500 {
+		t.Errorf("compact output too large: %d bytes", len(compact))
+	}
+	if len(compact) >= len(got) {
+		t.Errorf("compact cap (%d) must be smaller than the artifact cap (%d)", len(compact), len(got))
 	}
 }
 

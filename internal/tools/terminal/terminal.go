@@ -1425,6 +1425,7 @@ func executeCommandWithContextIDContext(ctx context.Context, contextID string, a
 
 	// If it still fails with "command not found", try one more install+retry.
 	// This catches tools not in extractCommands' list (e.g. piped commands).
+	missingCapability := ""
 	if exitCode == 127 || isCommandNotFound(output) {
 		missingCmd := extractMissingCommand(output)
 		if missingCmd != "" {
@@ -1439,6 +1440,10 @@ func executeCommandWithContextIDContext(ctx context.Context, contextID string, a
 				}
 				return tools.Result{Output: combined}, nil
 			}
+			// No package mapping: this is an execution-plane capability gap, not
+			// a bad model action. Report it as such without tripping the tool
+			// circuit breaker.
+			missingCapability = missingCmd
 		}
 	}
 
@@ -1446,13 +1451,21 @@ func executeCommandWithContextIDContext(ctx context.Context, contextID string, a
 	if len(preInstalled) > 0 {
 		output = fmt.Sprintf("[pre-installed: %s]\n%s", strings.Join(preInstalled, ", "), output)
 	}
+	var result tools.Result
+	if missingCapability != "" {
+		output += fmt.Sprintf("\n[capability_missing: %s is not installed in this execution plane and no package mapping is available]", missingCapability)
+		result.Metadata = map[string]any{
+			"capability_missing": missingCapability,
+			"capability_reason":  "command_not_found",
+		}
+	}
 
 	// Engine-side observation capture: if this output proves a sensitive
 	// artifact is served or leaks credential material, record it now instead
 	// of hoping the model calls add_hypothesis_evidence later.
 	observeSensitiveOutput(contextID, command, output)
-
-	return tools.Result{Output: output}, nil
+	result.Output = output
+	return result, nil
 }
 
 func ensureVenv(parent context.Context) {

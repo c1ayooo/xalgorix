@@ -23,7 +23,8 @@ func (a *Agent) registerInfoTools(reg *tools.Registry) {
 			"source=auto (default) reads the exploration graph aggregates + InfoItem atoms when the " +
 			"graph authority is available, and falls back to the cold-path InfoItem reader otherwise. " +
 			"layer=aggregate|atom narrows the result. Results are annotated context, NOT finding proof: " +
-			"never justify a vulnerability without the normal evidence and report gates.",
+			"never justify a vulnerability without the normal evidence and report gates. " +
+			"A result flagged incomplete/truncated/gap is a partial view, not proof of absence: do not treat it as a complete empty result.",
 		Parameters: []tools.Parameter{
 			{Name: "mode", Description: "One of: region, association, context.", Required: true},
 			{Name: "source", Description: "Optional auto (default), graph, or info (cold path only).", Required: false},
@@ -44,11 +45,19 @@ func (a *Agent) registerInfoTools(reg *tools.Registry) {
 	})
 }
 
-func (a *Agent) searchInfoTool(args map[string]string) (tools.Result, error) {
+func (a *Agent) searchInfoTool(args map[string]string) (res tools.Result, err error) {
+	mode := strings.ToLower(strings.TrimSpace(args["mode"]))
+	source := strings.ToLower(strings.TrimSpace(args["source"]))
+	if source == "" {
+		source = "auto"
+	}
+	// Record AFTER the read: an incomplete/truncated/failed query must never be
+	// logged as a complete empty result, and the flags are only known once the
+	// reader has returned.
+	defer func() { a.recordInfoSearch(mode, source, args, res) }()
 	if a.scanCtx == nil || strings.TrimSpace(a.scanCtx.ID) == "" {
 		return tools.Result{Error: "info search requires a scan context"}, nil
 	}
-	mode := strings.ToLower(strings.TrimSpace(args["mode"]))
 	limit, err := parseInfoLimit(args["limit"])
 	if err != nil {
 		return tools.Result{Error: err.Error()}, nil
@@ -68,10 +77,6 @@ func (a *Agent) searchInfoTool(args map[string]string) (tools.Result, error) {
 	until, err := parseInfoTime(args["until"])
 	if err != nil {
 		return tools.Result{Error: "until: " + err.Error()}, nil
-	}
-	source := strings.ToLower(strings.TrimSpace(args["source"]))
-	if source == "" {
-		source = "auto"
 	}
 	layer := infospace.Layer(strings.ToLower(strings.TrimSpace(args["layer"])))
 	if layer == "all" {
@@ -97,12 +102,6 @@ func (a *Agent) searchInfoTool(args map[string]string) (tools.Result, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-
-	// R3: record the query itself (mode + refs) before execution. Result-level
-	// truncation/incomplete flags are carried by the tool output; the trace
-	// records that the read happened and against which IDs.
-	a.recordInfoRead("search_info", mode, parsePreconditions(args["ids"]), true, false, false,
-		"subject="+strings.TrimSpace(args["subject"])+" purpose="+strings.TrimSpace(args["purpose"]))
 
 	switch mode {
 	case "region":
@@ -188,6 +187,51 @@ func (a *Agent) searchInfoTool(args map[string]string) (tools.Result, error) {
 	}
 }
 
+// recordInfoSearch is the deferred trace write for search_info. It records the
+// actual result shape; an error or incomplete/truncated flag means the query
+// was NOT a complete empty result.
+func (a *Agent) recordInfoSearch(mode, source string, args map[string]string, res tools.Result) {
+	if a == nil || a.scanCtx == nil || a.scanCtx.Ledger == nil {
+		return
+	}
+	count := 0
+	if v, ok := res.Metadata["count"].(int); ok {
+		count = v
+	}
+	truncated, _ := res.Metadata["truncated"].(bool)
+	incomplete, _ := res.Metadata["incomplete"].(bool)
+	reason := "search completed"
+	if msg := strings.TrimSpace(res.Error); msg != "" {
+		incomplete = true
+		reason = "search failed: " + msg
+	} else if incomplete || truncated {
+		reason = "search returned a partial result; absence is not proven"
+	} else if len(res.Metadata) == 0 && strings.Contains(res.Output, "disabled") {
+		// Reader disabled is unavailable, not an empty result.
+		incomplete = true
+		reason = "information space unavailable"
+	}
+	a.recordInfoRead("search_info", mode, infoSearchQueryJSON(args, source),
+		parsePreconditions(args["ids"]), count, count > 0, truncated, incomplete, reason)
+}
+
+func infoSearchQueryJSON(args map[string]string, source string) string {
+	q := map[string]any{"source": source}
+	for _, key := range []string{
+		"mode", "layer", "subject", "subject_kind", "purpose", "nature",
+		"context", "edge_types", "max_depth", "limit", "since", "until",
+	} {
+		if v := strings.TrimSpace(args[key]); v != "" {
+			q[key] = v
+		}
+	}
+	if ids := parsePreconditions(args["ids"]); len(ids) > 0 {
+		q["ids"] = ids
+	}
+	b, _ := json.Marshal(q)
+	return string(b)
+}
+
 func parseInfoLimit(raw string) (int, error) {
 	if strings.TrimSpace(raw) == "" {
 		return 20, nil
@@ -248,6 +292,10 @@ func infoResult(mode string, items []infoitem.Item, truncated, incomplete bool, 
 		b.WriteString("\n")
 	}
 	b.WriteString("Reminder: InfoItems are annotated context, not finding proof. Verdicts remain with the Verifier and report pipeline.")
+	if truncated || incomplete {
+		b.WriteString("\nPARTIAL RESULT: this query did not return a complete view (truncated/incomplete/gap). " +
+			"Do not treat it as proof that no matching information exists; narrow the query or read the gap reason before deciding.")
+	}
 	return tools.Result{
 		Output: b.String(),
 		Metadata: map[string]any{
@@ -390,6 +438,10 @@ func infoSpaceResult(mode string, items []infospace.Item, truncated, incomplete 
 		b.WriteString("\n")
 	}
 	b.WriteString("Reminder: the information space is annotated context, not finding proof. Verdicts remain with the Verifier and report pipeline.")
+	if truncated || incomplete {
+		b.WriteString("\nPARTIAL RESULT: this query did not return a complete view (truncated/incomplete/gap). " +
+			"Do not treat it as proof that no matching information exists; narrow the query or read the gap reason before deciding.")
+	}
 	return tools.Result{
 		Output: b.String(),
 		Metadata: map[string]any{

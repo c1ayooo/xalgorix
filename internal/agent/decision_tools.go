@@ -12,9 +12,12 @@ package agent
 
 import (
 	"fmt"
+	"log"
 	"strings"
 
+	"github.com/c1ayooo/xalgorix/v4/internal/domainjournal"
 	"github.com/c1ayooo/xalgorix/v4/internal/graph"
+	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
 )
 
 const (
@@ -85,6 +88,16 @@ func (a *Agent) ReprioritizeIntent(unitID string, priority int, reason string) e
 	if err := repo.UpdateNode(ctx, scanID, target.NodeID, payload, priority); err != nil {
 		return err
 	}
+	a.recordDecision(domainjournal.Decision{
+		Action:          "reprioritize_intent",
+		IntentID:        unitID,
+		Candidates:      []domainjournal.DecisionCandidate{{ID: unitID, Kind: "intent", Rank: 1, Selected: true}},
+		HardConstraints: []string{"priority_range=pass"},
+		Selected:        unitID,
+		Reason:          strings.TrimSpace(reason),
+		InfoUse:         domainjournal.DecisionInfoUseNone,
+		NoInfoReason:    domainjournal.DecisionNoInfoOperator,
+	}, "human")
 	meta := map[string]any{
 		"actor":    "human",
 		"action":   "reprioritize_intent",
@@ -96,4 +109,26 @@ func (a *Agent) ReprioritizeIntent(unitID string, priority int, reason string) e
 	}
 	a.emit(Event{Type: "plan_updated", Content: "human reprioritize: " + unitID, Meta: meta})
 	return nil
+}
+
+// recordDecision appends one structured decision to the scan's audit journal.
+// It is best-effort for the caller's primary action (the plan transition has
+// already committed), but a write failure is logged instead of silently
+// claiming the decision was traced.
+func (a *Agent) recordDecision(d domainjournal.Decision, actor string) {
+	if a == nil || a.scanCtx == nil || a.scanCtx.Ledger == nil {
+		return
+	}
+	if strings.TrimSpace(d.Actor) == "" {
+		d.Actor = strings.TrimSpace(actor)
+	}
+	if strings.TrimSpace(d.InfoUse) == "" {
+		d.InfoUse = domainjournal.DecisionInfoUseNone
+	}
+	if strings.TrimSpace(d.NoInfoReason) == "" {
+		d.NoInfoReason = domainjournal.DecisionNoInfoOperator
+	}
+	if _, err := a.scanCtx.Ledger.AppendDecision(d, scanctx.AuditActorForAgent(actor)); err != nil {
+		log.Printf("[agent] record decision %s failed: %v", d.Action, err)
+	}
 }

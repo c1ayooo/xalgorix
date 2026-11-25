@@ -1,0 +1,11 @@
+services:
+  r6-lab:
+    build: .
+    container_name: xalgorix-r6-lab
+    ports:
+      - "127.0.0.1:18080:18080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18080/').read()"]
+      interval: 3s
+      timeout: 2s
+      retries: 20

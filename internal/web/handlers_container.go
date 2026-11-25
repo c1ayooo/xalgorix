@@ -57,11 +57,12 @@ type containerDesiredProjection struct {
 }
 
 type containerToolsProjection struct {
-	Available bool                  `json:"available"`
-	Profile   string                `json:"profile,omitempty"`
-	Source    string                `json:"source,omitempty"`
-	Reason    string                `json:"reason,omitempty"`
-	Items     []toolrt.ToolpackTool `json:"items,omitempty"`
+	Available    bool                      `json:"available"`
+	Profile      string                    `json:"profile,omitempty"`
+	Source       string                    `json:"source,omitempty"`
+	Reason       string                    `json:"reason,omitempty"`
+	Items        []toolrt.ToolpackTool     `json:"items,omitempty"`
+	Capabilities []toolrt.CapabilityReport `json:"capabilities,omitempty"`
 }
 
 type instanceContainerDetailResponse struct {
@@ -284,6 +285,7 @@ func (s *Server) handleInstanceContainer(w http.ResponseWriter, r *http.Request,
 			resp.Tools.Available = true
 			resp.Tools.Source = toolrt.MountToolpack
 			resp.Tools.Items = pack.ToolsForProfile(profile)
+			resp.Tools.Capabilities = pack.CapabilityReports()
 		}
 	}
 	writeJSONStatus(w, http.StatusOK, resp)

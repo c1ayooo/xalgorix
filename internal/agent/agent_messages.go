@@ -24,14 +24,41 @@ import (
 // parts of most outputs) and drop the middle, telling the model to re-extract
 // what it needs with grep/head/jq. On-disk files written by the tool are
 // untouched, so subdomain collection etc. still see the full data.
-const maxToolResultBytes = 16000
+const (
+	// maxToolResultBytes keeps evidence-bearing output (HTTP exchanges,
+	// terminal/file reads, archived pages) readable in one turn.
+	maxToolResultBytes = 16000
+	// maxToolResultCompactBytes caps list/query tools (notes, ledger, info,
+	// request indexes). These outputs are re-sent every turn and rarely need
+	// more than a page; 8 KB keeps the context smaller without hiding evidence.
+	maxToolResultCompactBytes = 8000
+)
 
-func capToolOutputForLLM(output string) string {
-	if len(output) <= maxToolResultBytes {
+// artifactTool reports whether a tool's output is primary evidence that should
+// keep the larger cap. Everything else is treated as a compact/list result.
+func artifactTool(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "http_request", "send_request", "terminal_execute", "python_action",
+		"read_tool_output", "read_file", "download_file", "browser_action":
+		return true
+	}
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(name)), "browser_")
+}
+
+func capToolOutputForLLM(toolName, output string) string {
+	limit := maxToolResultCompactBytes
+	if artifactTool(toolName) {
+		limit = maxToolResultBytes
+	}
+	return capToolOutputTo(output, limit)
+}
+
+func capToolOutputTo(output string, limit int) string {
+	if limit <= 0 || len(output) <= limit {
 		return output
 	}
-	const headBytes = 12000
-	const tailBytes = 3000
+	headBytes := limit * 3 / 4
+	tailBytes := limit - headBytes
 	head := output[:headBytes]
 	tail := output[len(output)-tailBytes:]
 	return fmt.Sprintf(
@@ -42,7 +69,7 @@ func capToolOutputForLLM(output string) string {
 
 // formatToolResult formats tool execution results with helpful suggestions
 func formatToolResult(toolName string, result tools.Result) string {
-	output := capToolOutputForLLM(result.Output)
+	output := capToolOutputForLLM(toolName, result.Output)
 	errorMsg := result.Error
 
 	var msg string
@@ -662,7 +689,7 @@ func (a *Agent) hasActiveContent(snippet string) bool {
 	}
 	a.msgMu.Lock()
 	defer a.msgMu.Unlock()
-	capped := capToolOutputForLLM(snippet)
+	capped := capToolOutputTo(snippet, maxToolResultBytes)
 	for _, m := range a.messages {
 		if strings.Contains(m.Content, capped) || strings.Contains(m.Content, snippet) {
 			return true
@@ -723,7 +750,11 @@ func (a *Agent) toolArchiveMinBytes() int {
 // verbatim before older ones are stubbed.
 func (a *Agent) toolArchiveActiveWindow() int {
 	if a == nil || a.cfg == nil || a.cfg.ToolArchiveActiveWindow <= 0 {
-		return 8
+		// Four verbatim tool results is enough working memory for the next
+		// decision; older ones stay retrievable via read_tool_output. (Eight
+		// kept ~128 KB of raw output re-sent every turn; rounds 6-7 showed this
+		// dominating token cost.)
+		return 4
 	}
 	return a.cfg.ToolArchiveActiveWindow
 }

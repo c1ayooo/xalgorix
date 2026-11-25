@@ -57,6 +57,11 @@ func TestKillWorkerWithReasonStagnantValidation(t *testing.T) {
 	if err := ag.KillWorkerWithReason("unit-1", "duplicate", "same target as unit-2"); err != nil {
 		t.Fatalf("duplicate kill: %v", err)
 	}
+	decisions := sctx.Ledger.Decisions()
+	if len(decisions) != 1 || decisions[0].Action != "kill_work" ||
+		decisions[0].InfoUse != "none" || decisions[0].NoInfoReason != "engine_policy" {
+		t.Fatalf("kill decision = %+v", decisions)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	if _, status, _ := ag.WaitWorkerResult(ctx, agentID); status == "running" || status == "queued" {

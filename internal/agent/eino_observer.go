@@ -246,7 +246,12 @@ func (o *einoObserver) TransformToolOutput(_ context.Context, name string, _ map
 	}
 	result := tools.Result{Output: output, Metadata: metadata}
 	formatted := formatToolResult(name, result)
-	if a.boundedContextEnabled() && a.scanCtx != nil && len(output) >= a.toolArchiveMinBytes() {
+	// read_tool_output already returns a bounded page; archiving that page
+	// again would replace the content the caller just asked for with another
+	// stub (archive-of-archive), which is exactly how a 27 KB challenge listing
+	// became unreadable and the model fell back to guessing challenge codes.
+	if !strings.EqualFold(strings.TrimSpace(name), "read_tool_output") &&
+		a.boundedContextEnabled() && a.scanCtx != nil && len(output) >= a.toolArchiveMinBytes() {
 		if id := a.scanCtx.ToolOutputs.Archive(name, output, a.toolArchiveMinBytes()); id != "" {
 			formatted = strings.TrimRight(formatted, "\n") + "\n" + archiveToolResultMarker(id)
 		}
@@ -319,11 +324,9 @@ func (o *einoObserver) AfterTool(_ context.Context, name string, args map[string
 		if v, ok := metadata["work_completed"].(bool); ok && v && callErr == nil && a.state.DelegatedAgent {
 			// Persist the declared lane outcome before the lane ends: the
 			// scheduler's conclusion gate reads it (INTEL_HANDOFF_SPEC D6).
-			if a.scanCtx != nil && a.scanCtx.Progress != nil {
-				exit, _ := metadata["exit"].(string)
-				reason, _ := metadata["blocked_reason"].(string)
-				a.scanCtx.Progress.RecordExit(a.ID, exit, reason)
-			}
+			exit, _ := metadata["exit"].(string)
+			reason, _ := metadata["blocked_reason"].(string)
+			a.recordExitDeclaration(exit, reason)
 			a.completeWithFinish(output, func() int { return a.syncBudgetTokens() })
 			return
 		}
@@ -691,7 +694,7 @@ func schemaMessageToLLM(msg *schema.Message) llm.Message {
 // only archived messages are stubbed, so no unretrievable information is lost.
 func ageOutSchemaToolOutputs(input []*schema.Message, window int) []*schema.Message {
 	if window <= 0 {
-		window = 8
+		window = 4
 	}
 	indices := make([]int, 0, window+4)
 	for i := len(input) - 1; i >= 0; i-- {
@@ -746,4 +749,20 @@ func sleepContext(ctx context.Context, d time.Duration) bool {
 	case <-ctx.Done():
 		return false
 	}
+}
+
+// recordExitDeclaration persists the lane outcome under the DISPATCH identity
+// (the delegated agent id the pool uses for unit/agent lookups), falling back
+// to the local agent id for non-delegated callers. Recording under a.ID made
+// every compliant worker look undeclared because the pool queries the
+// delegated id returned by DispatchWorkerTask.
+func (a *Agent) recordExitDeclaration(exit, reason string) {
+	if a == nil || a.scanCtx == nil || a.scanCtx.Progress == nil {
+		return
+	}
+	owner := strings.TrimSpace(a.delegatedAgentID)
+	if owner == "" {
+		owner = a.ID
+	}
+	a.scanCtx.Progress.RecordExit(owner, exit, reason)
 }

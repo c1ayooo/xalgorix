@@ -19,6 +19,41 @@ const toolArchiveDir = "tool-outputs"
 // groupless pattern panics on the first nonempty reopen.
 var archiveIDPattern = regexp.MustCompile(`^to_([0-9]{1,12})$`)
 
+// bareArchiveIDPattern matches an id written without the to_ prefix, e.g.
+// "0012" or "12". Models routinely transcribe a stub id that way; rejecting it
+// costs a turn and counts against the tool's circuit breaker.
+var bareArchiveIDPattern = regexp.MustCompile(`^[0-9]{1,12}$`)
+
+// archiveIDCandidates lists the on-disk spellings to try for a retrieval id.
+// The canonical name is to_<seq> zero-padded to six digits (Archive's format),
+// but a model-written "0012", "to_12" or "12" resolves to the same record. A
+// non-canonical to_ spelling is tried verbatim first, so a record an older
+// layout wrote under an unpadded name stays retrievable.
+//
+// Every candidate is built from validated decimal digits, so no path
+// separator or traversal sequence can enter filepath.Join.
+func archiveIDCandidates(id string) []string {
+	id = strings.TrimSpace(id)
+	var digits string
+	switch {
+	case archiveIDPattern.MatchString(id):
+		digits = id[len("to_"):]
+	case bareArchiveIDPattern.MatchString(id):
+		digits = id
+	default:
+		return nil
+	}
+	seq, err := strconv.ParseUint(digits, 10, 64)
+	if err != nil || seq == 0 {
+		return nil // seq 0 is never issued: the counter starts at 1
+	}
+	canonical := fmt.Sprintf("to_%06d", seq)
+	if archiveIDPattern.MatchString(id) && id != canonical {
+		return []string{id, canonical}
+	}
+	return []string{canonical}
+}
+
 // ToolArchive persists the complete, untruncated raw output of tool results so
 // the conversation can replace aged tool-result messages with tiny retrieval
 // stubs without destroying any information: every archived byte stays
@@ -103,29 +138,29 @@ func (a *ToolArchive) Archive(toolName, content string, minBytes int) string {
 }
 
 // Get returns the archived content (tool header stripped) for an id.
+// Prefix-less and unpadded spellings resolve to the canonical record; see
+// archiveIDCandidates.
 func (a *ToolArchive) Get(id string) (string, bool) {
 	if !a.enabled() {
 		return "", false
 	}
-	id = strings.TrimSpace(id)
-	if !archiveIDPattern.MatchString(id) {
-		return "", false
+	for _, cand := range archiveIDCandidates(id) {
+		data, err := os.ReadFile(filepath.Join(a.dir, cand))
+		if err != nil {
+			continue
+		}
+		return stripArchiveHeader(string(data)), true
 	}
-	// archiveIDPattern already restricts ids to "to_<digits>", which excludes
-	// path separators and traversal sequences; the explicit check is belt-and-braces.
-	if strings.ContainsAny(id, "/\\.") {
-		return "", false
-	}
-	data, err := os.ReadFile(filepath.Join(a.dir, id))
-	if err != nil {
-		return "", false
-	}
-	s := string(data)
-	// Strip the self-describing tool header written by Archive.
+	return "", false
+}
+
+// stripArchiveHeader removes the self-describing tool header written by
+// Archive so a bare retrieval returns exactly the tool's output.
+func stripArchiveHeader(s string) string {
 	if idx := strings.Index(s, "\n\n"); idx >= 0 && strings.HasPrefix(s, "tool: ") {
-		s = s[idx+2:]
+		return s[idx+2:]
 	}
-	return s, true
+	return s
 }
 
 // Count reports how many outputs have been archived.

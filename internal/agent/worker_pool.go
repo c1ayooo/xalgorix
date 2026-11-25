@@ -13,6 +13,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/c1ayooo/xalgorix/v4/internal/domainjournal"
 )
 
 // Kill reason codes (PLANNER_OBSERVATION_AND_CORRECTION §4.1). A kill is a
@@ -205,7 +207,26 @@ func (a *Agent) KillWorkerWithReason(unitID, reasonCode, reason string) error {
 	} else {
 		reason = code + ": " + reason
 	}
-	return a.agentGraph.KillUnit(unitID, reason)
+	if err := a.agentGraph.KillUnit(unitID, reason); err != nil {
+		return err
+	}
+	actor := "controller"
+	noInfo := domainjournal.DecisionNoInfoEnginePolicy
+	if code == KillReasonHuman {
+		actor = "human"
+		noInfo = domainjournal.DecisionNoInfoOperator
+	}
+	a.recordDecision(domainjournal.Decision{
+		Action:          "kill_work",
+		IntentID:        unitID,
+		Candidates:      []domainjournal.DecisionCandidate{{ID: unitID, Kind: "intent", Rank: 1, Selected: true}},
+		HardConstraints: []string{"reason_code=pass", "progress_window=pass"},
+		Selected:        unitID,
+		Reason:          reason,
+		InfoUse:         "none",
+		NoInfoReason:    noInfo,
+	}, actor)
+	return nil
 }
 
 // workerAgentID resolves the delegated agent id for a unit without requiring a

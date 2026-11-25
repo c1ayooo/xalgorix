@@ -51,6 +51,10 @@ var (
 	catalogJSONRE = regexp.MustCompile(`(?i)"unique_code"\s*:\s*"([A-Za-z0-9][A-Za-z0-9._:-]{1,79})"`)
 	// catalogFormRE matches a form/query rendering of the same field.
 	catalogFormRE = regexp.MustCompile(`(?i)unique_code["']?\s*[=:]\s*["']?([A-Za-z0-9][A-Za-z0-9._:-]{1,79})`)
+	// catalogListingRE matches fields that only a challenge LISTING carries
+	// (per-challenge score/flag/container metadata). A submit body or a start
+	// acknowledgement has unique_code but none of these.
+	catalogListingRE = regexp.MustCompile(`(?i)"(?:total_score|flag_count|is_completed|container_status|difficulty)"\s*:`)
 )
 
 // looksLikeChallengeCatalog gates catalog learning: only an actual challenge
@@ -58,11 +62,31 @@ var (
 // model typed (`unique_code=c-25`) must not become a catalog entry, otherwise
 // the check could always be satisfied by the very value it is meant to reject
 // (round 5 submitted to invented codes such as a-19..a-25 and "web").
+//
+// The platform's listing is a BARE JSON ARRAY (`[{"unique_code":...}, ...]`),
+// so the old "challenges" keyword test never fired on the real payload and the
+// catalog only ever learned codes from start acknowledgements. Recognize the
+// array shape structurally: at least two entries plus listing-only metadata.
 func looksLikeChallengeCatalog(output string) bool {
 	lower := strings.ToLower(output)
-	return strings.Contains(lower, `"challenges"`) ||
+	if strings.Contains(lower, `"challenges"`) ||
 		strings.Contains(lower, "/challenges") ||
-		strings.Contains(lower, "challenge_list")
+		strings.Contains(lower, "challenge_list") {
+		return catalogJSONRE.MatchString(output) || strings.Contains(lower, `"unique_code"`)
+	}
+	return catalogListingRE.MatchString(output) && strings.Count(lower, `"unique_code"`) >= 2
+}
+
+// looksLikePlatformAck recognizes a per-challenge lifecycle response (start
+// returns container_addr, close returns closed) for a named unique_code. Such a
+// response is authoritative proof that the code exists in this round, so it is
+// learned even when the full listing was never observed.
+func looksLikePlatformAck(output string) bool {
+	lower := strings.ToLower(output)
+	if !strings.Contains(lower, `"unique_code"`) {
+		return false
+	}
+	return strings.Contains(lower, `"container_addr"`) || strings.Contains(lower, `"closed"`)
 }
 
 // SubmissionVerdict is the engine's decision on one submit attempt.
@@ -117,7 +141,7 @@ func (g *SubmitGuard) Observe(output string) {
 	if g.catalog == nil {
 		g.catalog = make(map[string]bool)
 	}
-	if len(g.catalog) < submitGuardCatalogLimit && looksLikeChallengeCatalog(output) {
+	if len(g.catalog) < submitGuardCatalogLimit && (looksLikeChallengeCatalog(output) || looksLikePlatformAck(output)) {
 		for _, m := range catalogJSONRE.FindAllStringSubmatch(output, -1) {
 			g.catalog[m[1]] = true
 		}

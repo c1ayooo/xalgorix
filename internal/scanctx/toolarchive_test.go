@@ -104,6 +104,41 @@ func TestToolArchiveConcurrentArchive(t *testing.T) {
 	}
 }
 
+// A model-written id tolerates the two common transcription failures — a
+// dropped to_ prefix and dropped zero padding — and resolves to the same
+// byte-identical record. Everything else keeps missing.
+func TestToolArchiveGetToleratesTranscribedIDs(t *testing.T) {
+	dir := t.TempDir()
+	a := NewToolArchive(dir)
+	content := strings.Repeat("raw-line\n", 300)
+	id := a.Archive("curl", content, 1)
+	if id != "to_000001" {
+		t.Fatalf("first id = %q", id)
+	}
+
+	for _, spelling := range []string{"to_000001", "1", "000001", "01", "to_1"} {
+		got, ok := a.Get(spelling)
+		if !ok || got != content {
+			t.Fatalf("Get(%q) = ok=%v len=%d, want the archived record", spelling, ok, len(got))
+		}
+	}
+
+	// A record an older layout wrote under an unpadded name stays retrievable
+	// under that exact spelling.
+	if err := os.WriteFile(filepath.Join(dir, toolArchiveDir, "to_7"), []byte("tool: legacy\n\nlegacy-body"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := a.Get("to_7"); !ok || got != "legacy-body" {
+		t.Fatalf("existing unpadded record lost: ok=%v %q", ok, got)
+	}
+
+	for _, bad := range []string{"to_000002", "2", "to_000000", "0", "to_", "to_abc", "to_1/2", "to_.", "1x"} {
+		if _, ok := a.Get(bad); ok {
+			t.Fatalf("Get(%q) must miss", bad)
+		}
+	}
+}
+
 // A reopened archive must never reuse a retrieval id or overwrite an existing
 // record: this is the regression for the reopen crash (groupless-pattern
 // submatch panic in NewToolArchive) and the sequence-restart overwrite it
