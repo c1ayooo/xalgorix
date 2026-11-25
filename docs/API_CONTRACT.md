@@ -541,7 +541,7 @@ interface ApprovalRule {
 
 ## 3.8 流量代理 raw 交换归档（只读，2026-11-22 增补）
 
-> 流量代理为归因流量持久化的原始 HTTP 请求/响应包（wire 保真：header 值与 body **不脱敏**，2026-11-22 操作者裁决修正 R2b 的「header 只记名」红线——摘要层 InfoItem 仍掩码，raw 归档是权威包体）。存储 = `<scanDir>/traffic/tr_<seq>.json`（`storage.WriteAtomic`，一交换一文件，重启续号不覆盖）——流量原始包是**字节产物**，R6 PG 主存储切换后仍留文件层（宪章 v3.0 §6.2，DSN 为启动必需）；findings 详情弹窗按 finding 的 endpoint/method 懒加载渲染。
+> 流量代理为归因流量持久化的原始 HTTP 请求/响应包（wire 保真：header 值与 body **不脱敏**，2026-11-22 操作者裁决修正 R2b 的「header 只记名」红线——摘要层 InfoItem 同样不掩码（2026-11-25 操作者裁决：情报视图要能直接复用凭据，掩码的 `token=***` 是死信息），raw 归档是权威包体）。存储 = `<scanDir>/traffic/tr_<seq>.json`（`storage.WriteAtomic`，一交换一文件，重启续号不覆盖）——流量原始包是**字节产物**，R6 PG 主存储切换后仍留文件层（宪章 v3.0 §6.2，DSN 为启动必需）；findings 详情弹窗按 finding 的 endpoint/method 懒加载渲染。
 
 | Method+Path | 请求 | 响应 |
 |---|---|---|

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -214,7 +215,35 @@ func upsertItem(ctx context.Context, tx pgx.Tx, item infoitem.Item) error {
 	return nil
 }
 
+// clampEdgeWeight maps a lexical score onto the [0,1] strength column.
+// infoitem.Rank scores are not normalised: a title-token hit weighs 2 and an
+// exact substring match adds another 1, so a strong match lands at 3 or 4.
+// Writing that value straight into info_item_edges.weight violated
+// info_item_edges_weight_check, which aborted the whole relation pass for the
+// item and re-logged on every cold-path batch — the association graph silently
+// lost edges while the log filled with constraint errors.
+//
+// ok=false means the value cannot be a weight at all (NaN/Inf) and the edge
+// must be dropped rather than clamped to 0, which would assert "unrelated".
+func clampEdgeWeight(w float64) (float64, bool) {
+	if math.IsNaN(w) || math.IsInf(w, 0) {
+		return 0, false
+	}
+	if w < 0 {
+		return 0, true
+	}
+	if w > 1 {
+		return 1, true
+	}
+	return w, true
+}
+
 func upsertRelation(ctx context.Context, tx pgx.Tx, rel infoitem.Relation) error {
+	weight, ok := clampEdgeWeight(rel.Weight)
+	if !ok {
+		return nil
+	}
+	rel.Weight = weight
 	_, err := tx.Exec(ctx, `
 		INSERT INTO info_item_edges (scan_id, source_seq, from_id, to_id, type, weight, created_at)
 		VALUES ($1,$2,$3,$4,$5,$6,$7)

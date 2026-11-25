@@ -82,7 +82,7 @@
 |---|---|---|---|---|
 | I-1 | ✅已修 | `einoApprovalBroker` 返回 typed nil 却被装进 `engine.ApprovalBroker` 接口，`ApprovalTool` 的 `broker == nil` 兜底失效；真实扫描第一次触发审批类工具即 `nil pointer dereference`，扫描标 `eino_runtime_error` | `internal/web/scan_session.go`（接口层不装 typed nil）、`internal/web/eino_approval.go`（方法层 nil 兜底）；E2E：同一靶标两次运行 0 panic | 已闭合 |
 | I-2 | ✅已修 | finding 与信息层无连接：`report_vulnerability` 只写 findings/scan.json，InfoItem 仅由 `add_hypothesis_evidence` 产生；模型直接报告时 info_items 恒为 0 | `internal/tools/reporting/reporting.go` 的 `projectFindingInfoItem` / `ensureFindingLedgerEvidence`；`domainjournal.OpFindingRecorded`；实测 XSS 靶标产出 `purpose=finding` 的 InfoItem | 已闭合 |
-| I-3 | ✅已修 | 纯工具观测无兜底：预算耗尽/断流时模型未调用台账工具，观测直接丢失 | `internal/tools/terminal/observation.go`（引擎侧模式匹配，密钥掩码）、`scanctx.AppendToolObservation`、`OpToolObservation`；实测一次 dirbust 产出 4 条 observed InfoItem | 已闭合 |
+| I-3 | ✅已修 | 纯工具观测无兜底：预算耗尽/断流时模型未调用台账工具，观测直接丢失 | `internal/tools/terminal/observation.go`（引擎侧模式匹配，凭据原值记录，供操作员复用）、`scanctx.AppendToolObservation`、`OpToolObservation`；实测一次 dirbust 产出 4 条 observed InfoItem | 已闭合 |
 | I-4 | ✅已修 | 平台 run 与扫描数据身份不通：`runs.legacy_scan_id` 为空，`ProjectScanIDs` 拿不到 `info_items.scan_id`，`/api/info/region` 恒空 | `platform.Repository.SetRunLegacyScanID`（PG/File 双实现）+ `internal/web/scan_session.go` 启动时回写；实测 region 返回 finding 与观测条目 | 已闭合 |
 | I-5 | ✅已修 | `incomplete()` 把「没有水位行的 id」也算未应用，项目里混入 instance_id 时永远 `incomplete=true` | `internal/infoitem/postgres/store.go`（改为 JOIN 已知水位行、只判非 applied）；实测 `incomplete=false` | 已闭合 |
 | I-6 | ✅已修 | 迁移测试假设每个迁移都 `CREATE TABLE`，0010 是 `ALTER TABLE` 导致 CI 假红 | `internal/infoitem/postgres/migrate_test.go`（接受 CREATE TABLE/ALTER TABLE/CREATE INDEX） | 已闭合 |

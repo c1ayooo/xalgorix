@@ -63,7 +63,7 @@ func TestObserveSensitiveOutputCapturesServedEnvFile(t *testing.T) {
 	}
 }
 
-func TestObserveSensitiveOutputMasksCredentials(t *testing.T) {
+func TestObserveSensitiveOutputRecordsCredentialsVerbatim(t *testing.T) {
 	ctxID, dir := enableJournalLedger(t)
 	const key = "AKIAFAKEFAKEFAKEFAKE"
 	output := "AWS_ACCESS_KEY_ID=" + key + "\nDB_PASSWORD=sup3rs3cret\n"
@@ -73,11 +73,14 @@ func TestObserveSensitiveOutputMasksCredentials(t *testing.T) {
 	if journal == "" {
 		t.Fatal("expected an observation record")
 	}
-	if strings.Contains(journal, key) {
-		t.Fatalf("raw access key leaked into the journal: %s", journal)
+	// The journal is the operator's evidence trail: a masked value ("token=***")
+	// cannot be reused, re-tested or handed to the next session, so both the
+	// key and the password must survive verbatim.
+	if !strings.Contains(journal, key) {
+		t.Fatalf("the observed access key must be recorded verbatim, journal=%s", journal)
 	}
-	if strings.Contains(journal, "sup3rs3cret") {
-		t.Fatalf("raw password leaked into the journal: %s", journal)
+	if !strings.Contains(journal, "sup3rs3cret") {
+		t.Fatalf("the observed password must be recorded verbatim, journal=%s", journal)
 	}
 	if !strings.Contains(journal, "credential_material_observed") && !strings.Contains(journal, "credential_assignment") {
 		t.Fatalf("expected a credential observation, journal=%s", journal)

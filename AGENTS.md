@@ -77,7 +77,7 @@
 7. **Verifier 与闸门不可改**：`verifier.go` 的判定逻辑、工具面裁剪、轮次/时限，以及 `report_vulnerability` 的闸门顺序，在改造 InfoItem/点亮/VOI 时一律不动。
 7.5 **工具执行面可切换，语义不变（v4.6 起）**：`XALGORIX_RUNTIME_BACKEND=native|docker`。native 是默认且行为逐字节保留；docker 时每扫描一个 toolbox 容器（`internal/runtime`），但安全链六环仍在平台侧 dispatch 前判定，容器不是安全边界。`XALGORIX_TOOLBOX_NETWORK_MODE=internal|host`（默认 internal）选择容器网络：host 共享宿主网络命名空间以直达 VPN/靶场网段，六环不因此放宽。`Exec` 绝不重试，只有 EnsureProject/StopProject/RemoveProject 幂等。容器实际状态权威是运行时（`xalgorix.*` 标签），期望态与 `desired_gen/applied_gen` 水位在 PG `toolbox_projects`；River 的 `toolbox` 队列只做保洁与追赶，不接管扫描循环/调度/审批/SSE。容器一律 `--cap-drop=ALL`，按 profile 加回 NET_RAW/NET_ADMIN/SYS_PTRACE，rootfs 只读，**工具容器内禁止出现 docker socket**。令牌/job 载荷内不得含密钥。
 
-8. **信息层不得有孤儿事实**：任何被持久化的 finding 必须同时产出 `finding_ref` evidence 与一条 `purpose=finding` 的 InfoItem（`report_vulnerability` 落库后由引擎投影，不依赖模型二次调用）；工具输出中的敏感文件/凭据命中由引擎侧捕获为 `tool_observation`（密钥必须掩码）。收工闸门在「有 finding、无 evidence」时拒绝收工。
+8. **信息层不得有孤儿事实**：任何被持久化的 finding 必须同时产出 `finding_ref` evidence 与一条 `purpose=finding` 的 InfoItem（`report_vulnerability` 落库后由引擎投影，不依赖模型二次调用）；工具输出中的敏感文件/凭据命中由引擎侧捕获为 `tool_observation`（**凭据原值落库**——操作员要能直接复用，掩码的 `token=***` 是死信息；掩码只保留在离开操作员边界的外发通道：agent 事件流 `redactSecrets` 与审批载荷 `maskSecretHeaders`）。收工闸门在「有 finding、无 evidence」时拒绝收工。
 
 9. **意图结论不得绕行**：`done` intent 必须经 `graph.Repository.ConcludeIntent` 单事务写入——校验 owner/lease/确认门/前置条件，幂等产出节点并连 `yields` 边，再迁移状态。禁止直接 `Transition` 到 `done` 或先写状态后写产出。运行期由 `graph.ValidateStore` / `GET /api/scans/{id}/graph/validate` 只读检查；检查器不修数据。
 

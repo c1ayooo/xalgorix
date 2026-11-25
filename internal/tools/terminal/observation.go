@@ -13,9 +13,12 @@ package terminal
 // records the observation itself. It is deliberately narrow:
 //
 //   - only patterns with a low false-positive rate are matched;
-//   - secret VALUES never reach the journal: every match is masked before the
-//     excerpt is built (the journal and its PG replica must not become a
-//     credential store);
+//   - secret VALUES are recorded verbatim. The journal is the operator's own
+//     evidence trail and the task intelligence view / search_info read it, so
+//     a masked value ("access_token=***") is a dead end: it cannot be reused,
+//     re-tested, or handed to the next session. Masking stays only on sinks
+//     that leave the operator's boundary — agent event streams
+//     (agent.redactSecrets) and approval payloads (maskSecretHeaders);
 //   - at most maxObservationsPerCommand items per command, so a directory
 //     bust cannot flood the cold path;
 //   - failures are logged, never propagated: observation capture must not turn
@@ -90,7 +93,6 @@ func observeSensitiveOutput(contextID, command, output string) {
 		if written >= maxObservationsPerCommand {
 			return
 		}
-		subject = maskObservationLine(subject)
 		item := buildObservationItem(label, purpose, command, subject, excerpt)
 		if err := sc.Ledger.AppendToolObservation(item, fmt.Sprintf("%s: %s", label, subject)); err != nil {
 			log.Printf("[terminal] observation capture failed (%s): %v", label, err)
@@ -110,11 +112,28 @@ func observeSensitiveOutput(contextID, command, output string) {
 	}
 	for _, p := range credentialPatterns {
 		if m := p.re.FindString(head); m != "" {
-			emit(p.label, m, maskCredential(m), "credential_material_observed")
+			emit(p.label, m, m, "credential_material_observed")
 		}
 	}
-	if m := credentialAssignment.FindStringSubmatch(head); len(m) == 3 {
-		emit("credential_assignment", m[0], m[1]+"=***", "credential_material_observed")
+	// Every assignment, not just the first: a .env dump puts the access key and
+	// the DB password on separate lines, and FindStringSubmatch would record the
+	// key twice and drop the password. Rows whose value a named pattern already
+	// captured are skipped so the per-command budget is not spent on duplicates.
+	for _, g := range credentialAssignment.FindAllStringSubmatch(head, -1) {
+		if len(g) != 3 {
+			continue
+		}
+		covered := false
+		for _, p := range credentialPatterns {
+			if p.re.MatchString(g[0]) || p.re.MatchString(g[2]) {
+				covered = true
+				break
+			}
+		}
+		if covered {
+			continue
+		}
+		emit("credential_assignment", g[0], g[0], "credential_material_observed")
 	}
 }
 
@@ -153,29 +172,6 @@ func buildObservationItem(label, purpose, command, subjectLine, excerpt string) 
 	}
 }
 
-// maskCredential keeps a recognisable prefix/suffix while removing the secret
-// itself. Anything unrecognised is fully masked.
-func maskCredential(s string) string {
-	switch {
-	case strings.HasPrefix(s, "AKIA") && len(s) >= 12:
-		return s[:4] + "****************" + s[len(s)-4:]
-	case strings.Contains(s, "PRIVATE KEY-----"):
-		return "-----BEGIN PRIVATE KEY----- (redacted)"
-	case strings.Contains(s, "://"):
-		if at := strings.LastIndex(s, "@"); at > 0 {
-			scheme := ""
-			if i := strings.Index(s, "://"); i > 0 {
-				scheme = s[:i+3]
-			}
-			return scheme + "***:***" + s[at:]
-		}
-	}
-	if len(s) > 8 {
-		return s[:2] + "***" + s[len(s)-2:]
-	}
-	return "***"
-}
-
 func firstNonEmptyLine(output, fallback string) string {
 	for _, line := range strings.Split(output, "\n") {
 		if strings.TrimSpace(line) != "" {
@@ -183,19 +179,6 @@ func firstNonEmptyLine(output, fallback string) string {
 		}
 	}
 	return truncateText(fallback, 200)
-}
-
-// maskObservationLine strips credential material from a single line before it
-// is used as an InfoItem subject or journal summary. The excerpt path masks
-// per-match already; this closes the other two sinks (subject_identifier and
-// the journal summary) so no raw secret can reach the journal or its PG copy.
-func maskObservationLine(line string) string {
-	out := line
-	for _, p := range credentialPatterns {
-		out = p.re.ReplaceAllStringFunc(out, maskCredential)
-	}
-	out = credentialAssignment.ReplaceAllString(out, "$1=***")
-	return out
 }
 
 func truncateText(s string, limit int) string {
