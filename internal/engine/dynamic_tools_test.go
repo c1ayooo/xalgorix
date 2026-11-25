@@ -43,7 +43,6 @@ var dynamicFixtureCore = []string{
 
 // dynamicFixtureSearchable are the curated discovery-gated tools.
 var dynamicFixtureSearchable = []string{
-	"record_intelligence",
 	"str_replace_editor",
 }
 
@@ -420,11 +419,17 @@ func TestDynamicSplitDefaultsUnknownToolsToCore(t *testing.T) {
 	if !isSearchableToolIn("custom_tool", prefixedPool) {
 		t.Fatal("an unprefixed curated tool must be searchable")
 	}
-	core, searchable := splitToolSurface([]namedTool{{name: "finish"}, {name: "mcp__x__y"}, {name: "record_intelligence"}})
+	core, searchable := splitToolSurface([]namedTool{{name: "finish"}, {name: "mcp__x__y"}, {name: "str_replace_editor"}})
 	if got := toolNames(core); strings.Join(got, ",") != "finish,mcp__x__y" {
 		t.Fatalf("core = %v", got)
 	}
-	if got := toolNames(searchable); strings.Join(got, ",") != "record_intelligence" {
+	if got := toolNames(searchable); strings.Join(got, ",") != "str_replace_editor" {
 		t.Fatalf("searchable = %v", got)
+	}
+	// record_intelligence is the operator's intelligence feed; the prompt names
+	// it as a must-call, so it must never be hidden behind tool_search.
+	core2, _ := splitToolSurface([]namedTool{{name: "record_intelligence"}})
+	if got := toolNames(core2); strings.Join(got, ",") != "record_intelligence" {
+		t.Fatalf("record_intelligence must stay in the core surface, got core=%v", got)
 	}
 }

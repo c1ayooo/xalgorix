@@ -122,7 +122,12 @@ func ParseTaskBrief(goal, instruction string) TaskBrief {
 	if !structured {
 		// Backward compatibility: no recognized headings, so the whole
 		// instruction is the shared rules text for every lane.
-		tb.Rules = strings.TrimSpace(instruction)
+		//
+		// The one thing that must never be shared: an API reference manual.
+		// Operators write "## 5.4 提交 Flag"-style chapters, not "## Rules",
+		// so without this split every execution worker is handed the platform
+		// manual — the leak the lane routing exists to prevent.
+		tb.Rules, tb.ControlPlane = splitControlPlaneManual(strings.TrimSpace(instruction))
 		return tb
 	}
 
@@ -134,7 +139,176 @@ func ParseTaskBrief(goal, instruction string) TaskBrief {
 	tb.ControlPlane = strings.TrimSpace(cpSec.String())
 	tb.Execution = strings.TrimSpace(execSec.String())
 	tb.Analysis = strings.TrimSpace(anaSec.String())
+
+	// A structured brief can still carry the manual inside the shared block
+	// (operators mix formats). Peel it out for the same reason as above.
+	rules, extra := splitControlPlaneManual(tb.Rules)
+	tb.Rules = rules
+	tb.ControlPlane = joinBriefSections(tb.ControlPlane, extra)
 	return tb
+}
+
+// splitControlPlaneManual divides an instruction into the part every lane
+// needs (constraints, procedure, prohibitions) and the API reference manual
+// that only the control-plane lane can act on.
+//
+// Two deterministic signals, no model call:
+//   - a chapter heading names the API surface ("TSecBench API 接入文档",
+//     "5.4 提交 Flag", "认证方式", "错误码");
+//   - a chapter body is dense in endpoints and HTTP methods.
+//
+// Once a manual chapter is found the block runs forward until a chapter whose
+// heading names a constraint ("纪律/约束/禁止/要求/协议..."), so sub-chapters and
+// trailing "最佳实践" stay with the manual instead of needing their own match.
+func splitControlPlaneManual(text string) (string, string) {
+	if strings.TrimSpace(text) == "" {
+		return text, ""
+	}
+	chapters, lines := splitBriefChapters(text)
+	if len(chapters) == 0 {
+		return text, ""
+	}
+	first := -1
+	for i, c := range chapters {
+		if manualChapterTitle(c.title) || manualChapterBody(lines[c.head:c.end]) {
+			first = i
+			break
+		}
+	}
+	if first < 0 {
+		return text, ""
+	}
+	last := len(chapters)
+	for i := first + 1; i < len(chapters); i++ {
+		// Only a heading at the manual's own level (or higher) can end the
+		// block. A deeper heading is a manual sub-chapter — "## 3. 注意事项"
+		// inside an API reference is still reference material.
+		if chapters[i].level > chapters[first].level {
+			continue
+		}
+		if constraintChapterTitle(chapters[i].title) {
+			last = i
+			break
+		}
+	}
+	from, to := chapters[first].head, chapters[last-1].end
+	body := strings.Join(append(append([]string{}, lines[:from]...), lines[to:]...), "\n")
+	manual := strings.Join(lines[from:to], "\n")
+	return strings.TrimSpace(body), strings.TrimSpace(manual)
+}
+
+// briefChapter is one heading-delimited block, in line coordinates.
+type briefChapter struct {
+	head, end int
+	title     string
+	level     int
+}
+
+// splitBriefChapters indexes heading-delimited blocks. A `#` inside a fenced
+// code block is content, never a chapter boundary.
+func splitBriefChapters(text string) ([]briefChapter, []string) {
+	lines := strings.Split(text, "\n")
+	var chapters []briefChapter
+	inFence := false
+	fence := ""
+	for i, raw := range lines {
+		trimmed := strings.TrimSpace(raw)
+		if inFence {
+			if strings.HasPrefix(trimmed, fence) {
+				inFence = false
+			}
+			continue
+		}
+		if marker, ok := fenceMarkerOf(trimmed); ok {
+			inFence = true
+			fence = marker
+			continue
+		}
+		level, title, ok := headingParts(trimmed)
+		if !ok {
+			continue
+		}
+		chapters = append(chapters, briefChapter{head: i, title: title, level: level})
+	}
+	for i := range chapters {
+		if i+1 < len(chapters) {
+			chapters[i].end = chapters[i+1].head
+		} else {
+			chapters[i].end = len(lines)
+		}
+	}
+	return chapters, lines
+}
+
+// headingParts splits an ATX heading into level and title.
+func headingParts(line string) (int, string, bool) {
+	if !strings.HasPrefix(line, "#") {
+		return 0, "", false
+	}
+	i := 0
+	for i < len(line) && line[i] == '#' {
+		i++
+	}
+	if i == 0 || i > 6 || i >= len(line) || (line[i] != ' ' && line[i] != '	') {
+		return 0, "", false
+	}
+	title := strings.TrimSpace(line[i:])
+	return i, strings.TrimSpace(strings.TrimRight(title, "#")), true
+}
+
+// manualChapterTitle reports a heading that introduces API reference material.
+func manualChapterTitle(title string) bool {
+	t := normalizeBriefHeading(title)
+	if strings.Contains(t, "api") {
+		for _, k := range []string{"文档", "接入", "手册", "参考", "说明", "规范", "详情"} {
+			if strings.Contains(t, k) {
+				return true
+			}
+		}
+	}
+	if strings.Contains(t, "接口") {
+		for _, k := range []string{"详情", "列表", "说明", "文档", "定义", "汇总"} {
+			if strings.Contains(t, k) {
+				return true
+			}
+		}
+	}
+	for _, k := range []string{"认证方式", "错误码", "请求示例", "响应格式", "返回格式", "调用流程"} {
+		if strings.Contains(t, k) {
+			return true
+		}
+	}
+	return false
+}
+
+// manualChapterBody reports a chapter that reads like reference material even
+// without a telling title: several endpoints plus several HTTP methods.
+func manualChapterBody(lines []string) bool {
+	s := strings.Join(lines, "\n")
+	endpoints := strings.Count(s, "/openapi/") + strings.Count(s, "/api/v1/")
+	if endpoints < 2 {
+		return false
+	}
+	methods := 0
+	for _, m := range []string{"GET ", "POST ", "PUT ", "DELETE ", "PATCH "} {
+		methods += strings.Count(s, m)
+	}
+	return methods >= 2
+}
+
+// constraintChapterTitle reports a heading that ends a manual block: the rest
+// of the instruction is about how to work, not about the API surface.
+func constraintChapterTitle(title string) bool {
+	t := normalizeBriefHeading(title)
+	for _, k := range []string{
+		"纪律", "约束", "要求", "禁止", "规则", "协议", "必须",
+		"注意", "上报", "委派", "收尾", "时限", "停止", "交付",
+	} {
+		if strings.Contains(t, k) {
+			return true
+		}
+	}
+	return false
 }
 
 // PromptFor renders the brief for one lane: Goal, the shared Rules, then the
@@ -156,6 +330,11 @@ func (tb *TaskBrief) PromptFor(lane string) string {
 		}
 		if tb.structured {
 			fmt.Fprintf(&b, "## %s\n%s\n", heading, body)
+		} else if heading == "Control-plane" {
+			// Unstructured brief: the shared block is rendered verbatim, but
+			// the API manual needs its own label so the lane can tell the
+			// operator's constraints apart from the reference it drives.
+			fmt.Fprintf(&b, "## Control-plane API reference\n%s\n", body)
 		} else {
 			b.WriteString(body)
 			b.WriteString("\n")

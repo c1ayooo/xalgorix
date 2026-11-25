@@ -121,21 +121,26 @@ var dynamicCoreTools = map[string]struct{}{
 // named somewhere in agent_prompt.go / hooks.go / agent_guard.go (grep counts:
 // add_note 22, browser_action 30, terminal_execute 36, report_vulnerability 33,
 // finish 109, ...), so hiding one would contradict an instruction the model is
-// already following. The two entries below are the tools with zero "must call"
-// references in the scan prompt and hook/gate code:
-//   - str_replace_editor: the prompt explicitly tells the model NOT to use it
-//     ("Use terminal_execute with cat, grep, or head ... intent"), it exists for
-//     whitebox source edits;
-//   - record_intelligence: auxiliary information-layer write; the engine
-//     projects finding InfoItems itself (AGENTS.md invariant #8), so no gate
-//     depends on the model calling it.
+// already following. The entry below is the tool with no "must call" reference
+// in the scan prompt and hook/gate code:
+//
+//	str_replace_editor: the prompt explicitly tells the model NOT to use it
+//	("Use terminal_execute with cat, grep, or head ... intent"), it exists for
+//	whitebox source edits.
+//
+// record_intelligence used to live here on the theory that the engine projects
+// finding InfoItems itself. In practice that projection masks secrets
+// (info_items carries "token=***"), so the operator's intelligence view went
+// empty: round 7 produced zero record_intelligence calls and the task intel tab
+// had nothing to show. The prompt now names it as a must-call for credentials
+// and sensitive data, so it is core again — a tool the operator reads from is
+// not auxiliary.
 //
 // Expanding the pool is a per-tool review: add the name only after grepping
 // prompt/hook/gate code for a "must call" reference and adding it to the gate
 // test's core expectations if the greps show a dependency.
 var dynamicToolSearchable = map[string]struct{}{
-	"str_replace_editor":  {},
-	"record_intelligence": {},
+	"str_replace_editor": {},
 }
 
 // namedTool pairs a registry tool adapter with its canonical name so the

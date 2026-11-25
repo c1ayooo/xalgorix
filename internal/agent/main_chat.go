@@ -21,8 +21,10 @@ import (
 	"time"
 
 	"github.com/c1ayooo/xalgorix/v4/internal/assets"
+	"github.com/c1ayooo/xalgorix/v4/internal/domainjournal"
 	"github.com/c1ayooo/xalgorix/v4/internal/graph"
 	"github.com/c1ayooo/xalgorix/v4/internal/infospace"
+	"github.com/c1ayooo/xalgorix/v4/internal/intelsubmit"
 	"github.com/c1ayooo/xalgorix/v4/internal/llm"
 	"github.com/c1ayooo/xalgorix/v4/internal/scanctx"
 	"github.com/c1ayooo/xalgorix/v4/internal/tools"
@@ -579,6 +581,14 @@ func (a *Agent) mainChatToolResult(call llm.ToolCall, userMsg string) (string, b
 		// not: it must re-run the deterministic required-objective gate instead
 		// of treating an empty frontier as goal achievement (XALG012).
 		if !isExplicitOperatorStop(userMsg) {
+			// Proven-but-unsubmitted results are not "done". Round 7 drained its
+			// frontier and finished with 1000/23000 while verified findings sat
+			// in notes, because nothing tied "no more work to plan" to "nothing
+			// left to score". The receipt store is the authority for that.
+			if digest := intelsubmit.PendingDigest(context.Background(), a.scanTaskID(), 20); digest != "" {
+				return "error: proven results are still unsubmitted: " + digest +
+					". Submit them first — the control-plane lane owns the platform API — then finish.", false
+			}
 			if gate := hookGoalFinishGate(a.state, nil); gate.Block {
 				return "error: " + gate.BlockReason + " To abort immediately, use the operator Stop control.", false
 			}
@@ -931,6 +941,20 @@ func mainChatExplicitConfirm(msg string) bool {
 	return text == "yes" || text == "ok"
 }
 
+// scanTaskID returns the dispatching task id for this run, or "" when the run
+// is not task-bound (legacy CLI / ad-hoc scan). Submission receipts are
+// task-scoped, so a run without a task has nothing to reconcile.
+func (a *Agent) scanTaskID() string {
+	if a == nil || a.state == nil {
+		return ""
+	}
+	sc := scanctx.Get(a.state.ScanContextID)
+	if sc == nil {
+		return ""
+	}
+	return strings.TrimSpace(sc.TaskID)
+}
+
 func (a *Agent) mainChatAddHint(args map[string]string) (string, error) {
 	msg := strings.TrimSpace(args["message"])
 	if msg == "" {
@@ -1071,6 +1095,16 @@ func (a *Agent) mainChatRetireIntent(args map[string]string) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("intent %s changed state before the retire could be applied; re-read the plan and retry", unitKey)
 	}
+	a.recordDecision(domainjournal.Decision{
+		Action:          "retire_intent",
+		IntentID:        unitKey,
+		Candidates:      []domainjournal.DecisionCandidate{{ID: unitKey, Kind: "intent", Rank: 1, Selected: true}},
+		HardConstraints: []string{"open_only=pass"},
+		Selected:        unitKey,
+		Reason:          reason,
+		InfoUse:         domainjournal.DecisionInfoUseNone,
+		NoInfoReason:    domainjournal.DecisionNoInfoOperator,
+	}, "human")
 	a.emit(Event{Type: "plan_updated", Content: "human retire: " + unitKey, Meta: map[string]any{
 		"actor": "human", "action": "retire_intent", "unit_id": unitKey, "reason": reason,
 	}})
