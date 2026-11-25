@@ -28,6 +28,7 @@ import (
 	"github.com/c1ayooo/xalgorix/v4/internal/scopeguard"
 	"github.com/c1ayooo/xalgorix/v4/internal/tools/intelligence"
 	"github.com/c1ayooo/xalgorix/v4/internal/tools/notes"
+	notestools "github.com/c1ayooo/xalgorix/v4/internal/tools/notes"
 	"github.com/c1ayooo/xalgorix/v4/internal/tools/reporting"
 	"github.com/c1ayooo/xalgorix/v4/internal/trafficproxy"
 )
@@ -364,6 +365,12 @@ func (s *Server) executeScanSession(sess *scanSession) {
 	sctx.Notes.SetInstanceID(sess.instanceID)
 	sctx.Coverage.SetInstanceID(sess.instanceID)
 	intelligence.SetInstanceIDForContext(sctx.ID, sess.instanceID)
+	// The add_note tool keeps its own per-context store (separate from
+	// scanctx.Notes); without this stamp its run_state_files rows carry an
+	// empty instance_id and a re-dispatched sibling session cannot inherit
+	// the notes (R6.1/D11 continuity). This was the only one of the four
+	// bounded state families left unstamped in production wiring.
+	notestools.SetInstanceIDForContext(sctx.ID, sess.instanceID)
 	// A crashed/restarted session must not leave phantom claims behind. The
 	// graph is the authority, so reset this run's running intents to open
 	// before the agent loop reads the frontier.
@@ -979,9 +986,15 @@ func (s *Server) executeScanSession(sess *scanSession) {
 					return agnt.KillWorker(unitID, reason)
 				},
 				OnDrained: func() {
-					if agnt != nil {
-						agnt.NotifyMainSystem("The planner produced no new intent and the frontier is drained. If the user's goal is complete, call finish; otherwise insert the next intent or ask the user.")
+					if agnt == nil {
+						return
 					}
+					if digest := pendingSubmissionDigest(sctx.TaskID); digest != "" {
+						agnt.NotifyMainSystem("The planner produced no new intent and the frontier is drained, but proven results are still unsubmitted: " +
+							digest + ". The control-plane lane must submit them before finish; submitting first is strictly better than planning more work.")
+						return
+					}
+					agnt.NotifyMainSystem("The planner produced no new intent and the frontier is drained. If the user's goal is complete, call finish; otherwise insert the next intent or ask the user.")
 				},
 			})
 			defer planner.Stop()
@@ -1269,6 +1282,13 @@ func clonePhaseStatus(m map[string]string) map[string]string {
 }
 
 func (s *Server) processEvent(evt agent.Event, sess *scanSession) {
+	// Submission receipts: platform responses are the only authority on what a
+	// proved result became. A cheap no-op unless the store is wired and the
+	// call actually targets the platform's challenges API.
+	if evt.Type == "tool_call" || evt.Type == "tool_result" {
+		s.observeIntelSubmit(evt, sess)
+	}
+
 	// Durable worker projection: every delegated-agent lifecycle boundary is
 	// upserted into run_workers so the session page can list this run's
 	// workers (finished ones included) after the live graph is gone.

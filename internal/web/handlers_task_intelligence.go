@@ -36,6 +36,7 @@ import (
 	"time"
 
 	"github.com/c1ayooo/xalgorix/v4/internal/intelaccess"
+	"github.com/c1ayooo/xalgorix/v4/internal/intelsubmit"
 	"github.com/c1ayooo/xalgorix/v4/internal/platform"
 	"github.com/c1ayooo/xalgorix/v4/internal/runstate"
 	"github.com/c1ayooo/xalgorix/v4/internal/tools/intelligence"
@@ -62,6 +63,10 @@ type taskIntelItem struct {
 	// Access is the M2 reachability projection for this fingerprint, resolved
 	// across the item's scans (a usable row wins over a stale one).
 	Access *intelaccess.Access `json:"access,omitempty"`
+	// Submit is the scoring receipt for the same result: did this actually
+	// become points? Task-scoped (unique_code identity), so it survives the
+	// per-scan partition that hides a newer session's predecessors.
+	Submit *intelsubmit.Submit `json:"submit,omitempty"`
 }
 
 // handleTaskIntelligence serves GET /api/tasks/{id}/intelligence.
@@ -176,6 +181,20 @@ func (s *Server) handleTaskIntelligence(w http.ResponseWriter, r *http.Request, 
 				accessCopy := access
 				ti.Access = &accessCopy
 			}
+		}
+	}
+
+	// Submission receipt overlay: did this result actually become points?
+	// Task-scoped, so it is read once for the whole task and matched per item.
+	// Endpoint is the authoritative join (it comes from the platform's start
+	// response); the challenge code named in the item is the fallback for
+	// results recorded before the endpoint was captured.
+	if submitStore := intelsubmit.StoreOrNil(); submitStore != nil {
+		receipts, err := submitStore.ListByTask(ctx, taskID, 200)
+		if err != nil {
+			log.Printf("[intel] task %s: submit receipt read failed: %v", taskID, err)
+		} else {
+			attachReceipts(ordered, receipts)
 		}
 	}
 

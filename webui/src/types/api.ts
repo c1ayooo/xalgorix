@@ -2098,6 +2098,19 @@ export interface IntelItem {
   triage?: IntelTriage;
   /** 引擎侧可达性投影（与人工 triage 是两件事）。 */
   access?: IntelAccess;
+  /**
+   * 得分回执（任务级，按平台 unique_code 记账）：这条战果有没有真的
+   * 换成分。pending = 容器在、结果未交；submitted = 平台判正确；
+   * invalid = 判错或容器已关（flag 随之失效）；duplicate = 幂等重复提交。
+   */
+  submit?: {
+    state: "pending" | "submitted" | "invalid" | "duplicate";
+    unique_code: string;
+    endpoint?: string;
+    awarded: number;
+    attempts: number;
+    last_attempt_at?: string;
+  };
 }
 
 export interface TaskIntelResponse {

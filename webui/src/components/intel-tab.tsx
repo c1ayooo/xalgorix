@@ -80,6 +80,21 @@ const TRIAGE_VARIANT: Record<
   dismissed: "muted",
 };
 
+/**
+ * 得分回执的徽标样式：与 triage 分开，因为两者是不同事实 —— triage 是人的
+ * 判断（这条情报可不可用），submit 是平台的事实（这条战果换没换成分）。
+ * pending 用警告色，让"容器在跑但没交"在列表里一眼可见。
+ */
+const SUBMIT_VARIANT: Record<
+  NonNullable<IntelItem["submit"]>["state"],
+  "default" | "success" | "muted" | "warning" | "destructive"
+> = {
+  pending: "warning",
+  submitted: "success",
+  invalid: "muted",
+  duplicate: "destructive",
+};
+
 function IntelRow({
   item,
   taskId,
@@ -150,6 +165,21 @@ function IntelRow({
             title={item.access.grants?.join(", ")}
           >
             {t(`intelAccess.state.${item.access.state}`)}
+          </Badge>
+        )}
+        {/* 得分回执：排队在跑但没交的结果，必须比"已交"更显眼。 */}
+        {item.submit && (
+          <Badge
+            variant={SUBMIT_VARIANT[item.submit.state]}
+            className="shrink-0 tabular-nums"
+            title={`${item.submit.unique_code}${
+              item.submit.awarded ? ` · +${item.submit.awarded}` : ""
+            }`}
+          >
+            {t(`intel.submit.${item.submit.state}`)}
+            {item.submit.state === "submitted" && item.submit.awarded > 0
+              ? ` +${item.submit.awarded}`
+              : ""}
           </Badge>
         )}
         {item.kind !== "sensitive_data" && (
@@ -224,6 +254,16 @@ function IntelRow({
             <p className="font-mono text-[10px] text-muted-foreground">
               {t("intel.triage.by")} {item.triage.decided_by} ·{" "}
               {new Date(item.triage.decided_at).toLocaleString()}
+            </p>
+          )}
+          {item.submit && (
+            <p className="font-mono text-[10px] text-muted-foreground">
+              {t("intel.submit.receipt")} {item.submit.unique_code}
+              {item.submit.endpoint ? ` @ ${item.submit.endpoint}` : ""} ·{" "}
+              {t("intel.submit.attempts")} {item.submit.attempts}
+              {item.submit.last_attempt_at
+                ? ` · ${new Date(item.submit.last_attempt_at).toLocaleString()}`
+                : ""}
             </p>
           )}
         </div>
@@ -301,15 +341,19 @@ export function IntelTab({
   const [statusFilter, setStatusFilter] = useState<IntelTriageStatus | "all">(
     "all",
   );
+  // 只看待提交的结果：跑分/长任务里最需要的过滤，"容器在跑但没人交"这一条
+  // 以前在任何视图里都看不见。
+  const [onlyPending, setOnlyPending] = useState(false);
 
   const items = useMemo(() => {
     const all = data?.items ?? [];
     return all.filter(
       (it) =>
         (kindFilter === "all" || it.kind === kindFilter) &&
-        (statusFilter === "all" || (it.triage?.status ?? "open") === statusFilter),
+        (statusFilter === "all" || (it.triage?.status ?? "open") === statusFilter) &&
+        (!onlyPending || it.submit?.state === "pending"),
     );
-  }, [data, kindFilter, statusFilter]);
+  }, [data, kindFilter, statusFilter, onlyPending]);
 
   if (error) {
     return (
@@ -398,6 +442,23 @@ export function IntelTab({
             {st === "all" ? t("intel.statusAll") : t(`intel.status.${st}`)}
           </button>
         ))}
+        <span className="mx-1 h-4 w-px bg-border" aria-hidden />
+        <button
+          type="button"
+          onClick={() => setOnlyPending((v) => !v)}
+          className={cn(
+            "rounded-full border px-2.5 py-0.5 text-xs transition-colors",
+            onlyPending
+              ? "border-amber-500/50 bg-amber-500/10 text-amber-600 dark:text-amber-400"
+              : "border-border text-muted-foreground hover:text-foreground",
+          )}
+        >
+          {t("intel.submit.onlyPending")}
+          <span className="ml-1 font-mono tabular-nums">
+            {data.items?.filter((it) => it.submit?.state === "pending").length ??
+              0}
+          </span>
+        </button>
       </div>
 
       {data.damaged_runs ? (

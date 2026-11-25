@@ -27,6 +27,7 @@ import (
 	"github.com/c1ayooo/xalgorix/v4/internal/graph"
 	"github.com/c1ayooo/xalgorix/v4/internal/imhub"
 	"github.com/c1ayooo/xalgorix/v4/internal/intelaccess"
+	"github.com/c1ayooo/xalgorix/v4/internal/intelsubmit"
 	"github.com/c1ayooo/xalgorix/v4/internal/jobs"
 	"github.com/c1ayooo/xalgorix/v4/internal/platform"
 	"github.com/c1ayooo/xalgorix/v4/internal/proxy"
@@ -435,6 +436,19 @@ func main() {
 		}
 		intelaccess.SetStore(intelAccessStore)
 		graph.SetConcludeHook(intelAccessStore.ConcludeHook())
+		// Submission receipts (migration 0038): what a proven result actually
+		// became. Identity is the platform's unique_code at task level, so a
+		// later session can see which results are still unsubmitted instead of
+		// re-deriving them from scratch. Same own-pool + shared-migrator
+		// convention as the projection above.
+		intelSubmitStore, intelSubmitErr := intelsubmit.Open(context.Background(), cfg.DatabaseURL)
+		if intelSubmitErr != nil {
+			fmt.Fprintf(os.Stderr, "❌ submission receipt store failed to start: %v\n", intelSubmitErr)
+			fmt.Fprintln(os.Stderr, "   Fix the DSN / database, then start again — receipts have no file fallback.")
+			os.Exit(1)
+		}
+		intelsubmit.SetStore(intelSubmitStore)
+		defer intelSubmitStore.Close()
 		// Explicit detail fetches are the one place intel content reaches the
 		// model; record them on the audit projection of the run (the intel
 		// store's context id maps to the graph run id through the scan context).
